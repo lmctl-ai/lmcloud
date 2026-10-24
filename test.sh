@@ -50,6 +50,8 @@ for f in examples/*.lms; do
 done
 
 # Error paths
+mkdir -p build
+
 # 1. Invalid usage returns exit 2
 set +e
 "$HOST" --invalid-flag >/dev/null 2>&1
@@ -58,7 +60,7 @@ set -e
 [ "$code" -eq 2 ] || fail "--invalid-flag exited $code, want 2"; ok "invalid CLI flag returns exit 2"
 
 # 2. Corrupt bytecode returns exit 3 with LOAD_BAD_BYTECODE
-bad_code="$(mktemp)"; trap 'rm -f "$bad_code"' EXIT
+bad_code="$(mktemp build/bad_code.XXXXXX)"; trap 'rm -f "$bad_code"' EXIT
 echo "not bytecode" > "$bad_code"
 out="$("$HOST" --dsl "$bad_code" 2>&1 || true)"
 echo "$out" | grep -q "LOAD_BAD_BYTECODE" || fail "bad bytecode not rejected with LOAD_BAD_BYTECODE: $out"; ok "corrupt bytecode rejected cleanly with exit 3"
@@ -67,7 +69,7 @@ echo "$out" | grep -q "LOAD_BAD_BYTECODE" || fail "bad bytecode not rejected wit
 run_dsl() { # NAME BODY
   local snippet="$1"
   local body="$2"
-  local tmpdir; tmpdir="$(mktemp -d)"
+  local tmpdir; tmpdir="$(mktemp -d build/tmp.XXXXXX)"
   cat > "$tmpdir/script.lms" <<LMS
 p = _dsl_ cli="lmcloud";
 $body
@@ -93,7 +95,7 @@ echo "$out" | grep -q 'code=0' || fail "missing dir plan did not handle error cl
 ok "plan against non-existent dir sets last_error and returns 0 adds"
 
 # 5. Apply without init sets last_error and returns false
-td_noinit="$(mktemp -d)"
+td_noinit="$(mktemp -d build/td_noinit.XXXXXX)"
 echo 'resource "terraform_data" "x" {}' > "$td_noinit/main.tf"
 out="$(run_dsl "no_init" "
 let ok = tofu.apply(\"$td_noinit\");
@@ -104,7 +106,7 @@ echo "$out" | grep -q 'code=0' || fail "apply without init did not report false:
 ok "apply without init returns false and sets last_error"
 
 # 6. Output of unknown name returns empty string and sets last_error
-td_out="$(mktemp -d)"
+td_out="$(mktemp -d build/td_out.XXXXXX)"
 cat > "$td_out/main.tf" <<TF
 resource "terraform_data" "x" {
   input = "val"
