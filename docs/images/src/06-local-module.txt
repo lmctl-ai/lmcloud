@@ -1,0 +1,16 @@
+$ cat examples/06-local-module.lms | head -n 17
+# Pattern: Modular infrastructure composition via local module source.
+# Demonstrates local module directory references, module initialization,
+# and passing inputs/outputs across module boundaries.
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex06-workdir";
+let ok_init = tofu.init(dir);
+let plan = tofu.plan(dir);
+let ok_apply = tofu.apply(dir);
+let auth_id = tofu.output(dir, "auth_id");
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+$ lmscript examples/06-local-module.lms
+ok 06-local-module - initialized and evaluated local submodule hierarchy

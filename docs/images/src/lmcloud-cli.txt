@@ -1,0 +1,22 @@
+$ lmcloud --version
+lmcloud 0.1.0 (opentofu 1.13.2)
+
+$ lmcloud --dsl-schema
+context tofu: Tofu
+Plan:
+  Plan.add() -> int
+  Plan.change() -> int
+  Plan.destroy() -> int
+  Plan.save(string) -> bool
+  Plan.summary() -> string
+Tofu:
+  Tofu.apply(string) -> bool
+  Tofu.destroy(string) -> bool
+  Tofu.fmt(string) -> string
+  Tofu.init(string) -> bool
+  Tofu.last_error() -> string
+  Tofu.output(string, string) -> string
+  Tofu.plan(string) -> Plan
+  Tofu.show_state(string) -> string
+  Tofu.validate(string) -> bool
+  Tofu.var(string, string) -> void

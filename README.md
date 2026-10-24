@@ -27,14 +27,20 @@ end _dsl_
 
 All examples live in [`examples/`](examples) and run completely offline:
 
-| Example | Pattern & Description | Execution Output Caption |
+| **01-fmt-and-validate** | **02-plan-inspection** | **03-lifecycle** |
 | --- | --- | --- |
-| **01-fmt-and-validate**<br>[`examples/01-fmt-and-validate.lms`](examples/01-fmt-and-validate.lms) | Canonical HCL formatting and syntax validation in memory without cloud dependencies. | `ok 01-fmt-and-validate - formatted HCL and validated configuration`<br>`Result: {"ok": true, "result": null}` |
-| **02-plan-inspection**<br>[`examples/02-plan-inspection.lms`](examples/02-plan-inspection.lms) | In-process planning, reading structured resource change counts (`plan.add()`, `plan.change()`, `plan.destroy()`), and saving binary plan files. | `ok 02-plan-inspection - inspected planned additions and saved binary plan`<br>`Summary: Plan: 2 to add, 0 to change, 0 to destroy.` |
-| **03-lifecycle**<br>[`examples/03-lifecycle.lms`](examples/03-lifecycle.lms) | Complete end-to-end lifecycle: initialize directory, plan, apply, retrieve outputs, inspect state JSON, and destroy. | `ok 03-lifecycle - completed init, plan, apply, output, state check, and destroy`<br>`Status: db-cluster-ready` |
-| **04-variables-and-locals**<br>[`examples/04-variables-and-locals.lms`](examples/04-variables-and-locals.lms) | Programmatic variable injection via `tofu.var(name, value)` before plan/apply, evaluating computed local expressions. | `ok 04-variables-and-locals - injected variables and evaluated local expressions`<br>`Output: prod.us-east.cloud.internal` |
-| **05-count-and-for-each**<br>[`examples/05-count-and-for-each.lms`](examples/05-count-and-for-each.lms) | Multi-resource iteration and scaling using HCL `count` and `for_each` on `terraform_data`. | `ok 05-count-and-for-each - scaled resources via count and for_each`<br>`Planned additions: 6` |
-| **06-local-module**<br>[`examples/06-local-module.lms`](examples/06-local-module.lms) | Hierarchical module composition using local directory modules (`source = "./modules/subservice"`). | `ok 06-local-module - initialized and evaluated local submodule hierarchy`<br>`Output: service-authentication` |
+| <img src="docs/images/01-fmt-and-validate.png" width="290"> | <img src="docs/images/02-plan-inspection.png" width="290"> | <img src="docs/images/03-lifecycle.png" width="290"> |
+| Canonical HCL formatting and syntax validation in memory without cloud dependencies.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/01-fmt-and-validate.lms` | In-process planning, reading change counts (`plan.add()`, `plan.change()`, `plan.destroy()`), and saving binary plan files.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/02-plan-inspection.lms` | Complete lifecycle: initialize directory, plan, apply, retrieve outputs, inspect state JSON, and destroy.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/03-lifecycle.lms` |
+
+| **04-variables-and-locals** | **05-count-and-for-each** | **06-local-module** |
+| --- | --- | --- |
+| <img src="docs/images/04-variables-and-locals.png" width="290"> | <img src="docs/images/05-count-and-for-each.png" width="290"> | <img src="docs/images/06-local-module.png" width="290"> |
+| Programmatic variable injection via `tofu.var()` before plan/apply, evaluating computed local expressions.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/04-variables-and-locals.lms` | Multi-resource iteration and scaling using HCL `count` and `for_each` on `terraform_data`.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/05-count-and-for-each.lms` | Hierarchical module composition using local directory modules (`source = "./modules/subservice"`).<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/06-local-module.lms` |
+
+| **lmcloud CLI & Schema** | **tofu.plan Summary** |
+| --- | --- |
+| <img src="docs/images/lmcloud-cli.png" width="450"> | <img src="docs/images/tofu-plan.png" width="450"> |
+| Version, embedded OpenTofu engine version, and DSL schema method signatures.<br>`lmcloud --version && lmcloud --dsl-schema` | Structured plan inspection, change counts, and binary plan persistence.<br>`tofu.plan(dir).summary()` |
 
 ## Licensing & Fork Rationale
 

@@ -1,0 +1,16 @@
+$ cat examples/01-fmt-and-validate.lms | head -n 14
+# Pattern: In-process HCL formatting and syntax validation.
+# Demonstrates using tofu.fmt() to canonically format configuration text
+# and tofu.validate() to verify syntax and block structures without touching cloud providers.
+
+unformatted = "resource   \"terraform_data\"   \"demo\"   {\n  input   =   \"formatted_val\"\n}\n";
+write_file(path_join(workdir, "main.tf"), unformatted);
+
+p = _dsl_ cli="lmcloud";
+let formatted = tofu.fmt(unformatted_snippet);
+let ok_init = tofu.init("build/ex01-workdir");
+let ok_val = tofu.validate("build/ex01-workdir");
+end _dsl_
+
+$ lmscript examples/01-fmt-and-validate.lms
+ok 01-fmt-and-validate - formatted HCL and validated configuration

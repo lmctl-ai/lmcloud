@@ -1,0 +1,18 @@
+$ cat examples/04-variables-and-locals.lms | head -n 16
+# Pattern: Dynamic input variable injection and local expression computation.
+# Demonstrates setting input variables programmatically via tofu.var() before plan/apply,
+# and reading resolved outputs derived from locals and variables.
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex04-workdir";
+tofu.var("tier", "prod");
+tofu.var("region", "us-east");
+let ok_init = tofu.init(dir);
+let plan = tofu.plan(dir);
+let ok_apply = tofu.apply(dir);
+let fqdn = tofu.output(dir, "endpoint_fqdn");
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+$ lmscript examples/04-variables-and-locals.lms
+ok 04-variables-and-locals - injected variables and evaluated local expressions

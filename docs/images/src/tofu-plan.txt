@@ -1,0 +1,19 @@
+$ cat infra/service.tf
+resource "terraform_data" "web" {
+  count = 2
+  input = "web-${count.index}"
+}
+resource "terraform_data" "db" {
+  input = "primary-db"
+}
+
+$ lmscript -e '
+p = _dsl_ cli="lmcloud";
+let ok_init = tofu.init("infra");
+let plan = tofu.plan("infra");
+out.print(plan.summary());
+out.print("plan.add=" + str(plan.add()) + " plan.change=" + str(plan.change()));
+end _dsl_
+'
+Plan: 3 to add, 0 to change, 0 to destroy.
+plan.add=3 plan.change=0
