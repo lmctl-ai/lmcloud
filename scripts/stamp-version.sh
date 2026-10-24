@@ -5,8 +5,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [ -f VERSION ]; then
-  current="$(head -n1 VERSION | tr -d '[:space:]')"
+if [ -f LMCLOUD_VERSION ]; then
+  current="$(head -n1 LMCLOUD_VERSION | tr -d '[:space:]')"
+elif [ -f cmd/lmcloud/VERSION ]; then
+  current="$(head -n1 cmd/lmcloud/VERSION | tr -d '[:space:]')"
 else
   current="0.1.0"
 fi
@@ -21,7 +23,9 @@ fi
 v="${1:-}"
 [ -n "$v" ] || exit 0
 
-printf '%s\n' "$v" > VERSION
+if [ -f LMCLOUD_VERSION ]; then
+  printf '%s\n' "$v" > LMCLOUD_VERSION
+fi
 if [ -d cmd/lmcloud ]; then
   printf '%s\n' "$v" > cmd/lmcloud/VERSION
 fi

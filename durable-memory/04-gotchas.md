@@ -25,3 +25,6 @@ Per the fork guidelines, upstream OpenTofu files must remain untouched wherever 
 
 5. **`_dsl_` Scope in LMScript:**
    LMScript treats the `_dsl_` block as an independent language scope. Outer LMScript variables cannot be directly referenced inside `_dsl_`. Use `let var = ...` inside `_dsl_` or pass string literals directly.
+
+6. **Case-Insensitive Filesystems and `version/`:**
+   On case-insensitive file systems (macOS APFS and Windows NTFS), a root-level file named `VERSION` collides with OpenTofu's package directory `version/`, causing `VERSION: Is a directory` errors during version stamping. lmcloud uses `LMCLOUD_VERSION` at the repository root and `cmd/lmcloud/VERSION` inside `cmd/lmcloud/`.

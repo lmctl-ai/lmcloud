@@ -22,7 +22,11 @@ if [ "$(uname -s)" = "Linux" ]; then
   ok "executable is statically linked"
 fi
 
-want_v="$(head -n1 VERSION)"
+if [ -f LMCLOUD_VERSION ]; then
+  want_v="$(head -n1 LMCLOUD_VERSION | tr -d '[:space:]')"
+else
+  want_v="$(head -n1 cmd/lmcloud/VERSION | tr -d '[:space:]')"
+fi
 want_tofu="1.13.2"
 want="lmcloud $want_v (opentofu $want_tofu)"
 got="$("$HOST" --version)"
