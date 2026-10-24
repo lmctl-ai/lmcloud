@@ -1,0 +1,25 @@
+# Pattern: In-process HCL formatting and syntax validation.
+# Demonstrates using tofu.fmt() to canonically format configuration text
+# and tofu.validate() to verify syntax and block structures without touching cloud providers.
+
+out = ARGV.len() > 0 ? ARGV[0] : "build/01-fmt-and-validate.dslb";
+mkdir("build");
+workdir = "build/ex01-workdir";
+mkdir(workdir);
+
+unformatted = "resource   \"terraform_data\"   \"demo\"   {\n  input   =   \"formatted_val\"\n}\n";
+write_file(path_join(workdir, "main.tf"), unformatted);
+
+p = _dsl_ cli="lmcloud";
+let unformatted_snippet = "resource   \"terraform_data\"   \"demo\"   {\n  input   =   \"formatted_val\"\n}\n";
+let formatted = tofu.fmt(unformatted_snippet);
+let ok_init = tofu.init("build/ex01-workdir");
+let ok_val = tofu.validate("build/ex01-workdir");
+end _dsl_
+
+savedsl(p, out);
+r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);
+assert(r.code == 0, "host execution failed: " + r.stderr);
+assert(starts_with(r.stdout, "{\"ok\": true"), "expected ok json output");
+
+println("ok 01-fmt-and-validate - formatted HCL and validated configuration");

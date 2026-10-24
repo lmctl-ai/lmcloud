@@ -1,57 +1,89 @@
-![](https://raw.githubusercontent.com/opentofu/brand-artifacts/main/full/transparent/SVG/on-dark.svg#gh-dark-mode-only)
-![](https://raw.githubusercontent.com/opentofu/brand-artifacts/main/full/transparent/SVG/on-light.svg#gh-light-mode-only)
+# lmcloud
 
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/10508/badge)](https://www.bestpractices.dev/projects/10508)
+**Drive OpenTofu infrastructure operations from LMScript with one static executable.**
 
-[Homepage](https://opentofu.org/) | [Slack](https://opentofu.org/slack) | [Get Started](https://opentofu.org/docs/intro/install)
+lmcloud is a native host for the lmscript `_dsl_` statement. It embeds the [OpenTofu](https://github.com/opentofu/opentofu) v1.13.2 engine in-process and exposes it through [`schema/lmcloud.dsl.json`](schema/lmcloud.dsl.json). Scripts can initialize, format, validate, plan, apply, destroy, and inspect state using typed objects with zero runtime dependencies.
 
-OpenTofu is an OSS tool for building, changing, and versioning infrastructure safely and efficiently. OpenTofu can manage existing and popular service providers as well as custom in-house solutions.
+```lms
+p = _dsl_ cli="lmcloud" install="github:lmctl-ai/lmcloud@latest";
+let ok_init = tofu.init("infra/production");
+let plan = tofu.plan("infra/production");
+let adds = plan.add();
+let ok_apply = tofu.apply("infra/production");
+let endpoint = tofu.output("infra/production", "api_endpoint");
+let state_json = tofu.show_state("infra/production");
+let ok_destroy = tofu.destroy("infra/production");
+end _dsl_
+```
 
-## Getting help and contributing
+## What it does (and does not)
 
-- Have a question?
-  - Post it in [GitHub Discussions](https://github.com/orgs/opentofu/discussions)
-  - Open a [GitHub issue](https://github.com/opentofu/opentofu/issues/new/choose)
-  - Join us in the [#opentofu channel on the CNCF Slack](https://opentofu.org/slack/)!
-- Want to contribute?
-  - Please read the [Contribution Guide](CONTRIBUTING.md).
-- Recurring Events
-  - [Community Meetings](https://meet.google.com/xfm-cgms-has) on Wednesdays at 12:30 UTC ([calendar](https://calendar.google.com/calendar/event?eid=NDg0aWl2Y3U1aHFva3N0bGhyMHBhNzdpZmsgY18zZjJkZDNjMWZlMGVmNGU5M2VmM2ZjNDU2Y2EyZGQyMTlhMmU4ZmQ4NWY2YjQwNzUwYWYxNmMzZGYzNzBiZjkzQGc))
-  - [Technical Steering Committee Meetings](https://meet.google.com/cry-houa-qbk) every other Tuesday at 4pm UTC ([calendar](https://calendar.google.com/calendar/u/0/event?eid=M3JyMWtuYWptdXI0Zms4ZnJpNmppcDczb3RfMjAyNTA1MjdUMTYwMDAwWiBjXzNmMmRkM2MxZmUwZWY0ZTkzZWYzZmM0NTZjYTJkZDIxOWEyZThmZDg1ZjZiNDA3NTBhZjE2YzNkZjM3MGJmOTNAZw))
+- **Real in-process engine:** All operations (`init`, `validate`, `fmt`, `plan`, `apply`, `destroy`, `output`, `show_state`) run within the process through OpenTofu's core `internal/command` subsystem with captured I/O streams. No child processes (`tofu` or `terraform` binaries) are spawned.
+- **Zero-network offline operations:** v1 operates completely offline with zero network access using the built-in provider `terraform.io/builtin/terraform` (`terraform_data` resource), `locals`, `variables`, `outputs`, `check` blocks, `count`, `for_each`, and local filesystem modules.
+- **Third-party cloud providers:** External cloud providers (AWS, Azure, GCP, Kubernetes) operate as separate gRPC plugin executables. In OpenTofu, downloading them requires network during `init`. A future version may embed selected providers.
+- **Single static executable:** Built with `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"` into a standalone binary with no dynamic library dependencies.
 
-> [!TIP]
-> For more OpenTofu events, subscribe to the [OpenTofu Events Calendar](https://calendar.google.com/calendar/embed?src=c_3f2dd3c1fe0ef4e93ef3fc456ca2dd219a2e8fd85f6b40750af16c3df370bf93%40group.calendar.google.com)!
+## Example Gallery
 
-## Key features
+All examples live in [`examples/`](examples) and run completely offline:
 
-- **Infrastructure as Code**: Infrastructure is described using a high-level configuration syntax. This allows a blueprint of your datacenter to be versioned and treated as you would any other code. Additionally, infrastructure can be shared and re-used.
+| Example | Pattern & Description | Execution Output Caption |
+| --- | --- | --- |
+| **01-fmt-and-validate**<br>[`examples/01-fmt-and-validate.lms`](examples/01-fmt-and-validate.lms) | Canonical HCL formatting and syntax validation in memory without cloud dependencies. | `ok 01-fmt-and-validate - formatted HCL and validated configuration`<br>`Result: {"ok": true, "result": null}` |
+| **02-plan-inspection**<br>[`examples/02-plan-inspection.lms`](examples/02-plan-inspection.lms) | In-process planning, reading structured resource change counts (`plan.add()`, `plan.change()`, `plan.destroy()`), and saving binary plan files. | `ok 02-plan-inspection - inspected planned additions and saved binary plan`<br>`Summary: Plan: 2 to add, 0 to change, 0 to destroy.` |
+| **03-lifecycle**<br>[`examples/03-lifecycle.lms`](examples/03-lifecycle.lms) | Complete end-to-end lifecycle: initialize directory, plan, apply, retrieve outputs, inspect state JSON, and destroy. | `ok 03-lifecycle - completed init, plan, apply, output, state check, and destroy`<br>`Status: db-cluster-ready` |
+| **04-variables-and-locals**<br>[`examples/04-variables-and-locals.lms`](examples/04-variables-and-locals.lms) | Programmatic variable injection via `tofu.var(name, value)` before plan/apply, evaluating computed local expressions. | `ok 04-variables-and-locals - injected variables and evaluated local expressions`<br>`Output: prod.us-east.cloud.internal` |
+| **05-count-and-for-each**<br>[`examples/05-count-and-for-each.lms`](examples/05-count-and-for-each.lms) | Multi-resource iteration and scaling using HCL `count` and `for_each` on `terraform_data`. | `ok 05-count-and-for-each - scaled resources via count and for_each`<br>`Planned additions: 6` |
+| **06-local-module**<br>[`examples/06-local-module.lms`](examples/06-local-module.lms) | Hierarchical module composition using local directory modules (`source = "./modules/subservice"`). | `ok 06-local-module - initialized and evaluated local submodule hierarchy`<br>`Output: service-authentication` |
 
-- **Execution Plans**: OpenTofu has a "planning" step where it generates an execution plan. The execution plan shows what OpenTofu will do when you call apply. This lets you avoid any surprises when OpenTofu manipulates infrastructure.
+## Licensing & Fork Rationale
 
-- **Resource Graph**: OpenTofu builds a graph of all your resources, and parallelizes the creation and modification of any non-dependent resources. Because of this, OpenTofu builds infrastructure as efficiently as possible, and operators get insight into dependencies in their infrastructure.
+HashiCorp Terraform >= 1.6 adopted the Business Source License (BUSL-1.1), which is non-open-source and restricts commercial and competitive use.
 
-- **Change Automation**: Complex changesets can be applied to your infrastructure with minimal human interaction. With the previously mentioned execution plan and resource graph, you know exactly what OpenTofu will change and in what order, avoiding many possible human errors.
+lmcloud is built upon **OpenTofu** (`github.com/opentofu/opentofu`, MPL-2.0), the open source, community-governed Terraform fork. OpenTofu maintains complete HCL compatibility, identical provider protocols, and state file interoperability.
 
-## Nightly Builds
+### License Split
 
-Nightly builds are available for testing the latest changes on `main`. These are experimental and not intended for production use. Each build is removed after 30 days.
+- **Upstream OpenTofu files:** Unchanged and governed by Mozilla Public License 2.0 (MPL-2.0). Upstream documentation is preserved at [`UPSTREAM-README.md`](UPSTREAM-README.md); upstream [`LICENSE`](LICENSE) remains untouched.
+- **Our added files:** Governed by the MIT License (`// SPDX-License-Identifier: MIT`). Added paths:
+  - `cmd/lmcloud/`
+  - `internal/lmhost/`
+  - `schema/`
+  - `examples/`
+  - `durable-memory/`
+  - `scripts/`
+  - `test.sh`
+  - `.github/workflows/ci.yml`
+- **Modified upstream files:**
+  - `go.mod`: Added `github.com/lmctl-ai/lmcode-go` dependency.
+  - `go.sum`: Checksums for `github.com/lmctl-ai/lmcode-go`.
+  - `.gitignore`: Added `build/` and `dist/` directories.
 
-Nightly builds can be found at `https://nightlies.opentofu.org/nightlies`. For those who want to automate with tooling, `https://nightlies.opentofu.org/nightlies/latest.json` will be kept up to date with the latest build information.
+## Build and Test
 
-For more details, see [RELEASE.md](RELEASE.md#nightly-builds).
+### Prerequisites
 
-## Reporting security vulnerabilities
+- Go 1.26 or Go 1.27
+- `lmscript` (installed via `npm i -g @lmctl-ai/lmctl@0.2.401`)
 
-If you've found a vulnerability or a potential vulnerability in OpenTofu please follow [Security Policy](https://github.com/opentofu/opentofu/security/policy). We'll send a confirmation email to acknowledge your report, and we'll send an additional email when we've identified the issue positively or negatively.
+### Build Static Executable
 
-## Reporting possible copyright issues
+```bash
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ./bin/lmcloud ./cmd/lmcloud
+```
 
-If you believe you have found any possible copyright or intellectual property issues, please contact liaison@opentofu.org. We'll send a confirmation email to acknowledge your report.
+Verify static linking:
+```bash
+file ./bin/lmcloud
+# ./bin/lmcloud: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped
+ldd ./bin/lmcloud
+# not a dynamic executable
+```
 
-## Registry Access
+### Run Tests
 
-In an effort to comply with applicable sanctions, we block access from specific countries of origin. For more details, see the [Registry Inclusion Policy](https://github.com/opentofu/registry/blob/main/POLICY.md).
+```bash
+./test.sh
+```
 
-## License
-
-[Mozilla Public License v2.0](https://github.com/opentofu/opentofu/blob/main/LICENSE)
+Verifies static linkage, schema byte-identity, signature parity against `lmscript --dsl-signatures`, all 6 zero-network examples, error handling paths (invalid flags, corrupt bytecode, missing directory, uninitialized apply, unknown output name, invalid HCL), and Go unit tests.

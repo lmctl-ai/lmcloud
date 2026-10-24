@@ -1,0 +1,166 @@
+name: ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Run a single matrix job (or 'all')"
+        required: true
+        default: "all"
+        type: choice
+        options: [all, linux-x64, linux-arm64, macos-arm64, macos-x64, windows-x64]
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["durable-memory/**", "**.md"]
+  pull_request:
+    paths-ignore: ["durable-memory/**", "**.md"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      v: ${{ steps.v.outputs.v }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"; echo "release=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main ]]; then
+            echo "v=$(scripts/stamp-version.sh --base).$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"; echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "v=" >> "$GITHUB_OUTPUT"; echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     name: linux-x64 }
+          - { os: ubuntu-24.04-arm, name: linux-arm64 }
+          - { os: macos-15,         name: macos-arm64 }
+          - { os: macos-15-intel,   name: macos-x64 }
+          - { os: windows-2022,     name: windows-x64 }
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    timeout-minutes: 60
+    env:
+      ONLY_OK: ${{ github.event_name != 'workflow_dispatch' || inputs.only == 'all' || matrix.name == inputs.only }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: env.ONLY_OK == 'true'
+        with:
+          persist-credentials: false
+
+      - name: stamp release version
+        if: needs.version.outputs.v != '' && env.ONLY_OK == 'true'
+        run: scripts/stamp-version.sh "${{ needs.version.outputs.v }}"
+
+      - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        if: env.ONLY_OK == 'true'
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: env.ONLY_OK == 'true'
+        with:
+          node-version: 24
+
+      - name: lmscript compiler (npm @lmctl-ai/lmctl)
+        if: env.ONLY_OK == 'true'
+        run: |
+          npm i -g @lmctl-ai/lmctl@0.2.401
+          lmscript --version
+
+      - name: test host package
+        if: env.ONLY_OK == 'true'
+        run: go test -v ./internal/lmhost
+
+      - name: build lmcloud
+        if: env.ONLY_OK == 'true'
+        run: |
+          mkdir -p bin
+          if [ "${{ matrix.name }}" = "windows-x64" ]; then
+            CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/lmcloud.exe ./cmd/lmcloud
+          else
+            CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/lmcloud ./cmd/lmcloud
+          fi
+
+      - name: test (static link, signatures, examples, error paths)
+        if: env.ONLY_OK == 'true'
+        run: ./test.sh
+
+      - name: package artifact
+        if: env.ONLY_OK == 'true'
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.name }}" = "windows-x64" ]; then
+            cp bin/lmcloud.exe "dist/lmcloud-${{ matrix.name }}.exe"
+          else
+            cp bin/lmcloud "dist/lmcloud-${{ matrix.name }}"
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: env.ONLY_OK == 'true'
+        with:
+          name: lmcloud-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: needs.version.outputs.release == 'true'
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    env:
+      REL_VERSION: ${{ needs.version.outputs.v }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: lmcloud-*
+          path: dist
+          merge-multiple: true
+
+      - name: verify linux-x64 version matches release tag
+        run: |
+          chmod +x dist/lmcloud-linux-x64
+          got="$(dist/lmcloud-linux-x64 --version)"
+          want="lmcloud $REL_VERSION (opentofu 1.13.2)"
+          test "$got" = "$want" || { echo "::error::tag v$REL_VERSION but binary says '$got'"; exit 1; }
+
+      - name: generate checksums
+        run: |
+          cd dist
+          sha256sum lmcloud-* > SHA256SUMS
+
+      - name: publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "v$REL_VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "v$REL_VERSION" -R "$GITHUB_REPOSITORY" --clobber dist/*
+          else
+            gh release create "v$REL_VERSION" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest --title "v$REL_VERSION" --generate-notes dist/*
+          fi

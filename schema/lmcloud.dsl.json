@@ -1,0 +1,130 @@
+{
+  "dsl.schema": 2,
+  "name": "lmcloud",
+  "types": {
+    "Tofu": {
+      "methods": {
+        "apply": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "destroy": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "fmt": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "string"
+          }
+        ],
+        "init": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "last_error": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "output": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "string"
+          }
+        ],
+        "plan": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "Plan"
+          }
+        ],
+        "show_state": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "string"
+          }
+        ],
+        "validate": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "var": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ]
+      }
+    },
+    "Plan": {
+      "methods": {
+        "add": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "change": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "destroy": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "save": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "summary": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ]
+      }
+    }
+  },
+  "functions": {},
+  "context": {
+    "tofu": "Tofu"
+  }
+}

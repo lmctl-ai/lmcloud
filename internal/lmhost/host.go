@@ -1,0 +1,620 @@
+// SPDX-License-Identifier: MIT
+
+package lmhost
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/lmctl-ai/lmcode-go"
+	"github.com/opentofu/opentofu/internal/addrs"
+	backendInit "github.com/opentofu/opentofu/internal/backend/init"
+	"github.com/opentofu/opentofu/internal/command"
+	"github.com/opentofu/opentofu/internal/command/system"
+	"github.com/opentofu/opentofu/internal/command/views"
+	viewsjson "github.com/opentofu/opentofu/internal/command/views/json"
+	"github.com/opentofu/opentofu/internal/command/workdir"
+	"github.com/opentofu/opentofu/internal/encryption"
+	"github.com/opentofu/opentofu/internal/plans"
+	"github.com/opentofu/opentofu/internal/plans/planfile"
+	"github.com/opentofu/opentofu/internal/terminal"
+	"github.com/opentofu/svchost/disco"
+)
+
+// Host implements the lmcloud host object for OpenTofu operations.
+type Host struct {
+	mu        sync.Mutex
+	vars      map[string]string
+	lastError string
+	services  *disco.Disco
+	initOnce  sync.Once
+}
+
+// Plan represents the planned changes for an infrastructure configuration.
+type Plan struct {
+	addCount     int64
+	changeCount  int64
+	destroyCount int64
+	summaryText  string
+	filePath     string
+	errored      bool
+	lastError    string
+}
+
+// NewHost creates a new initialized Host.
+func NewHost() *Host {
+	h := &Host{
+		vars:     make(map[string]string),
+		services: disco.New(),
+	}
+	return h
+}
+
+// newCapturedStreams creates OS-pipe-backed terminal streams capturing stdout and stderr.
+func newCapturedStreams() (*terminal.Streams, func() (string, string)) {
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		panic(err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		panic(err)
+	}
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		panic(err)
+	}
+	_ = stdinW.Close()
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(&stdoutBuf, stdoutR)
+	}()
+
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(&stderrBuf, stderrR)
+	}()
+
+	streams := &terminal.Streams{
+		Stdout: &terminal.OutputStream{File: stdoutW},
+		Stderr: &terminal.OutputStream{File: stderrW},
+		Stdin:  &terminal.InputStream{File: stdinR},
+	}
+
+	done := func() (string, string) {
+		_ = stdinR.Close()
+		_ = stdoutW.Close()
+		_ = stderrW.Close()
+		wg.Wait()
+		_ = stdoutR.Close()
+		_ = stderrR.Close()
+		return stdoutBuf.String(), stderrBuf.String()
+	}
+
+	return streams, done
+}
+
+func (h *Host) ensureInit() {
+	h.initOnce.Do(func() {
+		if h.services == nil {
+			h.services = disco.New()
+		}
+		backendInit.Init(h.services)
+	})
+}
+
+// runCommand runs an OpenTofu command in the specified directory while capturing output.
+func (h *Host) runCommand(dir string, fn func(meta command.Meta) int) (int, string, string) {
+	h.ensureInit()
+
+	origWd, err := os.Getwd()
+	if err != nil {
+		h.lastError = fmt.Sprintf("cannot get current working directory: %s", err)
+		return 1, "", h.lastError
+	}
+
+	targetDir := dir
+	if targetDir == "" {
+		targetDir = "."
+	}
+	absTarget, err := filepath.Abs(targetDir)
+	if err != nil {
+		h.lastError = fmt.Sprintf("cannot resolve directory %q: %s", dir, err)
+		return 1, "", h.lastError
+	}
+	if stat, err := os.Stat(absTarget); err != nil || !stat.IsDir() {
+		h.lastError = fmt.Sprintf("directory %q does not exist or is not a directory", dir)
+		return 1, "", h.lastError
+	}
+
+	if err := os.Chdir(absTarget); err != nil {
+		h.lastError = fmt.Sprintf("cannot change directory to %q: %s", absTarget, err)
+		return 1, "", h.lastError
+	}
+	defer func() {
+		_ = os.Chdir(origWd)
+	}()
+
+	streams, done := newCapturedStreams()
+	view := views.NewView(streams).SetRunningInAutomation(true)
+	meta := command.Meta{
+		WorkingDir:    workdir.NewDir("."),
+		View:          view,
+		Services:      h.services,
+		CallerContext: context.Background(),
+		ShutdownCh:    make(<-chan struct{}),
+		SystemCfg: system.Config{
+			RunningInAutomation: true,
+		},
+	}
+
+	code := fn(meta)
+	stdout, stderr := done()
+	return code, stdout, stderr
+}
+
+func (h *Host) buildVarArgs() []string {
+	keys := make([]string, 0, len(h.vars))
+	for k := range h.vars {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	varArgs := make([]string, 0, len(keys)*2)
+	for _, k := range keys {
+		varArgs = append(varArgs, "-var", fmt.Sprintf("%s=%s", k, h.vars[k]))
+	}
+	return varArgs
+}
+
+// Init initializes the working directory.
+func (h *Host) Init(dir string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	code, stdout, stderr := h.runCommand(dir, func(meta command.Meta) int {
+		return (&command.InitCommand{Meta: meta}).Run([]string{"-input=false", "-no-color"})
+	})
+	if code == 0 {
+		h.lastError = ""
+		return true
+	}
+	h.lastError = strings.TrimSpace(stderr)
+	if h.lastError == "" {
+		h.lastError = strings.TrimSpace(stdout)
+	}
+	return false
+}
+
+// Validate validates the configuration in the directory.
+func (h *Host) Validate(dir string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	code, stdout, stderr := h.runCommand(dir, func(meta command.Meta) int {
+		return (&command.ValidateCommand{Meta: meta}).Run([]string{"-no-color"})
+	})
+	if code == 0 {
+		h.lastError = ""
+		return true
+	}
+	h.lastError = strings.TrimSpace(stderr)
+	if h.lastError == "" {
+		h.lastError = strings.TrimSpace(stdout)
+	}
+	return false
+}
+
+// Fmt formats HCL code string.
+func (h *Host) Fmt(text string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	streams, done := newCapturedStreams()
+	view := views.NewView(streams).SetRunningInAutomation(true)
+	meta := command.Meta{
+		WorkingDir:    workdir.NewDir("."),
+		View:          view,
+		CallerContext: context.Background(),
+		ShutdownCh:    make(<-chan struct{}),
+		SystemCfg: system.Config{
+			RunningInAutomation: true,
+		},
+	}
+
+	code := command.RunCommand(command.FmtCommander(strings.NewReader(text)), meta, []string{"-"})
+	stdout, stderr := done()
+	if code == 0 {
+		h.lastError = ""
+		return stdout
+	}
+	h.lastError = strings.TrimSpace(stderr)
+	if h.lastError == "" {
+		h.lastError = strings.TrimSpace(stdout)
+	}
+	return text
+}
+
+// Var sets a variable value for subsequent plan/apply/destroy runs.
+func (h *Host) Var(name, value string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.vars[name] = value
+}
+
+// Plan generates an execution plan for the configuration directory.
+func (h *Host) Plan(dir string) *Plan {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	tmpFile, err := os.CreateTemp("", "lmcloud-plan-*.tfplan")
+	if err != nil {
+		h.lastError = fmt.Sprintf("cannot create temporary plan file: %s", err)
+		return &Plan{
+			errored:     true,
+			lastError:   h.lastError,
+			summaryText: "Plan failed: " + h.lastError,
+		}
+	}
+	tmpPath := tmpFile.Name()
+	_ = tmpFile.Close()
+
+	varArgs := h.buildVarArgs()
+	args := []string{"-input=false", "-no-color", "-out=" + tmpPath}
+	args = append(args, varArgs...)
+
+	code, stdout, stderr := h.runCommand(dir, func(meta command.Meta) int {
+		return (&command.PlanCommand{Meta: meta}).Run(args)
+	})
+
+	if code != 0 {
+		_ = os.Remove(tmpPath)
+		h.lastError = strings.TrimSpace(stderr)
+		if h.lastError == "" {
+			h.lastError = strings.TrimSpace(stdout)
+		}
+		return &Plan{
+			errored:     true,
+			lastError:   h.lastError,
+			summaryText: "Plan failed: " + h.lastError,
+		}
+	}
+
+	h.lastError = ""
+	r, err := planfile.Open(tmpPath, encryption.PlanEncryptionDisabled())
+	if err != nil {
+		h.lastError = fmt.Sprintf("cannot open plan file: %s", err)
+		return &Plan{
+			filePath:    tmpPath,
+			errored:     true,
+			lastError:   h.lastError,
+			summaryText: "Plan failed: " + h.lastError,
+		}
+	}
+
+	p, err := r.ReadPlan()
+	if err != nil {
+		h.lastError = fmt.Sprintf("cannot read plan: %s", err)
+		return &Plan{
+			filePath:    tmpPath,
+			errored:     true,
+			lastError:   h.lastError,
+			summaryText: "Plan failed: " + h.lastError,
+		}
+	}
+
+	var cs viewsjson.ChangeSummary
+	cs.Operation = viewsjson.OperationPlanned
+	if p != nil && p.Changes != nil {
+		for _, change := range p.Changes.Resources {
+			if change.Action == plans.Delete && change.Addr.Resource.Resource.Mode == addrs.DataResourceMode {
+				continue
+			}
+			if change.Importing != nil {
+				cs.Import++
+			}
+			switch change.Action {
+			case plans.Create:
+				cs.Add++
+			case plans.Delete:
+				cs.Remove++
+			case plans.Update:
+				cs.Change++
+			case plans.CreateThenDelete, plans.DeleteThenCreate:
+				cs.Add++
+				cs.Remove++
+			case plans.ForgetThenCreate:
+				cs.Add++
+				cs.Forget++
+			case plans.Forget:
+				cs.Forget++
+			}
+		}
+	}
+
+	return &Plan{
+		addCount:     int64(cs.Add),
+		changeCount:  int64(cs.Change),
+		destroyCount: int64(cs.Remove),
+		summaryText:  cs.String(),
+		filePath:     tmpPath,
+	}
+}
+
+// Apply applies configuration changes or a saved plan.
+func (h *Host) Apply(dir string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	varArgs := h.buildVarArgs()
+	args := []string{"-auto-approve", "-input=false", "-no-color"}
+	args = append(args, varArgs...)
+
+	code, stdout, stderr := h.runCommand(dir, func(meta command.Meta) int {
+		return (&command.ApplyCommand{Meta: meta}).Run(args)
+	})
+
+	if code == 0 {
+		h.lastError = ""
+		return true
+	}
+	h.lastError = strings.TrimSpace(stderr)
+	if h.lastError == "" {
+		h.lastError = strings.TrimSpace(stdout)
+	}
+	return false
+}
+
+// Destroy destroys infrastructure resources managed by configuration.
+func (h *Host) Destroy(dir string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	varArgs := h.buildVarArgs()
+	args := []string{"-auto-approve", "-input=false", "-no-color"}
+	args = append(args, varArgs...)
+
+	code, stdout, stderr := h.runCommand(dir, func(meta command.Meta) int {
+		return (&command.ApplyCommand{Meta: meta, Destroy: true}).Run(args)
+	})
+
+	if code == 0 {
+		h.lastError = ""
+		return true
+	}
+	h.lastError = strings.TrimSpace(stderr)
+	if h.lastError == "" {
+		h.lastError = strings.TrimSpace(stdout)
+	}
+	return false
+}
+
+// Output reads an output variable from state.
+func (h *Host) Output(dir, name string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	code, stdout, stderr := h.runCommand(dir, func(meta command.Meta) int {
+		return (&command.OutputCommand{Meta: meta}).Run([]string{"-raw", name})
+	})
+	if code == 0 {
+		h.lastError = ""
+		return stdout
+	}
+
+	// Try -json if -raw is unsupported for this type
+	code2, stdout2, stderr2 := h.runCommand(dir, func(meta command.Meta) int {
+		return (&command.OutputCommand{Meta: meta}).Run([]string{"-json", name})
+	})
+	if code2 == 0 {
+		h.lastError = ""
+		return strings.TrimRight(stdout2, "\r\n")
+	}
+
+	h.lastError = strings.TrimSpace(stderr)
+	if h.lastError == "" {
+		h.lastError = strings.TrimSpace(stderr2)
+	}
+	if h.lastError == "" {
+		h.lastError = strings.TrimSpace(stdout)
+	}
+	return ""
+}
+
+// ShowState returns the state snapshot as JSON.
+func (h *Host) ShowState(dir string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	code, stdout, stderr := h.runCommand(dir, func(meta command.Meta) int {
+		return (&command.ShowCommand{Meta: meta}).Run([]string{"-json"})
+	})
+	if code == 0 {
+		h.lastError = ""
+		return stdout
+	}
+	h.lastError = strings.TrimSpace(stderr)
+	if h.lastError == "" {
+		h.lastError = strings.TrimSpace(stdout)
+	}
+	return "{}"
+}
+
+// LastError returns the error message from the last failed operation.
+func (h *Host) LastError() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastError
+}
+
+// Add returns the number of resources to add.
+func (p *Plan) Add() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.addCount
+}
+
+// Change returns the number of resources to change.
+func (p *Plan) Change() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.changeCount
+}
+
+// Destroy returns the number of resources to destroy.
+func (p *Plan) Destroy() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.destroyCount
+}
+
+// Summary returns the plan change summary string.
+func (p *Plan) Summary() string {
+	if p == nil {
+		return ""
+	}
+	return p.summaryText
+}
+
+// Save writes the plan file to the given destination path.
+func (p *Plan) Save(path string) bool {
+	if p == nil || p.errored || p.filePath == "" {
+		return false
+	}
+	data, err := os.ReadFile(p.filePath)
+	if err != nil {
+		return false
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return false
+	}
+	return true
+}
+
+// Register registers all lmcloud host methods and context with the lmcode registry.
+func Register(reg *lmcode.Registry, h *Host) error {
+	// Methods on Tofu
+	if err := reg.Method("Tofu", "init", []string{"string"}, "bool", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		ok := host.Init(args[0].Str)
+		return lmcode.Bool(ok), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Tofu", "validate", []string{"string"}, "bool", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		ok := host.Validate(args[0].Str)
+		return lmcode.Bool(ok), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Tofu", "fmt", []string{"string"}, "string", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		res := host.Fmt(args[0].Str)
+		return lmcode.Str(res), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Tofu", "plan", []string{"string"}, "Plan", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		p := host.Plan(args[0].Str)
+		return lmcode.Obj("Plan", p), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Tofu", "apply", []string{"string"}, "bool", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		ok := host.Apply(args[0].Str)
+		return lmcode.Bool(ok), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Tofu", "destroy", []string{"string"}, "bool", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		ok := host.Destroy(args[0].Str)
+		return lmcode.Bool(ok), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Tofu", "output", []string{"string", "string"}, "string", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		res := host.Output(args[0].Str, args[1].Str)
+		return lmcode.Str(res), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Tofu", "var", []string{"string", "string"}, "void", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		host.Var(args[0].Str, args[1].Str)
+		return lmcode.None(), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Tofu", "show_state", []string{"string"}, "string", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		res := host.ShowState(args[0].Str)
+		return lmcode.Str(res), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Tofu", "last_error", []string{}, "string", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		return lmcode.Str(host.LastError()), nil
+	}); err != nil {
+		return err
+	}
+
+	// Methods on Plan
+	if err := reg.Method("Plan", "add", []string{}, "int", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		p := self.(*Plan)
+		return lmcode.Int(p.Add()), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Plan", "change", []string{}, "int", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		p := self.(*Plan)
+		return lmcode.Int(p.Change()), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Plan", "destroy", []string{}, "int", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		p := self.(*Plan)
+		return lmcode.Int(p.Destroy()), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Plan", "summary", []string{}, "string", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		p := self.(*Plan)
+		return lmcode.Str(p.Summary()), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Plan", "save", []string{"string"}, "bool", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		p := self.(*Plan)
+		ok := p.Save(args[0].Str)
+		return lmcode.Bool(ok), nil
+	}); err != nil {
+		return err
+	}
+
+	// Context
+	if err := reg.Context("tofu", "Tofu"); err != nil {
+		return err
+	}
+
+	return nil
+}

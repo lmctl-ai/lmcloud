@@ -2,6 +2,8 @@
 *.exe
 .DS_Store
 bin/
+build/
+dist/
 modules-dev/
 /pkg/
 website/.vagrant

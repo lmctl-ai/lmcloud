@@ -1,0 +1,28 @@
+# Pattern: Complete infrastructure lifecycle.
+# Demonstrates full workflow: init -> plan -> apply -> read output -> inspect JSON state -> destroy.
+# Runs 100% in-process with zero network using the built-in terraform_data provider.
+
+out = ARGV.len() > 0 ? ARGV[0] : "build/03-lifecycle.dslb";
+mkdir("build");
+workdir = "build/ex03-workdir";
+mkdir(workdir);
+
+tf = "resource \"terraform_data\" \"database\" {\n  input = \"db-cluster-ready\"\n}\noutput \"db_status\" {\n  value = terraform_data.database.output\n}\n";
+write_file(path_join(workdir, "main.tf"), tf);
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex03-workdir";
+let ok_init = tofu.init(dir);
+let plan = tofu.plan(dir);
+let ok_apply = tofu.apply(dir);
+let status = tofu.output(dir, "db_status");
+let state_json = tofu.show_state(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+savedsl(p, out);
+r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);
+assert(r.code == 0, "host execution failed: " + r.stderr);
+assert(starts_with(r.stdout, "{\"ok\": true"), "expected ok json output");
+
+println("ok 03-lifecycle - completed init, plan, apply, output, state check, and destroy");
