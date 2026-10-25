@@ -4,10 +4,21 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
-RENDERER="${RENDERER:-/home/mma/repos/lmctlhq/lmvideo/examples/terminal-shot.lms}"
-[ -f "$RENDERER" ] || { echo "Renderer not found at $RENDERER" >&2; exit 1; }
+LMVIDEO_DIR="${LMVIDEO_DIR:-}"
+if [ -z "$LMVIDEO_DIR" ]; then
+  if [ -d "$HERE/../lmvideo" ]; then
+    LMVIDEO_DIR="$HERE/../lmvideo"
+  elif [ -d "$HERE/../../lmctlhq/lmvideo" ]; then
+    LMVIDEO_DIR="$HERE/../../lmctlhq/lmvideo"
+  else
+    LMVIDEO_DIR="$HERE/../lmvideo"
+  fi
+fi
 
-export PATH="$HERE/bin:/home/mma/repos/lmctlhq/lmvideo/build:$PATH"
+RENDERER="${RENDERER:-$LMVIDEO_DIR/examples/terminal-shot.lms}"
+[ -f "$RENDERER" ] || { echo "Renderer not found at $RENDERER (set LMVIDEO_DIR or RENDERER)" >&2; exit 1; }
+
+export PATH="$HERE/bin:$LMVIDEO_DIR/build:$PATH"
 mkdir -p docs/images/src
 
 for src in docs/images/src/*.txt; do
