@@ -29,37 +29,37 @@ All 18 examples live in [`examples/`](examples) and run completely offline:
 
 | **01-fmt-and-validate** | **02-plan-inspection** | **03-lifecycle** |
 | --- | --- | --- |
-| <img src="docs/images/01-fmt-and-validate.png" width="290"> | <img src="docs/images/02-plan-inspection.png" width="290"> | <img src="docs/images/03-lifecycle.png" width="290"> |
+| <img src="docs/images/01-fmt-and-validate.png" width="290" alt="01-fmt-and-validate"> | <img src="docs/images/02-plan-inspection.png" width="290" alt="02-plan-inspection"> | <img src="docs/images/03-lifecycle.png" width="290" alt="03-lifecycle"> |
 | Canonical HCL formatting and syntax validation in memory without cloud dependencies.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/01-fmt-and-validate.lms` | In-process planning, reading change counts (`plan.add()`, `plan.change()`, `plan.destroy()`), and saving binary plan files.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/02-plan-inspection.lms` | Complete lifecycle: initialize directory, plan, apply, retrieve outputs, inspect state JSON, and destroy.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/03-lifecycle.lms` |
 
 | **04-variables-and-locals** | **05-count-and-for-each** | **06-local-module** |
 | --- | --- | --- |
-| <img src="docs/images/04-variables-and-locals.png" width="290"> | <img src="docs/images/05-count-and-for-each.png" width="290"> | <img src="docs/images/06-local-module.png" width="290"> |
+| <img src="docs/images/04-variables-and-locals.png" width="290" alt="04-variables-and-locals"> | <img src="docs/images/05-count-and-for-each.png" width="290" alt="05-count-and-for-each"> | <img src="docs/images/06-local-module.png" width="290" alt="06-local-module"> |
 | Programmatic variable injection via `tofu.var()` before plan/apply, evaluating computed local expressions.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/04-variables-and-locals.lms` | Multi-resource iteration and scaling using HCL `count` and `for_each` on `terraform_data`.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/05-count-and-for-each.lms` | Hierarchical module composition using local directory modules (`source = "./modules/subservice"`).<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/06-local-module.lms` |
 
 | **07-random-naming** | **08-local-file-template** | **09-time-lifecycle** |
 | --- | --- | --- |
-| <img src="docs/images/07-random-naming.png" width="290"> | <img src="docs/images/08-local-file-template.png" width="290"> | <img src="docs/images/09-time-lifecycle.png" width="290"> |
+| <img src="docs/images/07-random-naming.png" width="290" alt="07-random-naming"> | <img src="docs/images/08-local-file-template.png" width="290" alt="08-local-file-template"> | <img src="docs/images/09-time-lifecycle.png" width="290" alt="09-time-lifecycle"> |
 | Offline cryptographic pet names, random passwords, and hex IDs with embedded `random` provider.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/07-random-naming.lms` | Config templating via `templatefile()`, `local_file`, and permissioned `local_sensitive_file`.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/08-local-file-template.lms` | Static temporal anchors (`time_static`) and periodic certificate rotation schedules (`time_rotating`).<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/09-time-lifecycle.lms` |
 
 | **10-tls-cert-chain** | **11-archive-zip** | **12-null-triggers** |
 | --- | --- | --- |
-| <img src="docs/images/10-tls-cert-chain.png" width="290"> | <img src="docs/images/11-archive-zip.png" width="290"> | <img src="docs/images/12-null-triggers.png" width="290"> |
+| <img src="docs/images/10-tls-cert-chain.png" width="290" alt="10-tls-cert-chain"> | <img src="docs/images/11-archive-zip.png" width="290" alt="11-archive-zip"> | <img src="docs/images/12-null-triggers.png" width="290" alt="12-null-triggers"> |
 | Private ECDSA/RSA keys and full X.509 self-signed CA certificate chains generated offline.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/10-tls-cert-chain.lms` | Deterministic directory packaging into ZIP archives with SHA256 checksums and size verification.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/11-archive-zip.lms` | Orchestrating lifecycle hooks and declarative rebuild triggers using `null_resource`.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/12-null-triggers.lms` |
 
 | **13-plan-diff-and-drift** | **14-state-surgery** | **15-validation-and-conditions** |
 | --- | --- | --- |
-| <img src="docs/images/13-plan-diff-and-drift.png" width="290"> | <img src="docs/images/14-state-surgery.png" width="290"> | <img src="docs/images/15-validation-and-conditions.png" width="290"> |
+| <img src="docs/images/13-plan-diff-and-drift.png" width="290" alt="13-plan-diff-and-drift"> | <img src="docs/images/14-state-surgery.png" width="290" alt="14-state-surgery"> | <img src="docs/images/15-validation-and-conditions.png" width="290" alt="15-validation-and-conditions"> |
 | Detecting in-flight diffs between plans, change counts, and serializing plan JSON representations.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/13-plan-diff-and-drift.lms` | Zero-downtime refactoring with `moved {}` blocks, state listing (`state_list`), and `tofu.import()`.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/14-state-surgery.lms` | Declarative input validation rules, lifecycle `precondition` / `postcondition`, and `fmt_check`.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/15-validation-and-conditions.lms` |
 
 | **16-sensitive-outputs** | **17-multi-env-for-each** | **18-module-composition** |
 | --- | --- | --- |
-| <img src="docs/images/16-sensitive-outputs.png" width="290"> | <img src="docs/images/17-multi-env-for-each.png" width="290"> | <img src="docs/images/18-module-composition.png" width="290"> |
+| <img src="docs/images/16-sensitive-outputs.png" width="290" alt="16-sensitive-outputs"> | <img src="docs/images/17-multi-env-for-each.png" width="290" alt="17-multi-env-for-each"> | <img src="docs/images/18-module-composition.png" width="290" alt="18-module-composition"> |
 | Secret masking with `sensitive = true`, derived `nonsensitive()` casts, and unmasked state inspect.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/16-sensitive-outputs.lms` | Workspace-like multi-environment isolation (dev, staging, prod) using parameterized `for_each` maps.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/17-multi-env-for-each.lms` | Nested local modules encapsulating embedded providers and passing structured values to root.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/18-module-composition.lms` |
 
 | **lmcloud CLI & Schema** | **tofu.plan Summary** |
 | --- | --- |
-| <img src="docs/images/lmcloud-cli.png" width="450"> | <img src="docs/images/tofu-plan.png" width="450"> |
+| <img src="docs/images/lmcloud-cli.png" width="450" alt="lmcloud CLI & Schema"> | <img src="docs/images/tofu-plan.png" width="450" alt="tofu.plan Summary"> |
 | Version, embedded OpenTofu engine version, and DSL schema method signatures.<br>`lmcloud --version && lmcloud --dsl-schema` | Structured plan inspection, change counts, and binary plan persistence.<br>`tofu.plan(dir).summary()` |
 
 ## Licensing & Fork Rationale
