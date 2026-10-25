@@ -19,7 +19,14 @@ import (
 	plugin "github.com/hashicorp/go-plugin"
 
 	"github.com/opentofu/opentofu/internal/addrs"
+	builtinProviders "github.com/opentofu/opentofu/internal/builtin/providers"
+	"github.com/opentofu/opentofu/internal/builtin/providers/archive"
+	"github.com/opentofu/opentofu/internal/builtin/providers/local"
+	"github.com/opentofu/opentofu/internal/builtin/providers/null"
+	"github.com/opentofu/opentofu/internal/builtin/providers/random"
 	terraformProvider "github.com/opentofu/opentofu/internal/builtin/providers/tf"
+	"github.com/opentofu/opentofu/internal/builtin/providers/time"
+	"github.com/opentofu/opentofu/internal/builtin/providers/tls"
 	"github.com/opentofu/opentofu/internal/getproviders"
 	"github.com/opentofu/opentofu/internal/logging"
 	tfplugin "github.com/opentofu/opentofu/internal/plugin"
@@ -263,11 +270,17 @@ func (m *Meta) providerFactories() (map[addrs.Provider]providers.Factory, error)
 	factories := make(map[addrs.Provider]providers.Factory, len(providerLocks)+len(internalFactories)+len(unmanagedProviders))
 	for name, factory := range internalFactories {
 		factories[addrs.NewBuiltInProvider(name)] = factory
+		factories[addrs.NewDefaultProvider(name)] = factory
+		factories[addrs.NewProvider(addrs.DefaultProviderRegistryHost, "hashicorp", name)] = factory
+		factories[addrs.NewProvider("registry.terraform.io", "hashicorp", name)] = factory
 	}
 	for provider, lock := range providerLocks {
 		if locks.ProviderIsOverridden(provider) {
 			// Overridden providers we'll handle with the other separate
 			// loops below, for dev overrides etc.
+			continue
+		}
+		if _, ok := factories[provider]; ok {
 			continue
 		}
 
@@ -346,6 +359,12 @@ func (m *Meta) internalProviders() map[string]providers.Factory {
 		"terraform": func() (providers.Interface, error) {
 			return terraformProvider.NewProvider(), nil
 		},
+		"null":    builtinProviders.InProcessFrameworkFactory("null", null.New),
+		"local":   builtinProviders.InProcessFrameworkFactory("local", local.New),
+		"random":  builtinProviders.InProcessFrameworkFactory("random", random.New),
+		"time":    builtinProviders.InProcessFrameworkFactory("time", time.New),
+		"archive": builtinProviders.InProcessFrameworkFactory("archive", archive.New),
+		"tls":     builtinProviders.InProcessFrameworkFactory("tls", tls.New),
 	}
 }
 

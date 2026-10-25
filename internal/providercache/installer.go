@@ -281,13 +281,14 @@ func (i *Installer) ensureProviderVersionsMightNeed(
 	locked := map[addrs.Provider]bool{}
 
 	for provider, versionConstraints := range reqs {
-		if provider.IsBuiltIn() {
+		isBuiltin := provider.IsBuiltIn() || ((provider.Hostname == addrs.DefaultProviderRegistryHost || provider.Hostname.ForDisplay() == "registry.terraform.io") && provider.Namespace == "hashicorp" && slices.Contains(i.builtInProviderTypes, provider.Type))
+		if isBuiltin {
 			// Built in providers do not require installation but we'll still
 			// verify that the requested provider name is valid.
 			valid := slices.Contains(i.builtInProviderTypes, provider.Type)
 			var err error
 			if valid {
-				if len(versionConstraints) == 0 {
+				if len(versionConstraints) == 0 || !provider.IsBuiltIn() {
 					// Other than reporting an event for the outcome of this
 					// provider, we'll do nothing else with it: it's just
 					// automatically available for use.

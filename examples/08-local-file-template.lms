@@ -1,0 +1,58 @@
+# Pattern: File rendering from templates and sensitive file generation.
+# Demonstrates rendering configuration files using templatefile(), local_file,
+# and local_sensitive_file with file permission controls.
+
+out = ARGV.len() > 0 ? ARGV[0] : "build/08-local-file-template.dslb";
+mkdir("build");
+workdir = "build/ex08-workdir";
+mkdir(workdir);
+
+tpl = "server_name = ${name}\nport = ${port}\nenabled = ${enabled}\n";
+write_file(path_join(workdir, "config.tftpl"), tpl);
+
+tf = "variable \"app_port\" {\n" +
+     "  type    = number\n" +
+     "  default = 8080\n" +
+     "}\n\n" +
+     "locals {\n" +
+     "  rendered = templatefile(\"${path.module}/config.tftpl\", {\n" +
+     "    name    = \"web-service\"\n" +
+     "    port    = var.app_port\n" +
+     "    enabled = true\n" +
+     "  })\n" +
+     "}\n\n" +
+     "resource \"local_file\" \"app_config\" {\n" +
+     "  filename = \"${path.module}/app.cfg\"\n" +
+     "  content  = local.rendered\n" +
+     "}\n\n" +
+     "resource \"local_sensitive_file\" \"secret_token\" {\n" +
+     "  filename        = \"${path.module}/secret.key\"\n" +
+     "  content         = \"super-secret-auth-token-12345\"\n" +
+     "  file_permission = \"0600\"\n" +
+     "}\n\n" +
+     "output \"config_path\" {\n" +
+     "  value = local_file.app_config.filename\n" +
+     "}\n\n" +
+     "output \"rendered_content\" {\n" +
+     "  value = local.rendered\n" +
+     "}\n";
+write_file(path_join(workdir, "main.tf"), tf);
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex08-workdir";
+let ok_init = tofu.init(dir);
+let plan = tofu.plan(dir);
+let adds = plan.add();
+let ok_apply = tofu.apply(dir);
+let cfg_path = tofu.output(dir, "config_path");
+let rendered = tofu.output(dir, "rendered_content");
+let state_json = tofu.show_state(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+savedsl(p, out);
+r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);
+assert(r.code == 0, "host execution failed: " + r.stderr);
+assert(starts_with(r.stdout, "{\"ok\": true"), "expected ok json output");
+
+println("ok 08-local-file-template - rendered template file and generated sensitive file");

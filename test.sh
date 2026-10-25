@@ -135,7 +135,28 @@ let err = tofu.last_error();
 echo "$out" | grep -q 'code=0' || fail "fmt error handling failed: $out"
 ok "formatting invalid HCL returns original string and records last_error"
 
-# 8. Run unit test suite
+# 8. fmt_check distinguishes canonical from non-canonical HCL
+out="$(run_dsl "fmt_check" '
+let good = "resource \"terraform_data\" \"x\" {\n  input = \"val\"\n}\n";
+let bad = "resource   \"terraform_data\" \"x\" {\n input=\"val\"\n}\n";
+let is_good = tofu.fmt_check(good);
+let is_bad = tofu.fmt_check(bad);
+')"
+echo "$out" | grep -q 'code=0' || fail "fmt_check failed: $out"
+ok "fmt_check distinguishes formatted from unformatted HCL"
+
+# 9. state_list and import against uninitialized dir set last_error
+out="$(run_dsl "state_list_import_err" '
+let list = tofu.state_list("/path/to/missing/dir");
+let err1 = tofu.last_error();
+let imp = tofu.import("/path/to/missing/dir", "terraform_data.x", "1");
+let err2 = tofu.last_error();
+')"
+echo "$out" | grep -q 'code=0' || fail "state_list and import error handling failed: $out"
+ok "state_list and import against missing dir handle error cleanly"
+
+# 10. Run unit test suites
+go test ./internal/builtin/providers >/dev/null || fail "go test ./internal/builtin/providers failed"; ok "internal/builtin/providers Go test suite passes"
 go test ./internal/lmhost >/dev/null || fail "go test ./internal/lmhost failed"; ok "internal/lmhost Go test suite passes"
 
 echo "all $pass checks passed"

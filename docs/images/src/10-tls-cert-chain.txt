@@ -1,0 +1,18 @@
+$ cat examples/10-tls-cert-chain.lms | head -n 16
+# Pattern: Offline cryptographic key and self-signed certificate generation.
+# Demonstrates generating ECDSA/RSA keys and X.509 self-signed certificate chains
+# completely in-process using the embedded tls provider.
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex10-workdir";
+let ok_init = tofu.init(dir);
+let plan = tofu.plan(dir);
+let adds = plan.add();
+let ok_apply = tofu.apply(dir);
+let cert = tofu.output(dir, "ca_cert_pem");
+let state_json = tofu.show_state(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+$ lmscript examples/10-tls-cert-chain.lms
+ok 10-tls-cert-chain - generated private key and self-signed certificate chain

@@ -18,14 +18,14 @@ end _dsl_
 
 ## What it does (and does not)
 
-- **Real in-process engine:** All operations (`init`, `validate`, `fmt`, `plan`, `apply`, `destroy`, `output`, `show_state`) run within the process through OpenTofu's core `internal/command` subsystem with captured I/O streams. No child processes (`tofu` or `terraform` binaries) are spawned.
-- **Zero-network offline operations:** v1 operates completely offline with zero network access using the built-in provider `terraform.io/builtin/terraform` (`terraform_data` resource), `locals`, `variables`, `outputs`, `check` blocks, `count`, `for_each`, and local filesystem modules.
-- **Third-party cloud providers:** External cloud providers (AWS, Azure, GCP, Kubernetes) operate as separate gRPC plugin executables. In OpenTofu, downloading them requires network during `init`. A future version may embed selected providers.
-- **Single static executable:** Built with `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"` into a standalone binary with no dynamic library dependencies.
+- **Real in-process engine:** All operations (`init`, `validate`, `fmt`, `fmt_check`, `plan`, `plan_json`, `apply`, `destroy`, `output`, `show_state`, `state_list`, `import`) run within the process through OpenTofu's core `internal/command` subsystem with captured I/O streams. No child processes (`tofu` or `terraform` binaries) are spawned.
+- **Embedded offline providers:** In addition to built-in `terraform_data`, six core utility providers are compiled directly into the binary and served via in-memory gRPC (`bufconn`): `random`, `null`, `local`, `time`, `archive`, and `tls`. Cloud configurations with keys, certs, templates, zips, timestamps, and triggers run 100% offline with zero network lookups.
+- **External cloud providers:** External providers (AWS, Azure, GCP, Kubernetes) require network downloads or separate plugin binaries.
+- **Single static executable:** Built with `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"` into a standalone binary (~116 MB) with no dynamic library dependencies.
 
 ## Example Gallery
 
-All examples live in [`examples/`](examples) and run completely offline:
+All 18 examples live in [`examples/`](examples) and run completely offline:
 
 | **01-fmt-and-validate** | **02-plan-inspection** | **03-lifecycle** |
 | --- | --- | --- |
@@ -36,6 +36,26 @@ All examples live in [`examples/`](examples) and run completely offline:
 | --- | --- | --- |
 | <img src="docs/images/04-variables-and-locals.png" width="290"> | <img src="docs/images/05-count-and-for-each.png" width="290"> | <img src="docs/images/06-local-module.png" width="290"> |
 | Programmatic variable injection via `tofu.var()` before plan/apply, evaluating computed local expressions.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/04-variables-and-locals.lms` | Multi-resource iteration and scaling using HCL `count` and `for_each` on `terraform_data`.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/05-count-and-for-each.lms` | Hierarchical module composition using local directory modules (`source = "./modules/subservice"`).<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/06-local-module.lms` |
+
+| **07-random-naming** | **08-local-file-template** | **09-time-lifecycle** |
+| --- | --- | --- |
+| <img src="docs/images/07-random-naming.png" width="290"> | <img src="docs/images/08-local-file-template.png" width="290"> | <img src="docs/images/09-time-lifecycle.png" width="290"> |
+| Offline cryptographic pet names, random passwords, and hex IDs with embedded `random` provider.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/07-random-naming.lms` | Config templating via `templatefile()`, `local_file`, and permissioned `local_sensitive_file`.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/08-local-file-template.lms` | Static temporal anchors (`time_static`) and periodic certificate rotation schedules (`time_rotating`).<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/09-time-lifecycle.lms` |
+
+| **10-tls-cert-chain** | **11-archive-zip** | **12-null-triggers** |
+| --- | --- | --- |
+| <img src="docs/images/10-tls-cert-chain.png" width="290"> | <img src="docs/images/11-archive-zip.png" width="290"> | <img src="docs/images/12-null-triggers.png" width="290"> |
+| Private ECDSA/RSA keys and full X.509 self-signed CA certificate chains generated offline.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/10-tls-cert-chain.lms` | Deterministic directory packaging into ZIP archives with SHA256 checksums and size verification.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/11-archive-zip.lms` | Orchestrating lifecycle hooks and declarative rebuild triggers using `null_resource`.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/12-null-triggers.lms` |
+
+| **13-plan-diff-and-drift** | **14-state-surgery** | **15-validation-and-conditions** |
+| --- | --- | --- |
+| <img src="docs/images/13-plan-diff-and-drift.png" width="290"> | <img src="docs/images/14-state-surgery.png" width="290"> | <img src="docs/images/15-validation-and-conditions.png" width="290"> |
+| Detecting in-flight diffs between plans, change counts, and serializing plan JSON representations.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/13-plan-diff-and-drift.lms` | Zero-downtime refactoring with `moved {}` blocks, state listing (`state_list`), and `tofu.import()`.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/14-state-surgery.lms` | Declarative input validation rules, lifecycle `precondition` / `postcondition`, and `fmt_check`.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/15-validation-and-conditions.lms` |
+
+| **16-sensitive-outputs** | **17-multi-env-for-each** | **18-module-composition** |
+| --- | --- | --- |
+| <img src="docs/images/16-sensitive-outputs.png" width="290"> | <img src="docs/images/17-multi-env-for-each.png" width="290"> | <img src="docs/images/18-module-composition.png" width="290"> |
+| Secret masking with `sensitive = true`, derived `nonsensitive()` casts, and unmasked state inspect.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/16-sensitive-outputs.lms` | Workspace-like multi-environment isolation (dev, staging, prod) using parameterized `for_each` maps.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/17-multi-env-for-each.lms` | Nested local modules encapsulating embedded providers and passing structured values to root.<br>`lmctl autorun https://raw.githubusercontent.com/lmctl-ai/lmcloud/main/examples/18-module-composition.lms` |
 
 | **lmcloud CLI & Schema** | **tofu.plan Summary** |
 | --- | --- |
@@ -51,6 +71,7 @@ lmcloud is built upon **OpenTofu** (`github.com/opentofu/opentofu`, MPL-2.0), th
 ### License Split
 
 - **Upstream OpenTofu files:** Unchanged and governed by Mozilla Public License 2.0 (MPL-2.0). Upstream documentation is preserved at [`UPSTREAM-README.md`](UPSTREAM-README.md); upstream [`LICENSE`](LICENSE) remains untouched.
+- **Embedded Utility Providers:** Governed by Mozilla Public License 2.0 (MPL-2.0). See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for full licensing details, attributions, and notices for `random`, `null`, `local`, `time`, `archive`, and `tls`.
 - **Our added files:** Governed by the MIT License (`// SPDX-License-Identifier: MIT`). Added paths:
   - `cmd/lmcloud/`
   - `internal/lmhost/`
@@ -92,4 +113,4 @@ ldd ./bin/lmcloud
 ./test.sh
 ```
 
-Verifies static linkage, schema byte-identity, signature parity against `lmscript --dsl-signatures`, all 6 zero-network examples, error handling paths (invalid flags, corrupt bytecode, missing directory, uninitialized apply, unknown output name, invalid HCL), and Go unit tests.
+Verifies static linkage, schema byte-identity, signature parity against `lmscript --dsl-signatures`, all 18 zero-network examples, error handling paths (invalid flags, corrupt bytecode, missing directory, uninitialized apply, unknown output name, invalid HCL, format checking, state listing and import error handling), and Go unit test suites.

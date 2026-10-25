@@ -1,0 +1,40 @@
+# Pattern: Null resource lifecycle and execution triggers.
+# Demonstrates null_resource with triggers mapping to track state changes
+# and drive declarative workflow ordering without external cloud state.
+
+out = ARGV.len() > 0 ? ARGV[0] : "build/12-null-triggers.dslb";
+mkdir("build");
+workdir = "build/ex12-workdir";
+mkdir(workdir);
+
+tf = "variable \"cluster_version\" {\n" +
+     "  type    = string\n" +
+     "  default = \"1.0.0\"\n" +
+     "}\n\n" +
+     "resource \"null_resource\" \"deploy_hook\" {\n" +
+     "  triggers = {\n" +
+     "    version = var.cluster_version\n" +
+     "  }\n" +
+     "}\n\n" +
+     "output \"trigger_version\" {\n" +
+     "  value = null_resource.deploy_hook.triggers[\"version\"]\n" +
+     "}\n";
+write_file(path_join(workdir, "main.tf"), tf);
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex12-workdir";
+let ok_init = tofu.init(dir);
+let plan = tofu.plan(dir);
+let adds = plan.add();
+let ok_apply = tofu.apply(dir);
+let ver = tofu.output(dir, "trigger_version");
+let state_json = tofu.show_state(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+savedsl(p, out);
+r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);
+assert(r.code == 0, "host execution failed: " + r.stderr);
+assert(starts_with(r.stdout, "{\"ok\": true"), "expected ok json output");
+
+println("ok 12-null-triggers - managed null_resource with declarative trigger mappings");

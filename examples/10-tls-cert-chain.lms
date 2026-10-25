@@ -1,0 +1,48 @@
+# Pattern: Offline cryptographic key and self-signed certificate generation.
+# Demonstrates generating ECDSA/RSA keys and X.509 self-signed certificate chains
+# completely in-process using the embedded tls provider.
+
+out = ARGV.len() > 0 ? ARGV[0] : "build/10-tls-cert-chain.dslb";
+mkdir("build");
+workdir = "build/ex10-workdir";
+mkdir(workdir);
+
+tf = "resource \"tls_private_key\" \"ca\" {\n" +
+     "  algorithm   = \"ECDSA\"\n" +
+     "  ecdsa_curve = \"P384\"\n" +
+     "}\n\n" +
+     "resource \"tls_self_signed_cert\" \"ca\" {\n" +
+     "  private_key_pem = tls_private_key.ca.private_key_pem\n" +
+     "  subject {\n" +
+     "    common_name  = \"example.internal\"\n" +
+     "    organization = \"Internal Dev CA\"\n" +
+     "  }\n" +
+     "  validity_period_hours = 8760\n" +
+     "  allowed_uses = [\n" +
+     "    \"cert_signing\",\n" +
+     "    \"crl_signing\",\n" +
+     "  ]\n" +
+     "  is_ca_certificate = true\n" +
+     "}\n\n" +
+     "output \"ca_cert_pem\" {\n" +
+     "  value = tls_self_signed_cert.ca.cert_pem\n" +
+     "}\n";
+write_file(path_join(workdir, "main.tf"), tf);
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex10-workdir";
+let ok_init = tofu.init(dir);
+let plan = tofu.plan(dir);
+let adds = plan.add();
+let ok_apply = tofu.apply(dir);
+let cert = tofu.output(dir, "ca_cert_pem");
+let state_json = tofu.show_state(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+savedsl(p, out);
+r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);
+assert(r.code == 0, "host execution failed: " + r.stderr);
+assert(starts_with(r.stdout, "{\"ok\": true"), "expected ok json output");
+
+println("ok 10-tls-cert-chain - generated private key and self-signed certificate chain");

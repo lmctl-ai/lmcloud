@@ -1,0 +1,18 @@
+$ cat examples/12-null-triggers.lms | head -n 16
+# Pattern: Null resource lifecycle and execution triggers.
+# Demonstrates null_resource with triggers mapping to track state changes
+# and drive declarative workflow ordering without external cloud state.
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex12-workdir";
+let ok_init = tofu.init(dir);
+let plan = tofu.plan(dir);
+let adds = plan.add();
+let ok_apply = tofu.apply(dir);
+let ver = tofu.output(dir, "trigger_version");
+let state_json = tofu.show_state(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+$ lmscript examples/12-null-triggers.lms
+ok 12-null-triggers - managed null_resource with declarative trigger mappings

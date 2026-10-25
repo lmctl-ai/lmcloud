@@ -1,0 +1,54 @@
+# Pattern: Input variable validation and lifecycle preconditions/postconditions.
+# Demonstrates enforcement of declarative validation rules on variables,
+# resource lifecycle preconditions/postconditions, and HCL format checking.
+
+out = ARGV.len() > 0 ? ARGV[0] : "build/15-validation-and-conditions.dslb";
+mkdir("build");
+workdir = "build/ex15-workdir";
+mkdir(workdir);
+
+tf = "variable \"env_name\" {\n" +
+     "  type    = string\n" +
+     "  default = \"staging\"\n" +
+     "  validation {\n" +
+     "    condition     = contains([\"dev\", \"staging\", \"prod\"], var.env_name)\n" +
+     "    error_message = \"env_name must be one of: dev, staging, prod.\"\n" +
+     "  }\n" +
+     "}\n\n" +
+     "resource \"terraform_data\" \"env_config\" {\n" +
+     "  input = var.env_name\n\n" +
+     "  lifecycle {\n" +
+     "    precondition {\n" +
+     "      condition     = length(var.env_name) > 0\n" +
+     "      error_message = \"Environment name cannot be empty.\"\n" +
+     "    }\n" +
+     "    postcondition {\n" +
+     "      condition     = self.output == \"staging\" || self.output == \"prod\"\n" +
+     "      error_message = \"Only production-ready environments allowed.\"\n" +
+     "    }\n" +
+     "  }\n" +
+     "}\n\n" +
+     "output \"validated_env\" {\n" +
+     "  value = terraform_data.env_config.output\n" +
+     "}\n";
+write_file(path_join(workdir, "main.tf"), tf);
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex15-workdir";
+let canonical_snippet = "variable \"x\" {\n  type = string\n}\n";
+let is_canonical = tofu.fmt_check(canonical_snippet);
+let ok_init = tofu.init(dir);
+let ok_val = tofu.validate(dir);
+let plan = tofu.plan(dir);
+let ok_apply = tofu.apply(dir);
+let env_out = tofu.output(dir, "validated_env");
+let state_json = tofu.show_state(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+savedsl(p, out);
+r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);
+assert(r.code == 0, "host execution failed: " + r.stderr);
+assert(starts_with(r.stdout, "{\"ok\": true"), "expected ok json output");
+
+println("ok 15-validation-and-conditions - validated variable constraints and lifecycle conditions");

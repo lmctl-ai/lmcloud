@@ -1,0 +1,53 @@
+# Pattern: Plan diffs, drift detection, and plan JSON export.
+# Demonstrates detecting in-flight configuration changes between plans,
+# inspecting change counts (adds/changes/destroys), and exporting plan JSON.
+
+out = ARGV.len() > 0 ? ARGV[0] : "build/13-plan-diff-and-drift.dslb";
+mkdir("build");
+workdir = "build/ex13-workdir";
+mkdir(workdir);
+
+# Initial configuration
+tf1 = "resource \"local_file\" \"config\" {\n" +
+      "  filename = \"${path.module}/app.conf\"\n" +
+      "  content  = \"mode=staging\\nmax_conns=10\\n\"\n" +
+      "}\n";
+write_file(path_join(workdir, "main.tf"), tf1);
+
+# First DSL phase: init and apply baseline
+p1 = _dsl_ cli="lmcloud";
+let dir = "build/ex13-workdir";
+let ok_init = tofu.init(dir);
+let ok_apply = tofu.apply(dir);
+end _dsl_
+
+savedsl(p1, "build/13-phase1.dslb");
+r1 = system(concat(dsl_cli(p1), ["--dsl", "build/13-phase1.dslb"]), 60000);
+assert(r1.code == 0, "phase 1 failed: " + r1.stderr);
+
+# Modify configuration to introduce a diff
+tf2 = "resource \"local_file\" \"config\" {\n" +
+      "  filename = \"${path.module}/app.conf\"\n" +
+      "  content  = \"mode=production\\nmax_conns=50\\n\"\n" +
+      "}\n";
+write_file(path_join(workdir, "main.tf"), tf2);
+
+# Second DSL phase: plan diff inspection and JSON serialization
+p2 = _dsl_ cli="lmcloud";
+let dir = "build/ex13-workdir";
+let p = tofu.plan(dir);
+let adds = p.add();
+let changes = p.change();
+let destroys = p.destroy();
+let plan_json_from_method = p.json();
+let plan_json_from_dir = tofu.plan_json(dir);
+let ok_apply2 = tofu.apply(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+savedsl(p2, out);
+r2 = system(concat(dsl_cli(p2), ["--dsl", out]), 60000);
+assert(r2.code == 0, "phase 2 failed: " + r2.stderr);
+assert(starts_with(r2.stdout, "{\"ok\": true"), "expected ok json output");
+
+println("ok 13-plan-diff-and-drift - detected plan diffs, attribute changes, and exported plan JSON");

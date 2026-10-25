@@ -1,0 +1,54 @@
+# Pattern: State surgery, resource renaming with moved blocks, and programmatic import.
+# Demonstrates state listing with tofu.state_list(), zero-downtime resource refactoring
+# using HCL moved {} blocks, and programmatic state import with tofu.import().
+
+out = ARGV.len() > 0 ? ARGV[0] : "build/14-state-surgery.dslb";
+mkdir("build");
+workdir = "build/ex14-workdir";
+mkdir(workdir);
+
+# Phase 1: create initial resource
+tf1 = "resource \"terraform_data\" \"legacy\" {\n" +
+      "  input = \"legacy-data-record\"\n" +
+      "}\n";
+write_file(path_join(workdir, "main.tf"), tf1);
+
+p1 = _dsl_ cli="lmcloud";
+let dir = "build/ex14-workdir";
+let ok_init = tofu.init(dir);
+let ok_apply1 = tofu.apply(dir);
+let list1 = tofu.state_list(dir);
+end _dsl_
+
+savedsl(p1, "build/14-phase1.dslb");
+r1 = system(concat(dsl_cli(p1), ["--dsl", "build/14-phase1.dslb"]), 60000);
+assert(r1.code == 0, "phase 1 failed: " + r1.stderr);
+
+# Phase 2: Refactor resource with moved block and declare an imported resource
+tf2 = "moved {\n" +
+      "  from = terraform_data.legacy\n" +
+      "  to   = terraform_data.modern\n" +
+      "}\n\n" +
+      "resource \"terraform_data\" \"modern\" {\n" +
+      "  input = \"legacy-data-record\"\n" +
+      "}\n\n" +
+      "resource \"terraform_data\" \"external_imported\" {\n" +
+      "  input = \"imported-state-val\"\n" +
+      "}\n";
+write_file(path_join(workdir, "main.tf"), tf2);
+
+# Phase 3: Apply moved block, then import external resource and inspect state list
+p2 = _dsl_ cli="lmcloud";
+let dir = "build/ex14-workdir";
+let ok_apply2 = tofu.apply(dir);
+let ok_imp = tofu.import(dir, "terraform_data.external_imported", "imported-state-val");
+let list2 = tofu.state_list(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+savedsl(p2, out);
+r2 = system(concat(dsl_cli(p2), ["--dsl", out]), 60000);
+assert(r2.code == 0, "phase 2/3 failed: " + r2.stderr);
+assert(starts_with(r2.stdout, "{\"ok\": true"), "expected ok json output");
+
+println("ok 14-state-surgery - refactored state via moved blocks, listed state, and imported resource");

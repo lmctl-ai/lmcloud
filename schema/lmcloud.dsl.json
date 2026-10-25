@@ -28,6 +28,24 @@
             "returns": "string"
           }
         ],
+        "fmt_check": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "import": [
+          {
+            "params": [
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
         "init": [
           {
             "params": [
@@ -59,7 +77,23 @@
             "returns": "Plan"
           }
         ],
+        "plan_json": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "string"
+          }
+        ],
         "show_state": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "string"
+          }
+        ],
+        "state_list": [
           {
             "params": [
               "string"
@@ -104,6 +138,12 @@
           {
             "params": [],
             "returns": "int"
+          }
+        ],
+        "json": [
+          {
+            "params": [],
+            "returns": "string"
           }
         ],
         "save": [

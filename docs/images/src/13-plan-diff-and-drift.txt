@@ -1,0 +1,19 @@
+$ cat examples/13-plan-diff-and-drift.lms | head -n 16
+# Pattern: Plan diffs, drift detection, and plan JSON export.
+# Demonstrates detecting in-flight configuration changes between plans,
+# inspecting change counts (adds/changes/destroys), and exporting plan JSON.
+
+p2 = _dsl_ cli="lmcloud";
+let dir = "build/ex13-workdir";
+let p = tofu.plan(dir);
+let adds = p.add();
+let changes = p.change();
+let destroys = p.destroy();
+let plan_json_from_method = p.json();
+let plan_json_from_dir = tofu.plan_json(dir);
+let ok_apply2 = tofu.apply(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+$ lmscript examples/13-plan-diff-and-drift.lms
+ok 13-plan-diff-and-drift - detected plan diffs, attribute changes, and exported plan JSON

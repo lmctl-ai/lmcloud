@@ -15,6 +15,7 @@ lmcloud embeds OpenTofu core in-process to provide infrastructure management dir
 | [03-build-run-test.md](03-build-run-test.md) | Building the Go binary, running tests, and schema verification |
 | [04-gotchas.md](04-gotchas.md) | OpenTofu internals, state locks, and concurrency lessons |
 | [05-open-items.md](05-open-items.md) | Planned features and roadmap |
+| [06-embedded-providers.md](06-embedded-providers.md) | Embedded utility providers, in-process bufconn architecture, and binary size deltas |
 | [rebase-upstream.md](rebase-upstream.md) | Upstream OpenTofu synchronization and rebasing procedures |
 
 ## Adding an example or function

@@ -1,0 +1,19 @@
+$ cat examples/09-time-lifecycle.lms | head -n 16
+# Pattern: Static timestamps and periodic rotation triggers.
+# Demonstrates time_static for fixed temporal anchors and time_rotating
+# for scheduling key rotations and periodic certificate refreshes.
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex09-workdir";
+let ok_init = tofu.init(dir);
+let plan = tofu.plan(dir);
+let adds = plan.add();
+let ok_apply = tofu.apply(dir);
+let ts = tofu.output(dir, "static_rfc3339");
+let rot = tofu.output(dir, "rotation_rfc3339");
+let state_json = tofu.show_state(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+$ lmscript examples/09-time-lifecycle.lms
+ok 09-time-lifecycle - managed static timestamps and rotation schedules

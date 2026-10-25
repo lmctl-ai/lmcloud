@@ -1,0 +1,18 @@
+$ cat examples/17-multi-env-for-each.lms | head -n 16
+# Pattern: Multi-environment management with for_each maps.
+# Demonstrates parameterized multi-tier environment provisioning (dev, staging, prod)
+# using HCL maps and for_each to achieve workspace-like isolation in a unified configuration.
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex17-workdir";
+let ok_init = tofu.init(dir);
+let plan = tofu.plan(dir);
+let adds = plan.add();
+let ok_apply = tofu.apply(dir);
+let tiers = tofu.output(dir, "deployed_tiers");
+let state_json = tofu.show_state(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+$ lmscript examples/17-multi-env-for-each.lms
+ok 17-multi-env-for-each - deployed multi-environment topologies via for_each maps

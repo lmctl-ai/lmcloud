@@ -50,6 +50,16 @@ func (p *GRPCProviderPlugin) GRPCClient(ctx context.Context, broker *plugin.GRPC
 	}, nil
 }
 
+// NewInProcessGRPCProvider creates a new GRPCProvider from an in-process client and server.
+func NewInProcessGRPCProvider(ctx context.Context, client proto6.ProviderClient, testServer *grpc.Server) *GRPCProvider {
+	return &GRPCProvider{
+		TestServer:  testServer,
+		client:      client,
+		ctx:         ctx,
+		SchemaCache: providers.NewSchemaCache(),
+	}
+}
+
 func (p *GRPCProviderPlugin) GRPCServer(broker *plugin.GRPCBroker, s *grpc.Server) error {
 	proto6.RegisterProviderServer(s, p.GRPCProvider())
 	return nil

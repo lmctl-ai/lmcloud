@@ -1,0 +1,65 @@
+# Pattern: Hierarchical module composition and cross-module attribute passing.
+# Demonstrates composing multiple local reusable modules that encapsulate
+# embedded providers (random, local) and surface structured module outputs to the root.
+
+out = ARGV.len() > 0 ? ARGV[0] : "build/18-module-composition.dslb";
+mkdir("build");
+workdir = "build/ex18-workdir";
+mkdir(workdir);
+moddir = path_join(workdir, "modules/app");
+mkdir(moddir);
+
+child_tf = "variable \"app_name\" {\n" +
+           "  type = string\n" +
+           "}\n\n" +
+           "resource \"random_pet\" \"suffix\" {\n" +
+           "  length = 2\n" +
+           "}\n\n" +
+           "resource \"local_file\" \"descriptor\" {\n" +
+           "  filename = \"${path.module}/app-${var.app_name}.json\"\n" +
+           "  content  = jsonencode({\n" +
+           "    name = \"${var.app_name}-${random_pet.suffix.id}\"\n" +
+           "  })\n" +
+           "}\n\n" +
+           "output \"instance_id\" {\n" +
+           "  value = \"${var.app_name}-${random_pet.suffix.id}\"\n" +
+           "}\n\n" +
+           "output \"config_file\" {\n" +
+           "  value = local_file.descriptor.filename\n" +
+           "}\n";
+write_file(path_join(moddir, "main.tf"), child_tf);
+
+root_tf = "module \"primary_app\" {\n" +
+          "  source   = \"./modules/app\"\n" +
+          "  app_name = \"service-alpha\"\n" +
+          "}\n\n" +
+          "module \"secondary_app\" {\n" +
+          "  source   = \"./modules/app\"\n" +
+          "  app_name = \"service-beta\"\n" +
+          "}\n\n" +
+          "output \"alpha_id\" {\n" +
+          "  value = module.primary_app.instance_id\n" +
+          "}\n\n" +
+          "output \"beta_id\" {\n" +
+          "  value = module.secondary_app.instance_id\n" +
+          "}\n";
+write_file(path_join(workdir, "main.tf"), root_tf);
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex18-workdir";
+let ok_init = tofu.init(dir);
+let plan = tofu.plan(dir);
+let adds = plan.add();
+let ok_apply = tofu.apply(dir);
+let a_id = tofu.output(dir, "alpha_id");
+let b_id = tofu.output(dir, "beta_id");
+let state_json = tofu.show_state(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+savedsl(p, out);
+r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);
+assert(r.code == 0, "host execution failed: " + r.stderr);
+assert(starts_with(r.stdout, "{\"ok\": true"), "expected ok json output");
+
+println("ok 18-module-composition - composed nested modules with embedded provider resources");

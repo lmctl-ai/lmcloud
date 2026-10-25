@@ -1,0 +1,64 @@
+# Pattern: Multi-environment management with for_each maps.
+# Demonstrates parameterized multi-tier environment provisioning (dev, staging, prod)
+# using HCL maps and for_each to achieve workspace-like isolation in a unified configuration.
+
+out = ARGV.len() > 0 ? ARGV[0] : "build/17-multi-env-for-each.dslb";
+mkdir("build");
+workdir = "build/ex17-workdir";
+mkdir(workdir);
+
+tf = "variable \"environments\" {\n" +
+     "  type = map(object({\n" +
+     "    subdomain = string\n" +
+     "    replicas  = number\n" +
+     "    debug     = bool\n" +
+     "  }))\n" +
+     "  default = {\n" +
+     "    dev = {\n" +
+     "      subdomain = \"dev.internal\"\n" +
+     "      replicas  = 1\n" +
+     "      debug     = true\n" +
+     "    }\n" +
+     "    staging = {\n" +
+     "      subdomain = \"staging.internal\"\n" +
+     "      replicas  = 2\n" +
+     "      debug     = false\n" +
+     "    }\n" +
+     "    prod = {\n" +
+     "      subdomain = \"prod.internal\"\n" +
+     "      replicas  = 5\n" +
+     "      debug     = false\n" +
+     "    }\n" +
+     "  }\n" +
+     "}\n\n" +
+     "resource \"terraform_data\" \"env_tier\" {\n" +
+     "  for_each = var.environments\n\n" +
+     "  input = {\n" +
+     "    tier     = each.key\n" +
+     "    host     = each.value.subdomain\n" +
+     "    replicas = each.value.replicas\n" +
+     "    debug    = each.value.debug\n" +
+     "  }\n" +
+     "}\n\n" +
+     "output \"deployed_tiers\" {\n" +
+     "  value = [for k, v in terraform_data.env_tier : v.input.tier]\n" +
+     "}\n";
+write_file(path_join(workdir, "main.tf"), tf);
+
+p = _dsl_ cli="lmcloud";
+let dir = "build/ex17-workdir";
+let ok_init = tofu.init(dir);
+let plan = tofu.plan(dir);
+let adds = plan.add();
+let ok_apply = tofu.apply(dir);
+let tiers = tofu.output(dir, "deployed_tiers");
+let state_json = tofu.show_state(dir);
+let ok_destroy = tofu.destroy(dir);
+end _dsl_
+
+savedsl(p, out);
+r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);
+assert(r.code == 0, "host execution failed: " + r.stderr);
+assert(starts_with(r.stdout, "{\"ok\": true"), "expected ok json output");
+
+println("ok 17-multi-env-for-each - deployed multi-environment topologies via for_each maps");

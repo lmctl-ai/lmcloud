@@ -39,6 +39,8 @@ type Host struct {
 
 // Plan represents the planned changes for an infrastructure configuration.
 type Plan struct {
+	host         *Host
+	dir          string
 	addCount     int64
 	changeCount  int64
 	destroyCount int64
@@ -344,6 +346,8 @@ func (h *Host) Plan(dir string) *Plan {
 	}
 
 	return &Plan{
+		host:         h,
+		dir:          dir,
 		addCount:     int64(cs.Add),
 		changeCount:  int64(cs.Change),
 		destroyCount: int64(cs.Remove),
@@ -458,6 +462,78 @@ func (h *Host) LastError() string {
 	return h.lastError
 }
 
+// PlanJSON generates a plan in dir and returns the machine-readable plan in JSON format.
+func (h *Host) PlanJSON(dir string) string {
+	p := h.Plan(dir)
+	if p.errored {
+		return "{}"
+	}
+	defer os.Remove(p.filePath)
+	return p.JSON()
+}
+
+// StateList lists the addresses of resources in state.
+func (h *Host) StateList(dir string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	code, stdout, stderr := h.runCommand(dir, func(meta command.Meta) int {
+		return (&command.StateListCommand{StateMeta: command.StateMeta{Meta: meta}}).Run([]string{})
+	})
+	if code == 0 {
+		h.lastError = ""
+		return stdout
+	}
+	h.lastError = strings.TrimSpace(stderr)
+	if h.lastError == "" {
+		h.lastError = strings.TrimSpace(stdout)
+	}
+	return ""
+}
+
+// FmtCheck checks if configuration files in dir are formatted.
+func (h *Host) FmtCheck(dir string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	code, stdout, stderr := h.runCommand(dir, func(meta command.Meta) int {
+		return command.RunCommand(command.FmtCommander(nil), meta, []string{"-check", "-list=false"})
+	})
+	if code == 0 {
+		h.lastError = ""
+		return true
+	}
+	h.lastError = strings.TrimSpace(stderr)
+	if h.lastError == "" {
+		h.lastError = strings.TrimSpace(stdout)
+	}
+	return false
+}
+
+// Import imports an existing resource into state.
+func (h *Host) Import(dir, addr, id string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	varArgs := h.buildVarArgs()
+	args := []string{"-input=false", "-no-color"}
+	args = append(args, varArgs...)
+	args = append(args, addr, id)
+
+	code, stdout, stderr := h.runCommand(dir, func(meta command.Meta) int {
+		return (&command.ImportCommand{Meta: meta}).Run(args)
+	})
+	if code == 0 {
+		h.lastError = ""
+		return true
+	}
+	h.lastError = strings.TrimSpace(stderr)
+	if h.lastError == "" {
+		h.lastError = strings.TrimSpace(stdout)
+	}
+	return false
+}
+
 // Add returns the number of resources to add.
 func (p *Plan) Add() int64 {
 	if p == nil {
@@ -480,6 +556,27 @@ func (p *Plan) Destroy() int64 {
 		return 0
 	}
 	return p.destroyCount
+}
+
+// JSON returns the machine-readable plan representation in JSON format.
+func (p *Plan) JSON() string {
+	if p == nil || p.errored || p.filePath == "" || p.host == nil {
+		return "{}"
+	}
+	p.host.mu.Lock()
+	defer p.host.mu.Unlock()
+
+	code, stdout, stderr := p.host.runCommand(p.dir, func(meta command.Meta) int {
+		return (&command.ShowCommand{Meta: meta}).Run([]string{"-json", p.filePath})
+	})
+	if code == 0 {
+		return stdout
+	}
+	p.host.lastError = strings.TrimSpace(stderr)
+	if p.host.lastError == "" {
+		p.host.lastError = strings.TrimSpace(stdout)
+	}
+	return "{}"
 }
 
 // Summary returns the plan change summary string.
@@ -529,10 +626,31 @@ func Register(reg *lmcode.Registry, h *Host) error {
 	}); err != nil {
 		return err
 	}
+	if err := reg.Method("Tofu", "fmt_check", []string{"string"}, "bool", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		ok := host.FmtCheck(args[0].Str)
+		return lmcode.Bool(ok), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Tofu", "import", []string{"string", "string", "string"}, "bool", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		ok := host.Import(args[0].Str, args[1].Str, args[2].Str)
+		return lmcode.Bool(ok), nil
+	}); err != nil {
+		return err
+	}
 	if err := reg.Method("Tofu", "plan", []string{"string"}, "Plan", func(self any, args []lmcode.Value) (lmcode.Value, error) {
 		host := self.(*Host)
 		p := host.Plan(args[0].Str)
 		return lmcode.Obj("Plan", p), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Tofu", "plan_json", []string{"string"}, "string", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		res := host.PlanJSON(args[0].Str)
+		return lmcode.Str(res), nil
 	}); err != nil {
 		return err
 	}
@@ -571,6 +689,13 @@ func Register(reg *lmcode.Registry, h *Host) error {
 	}); err != nil {
 		return err
 	}
+	if err := reg.Method("Tofu", "state_list", []string{"string"}, "string", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		host := self.(*Host)
+		res := host.StateList(args[0].Str)
+		return lmcode.Str(res), nil
+	}); err != nil {
+		return err
+	}
 	if err := reg.Method("Tofu", "last_error", []string{}, "string", func(self any, args []lmcode.Value) (lmcode.Value, error) {
 		host := self.(*Host)
 		return lmcode.Str(host.LastError()), nil
@@ -594,6 +719,12 @@ func Register(reg *lmcode.Registry, h *Host) error {
 	if err := reg.Method("Plan", "destroy", []string{}, "int", func(self any, args []lmcode.Value) (lmcode.Value, error) {
 		p := self.(*Plan)
 		return lmcode.Int(p.Destroy()), nil
+	}); err != nil {
+		return err
+	}
+	if err := reg.Method("Plan", "json", []string{}, "string", func(self any, args []lmcode.Value) (lmcode.Value, error) {
+		p := self.(*Plan)
+		return lmcode.Str(p.JSON()), nil
 	}); err != nil {
 		return err
 	}
