@@ -52,6 +52,7 @@ done
 
 # Prove standard calls compile and run without host declarations or cloud effects.
 STD_WORK="$(mktemp -d "${TMPDIR:-/tmp}/lmcloud-std-XXXXXX")"
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) STD_WORK="$(cygpath -m "$STD_WORK")";; esac
 cat > "$STD_WORK/probe.lms" <<LMS
 p = _lmcode_ cli="lmcloud";
 let n = str_len("abc");
