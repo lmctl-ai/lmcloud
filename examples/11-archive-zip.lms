@@ -25,7 +25,7 @@ tf = "data \"archive_file\" \"bundle\" {\n" +
      "}\n";
 write_file(path_join(workdir, "main.tf"), tf);
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let dir = "build/ex11-workdir";
 let ok_init = tofu.init(dir);
 let plan = tofu.plan(dir);
@@ -34,7 +34,7 @@ let hash = tofu.output(dir, "archive_sha256");
 let sz = tofu.output(dir, "archive_size");
 let state_json = tofu.show_state(dir);
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 savedsl(p, out);
 r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);

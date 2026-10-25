@@ -10,7 +10,7 @@ mkdir(workdir);
 tf = "variable \"tier\" {\n  type = string\n}\nvariable \"region\" {\n  type = string\n}\nlocals {\n  fqdn = \"${var.tier}.${var.region}.cloud.internal\"\n}\nresource \"terraform_data\" \"endpoint\" {\n  input = local.fqdn\n}\noutput \"endpoint_fqdn\" {\n  value = terraform_data.endpoint.output\n}\n";
 write_file(path_join(workdir, "main.tf"), tf);
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let dir = "build/ex04-workdir";
 tofu.var("tier", "prod");
 tofu.var("region", "us-east");
@@ -19,7 +19,7 @@ let plan = tofu.plan(dir);
 let ok_apply = tofu.apply(dir);
 let fqdn = tofu.output(dir, "endpoint_fqdn");
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 savedsl(p, out);
 r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);

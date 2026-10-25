@@ -45,7 +45,7 @@ root_tf = "module \"primary_app\" {\n" +
           "}\n";
 write_file(path_join(workdir, "main.tf"), root_tf);
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let dir = "build/ex18-workdir";
 let ok_init = tofu.init(dir);
 let plan = tofu.plan(dir);
@@ -55,7 +55,7 @@ let a_id = tofu.output(dir, "alpha_id");
 let b_id = tofu.output(dir, "beta_id");
 let state_json = tofu.show_state(dir);
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 savedsl(p, out);
 r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);

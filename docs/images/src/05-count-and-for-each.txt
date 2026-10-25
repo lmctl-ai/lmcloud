@@ -2,7 +2,7 @@ $ cat examples/05-count-and-for-each.lms | head -n 17
 # Pattern: Resource scaling and iteration with count and for_each.
 # Demonstrates multi-instance resource definitions and inspecting multi-resource plan counts.
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let dir = "build/ex05-workdir";
 let ok_init = tofu.init(dir);
 let plan = tofu.plan(dir);
@@ -10,7 +10,7 @@ let adds = plan.add();
 let ok_apply = tofu.apply(dir);
 let count_out = tofu.output(dir, "server_count");
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 $ lmscript examples/05-count-and-for-each.lms
 ok 05-count-and-for-each - scaled resources via count and for_each

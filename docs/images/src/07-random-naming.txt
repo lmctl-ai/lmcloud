@@ -3,7 +3,7 @@ $ cat examples/07-random-naming.lms | head -n 16
 # Demonstrates offline generation of unique pet names, passwords, and identifiers
 # using the embedded random provider with zero network or external plugins.
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let dir = "build/ex07-workdir";
 let ok_init = tofu.init(dir);
 let plan = tofu.plan(dir);
@@ -13,7 +13,7 @@ let server = tofu.output(dir, "server_name");
 let cluster = tofu.output(dir, "cluster_hex");
 let state_json = tofu.show_state(dir);
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 $ lmscript examples/07-random-naming.lms
 ok 07-random-naming - generated offline server pet names, passwords, and cluster IDs

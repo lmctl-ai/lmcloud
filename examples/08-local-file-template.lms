@@ -38,7 +38,7 @@ tf = "variable \"app_port\" {\n" +
      "}\n";
 write_file(path_join(workdir, "main.tf"), tf);
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let dir = "build/ex08-workdir";
 let ok_init = tofu.init(dir);
 let plan = tofu.plan(dir);
@@ -48,7 +48,7 @@ let cfg_path = tofu.output(dir, "config_path");
 let rendered = tofu.output(dir, "rendered_content");
 let state_json = tofu.show_state(dir);
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 savedsl(p, out);
 r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);

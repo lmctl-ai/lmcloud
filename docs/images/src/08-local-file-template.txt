@@ -3,7 +3,7 @@ $ cat examples/08-local-file-template.lms | head -n 16
 # Demonstrates rendering configuration files using templatefile(), local_file,
 # and local_sensitive_file with file permission controls.
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let dir = "build/ex08-workdir";
 let ok_init = tofu.init(dir);
 let plan = tofu.plan(dir);
@@ -13,7 +13,7 @@ let cfg_path = tofu.output(dir, "config_path");
 let rendered = tofu.output(dir, "rendered_content");
 let state_json = tofu.show_state(dir);
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 $ lmscript examples/08-local-file-template.lms
 ok 08-local-file-template - rendered template file and generated sensitive file

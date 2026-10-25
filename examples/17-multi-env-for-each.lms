@@ -45,7 +45,7 @@ tf = "variable \"environments\" {\n" +
      "}\n";
 write_file(path_join(workdir, "main.tf"), tf);
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let dir = "build/ex17-workdir";
 let ok_init = tofu.init(dir);
 let plan = tofu.plan(dir);
@@ -54,7 +54,7 @@ let ok_apply = tofu.apply(dir);
 let tiers = tofu.output(dir, "deployed_tiers");
 let state_json = tofu.show_state(dir);
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 savedsl(p, out);
 r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);

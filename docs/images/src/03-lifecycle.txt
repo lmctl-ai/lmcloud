@@ -3,7 +3,7 @@ $ cat examples/03-lifecycle.lms | head -n 17
 # Demonstrates full workflow: init -> plan -> apply -> read output -> inspect JSON state -> destroy.
 # Runs 100% in-process with zero network using the built-in terraform_data provider.
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let dir = "build/ex03-workdir";
 let ok_init = tofu.init(dir);
 let plan = tofu.plan(dir);
@@ -11,7 +11,7 @@ let ok_apply = tofu.apply(dir);
 let status = tofu.output(dir, "db_status");
 let state_json = tofu.show_state(dir);
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 $ lmscript examples/03-lifecycle.lms
 ok 03-lifecycle - completed init, plan, apply, output, state check, and destroy

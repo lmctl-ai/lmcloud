@@ -3,13 +3,13 @@ $ cat examples/14-state-surgery.lms | head -n 16
 # Demonstrates state listing with tofu.state_list(), zero-downtime resource refactoring
 # using HCL moved {} blocks, and programmatic state import with tofu.import().
 
-p2 = _dsl_ cli="lmcloud";
+p2 = _lmcode_ cli="lmcloud";
 let dir = "build/ex14-workdir";
 let ok_apply2 = tofu.apply(dir);
 let ok_imp = tofu.import(dir, "terraform_data.external_imported", "imported-state-val");
 let list2 = tofu.state_list(dir);
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 $ lmscript examples/14-state-surgery.lms
 ok 14-state-surgery - refactored state via moved blocks, listed state, and imported resource

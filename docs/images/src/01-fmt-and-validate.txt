@@ -6,11 +6,11 @@ $ cat examples/01-fmt-and-validate.lms | head -n 14
 unformatted = "resource   \"terraform_data\"   \"demo\"   {\n  input   =   \"formatted_val\"\n}\n";
 write_file(path_join(workdir, "main.tf"), unformatted);
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let formatted = tofu.fmt(unformatted_snippet);
 let ok_init = tofu.init("build/ex01-workdir");
 let ok_val = tofu.validate("build/ex01-workdir");
-end _dsl_
+end _lmcode_
 
 $ lmscript examples/01-fmt-and-validate.lms
 ok 01-fmt-and-validate - formatted HCL and validated configuration

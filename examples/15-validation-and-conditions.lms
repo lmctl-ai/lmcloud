@@ -33,7 +33,7 @@ tf = "variable \"env_name\" {\n" +
      "}\n";
 write_file(path_join(workdir, "main.tf"), tf);
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let dir = "build/ex15-workdir";
 let canonical_snippet = "variable \"x\" {\n  type = string\n}\n";
 let is_canonical = tofu.fmt_check(canonical_snippet);
@@ -44,7 +44,7 @@ let ok_apply = tofu.apply(dir);
 let env_out = tofu.output(dir, "validated_env");
 let state_json = tofu.show_state(dir);
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 savedsl(p, out);
 r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);

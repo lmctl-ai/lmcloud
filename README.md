@@ -5,7 +5,7 @@
 lmcloud is a native host for the lmscript `_dsl_` statement. It embeds the [OpenTofu](https://github.com/opentofu/opentofu) v1.13.2 engine in-process and exposes it through [`schema/lmcloud.dsl.json`](schema/lmcloud.dsl.json). Requires lmscript >=0.2.420; its implicit standard is provided by the Go SDK without entries in the host schema. Scripts can initialize, format, validate, plan, apply, destroy, and inspect state using typed objects with zero runtime dependencies.
 
 ```lms
-p = _dsl_ cli="lmcloud" install="github:lmctl-ai/lmcloud@latest";
+p = _lmcode_ cli="lmcloud" install="github:lmctl-ai/lmcloud@latest";
 let ok_init = tofu.init("infra/production");
 let plan = tofu.plan("infra/production");
 let adds = plan.add();
@@ -13,7 +13,7 @@ let ok_apply = tofu.apply("infra/production");
 let endpoint = tofu.output("infra/production", "api_endpoint");
 let state_json = tofu.show_state("infra/production");
 let ok_destroy = tofu.destroy("infra/production");
-end _dsl_
+end _lmcode_
 ```
 
 ## What it does (and does not)

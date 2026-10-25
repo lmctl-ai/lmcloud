@@ -15,11 +15,11 @@ tf1 = "resource \"local_file\" \"config\" {\n" +
 write_file(path_join(workdir, "main.tf"), tf1);
 
 # First DSL phase: init and apply baseline
-p1 = _dsl_ cli="lmcloud";
+p1 = _lmcode_ cli="lmcloud";
 let dir = "build/ex13-workdir";
 let ok_init = tofu.init(dir);
 let ok_apply = tofu.apply(dir);
-end _dsl_
+end _lmcode_
 
 savedsl(p1, "build/13-phase1.dslb");
 r1 = system(concat(dsl_cli(p1), ["--dsl", "build/13-phase1.dslb"]), 60000);
@@ -33,7 +33,7 @@ tf2 = "resource \"local_file\" \"config\" {\n" +
 write_file(path_join(workdir, "main.tf"), tf2);
 
 # Second DSL phase: plan diff inspection and JSON serialization
-p2 = _dsl_ cli="lmcloud";
+p2 = _lmcode_ cli="lmcloud";
 let dir = "build/ex13-workdir";
 let p = tofu.plan(dir);
 let adds = p.add();
@@ -43,7 +43,7 @@ let plan_json_from_method = p.json();
 let plan_json_from_dir = tofu.plan_json(dir);
 let ok_apply2 = tofu.apply(dir);
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 savedsl(p2, out);
 r2 = system(concat(dsl_cli(p2), ["--dsl", out]), 60000);

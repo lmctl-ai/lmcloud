@@ -8,12 +8,12 @@ resource "terraform_data" "db" {
 }
 
 $ lmscript -e '
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let ok_init = tofu.init("infra");
 let plan = tofu.plan("infra");
 out.print(plan.summary());
 out.print("plan.add=" + str(plan.add()) + " plan.change=" + str(plan.change()));
-end _dsl_
+end _lmcode_
 '
 Plan: 3 to add, 0 to change, 0 to destroy.
 plan.add=3 plan.change=0

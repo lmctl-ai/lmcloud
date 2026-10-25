@@ -3,7 +3,7 @@ $ cat examples/18-module-composition.lms | head -n 16
 # Demonstrates composing multiple local reusable modules that encapsulate
 # embedded providers (random, local) and surface structured module outputs to the root.
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let dir = "build/ex18-workdir";
 let ok_init = tofu.init(dir);
 let plan = tofu.plan(dir);
@@ -13,7 +13,7 @@ let a_id = tofu.output(dir, "alpha_id");
 let b_id = tofu.output(dir, "beta_id");
 let state_json = tofu.show_state(dir);
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 $ lmscript examples/18-module-composition.lms
 ok 18-module-composition - composed nested modules with embedded provider resources

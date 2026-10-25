@@ -3,7 +3,7 @@ $ cat examples/15-validation-and-conditions.lms | head -n 16
 # Demonstrates enforcement of declarative validation rules on variables,
 # resource lifecycle preconditions/postconditions, and HCL format checking.
 
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 let dir = "build/ex15-workdir";
 let canonical_snippet = "variable \"x\" {\n  type = string\n}\n";
 let is_canonical = tofu.fmt_check(canonical_snippet);
@@ -14,7 +14,7 @@ let ok_apply = tofu.apply(dir);
 let env_out = tofu.output(dir, "validated_env");
 let state_json = tofu.show_state(dir);
 let ok_destroy = tofu.destroy(dir);
-end _dsl_
+end _lmcode_
 
 $ lmscript examples/15-validation-and-conditions.lms
 ok 15-validation-and-conditions - validated variable constraints and lifecycle conditions

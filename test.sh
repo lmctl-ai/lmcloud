@@ -88,9 +88,9 @@ run_dsl() { # NAME BODY
   local body="$2"
   local tmpdir; tmpdir="$(mktemp -d build/tmp.XXXXXX)"
   cat > "$tmpdir/script.lms" <<LMS
-p = _dsl_ cli="lmcloud";
+p = _lmcode_ cli="lmcloud";
 $body
-end _dsl_
+end _lmcode_
 savedsl(p, "$tmpdir/script.dslb");
 r = system(concat(dsl_cli(p), ["--dsl", "$tmpdir/script.dslb"]), 60000);
 println("code=" + str(r.code));

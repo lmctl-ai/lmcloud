@@ -19,7 +19,7 @@ PYVERSION
 python3 - "$(native "$WORK/probe.schema.json")" "$(native "$WORK")" <<'PY'
 import json,pathlib,sys
 work=pathlib.Path(sys.argv[2])
-(work/'probe.lms').write_text('p = _dsl_ schema='+json.dumps(sys.argv[1])+';\nlet n = str_len("implicit std");\nend _dsl_\nsavedsl(p, '+json.dumps(str(work/'probe.dslb'))+');\n')
+(work/'probe.lms').write_text('p = _lmcode_ schema='+json.dumps(sys.argv[1])+';\nlet n = str_len("implicit std");\nend _lmcode_\nsavedsl(p, '+json.dumps(str(work/'probe.dslb'))+');\n')
 PY
 if [ -n "$candidate" ] &&
    "$candidate" --dsl-signatures "$WORK/probe.schema.json" > /dev/null 2>&1 &&
