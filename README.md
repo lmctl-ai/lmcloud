@@ -2,7 +2,7 @@
 
 **Drive OpenTofu infrastructure operations from LMScript with one static executable.**
 
-lmcloud is a native host for the lmscript `_dsl_` statement. It embeds the [OpenTofu](https://github.com/opentofu/opentofu) v1.13.2 engine in-process and exposes it through [`schema/lmcloud.dsl.json`](schema/lmcloud.dsl.json). Scripts can initialize, format, validate, plan, apply, destroy, and inspect state using typed objects with zero runtime dependencies.
+lmcloud is a native host for the lmscript `_dsl_` statement. It embeds the [OpenTofu](https://github.com/opentofu/opentofu) v1.13.2 engine in-process and exposes it through [`schema/lmcloud.dsl.json`](schema/lmcloud.dsl.json). Requires lmscript >=0.2.420; its implicit standard is provided by the Go SDK without entries in the host schema. Scripts can initialize, format, validate, plan, apply, destroy, and inspect state using typed objects with zero runtime dependencies.
 
 ```lms
 p = _dsl_ cli="lmcloud" install="github:lmctl-ai/lmcloud@latest";
@@ -91,7 +91,7 @@ lmcloud is built upon **OpenTofu** (`github.com/opentofu/opentofu`, MPL-2.0), th
 ### Prerequisites
 
 - Go 1.26 or Go 1.27
-- `lmscript` (installed via `npm i -g @lmctl-ai/lmctl@0.2.401`)
+- `lmscript` (installed via `npm i -g @lmctl-ai/lmctl@0.2.420`)
 
 ### Build Static Executable
 

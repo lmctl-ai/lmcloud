@@ -4,7 +4,7 @@
 
 - Go 1.26 or Go 1.27 (`GOTOOLCHAIN=auto` handles minor toolchain transitions automatically).
 - CGO is disabled (`CGO_ENABLED=0`).
-- `lmscript` on PATH (installed via `npm i -g @lmctl-ai/lmctl@0.2.401`).
+- `lmscript` on PATH (installed via `npm i -g @lmctl-ai/lmctl@0.2.420`).
 
 ## Build
 
@@ -50,3 +50,5 @@ Checks performed (19/19 checks):
 17. Unknown output key handling (returns empty string and populates `last_error()`)
 18. Formatting invalid HCL returns original string and records `last_error()`
 19. In-process Go unit tests (`go test -v ./internal/lmhost`)
+
+Compiler >=0.2.420 is capability-probed against an empty schema; the existing host-only schema is unchanged, with default SDK std and full/`--without-std` parity checked alongside a std-only runtime probe.

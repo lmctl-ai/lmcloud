@@ -86,7 +86,7 @@ jobs:
       - name: lmscript compiler (npm @lmctl-ai/lmctl)
         if: env.ONLY_OK == 'true'
         run: |
-          npm i -g @lmctl-ai/lmctl@0.2.401
+          npm i -g @lmctl-ai/lmctl@0.2.420
           lmscript --version
 
       - name: test host package

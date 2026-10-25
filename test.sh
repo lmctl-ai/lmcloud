@@ -32,8 +32,9 @@ want="lmcloud $want_v (opentofu $want_tofu)"
 got="$("$HOST" --version)"
 [ "$got" = "$want" ] || fail "--version was '$got', want '$want'"; ok "--version prints '$want'"
 
-LMSCRIPT="${LMSCRIPT_BIN:-lmscript}"
+LMSCRIPT="$(scripts/select-compiler.sh)"
 diff <("$LMSCRIPT" --dsl-signatures schema/lmcloud.dsl.json) <("$HOST" --dsl-signatures) >/dev/null || fail "schema/host signature drift"; ok "host signatures match the schema"
+diff <("$LMSCRIPT" --dsl-signatures schema/lmcloud.dsl.json --without-std) <("$HOST" --dsl-signatures --without-std) >/dev/null || fail "host-only signature drift"; ok "host-only compiler/registry parity"
 cmp <("$HOST" --dsl-schema --json) schema/lmcloud.dsl.json >/dev/null || fail "embedded schema differs"; ok "embedded schema is byte-identical"
 
 schema_summary="$("$HOST" --dsl-schema)"
@@ -48,6 +49,21 @@ for f in examples/*.lms; do
   echo "$out" | grep -q "^ok " || { echo "$out" >&2; fail "$f printed no ok line"; }
   ok "$f"
 done
+
+# Prove standard calls compile and run without host declarations or cloud effects.
+STD_WORK="$(mktemp -d "${TMPDIR:-/tmp}/lmcloud-std-XXXXXX")"
+cat > "$STD_WORK/probe.lms" <<LMS
+p = _lmcode_ cli="lmcloud";
+let n = str_len("abc");
+let list = str_list().add("value");
+if (n != 3 || list.at(0) != "value") { let invalid = int_list().at(0); }
+end _lmcode_
+savedsl(p, "$STD_WORK/probe.dslb");
+LMS
+"$LMSCRIPT" "$STD_WORK/probe.lms"
+"$HOST" --dsl "$STD_WORK/probe.dslb" >/dev/null || fail "implicit std runtime"
+rm -rf "$STD_WORK"
+ok "implicit std compiles and runs against host-only schema"
 
 # Error paths
 mkdir -p build

@@ -56,7 +56,7 @@ func realMain(args []string) int {
 		return lmcode.ReportAppFailure("failed to register host: " + err.Error())
 	}
 
-	const usage = "usage: lmcloud --version | --dsl-schema [--json] | --dsl-signatures | --dsl FILE [FILE ...]\n"
+	const usage = "usage: lmcloud --version | --dsl-schema [--json] | --dsl-signatures [--without-std] | --dsl FILE [FILE ...]\n"
 
 	if len(args) == 2 && args[1] == "--version" {
 		v := strings.TrimSpace(rawVersion)
@@ -83,6 +83,12 @@ func realMain(args []string) int {
 		return 2
 	}
 
+	if len(args) == 3 && args[1] == "--dsl-signatures" && args[2] == "--without-std" {
+		for _, s := range reg.HostSignatures() {
+			fmt.Println(s)
+		}
+		return 0
+	}
 	if len(args) == 2 && args[1] == "--dsl-signatures" {
 		for _, s := range reg.Signatures() {
 			fmt.Println(s)
