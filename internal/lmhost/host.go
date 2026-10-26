@@ -184,6 +184,7 @@ func (h *Host) runCommand(dir string, fn func(meta command.Meta) int) (int, stri
 		_ = os.Chdir(origWd)
 	}()
 
+	pluginCacheDir, pluginCacheMayBreak := resolvePluginCacheConfig(cfg)
 	streams, done := newCapturedStreams()
 	view := views.NewView(streams).SetRunningInAutomation(true)
 	meta := command.Meta{
@@ -195,10 +196,10 @@ func (h *Host) runCommand(dir string, fn func(meta command.Meta) int) (int, stri
 		SystemCfg: system.Config{
 			RunningInAutomation: true,
 			CLIConfigDir:        configDir,
-			PluginCacheDir:      cfg.PluginCacheDir,
+			PluginCacheDir:      pluginCacheDir,
 			GlobalPluginDirs:    globalPluginDirs(),
 		},
-		PluginCacheMayBreakDependencyLockFile: cfg.PluginCacheMayBreakDependencyLockFile,
+		PluginCacheMayBreakDependencyLockFile: pluginCacheMayBreak,
 		MakeRegistryHTTPClient: func() *retryablehttp.Client {
 			return newRegistryHTTPClient(ctx, cfg.RegistryProtocols)
 		},
@@ -214,6 +215,59 @@ func (h *Host) runCommand(dir string, fn func(meta command.Meta) int) (int, stri
 	plugin.CleanupClients()
 	stdout, stderr := done()
 	return code, stdout, stderr
+}
+
+func resolvePluginCacheConfig(cfg *cliconfig.Config) (string, bool) {
+	dir := resolvePluginCacheDir(cfg)
+	mayBreak := cfg != nil && cfg.PluginCacheMayBreakDependencyLockFile
+	if envBreak, ok := os.LookupEnv("TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE"); ok {
+		trimmed := strings.ToLower(strings.TrimSpace(envBreak))
+		if trimmed == "0" || trimmed == "false" {
+			return dir, false
+		}
+		if trimmed != "" {
+			return dir, true
+		}
+	}
+	if dir != "" && !mayBreak {
+		mayBreak = true
+	}
+	return dir, mayBreak
+}
+
+func resolvePluginCacheDir(cfg *cliconfig.Config) string {
+	if cfg != nil && cfg.PluginCacheDir != "" {
+		if abs, err := filepath.Abs(cfg.PluginCacheDir); err == nil {
+			_ = os.MkdirAll(abs, 0755)
+			return abs
+		}
+		_ = os.MkdirAll(cfg.PluginCacheDir, 0755)
+		return cfg.PluginCacheDir
+	}
+	if envDir := strings.TrimSpace(os.Getenv("LMCLOUD_PLUGIN_CACHE_DIR")); envDir != "" {
+		if strings.EqualFold(envDir, "off") || strings.EqualFold(envDir, "false") || envDir == "0" {
+			return ""
+		}
+		if abs, err := filepath.Abs(envDir); err == nil {
+			envDir = abs
+		}
+		if err := os.MkdirAll(envDir, 0755); err == nil {
+			return envDir
+		}
+	}
+	var baseDir string
+	if userCache, err := os.UserCacheDir(); err == nil && userCache != "" {
+		baseDir = filepath.Join(userCache, "lmcloud", "plugin-cache")
+	} else {
+		baseDir = filepath.Join(os.TempDir(), "lmcloud-plugin-cache")
+	}
+	if abs, err := filepath.Abs(baseDir); err == nil {
+		baseDir = abs
+	}
+	if err := os.MkdirAll(baseDir, 0755); err == nil {
+		return baseDir
+	}
+	return ""
 }
 
 func (h *Host) persistedVarsPath(absDir string) string {

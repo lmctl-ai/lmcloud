@@ -79,3 +79,33 @@ func (d *Dir) ProviderVersion(provider addrs.Provider, version getproviders.Vers
 
 	return nil
 }
+
+// CachedVersions returns all versions of the given provider currently present
+// for the target platform in this cache directory.
+func (d *Dir) CachedVersions(provider addrs.Provider) getproviders.VersionList {
+	if d == nil {
+		return nil
+	}
+	providerDir := filepath.Join(d.baseDir, provider.Hostname.String(), provider.Namespace, provider.Type)
+	entries, err := os.ReadDir(providerDir)
+	if err != nil {
+		return nil
+	}
+	var out getproviders.VersionList
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		v, err := getproviders.ParseVersion(entry.Name())
+		if err != nil {
+			continue
+		}
+		if cp := d.ProviderVersion(provider, v); cp != nil {
+			if _, err := cp.ExecutableFile(); err == nil {
+				out = append(out, v)
+			}
+		}
+	}
+	out.Sort()
+	return out
+}

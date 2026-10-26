@@ -284,4 +284,64 @@ terraform {
 	}
 }
 
+func TestPluginCacheReuseAcrossWorkdirs(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("LMCLOUD_PLUGIN_CACHE_DIR", cacheDir)
+
+	platform := runtime.GOOS + "_" + runtime.GOARCH
+	td1 := t.TempDir()
+	mirrorDir := filepath.Join(td1, "terraform.d", "plugins", "registry.opentofu.org", "example", "cachedprov", "2.0.0", platform)
+	if err := os.MkdirAll(mirrorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	binName := "terraform-provider-cachedprov_v2.0.0"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	if err := os.WriteFile(filepath.Join(mirrorDir, binName), []byte("#!/bin/sh\necho cachedprov\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	tf := `
+terraform {
+  required_providers {
+    cachedprov = {
+      source  = "example/cachedprov"
+      version = "2.0.0"
+    }
+  }
+}
+`
+	if err := os.WriteFile(filepath.Join(td1, "main.tf"), []byte(tf), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewHost()
+	if !h.Init(td1) {
+		t.Fatalf("Init td1 failed: %s", h.LastError())
+	}
+
+	cachedPkgDir := filepath.Join(cacheDir, "registry.opentofu.org", "example", "cachedprov", "2.0.0", platform)
+	if _, err := os.Stat(cachedPkgDir + ".h1"); err != nil {
+		t.Fatalf("expected sidecar .h1 hash cache at %s.h1: %s", cachedPkgDir, err)
+	}
+
+	// Second directory td2 has NO local mirror and NO lockfile; it must reuse cacheDir offline.
+	td2 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(td2, "main.tf"), []byte(tf), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !h.Init(td2) {
+		t.Fatalf("Init td2 from shared plugin cache failed: %s", h.LastError())
+	}
+	lockBytes, err := os.ReadFile(filepath.Join(td2, ".terraform.lock.hcl"))
+	if err != nil {
+		t.Fatalf("expected td2 .terraform.lock.hcl: %s", err)
+	}
+	if !strings.Contains(string(lockBytes), "registry.opentofu.org/example/cachedprov") {
+		t.Fatalf("expected td2 lockfile to contain example/cachedprov, got:\n%s", string(lockBytes))
+	}
+}
+
+
 

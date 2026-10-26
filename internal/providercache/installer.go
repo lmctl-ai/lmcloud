@@ -395,6 +395,17 @@ func (i *Installer) ensureProviderVersionsNeed(
 
 		available, warnings, err := i.source.AvailableVersions(ctx, provider)
 		if err != nil {
+			if i.globalCacheDir != nil && i.globalCacheDirMayBreakDependencyLockFile {
+				cached := i.globalCacheDir.CachedVersions(provider)
+				for idx := len(cached) - 1; idx >= 0; idx-- {
+					if acceptableVersions.Has(cached[idx]) {
+						if cb := evts.QueryPackagesSuccess; cb != nil {
+							cb(provider, cached[idx])
+						}
+						return cached[idx], nil
+					}
+				}
+			}
 			if cb := evts.QueryPackagesFailure; cb != nil {
 				cb(provider, err)
 			}
@@ -651,10 +662,23 @@ func (i *Installer) ensureProviderVersionInDirectory(
 	}
 	meta, err := i.source.PackageMeta(ctx, provider, version, targetPlatform)
 	if err != nil {
-		if cb := evts.FetchPackageFailure; cb != nil {
-			cb(provider, version, err)
+		if installed := installTo.ProviderVersion(provider, version); installed != nil && i.globalCacheDirMayBreakDependencyLockFile && isGlobalCache {
+			if _, execErr := installed.ExecutableFile(); execErr == nil {
+				meta = getproviders.PackageMeta{
+					Provider:       provider,
+					Version:        version,
+					TargetPlatform: targetPlatform,
+					Location:       installed.PackageLocation(),
+				}
+				err = nil
+			}
 		}
-		return nil, nil, err
+		if err != nil {
+			if cb := evts.FetchPackageFailure; cb != nil {
+				cb(provider, version, err)
+			}
+			return nil, nil, err
+		}
 	}
 
 	// Step 3c: Retrieve the package indicated by the metadata we received,

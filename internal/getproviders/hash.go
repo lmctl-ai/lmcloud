@@ -421,9 +421,33 @@ func PackageHashV1(loc PackageLocation) (Hash, error) {
 			return "", err
 		}
 
+		sidecarBase := ""
+		if _, err := os.Stat(packageDir + ".lock"); err == nil {
+			sidecarBase = packageDir
+		} else if rawDir := filepath.Clean(string(loc)); rawDir != "" {
+			if _, err := os.Stat(rawDir + ".lock"); err == nil {
+				sidecarBase = rawDir
+			}
+		}
+		var fp string
+		if sidecarBase != "" {
+			if computedFP, fpErr := packageDirMetadataFingerprint(packageDir); fpErr == nil && computedFP != "" {
+				fp = computedFP
+				if cached, readErr := os.ReadFile(sidecarBase + ".h1"); readErr == nil {
+					lines := strings.SplitN(strings.TrimSpace(string(cached)), "\n", 2)
+					if len(lines) == 2 && lines[0] == fp && strings.HasPrefix(lines[1], string(HashScheme1)) {
+						return Hash(lines[1]), nil
+					}
+				}
+			}
+		}
+
 		// The dirhash.HashDir result is already in our expected h1:...
 		// format, so we can just convert directly to Hash.
 		s, err := dirhash.HashDir(packageDir, "", dirhash.Hash1)
+		if err == nil && sidecarBase != "" && fp != "" {
+			_ = os.WriteFile(sidecarBase+".h1", []byte(fp+"\n"+s+"\n"), 0644)
+		}
 		return Hash(s), err
 
 	case PackageLocalArchive:
@@ -440,6 +464,34 @@ func PackageHashV1(loc PackageLocation) (Hash, error) {
 	default:
 		return "", fmt.Errorf("cannot hash package at %s", loc.String())
 	}
+}
+
+func packageDirMetadataFingerprint(packageDir string) (string, error) {
+	var entries []string
+	err := filepath.WalkDir(packageDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == packageDir {
+			return nil
+		}
+		rel, err := filepath.Rel(packageDir, path)
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		entries = append(entries, fmt.Sprintf("%s:%d:%d:%d", filepath.ToSlash(rel), info.Mode(), info.Size(), info.ModTime().UnixNano()))
+		return nil
+	})
+	if err != nil || len(entries) == 0 {
+		return "", err
+	}
+	sort.Strings(entries)
+	sum := sha256.Sum256([]byte(strings.Join(entries, "|")))
+	return fmt.Sprintf("fp1:%x", sum[:]), nil
 }
 
 // Hash computes a hash of the contents of the package at the location
