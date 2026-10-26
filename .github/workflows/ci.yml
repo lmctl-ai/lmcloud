@@ -9,12 +9,6 @@ on:
         default: "all"
         type: choice
         options: [all, linux-x64, linux-arm64, macos-arm64, macos-x64, windows-x64]
-  push:
-    branches: [main]
-    tags: ["v*"]
-    paths-ignore: ["durable-memory/**", "**.md"]
-  pull_request:
-    paths-ignore: ["durable-memory/**", "**.md"]
 
 permissions:
   contents: read
