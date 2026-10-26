@@ -3,6 +3,7 @@
 package lmhost
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -342,6 +343,63 @@ terraform {
 		t.Fatalf("expected td2 lockfile to contain example/cachedprov, got:\n%s", string(lockBytes))
 	}
 }
+
+func TestClearSpotRequestIDs(t *testing.T) {
+	stateJSON := `{
+  "version": 4,
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "aws_instance",
+      "name": "app",
+      "instances": [
+        {
+          "attributes": {
+            "id": "i-0123456789abcdef0",
+            "instance_lifecycle": "spot",
+            "spot_instance_request_id": "sir-abc12345",
+            "instance_market_options": [
+              {
+                "market_type": "spot",
+                "spot_options": [
+                  {
+                    "spot_instance_type": "one-time",
+                    "instance_interruption_behavior": "terminate"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}`
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(stateJSON), &doc); err != nil {
+		t.Fatalf("unmarshal state failed: %s", err)
+	}
+	if !clearSpotRequestIDs(doc) {
+		t.Fatal("expected clearSpotRequestIDs to return true on spot instance state")
+	}
+	if clearSpotRequestIDs(doc) {
+		t.Fatal("expected second clearSpotRequestIDs call to be idempotent and return false")
+	}
+
+	res := doc["resources"].([]any)[0].(map[string]any)
+	inst := res["instances"].([]any)[0].(map[string]any)
+	attrs := inst["attributes"].(map[string]any)
+	if got := attrs["spot_instance_request_id"]; got != "" {
+		t.Fatalf("expected empty spot_instance_request_id, got %v", got)
+	}
+	if got := attrs["instance_lifecycle"]; got != "" {
+		t.Fatalf("expected empty instance_lifecycle, got %v", got)
+	}
+	if got := len(attrs["instance_market_options"].([]any)); got != 0 {
+		t.Fatalf("expected empty instance_market_options slice, got len %d", got)
+	}
+}
+
 
 
 

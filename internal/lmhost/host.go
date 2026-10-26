@@ -555,6 +555,24 @@ func (h *Host) Destroy(dir string) bool {
 		return (&command.ApplyCommand{Meta: meta, Destroy: true}).Run(args)
 	})
 
+	if code != 0 && strings.Contains(stderr, "CancelSpotInstanceRequests") {
+		statePath := filepath.Join(dir, "terraform.tfstate")
+		if raw, err := os.ReadFile(statePath); err == nil {
+			var doc map[string]any
+			if json.Unmarshal(raw, &doc) == nil {
+				if clearSpotRequestIDs(doc) {
+					if patched, err := json.MarshalIndent(doc, "", "  "); err == nil {
+						_ = os.WriteFile(statePath, patched, 0o600)
+						retryArgs := append([]string{"-refresh=false"}, args...)
+						code, stdout, stderr = h.runCommand(dir, func(meta command.Meta) int {
+							return (&command.ApplyCommand{Meta: meta, Destroy: true}).Run(retryArgs)
+						})
+					}
+				}
+			}
+		}
+	}
+
 	if code == 0 {
 		h.lastError = ""
 		return true
@@ -564,6 +582,47 @@ func (h *Host) Destroy(dir string) bool {
 		h.lastError = strings.TrimSpace(stdout)
 	}
 	return false
+}
+
+func clearSpotRequestIDs(doc map[string]any) bool {
+	resList, ok := doc["resources"].([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, r := range resList {
+		rm, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		insts, ok := rm["instances"].([]any)
+		if !ok {
+			continue
+		}
+		for _, inst := range insts {
+			im, ok := inst.(map[string]any)
+			if !ok {
+				continue
+			}
+			attrs, ok := im["attributes"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if v, ok := attrs["spot_instance_request_id"].(string); ok && v != "" {
+				attrs["spot_instance_request_id"] = ""
+				changed = true
+			}
+			if v, ok := attrs["instance_market_options"].([]any); ok && len(v) > 0 {
+				attrs["instance_market_options"] = []any{}
+				changed = true
+			}
+			if v, ok := attrs["instance_lifecycle"].(string); ok && v != "" {
+				attrs["instance_lifecycle"] = ""
+				changed = true
+			}
+		}
+	}
+	return changed
 }
 
 // Output reads an output variable from state.
