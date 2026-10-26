@@ -31,8 +31,8 @@ Rather than compiling separate plugin executables or opening TCP/Unix sockets, p
    `InternalProviders()` registers factories for each embedded provider under `builtin`, `hashicorp`, default registry hostname, and `registry.terraform.io`.
 2. **Dependency Installer (`internal/providercache/installer.go`):**
    `Install()` checks if the required provider matches an embedded type and skips network lookups during `tofu init`.
-3. **Lock File Exemption (`internal/depsfile/locks.go`):**
-   `ProviderIsLockable()` treats embedded utility providers as internal, preventing failures due to missing `.terraform.lock.hcl` entries in offline environments.
+3. **Lock File Exemption (`internal/depsfile/locks.go` and `locks_file.go`):**
+   `ProviderIsLockable()` treats the embedded `hashicorp/*` utility providers (`random`, `null`, `local`, `time`, `archive`, `tls`, `terraform`) as internal, preventing failures due to missing `.terraform.lock.hcl` entries in offline environments and ignoring pre-existing lock entries for them cleanly, while locking all external providers (`hashicorp/aws`, `hashicorp/google`, `hashicorp/azurerm`, etc.) normally.
 
 ## Protobuf Namespace Resolution
 

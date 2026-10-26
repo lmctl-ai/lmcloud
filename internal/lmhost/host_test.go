@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -44,6 +45,21 @@ func TestHostSignatureParity(t *testing.T) {
 	for i, line := range expectedLines {
 		if hostSigs[i] != line {
 			t.Errorf("line %d: got %q, want %q", i, hostSigs[i], line)
+		}
+	}
+
+	hostOnlySigs := reg.HostSignatures()
+	outNoStd, err := exec.Command(lmscriptBin, "--dsl-signatures", schemaPath, "--without-std").CombinedOutput()
+	if err != nil {
+		t.Fatalf("lmscript --dsl-signatures --without-std failed: %s\n%s", err, string(outNoStd))
+	}
+	expectedNoStd := strings.Split(strings.TrimSpace(string(outNoStd)), "\n")
+	if len(hostOnlySigs) != len(expectedNoStd) {
+		t.Fatalf("host-only signature count mismatch: got %d, want %d", len(hostOnlySigs), len(expectedNoStd))
+	}
+	for i, line := range expectedNoStd {
+		if hostOnlySigs[i] != line {
+			t.Errorf("host-only line %d: got %q, want %q", i, hostOnlySigs[i], line)
 		}
 	}
 }
@@ -149,6 +165,15 @@ output "message" {
 		t.Fatalf("destroy failed: %s", h.LastError())
 	}
 
+	// 10b. Output after destroy returns empty string and sets LastError
+	postDestroy := h.Output(td, "message")
+	if postDestroy != "" {
+		t.Fatalf("expected empty output after destroy, got %q", postDestroy)
+	}
+	if h.LastError() == "" {
+		t.Fatal("expected LastError to be populated when querying output after destroy")
+	}
+
 	// 11. Fmt
 	unformatted := "resource   \"terraform_data\"   \"a\"   {\n  input = \"b\"\n}\n"
 	formatted := h.Fmt(unformatted)
@@ -174,3 +199,89 @@ output "message" {
 		t.Fatal("expected LastError to be set on missing dir")
 	}
 }
+
+func TestVarPersistenceAndDeclaredFiltering(t *testing.T) {
+	td1 := t.TempDir()
+	tf1 := `
+variable "run_id" {
+  type = string
+}
+resource "terraform_data" "item" {
+  input = var.run_id
+}
+output "run_id_out" {
+  value = terraform_data.item.output
+}
+`
+	if err := os.WriteFile(filepath.Join(td1, "main.tf"), []byte(tf1), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Process 1: sets run_id + an extra variable for another dir, runs init + apply
+	h1 := NewHost()
+	h1.Var("run_id", "run-abc123")
+	h1.Var("other_dir_var", "unused-here")
+	if !h1.Init(td1) {
+		t.Fatalf("h1.Init failed: %s", h1.LastError())
+	}
+	if !h1.Apply(td1) {
+		t.Fatalf("h1.Apply failed: %s", h1.LastError())
+	}
+	if got := h1.Output(td1, "run_id_out"); got != "run-abc123" {
+		t.Fatalf("expected output 'run-abc123', got %q", got)
+	}
+
+	// Process 2 (separate Host instance, simulating separate cleanup invocation):
+	// does NOT call Var("run_id", ...), yet Destroy succeeds using persisted workdir vars.
+	h2 := NewHost()
+	if !h2.Destroy(td1) {
+		t.Fatalf("h2.Destroy without re-setting Var failed: %s", h2.LastError())
+	}
+	if got := strings.TrimSpace(h2.StateList(td1)); got != "" {
+		t.Fatalf("expected empty state after h2.Destroy, got %q", got)
+	}
+}
+
+func TestExternalProviderFilesystemMirrorInit(t *testing.T) {
+	td := t.TempDir()
+	platform := runtime.GOOS + "_" + runtime.GOARCH
+	pluginDir := filepath.Join(td, "terraform.d", "plugins", "registry.opentofu.org", "example", "custom", "1.2.3", platform)
+	if err := os.MkdirAll(pluginDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	binName := "terraform-provider-custom_v1.2.3"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	if err := os.WriteFile(filepath.Join(pluginDir, binName), []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	tf := `
+terraform {
+  required_providers {
+    custom = {
+      source  = "example/custom"
+      version = "1.2.3"
+    }
+  }
+}
+`
+	if err := os.WriteFile(filepath.Join(td, "main.tf"), []byte(tf), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewHost()
+	if !h.Init(td) {
+		t.Fatalf("Init with external provider in filesystem mirror failed: %s", h.LastError())
+	}
+	lockBytes, err := os.ReadFile(filepath.Join(td, ".terraform.lock.hcl"))
+	if err != nil {
+		t.Fatalf("expected .terraform.lock.hcl to be written: %s", err)
+	}
+	if !strings.Contains(string(lockBytes), "registry.opentofu.org/example/custom") {
+		t.Fatalf("expected lockfile to contain example/custom, got:\n%s", string(lockBytes))
+	}
+}
+
+

@@ -18,9 +18,10 @@ end _lmcode_
 
 ## What it does (and does not)
 
-- **Real in-process engine:** All operations (`init`, `validate`, `fmt`, `fmt_check`, `plan`, `plan_json`, `apply`, `destroy`, `output`, `show_state`, `state_list`, `import`) run within the process through OpenTofu's core `internal/command` subsystem with captured I/O streams. No child processes (`tofu` or `terraform` binaries) are spawned.
+- **Real in-process engine:** All operations (`init`, `validate`, `fmt`, `fmt_check`, `plan`, `plan_json`, `apply`, `destroy`, `output`, `show_state`, `state_list`, `import`) run within the process through OpenTofu's core `internal/command` subsystem with captured I/O streams. No external `tofu` or `terraform` CLI binary is required.
 - **Embedded offline providers:** In addition to built-in `terraform_data`, six core utility providers are compiled directly into the binary and served via in-memory gRPC (`bufconn`): `random`, `null`, `local`, `time`, `archive`, and `tls`. Cloud configurations with keys, certs, templates, zips, timestamps, and triggers run 100% offline with zero network lookups.
-- **External cloud providers:** External providers (AWS, Azure, GCP, Kubernetes) require network downloads or separate plugin binaries.
+- **External cloud providers (`aws`, `google`, `azurerm`, etc.):** `tofu.init(dir)` resolves and installs external providers from `registry.opentofu.org` (as well as local `terraform.d/plugins` mirrors, `.tofurc` / `TF_CLI_CONFIG_FILE` installation rules, and `TF_PLUGIN_CACHE_DIR`), writes `.terraform.lock.hcl`, and executes the installed provider plugins as managed `go-plugin` gRPC child processes during `validate`, `plan`, `apply`, `destroy`, and `import`.
+- **Variable persistence across processes:** `tofu.var(name, value)` injects input variables for `plan`, `apply`, `destroy`, and `import` (filtered to variables declared in the target directory) and persists them per working directory in `<dir>/.terraform/lmcloud-vars.json` (`0600`) so a separate cleanup process calling `tofu.destroy(dir)` inherits them automatically.
 - **Single static executable:** Built with `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"` into a standalone binary (~116 MB) with no dynamic library dependencies.
 
 ## Example Gallery

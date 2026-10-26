@@ -225,9 +225,11 @@ func ProviderIsLockable(addr addrs.Provider) bool {
 	if addr.IsBuiltIn() || addr.IsLegacy() {
 		return false
 	}
-	switch addr.Type {
-	case "terraform", "random", "null", "local", "time", "archive", "tls":
-		return false
+	if (addr.Hostname == addrs.DefaultProviderRegistryHost || addr.Hostname.ForDisplay() == "registry.terraform.io") && addr.Namespace == "hashicorp" {
+		switch addr.Type {
+		case "terraform", "random", "null", "local", "time", "archive", "tls":
+			return false
+		}
 	}
 	return true
 }

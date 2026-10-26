@@ -5,6 +5,7 @@ package lmhost
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -13,14 +14,18 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hashicorp/go-plugin"
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/lmctl-ai/lmcode-go"
 	"github.com/opentofu/opentofu/internal/addrs"
 	backendInit "github.com/opentofu/opentofu/internal/backend/init"
 	"github.com/opentofu/opentofu/internal/command"
+	"github.com/opentofu/opentofu/internal/command/cliconfig"
 	"github.com/opentofu/opentofu/internal/command/system"
 	"github.com/opentofu/opentofu/internal/command/views"
 	viewsjson "github.com/opentofu/opentofu/internal/command/views/json"
 	"github.com/opentofu/opentofu/internal/command/workdir"
+	"github.com/opentofu/opentofu/internal/configs"
 	"github.com/opentofu/opentofu/internal/encryption"
 	"github.com/opentofu/opentofu/internal/plans"
 	"github.com/opentofu/opentofu/internal/plans/planfile"
@@ -110,9 +115,17 @@ func newCapturedStreams() (*terminal.Streams, func() (string, string)) {
 
 func (h *Host) ensureInit() {
 	h.initOnce.Do(func() {
-		if h.services == nil {
-			h.services = disco.New()
+		ctx := context.Background()
+		cfg, _ := cliconfig.LoadConfig(ctx)
+		if cfg == nil {
+			cfg = &cliconfig.Config{}
 		}
+		credsSrc, err := credentialsSource(cfg)
+		if err != nil {
+			credsSrc = nil
+		}
+		h.services = newServiceDiscovery(ctx, cfg.RegistryProtocols, credsSrc)
+		configureHostServices(h.services, cfg)
 		backendInit.Init(h.services)
 	})
 }
@@ -141,6 +154,28 @@ func (h *Host) runCommand(dir string, fn func(meta command.Meta) int) (int, stri
 		return 1, "", h.lastError
 	}
 
+	ctx := context.Background()
+	cfg, _ := cliconfig.LoadConfig(ctx)
+	if cfg == nil {
+		cfg = &cliconfig.Config{}
+	}
+	configureHostServices(h.services, cfg)
+
+	providerSrc, _ := buildProviderSource(
+		ctx,
+		cfg.ProviderInstallation,
+		cfg.RegistryProtocols,
+		h.services,
+		cfg.OCICredentialsPolicy,
+		origWd,
+		absTarget,
+	)
+	unmanagedProviders, _ := parseReattachProviders(os.Getenv("TF_REATTACH_PROVIDERS"))
+	configDir, err := cliconfig.ConfigDir()
+	if err != nil {
+		configDir = ""
+	}
+
 	if err := os.Chdir(absTarget); err != nil {
 		h.lastError = fmt.Sprintf("cannot change directory to %q: %s", absTarget, err)
 		return 1, "", h.lastError
@@ -155,27 +190,97 @@ func (h *Host) runCommand(dir string, fn func(meta command.Meta) int) (int, stri
 		WorkingDir:    workdir.NewDir("."),
 		View:          view,
 		Services:      h.services,
-		CallerContext: context.Background(),
+		CallerContext: ctx,
 		ShutdownCh:    make(<-chan struct{}),
 		SystemCfg: system.Config{
 			RunningInAutomation: true,
+			CLIConfigDir:        configDir,
+			PluginCacheDir:      cfg.PluginCacheDir,
+			GlobalPluginDirs:    globalPluginDirs(),
 		},
+		PluginCacheMayBreakDependencyLockFile: cfg.PluginCacheMayBreakDependencyLockFile,
+		MakeRegistryHTTPClient: func() *retryablehttp.Client {
+			return newRegistryHTTPClient(ctx, cfg.RegistryProtocols)
+		},
+		ModulePackageFetcher:         remoteModulePackageFetcher(ctx, cfg.OCICredentialsPolicy),
+		ProviderSource:               providerSrc,
+		ProviderDevOverrides:         providerDevOverrides(cfg.ProviderInstallation),
+		UnmanagedProviders:           unmanagedProviders,
+		OCICredentialsPolicyBuilder:  cfg.OCICredentialsPolicy,
+		ProviderSourceLocationConfig: providerSourceLocationConfigFromEnv(),
 	}
 
 	code := fn(meta)
+	plugin.CleanupClients()
 	stdout, stderr := done()
 	return code, stdout, stderr
 }
 
-func (h *Host) buildVarArgs() []string {
-	keys := make([]string, 0, len(h.vars))
-	for k := range h.vars {
+func (h *Host) persistedVarsPath(absDir string) string {
+	return filepath.Join(absDir, ".terraform", "lmcloud-vars.json")
+}
+
+func (h *Host) syncVarsForDir(dir string) map[string]string {
+	merged := make(map[string]string, len(h.vars))
+	targetDir := dir
+	if targetDir == "" {
+		targetDir = "."
+	}
+	absDir, err := filepath.Abs(targetDir)
+	if err == nil {
+		if data, readErr := os.ReadFile(h.persistedVarsPath(absDir)); readErr == nil {
+			_ = json.Unmarshal(data, &merged)
+		}
+	}
+	for k, v := range h.vars {
+		merged[k] = v
+	}
+	if err == nil && len(merged) > 0 {
+		if stat, statErr := os.Stat(absDir); statErr == nil && stat.IsDir() {
+			tfDir := filepath.Join(absDir, ".terraform")
+			if mkErr := os.MkdirAll(tfDir, 0755); mkErr == nil {
+				if data, jsonErr := json.MarshalIndent(merged, "", "  "); jsonErr == nil {
+					_ = os.WriteFile(h.persistedVarsPath(absDir), data, 0600)
+				}
+			}
+		}
+	}
+	return merged
+}
+
+func (h *Host) buildVarArgs(dir string) []string {
+	vars := h.syncVarsForDir(dir)
+	if len(vars) == 0 {
+		return nil
+	}
+
+	var declared map[string]struct{}
+	targetDir := dir
+	if targetDir == "" {
+		targetDir = "."
+	}
+	if absDir, err := filepath.Abs(targetDir); err == nil {
+		if mod, diags := configs.NewParser(nil).LoadConfigDir(absDir); mod != nil && !diags.HasErrors() {
+			declared = make(map[string]struct{}, len(mod.Variables))
+			for k := range mod.Variables {
+				declared[k] = struct{}{}
+			}
+		}
+	}
+
+	keys := make([]string, 0, len(vars))
+	for k := range vars {
+		if declared != nil {
+			if _, ok := declared[k]; !ok {
+				continue
+			}
+		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	varArgs := make([]string, 0, len(keys)*2)
 	for _, k := range keys {
-		varArgs = append(varArgs, "-var", fmt.Sprintf("%s=%s", k, h.vars[k]))
+		varArgs = append(varArgs, "-var", fmt.Sprintf("%s=%s", k, vars[k]))
 	}
 	return varArgs
 }
@@ -189,6 +294,9 @@ func (h *Host) Init(dir string) bool {
 		return (&command.InitCommand{Meta: meta}).Run([]string{"-input=false", "-no-color"})
 	})
 	if code == 0 {
+		if len(h.vars) > 0 {
+			_ = h.syncVarsForDir(dir)
+		}
 		h.lastError = ""
 		return true
 	}
@@ -272,7 +380,7 @@ func (h *Host) Plan(dir string) *Plan {
 	tmpPath := tmpFile.Name()
 	_ = tmpFile.Close()
 
-	varArgs := h.buildVarArgs()
+	varArgs := h.buildVarArgs(dir)
 	args := []string{"-input=false", "-no-color", "-out=" + tmpPath}
 	args = append(args, varArgs...)
 
@@ -361,7 +469,7 @@ func (h *Host) Apply(dir string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	varArgs := h.buildVarArgs()
+	varArgs := h.buildVarArgs(dir)
 	args := []string{"-auto-approve", "-input=false", "-no-color"}
 	args = append(args, varArgs...)
 
@@ -385,7 +493,7 @@ func (h *Host) Destroy(dir string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	varArgs := h.buildVarArgs()
+	varArgs := h.buildVarArgs(dir)
 	args := []string{"-auto-approve", "-input=false", "-no-color"}
 	args = append(args, varArgs...)
 
@@ -409,31 +517,36 @@ func (h *Host) Output(dir, name string) string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	if strings.TrimSpace(name) == "" {
+		h.lastError = "output name must not be empty"
+		return ""
+	}
+
 	code, stdout, stderr := h.runCommand(dir, func(meta command.Meta) int {
-		return (&command.OutputCommand{Meta: meta}).Run([]string{"-raw", name})
+		return (&command.OutputCommand{Meta: meta}).Run([]string{"-no-color", "-json", name})
 	})
-	if code == 0 {
-		h.lastError = ""
-		return stdout
+	if code != 0 {
+		h.lastError = strings.TrimSpace(stderr)
+		if h.lastError == "" {
+			h.lastError = strings.TrimSpace(stdout)
+		}
+		if h.lastError == "" {
+			h.lastError = fmt.Sprintf("output %q not found", name)
+		}
+		return ""
 	}
 
-	// Try -json if -raw is unsupported for this type
-	code2, stdout2, stderr2 := h.runCommand(dir, func(meta command.Meta) int {
-		return (&command.OutputCommand{Meta: meta}).Run([]string{"-json", name})
-	})
-	if code2 == 0 {
-		h.lastError = ""
-		return strings.TrimRight(stdout2, "\r\n")
+	h.lastError = ""
+	raw := strings.TrimSpace(stdout)
+	if raw == "" || raw == "null" {
+		return ""
 	}
 
-	h.lastError = strings.TrimSpace(stderr)
-	if h.lastError == "" {
-		h.lastError = strings.TrimSpace(stderr2)
+	var strVal string
+	if err := json.Unmarshal([]byte(raw), &strVal); err == nil {
+		return strVal
 	}
-	if h.lastError == "" {
-		h.lastError = strings.TrimSpace(stdout)
-	}
-	return ""
+	return raw
 }
 
 // ShowState returns the state snapshot as JSON.
@@ -515,7 +628,7 @@ func (h *Host) Import(dir, addr, id string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	varArgs := h.buildVarArgs()
+	varArgs := h.buildVarArgs(dir)
 	args := []string{"-input=false", "-no-color"}
 	args = append(args, varArgs...)
 	args = append(args, addr, id)
@@ -604,6 +717,10 @@ func (p *Plan) Save(path string) bool {
 
 // Register registers all lmcloud host methods and context with the lmcode registry.
 func Register(reg *lmcode.Registry, h *Host) error {
+	if err := lmcode.RegisterTesting(reg, nil); err != nil {
+		return err
+	}
+
 	// Methods on Tofu
 	if err := reg.Method("Tofu", "init", []string{"string"}, "bool", func(self any, args []lmcode.Value) (lmcode.Value, error) {
 		host := self.(*Host)

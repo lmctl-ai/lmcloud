@@ -27,10 +27,11 @@ if [ -f LMCLOUD_VERSION ]; then
 else
   want_v="$(head -n1 cmd/lmcloud/VERSION | tr -d '[:space:]')"
 fi
-want_tofu="1.13.2"
-want="lmcloud $want_v (opentofu $want_tofu)"
-got="$("$HOST" --version)"
+want="lmcloud $want_v"
+got="$("$HOST" --version | tr -d '\r')"
 [ "$got" = "$want" ] || fail "--version was '$got', want '$want'"; ok "--version prints '$want'"
+ver_count="$(printf '%s\n' "$got" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | wc -l | tr -d '[:space:]')"
+[ "$ver_count" = "1" ] || fail "--version '$got' contains $ver_count version numbers, want 1"; ok "--version contains exactly one version number"
 
 LMSCRIPT="$(scripts/select-compiler.sh)"
 diff <("$LMSCRIPT" --dsl-signatures schema/lmcloud.dsl.json) <("$HOST" --dsl-signatures) >/dev/null || fail "schema/host signature drift"; ok "host signatures match the schema"
@@ -57,14 +58,17 @@ cat > "$STD_WORK/probe.lms" <<LMS
 p = _lmcode_ cli="lmcloud";
 let n = str_len("abc");
 let list = str_list().add("value");
+assert_close(1.25, 1.25, 0.0001);
+print("testing-ok\n");
 if (n != 3 || list.at(0) != "value") { let invalid = int_list().at(0); }
 end _lmcode_
 savedsl(p, "$STD_WORK/probe.dslb");
 LMS
 "$LMSCRIPT" "$STD_WORK/probe.lms"
-"$HOST" --dsl "$STD_WORK/probe.dslb" >/dev/null || fail "implicit std runtime"
+probe_out="$("$HOST" --dsl "$STD_WORK/probe.dslb")" || fail "implicit std runtime"
+echo "$probe_out" | grep -q "testing-ok" || fail "print() output missing from std runtime probe: $probe_out"
 rm -rf "$STD_WORK"
-ok "implicit std compiles and runs against host-only schema"
+ok "implicit std and testing helpers (assert_close, print) compile and run"
 
 # Error paths
 mkdir -p build
@@ -122,7 +126,7 @@ rm -rf "$td_noinit"
 echo "$out" | grep -q 'code=0' || fail "apply without init did not report false: $out"
 ok "apply without init returns false and sets last_error"
 
-# 6. Output of unknown name returns empty string and sets last_error
+# 6. Output of unknown name or after destroy returns empty string, sets last_error, and is quiet on stderr
 td_out="$(mktemp -d build/td_out.XXXXXX)"
 cat > "$td_out/main.tf" <<TF
 resource "terraform_data" "x" {
@@ -136,12 +140,41 @@ out="$(run_dsl "unknown_output" "
 let ok_init = tofu.init(\"$td_out\");
 let ok_app = tofu.apply(\"$td_out\");
 let unk = tofu.output(\"$td_out\", \"does_not_exist\");
-let err = tofu.last_error();
+let err1 = tofu.last_error();
+if (unk != \"\" || str_len(err1) == 0) { let bad = int_list().at(0); }
 let ok_des = tofu.destroy(\"$td_out\");
+let post_des = tofu.output(\"$td_out\", \"known\");
+let err2 = tofu.last_error();
+if (post_des != \"\" || str_len(err2) == 0) { let bad2 = int_list().at(0); }
 ")"
 rm -rf "$td_out"
-echo "$out" | grep -q 'code=0' || fail "unknown output handling failed: $out"
-ok "output of unknown name returns empty string and sets last_error"
+echo "$out" | grep -q 'code=0' || fail "unknown/post-destroy output handling failed: $out"
+echo "$out" | tr -d '\r' | grep -q '^stderr=$' || fail "tofu.output leaked to stderr: $out"
+ok "output of unknown name or after destroy is quiet on stderr and sets last_error"
+
+# 6b. tofu.var() values persist in workdir for separate cleanup process
+td_var="$(mktemp -d build/td_var.XXXXXX)"
+cat > "$td_var/main.tf" <<TF
+variable "required_tag" {
+  type = string
+}
+resource "terraform_data" "tagged" {
+  input = var.required_tag
+}
+TF
+out_apply="$(run_dsl "var_apply" "
+tofu.var(\"required_tag\", \"run-42\");
+if (!tofu.init(\"$td_var\")) { let bad = int_list().at(0); }
+if (!tofu.apply(\"$td_var\")) { let bad2 = int_list().at(0); }
+")"
+out_cleanup="$(run_dsl "var_cleanup" "
+if (!tofu.destroy(\"$td_var\")) { let bad = int_list().at(0); }
+if (tofu.state_list(\"$td_var\") != \"\") { let bad2 = int_list().at(0); }
+")"
+rm -rf "$td_var"
+echo "$out_apply" | grep -q 'code=0' || fail "var_apply failed: $out_apply"
+echo "$out_cleanup" | grep -q 'code=0' || fail "separate-process var_cleanup failed: $out_cleanup"
+ok "tofu.var() values persist in workdir across separate cleanup processes"
 
 # 7. Invalid HCL format error handling
 out="$(run_dsl "fmt_err" '

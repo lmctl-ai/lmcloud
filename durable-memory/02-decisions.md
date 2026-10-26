@@ -25,19 +25,27 @@ Types:
   - `init(dir: string) -> bool`
   - `validate(dir: string) -> bool`
   - `fmt(text: string) -> string`
+  - `fmt_check(dir: string) -> bool`
+  - `import(dir: string, addr: string, id: string) -> bool`
   - `plan(dir: string) -> Plan`
+  - `plan_json(dir: string) -> string`
   - `apply(dir: string) -> bool`
   - `destroy(dir: string) -> bool`
   - `output(dir: string, name: string) -> string`
   - `var(name: string, value: string) -> void`
   - `show_state(dir: string) -> string`
+  - `state_list(dir: string) -> string`
   - `last_error() -> string`
 - `Plan`:
   - `add() -> int`
   - `change() -> int`
   - `destroy() -> int`
+  - `json() -> string`
   - `summary() -> string`
   - `save(path: string) -> bool`
+- Host functions (`lmcode.RegisterTesting(reg, nil)`):
+  - `assert_close(actual: float, expected: float, tol: float) -> void`
+  - `print(text: string) -> void`
 
 ## 4. Exit Codes & Results
 

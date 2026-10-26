@@ -282,6 +282,11 @@ func decodeProviderLockFromHCL(block *hcl.Block) (*ProviderLock, tfdiags.Diagnos
 			})
 			return nil, diags
 		}
+		if !addr.IsLegacy() {
+			// Embedded in-process utility providers (random, null, local, time, archive, tls)
+			// do not need lock entries; ignore any pre-existing lock entry for them cleanly.
+			return nil, diags
+		}
 		// Otherwise, we'll use a generic error message.
 		diags = diags.Append(&hcl.Diagnostic{
 			Severity: hcl.DiagError,

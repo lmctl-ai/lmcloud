@@ -163,7 +163,26 @@
       }
     }
   },
-  "functions": {},
+  "functions": {
+    "assert_close": [
+      {
+        "params": [
+          "float",
+          "float",
+          "float"
+        ],
+        "returns": "void"
+      }
+    ],
+    "print": [
+      {
+        "params": [
+          "string"
+        ],
+        "returns": "void"
+      }
+    ]
+  },
   "context": {
     "tofu": "Tofu"
   }

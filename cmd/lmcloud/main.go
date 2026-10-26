@@ -11,7 +11,6 @@ import (
 	"github.com/lmctl-ai/lmcode-go"
 	"github.com/opentofu/opentofu/internal/lmhost"
 	"github.com/opentofu/opentofu/schema"
-	"github.com/opentofu/opentofu/version"
 )
 
 //go:embed VERSION
@@ -63,7 +62,7 @@ func realMain(args []string) int {
 		if v == "" {
 			v = "0.1.0"
 		}
-		fmt.Printf("lmcloud %s (opentofu %s)\n", v, version.Version)
+		fmt.Printf("lmcloud %s\n", v)
 		return 0
 	}
 

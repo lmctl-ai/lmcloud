@@ -30,25 +30,27 @@ Run the full verification script:
 ./test.sh
 ```
 
-Checks performed (19/19 checks):
+Checks performed (38/38 checks):
 1. Binary exists and executable
 2. Static linking verification (`ldd`)
-3. `--version` output matches `lmcloud X.Y.Z (opentofu 1.13.2)`
-4. Host signatures parity against `lmscript --dsl-signatures schema/lmcloud.dsl.json`
-5. Embedded schema byte-identity (`cmp <(./bin/lmcloud --dsl-schema --json) schema/lmcloud.dsl.json`)
-6. Schema summary text formatting
-7. `examples/01-fmt-and-validate.lms`
-8. `examples/02-plan-inspection.lms`
-9. `examples/03-lifecycle.lms`
-10. `examples/04-variables-and-locals.lms`
-11. `examples/05-count-and-for-each.lms`
-12. `examples/06-local-module.lms`
-13. Invalid CLI flags return exit code 2
-14. Corrupted bytecode rejected with exit code 3 (`LOAD_BAD_BYTECODE`)
-15. Non-existent directory handling in plan
-16. Uninitialized directory handling in apply
-17. Unknown output key handling (returns empty string and populates `last_error()`)
-18. Formatting invalid HCL returns original string and records `last_error()`
-19. In-process Go unit tests (`go test -v ./internal/lmhost`)
+3. `--version` output matches `lmcloud X.Y.Z`
+4. `--version` contains a single version number (`grep -Eo '[0-9]+\.[0-9]+\.[0-9]+'`)
+5. Host signatures parity against `lmscript --dsl-signatures schema/lmcloud.dsl.json`
+6. Host-only signatures parity against `lmscript --dsl-signatures schema/lmcloud.dsl.json --without-std`
+7. Embedded schema byte-identity (`cmp <(./bin/lmcloud --dsl-schema --json) schema/lmcloud.dsl.json`)
+8. Schema summary text formatting
+9-26. All 18 examples (`examples/01-fmt-and-validate.lms` .. `examples/18-module-composition.lms`)
+27. Implicit std and testing helpers (`assert_close`, `print`) compile and run
+28. Invalid CLI flags return exit code 2
+29. Corrupted bytecode rejected with exit code 3 (`LOAD_BAD_BYTECODE`)
+30. Non-existent directory handling in plan
+31. Uninitialized directory handling in apply
+32. Unknown output key or post-`destroy` output query returns empty string, populates `last_error()`, and emits nothing on `stderr`
+33. `tofu.var()` values persist in `<dir>/.terraform/lmcloud-vars.json` across separate cleanup processes
+34. Formatting invalid HCL returns original string and records `last_error()`
+35. `fmt_check` distinguishes formatted from unformatted HCL
+36. `state_list` and `import` against missing dir handle error cleanly
+37. `go test ./internal/builtin/providers`
+38. `go test ./internal/lmhost`
 
 Compiler >=0.2.420 is capability-probed against an empty schema; the existing host-only schema is unchanged, with default SDK std and full/`--without-std` parity checked alongside a std-only runtime probe.
