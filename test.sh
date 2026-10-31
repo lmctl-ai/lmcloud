@@ -13,6 +13,7 @@ ok() { pass=$((pass+1)); echo "ok $pass - $1"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 [ -x "$HOST" ] || fail "$HOST not built: run 'CGO_ENABLED=0 go build -trimpath -ldflags \"-s -w\" -o ./bin/lmcloud ./cmd/lmcloud'"; ok "binary exists and is executable"
+python3 testing/lmcloud/check-host-flags.py schema/lmcloud.dsl.json "$HOST" || fail "hard host flag cutover"
 
 if [ "$(uname -s)" = "Linux" ]; then
   case "$(ldd "$HOST" 2>&1 || true)" in
@@ -34,11 +35,11 @@ ver_count="$(printf '%s\n' "$got" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | wc -l | 
 [ "$ver_count" = "1" ] || fail "--version '$got' contains $ver_count version numbers, want 1"; ok "--version contains exactly one version number"
 
 LMSCRIPT="$(scripts/select-compiler.sh)"
-diff <("$LMSCRIPT" --dsl-signatures schema/lmcloud.dsl.json) <("$HOST" --dsl-signatures) >/dev/null || fail "schema/host signature drift"; ok "host signatures match the schema"
-diff <("$LMSCRIPT" --dsl-signatures schema/lmcloud.dsl.json --without-std) <("$HOST" --dsl-signatures --without-std) >/dev/null || fail "host-only signature drift"; ok "host-only compiler/registry parity"
-cmp <("$HOST" --dsl-schema --json) schema/lmcloud.dsl.json >/dev/null || fail "embedded schema differs"; ok "embedded schema is byte-identical"
+diff <("$LMSCRIPT" --lmcode-signatures schema/lmcloud.dsl.json) <("$HOST" --lmcode-signatures) >/dev/null || fail "schema/host signature drift"; ok "host signatures match the schema"
+diff <("$LMSCRIPT" --lmcode-signatures schema/lmcloud.dsl.json --without-std) <("$HOST" --lmcode-signatures --without-std) >/dev/null || fail "host-only signature drift"; ok "host-only compiler/registry parity"
+cmp <("$HOST" --lmcode-schema --json) schema/lmcloud.dsl.json >/dev/null || fail "embedded schema differs"; ok "embedded schema is byte-identical"
 
-schema_summary="$("$HOST" --dsl-schema)"
+schema_summary="$("$HOST" --lmcode-schema)"
 echo "$schema_summary" | grep -q "context tofu: Tofu" || fail "schema summary missing context";
 echo "$schema_summary" | grep -q "Plan:" || fail "schema summary missing Plan type";
 echo "$schema_summary" | grep -q "Tofu:" || fail "schema summary missing Tofu type";
@@ -65,7 +66,7 @@ end _lmcode_
 savedsl(p, "$STD_WORK/probe.dslb");
 LMS
 "$LMSCRIPT" "$STD_WORK/probe.lms"
-probe_out="$("$HOST" --dsl "$STD_WORK/probe.dslb")" || fail "implicit std runtime"
+probe_out="$("$HOST" --lmcode "$STD_WORK/probe.dslb")" || fail "implicit std runtime"
 echo "$probe_out" | grep -q "testing-ok" || fail "print() output missing from std runtime probe: $probe_out"
 rm -rf "$STD_WORK"
 ok "implicit std and testing helpers (assert_close, print) compile and run"
@@ -83,7 +84,7 @@ set -e
 # 2. Corrupt bytecode returns exit 3 with LOAD_BAD_BYTECODE
 bad_code="$(mktemp build/bad_code.XXXXXX)"; trap 'rm -f "$bad_code"' EXIT
 echo "not bytecode" > "$bad_code"
-out="$("$HOST" --dsl "$bad_code" 2>&1 || true)"
+out="$("$HOST" --lmcode "$bad_code" 2>&1 || true)"
 echo "$out" | grep -q "LOAD_BAD_BYTECODE" || fail "bad bytecode not rejected with LOAD_BAD_BYTECODE: $out"; ok "corrupt bytecode rejected cleanly with exit 3"
 
 # 3. In-process error handling verified through DSL snippets
@@ -96,7 +97,7 @@ p = _lmcode_ cli="lmcloud";
 $body
 end _lmcode_
 savedsl(p, "$tmpdir/script.dslb");
-r = system(concat(dsl_cli(p), ["--dsl", "$tmpdir/script.dslb"]), 60000);
+r = system(concat(dsl_cli(p), ["--lmcode", "$tmpdir/script.dslb"]), 60000);
 println("code=" + str(r.code));
 println("stdout=" + r.stdout);
 println("stderr=" + r.stderr);

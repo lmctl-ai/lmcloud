@@ -3,7 +3,7 @@
 lmcloud is a native `lmscript` `_dsl_` host: a single, statically linked, dependency-free binary that runs LMScript `_dsl_` bytecode (via SDK `github.com/lmctl-ai/lmcode-go`) and embeds the OpenTofu v1.13.2 engine in-process to expose infrastructure operations (init, validate, fmt, plan, apply, destroy, output, state inspection) as typed objects to DSL scripts.
 
 ```
-LMScript (.lms) --lmscript--> DSL bytecode (.dslb) --lmcloud --dsl--> In-Process OpenTofu Engine
+LMScript (.lms) --lmscript--> DSL bytecode (.dslb) --lmcloud --lmcode--> In-Process OpenTofu Engine
                   schema/lmcloud.dsl.json  (SHA-256 bound to bytecode)
 ```
 

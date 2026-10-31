@@ -431,6 +431,8 @@ github.com/lmctl-ai/lmcode-go v0.0.0-20261024145206-02a079095550 h1:O7A46OO5iWYH
 github.com/lmctl-ai/lmcode-go v0.0.0-20261024145206-02a079095550/go.mod h1:Wfm1dj/9Uek4C4Y6LOkL5kFNRojgFUej7DDRGStSfVc=
 github.com/lmctl-ai/lmcode-go v0.0.0-20261025030137-9b9a03559f50 h1:Qi0QjI3vHeb7yXJBer5uKnXeaEWXDk3Yk6tV4mbDHGc=
 github.com/lmctl-ai/lmcode-go v0.0.0-20261025030137-9b9a03559f50/go.mod h1:Wfm1dj/9Uek4C4Y6LOkL5kFNRojgFUej7DDRGStSfVc=
+github.com/lmctl-ai/lmcode-go v0.6.39-0.20261031113748-65f0ef2275b0 h1:EI9xRa8z5XikrNpy8hne2FJnVCikgJZFyuRA2JBQBeo=
+github.com/lmctl-ai/lmcode-go v0.6.39-0.20261031113748-65f0ef2275b0/go.mod h1:Wfm1dj/9Uek4C4Y6LOkL5kFNRojgFUej7DDRGStSfVc=
 github.com/mailru/easyjson v0.7.7 h1:UGYAvKxe3sBsEDzO8ZeWOSlIQfWFlxbzLZe7hwFURr0=
 github.com/mailru/easyjson v0.7.7/go.mod h1:xzfreul335JAWq5oZzymOObrkdz5UnU4kGfJJLY9Nlc=
 github.com/mattn/go-colorable v0.0.9/go.mod h1:9vuHe8Xs5qXnSaW/c/ABM9alt+Vo+STaOChaDxuIBZU=

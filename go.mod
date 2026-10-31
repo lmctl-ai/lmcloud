@@ -213,7 +213,7 @@ require (
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
-	github.com/lmctl-ai/lmcode-go v0.0.0-20261025030137-9b9a03559f50 // indirect
+	github.com/lmctl-ai/lmcode-go v0.6.39-0.20261031113748-65f0ef2275b0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mitchellh/go-testing-interface v1.14.1 // indirect

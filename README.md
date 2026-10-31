@@ -62,7 +62,7 @@ All 18 examples live in [`examples/`](examples) and run completely offline:
 | **lmcloud CLI & Schema** | **tofu.plan Summary** |
 | --- | --- |
 | <img src="docs/images/lmcloud-cli.png" width="450" alt="lmcloud CLI & Schema"> | <img src="docs/images/tofu-plan.png" width="450" alt="tofu.plan Summary"> |
-| Version, embedded OpenTofu engine version, and DSL schema method signatures.<br>`lmcloud --version && lmcloud --dsl-schema` | Structured plan inspection, change counts, and binary plan persistence.<br>`tofu.plan(dir).summary()` |
+| Version, embedded OpenTofu engine version, and DSL schema method signatures.<br>`lmcloud --version && lmcloud --lmcode-schema` | Structured plan inspection, change counts, and binary plan persistence.<br>`tofu.plan(dir).summary()` |
 
 ## Licensing & Fork Rationale
 
@@ -115,4 +115,4 @@ ldd ./bin/lmcloud
 ./test.sh
 ```
 
-Verifies static linkage, schema byte-identity, signature parity against `lmscript --dsl-signatures`, all 18 zero-network examples, error handling paths (invalid flags, corrupt bytecode, missing directory, uninitialized apply, unknown output name, invalid HCL, format checking, state listing and import error handling), and Go unit test suites.
+Verifies static linkage, schema byte-identity, signature parity against `lmscript --lmcode-signatures`, all 18 zero-network examples, error handling paths (invalid flags, corrupt bytecode, missing directory, uninitialized apply, unknown output name, invalid HCL, format checking, state listing and import error handling), and Go unit test suites.

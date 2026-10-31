@@ -35,9 +35,9 @@ Checks performed (38/38 checks):
 2. Static linking verification (`ldd`)
 3. `--version` output matches `lmcloud X.Y.Z`
 4. `--version` contains a single version number (`grep -Eo '[0-9]+\.[0-9]+\.[0-9]+'`)
-5. Host signatures parity against `lmscript --dsl-signatures schema/lmcloud.dsl.json`
-6. Host-only signatures parity against `lmscript --dsl-signatures schema/lmcloud.dsl.json --without-std`
-7. Embedded schema byte-identity (`cmp <(./bin/lmcloud --dsl-schema --json) schema/lmcloud.dsl.json`)
+5. Host signatures parity against `lmscript --lmcode-signatures schema/lmcloud.dsl.json`
+6. Host-only signatures parity against `lmscript --lmcode-signatures schema/lmcloud.dsl.json --without-std`
+7. Embedded schema byte-identity (`cmp <(./bin/lmcloud --lmcode-schema --json) schema/lmcloud.dsl.json`)
 8. Schema summary text formatting
 9-26. All 18 examples (`examples/01-fmt-and-validate.lms` .. `examples/18-module-composition.lms`)
 27. Implicit std and testing helpers (`assert_close`, `print`) compile and run

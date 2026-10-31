@@ -1,7 +1,7 @@
 $ lmcloud --version
 lmcloud 0.1.0 (opentofu 1.13.2)
 
-$ lmcloud --dsl-schema
+$ lmcloud --lmcode-schema
 context tofu: Tofu
 Plan:
   Plan.add() -> int

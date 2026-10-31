@@ -33,9 +33,9 @@ func TestHostSignatureParity(t *testing.T) {
 	}
 
 	schemaPath := filepath.Join("..", "..", "schema", "lmcloud.dsl.json")
-	out, err := exec.Command(lmscriptBin, "--dsl-signatures", schemaPath).CombinedOutput()
+	out, err := exec.Command(lmscriptBin, "--lmcode-signatures", schemaPath).CombinedOutput()
 	if err != nil {
-		t.Fatalf("lmscript --dsl-signatures failed: %s\n%s", err, string(out))
+		t.Fatalf("lmscript --lmcode-signatures failed: %s\n%s", err, string(out))
 	}
 
 	expectedLines := strings.Split(strings.TrimSpace(string(out)), "\n")
@@ -50,9 +50,9 @@ func TestHostSignatureParity(t *testing.T) {
 	}
 
 	hostOnlySigs := reg.HostSignatures()
-	outNoStd, err := exec.Command(lmscriptBin, "--dsl-signatures", schemaPath, "--without-std").CombinedOutput()
+	outNoStd, err := exec.Command(lmscriptBin, "--lmcode-signatures", schemaPath, "--without-std").CombinedOutput()
 	if err != nil {
-		t.Fatalf("lmscript --dsl-signatures --without-std failed: %s\n%s", err, string(outNoStd))
+		t.Fatalf("lmscript --lmcode-signatures --without-std failed: %s\n%s", err, string(outNoStd))
 	}
 	expectedNoStd := strings.Split(strings.TrimSpace(string(outNoStd)), "\n")
 	if len(hostOnlySigs) != len(expectedNoStd) {

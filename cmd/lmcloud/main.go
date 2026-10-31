@@ -55,7 +55,7 @@ func realMain(args []string) int {
 		return lmcode.ReportAppFailure("failed to register host: " + err.Error())
 	}
 
-	const usage = "usage: lmcloud --version | --dsl-schema [--json] | --dsl-signatures [--without-std] | --dsl FILE [FILE ...]\n"
+	const usage = "usage: lmcloud --version | --lmcode-schema [--json] | --lmcode-signatures [--without-std] | --lmcode FILE [FILE ...]\n"
 
 	if len(args) == 2 && args[1] == "--version" {
 		v := strings.TrimSpace(rawVersion)
@@ -66,7 +66,7 @@ func realMain(args []string) int {
 		return 0
 	}
 
-	if len(args) >= 2 && args[1] == "--dsl-schema" {
+	if len(args) >= 2 && args[1] == "--lmcode-schema" {
 		if len(args) == 2 {
 			printSchemaSummary(reg)
 			return 0
@@ -82,20 +82,20 @@ func realMain(args []string) int {
 		return 2
 	}
 
-	if len(args) == 3 && args[1] == "--dsl-signatures" && args[2] == "--without-std" {
+	if len(args) == 3 && args[1] == "--lmcode-signatures" && args[2] == "--without-std" {
 		for _, s := range reg.HostSignatures() {
 			fmt.Println(s)
 		}
 		return 0
 	}
-	if len(args) == 2 && args[1] == "--dsl-signatures" {
+	if len(args) == 2 && args[1] == "--lmcode-signatures" {
 		for _, s := range reg.Signatures() {
 			fmt.Println(s)
 		}
 		return 0
 	}
 
-	if len(args) >= 3 && args[1] == "--dsl" {
+	if len(args) >= 3 && args[1] == "--lmcode" {
 		for i := 2; i < len(args); i++ {
 			if args[i] == "" || strings.HasPrefix(args[i], "--") {
 				fmt.Fprint(os.Stderr, usage)

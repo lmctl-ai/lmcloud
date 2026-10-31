@@ -18,7 +18,7 @@ let ok_val = tofu.validate("build/ex01-workdir");
 end _lmcode_
 
 savedsl(p, out);
-r = system(concat(dsl_cli(p), ["--dsl", out]), 60000);
+r = system(concat(dsl_cli(p), ["--lmcode", out]), 60000);
 assert(r.code == 0, "host execution failed: " + r.stderr);
 assert(starts_with(r.stdout, "{\"ok\": true"), "expected ok json output");
 
