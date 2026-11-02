@@ -1,6 +1,6 @@
 # Requires: tables
-# Scenario 13: Scan over a key-only table — all items returned (set order not assumed),
-# and items carry non-empty version tokens.
+# Scenario 13: Scan over a key-only table — restart-style full walks (eventual scan, design 12 §4.5),
+# deduplicated set collection, empty-page-with-token tolerance, non-empty version tokens.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 t1 = "lmt13" + run_id + "a";
@@ -20,52 +20,46 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
     i = i + 1;
   }
 
-  # bounded-scan to completion (aggregate read: eventual-consistency poll, design 12 §4.5)
   let seen = str_list();
-  let tok = "";
   let ver_all = true;
-  let page = cloud.item_scan(t, 2, tok);
-  let j = 0;
-  while (j < page.len()) {
-    seen = seen.add(page.at(j).pk());
-    if (str_len(page.at(j).version()) == 0) { ver_all = false; }
-    j = j + 1;
-  }
-  let guard = 0;
-  let polls = 0;
-  while (seen.len() < 3 && polls < 10 && !page.has_more()) {
-    polls = polls + 1;
-    page = cloud.item_scan(t, 2, "");
+  let completed = false;
+  let attempt = 0;
+  while (!completed && attempt < 12) {
+    attempt = attempt + 1;
     seen = str_list();
-    j = 0;
-    while (j < page.len()) {
-      seen = seen.add(page.at(j).pk());
-      if (str_len(page.at(j).version()) == 0) { ver_all = false; }
-      j = j + 1;
+    ver_all = true;
+    let tok = "";
+    let guard = 0;
+    let done_walk = false;
+    while (!done_walk && guard < 20) {
+      guard = guard + 1;
+      let page = cloud.item_scan(t, 2, tok);
+      let j = 0;
+      while (j < page.len()) {
+        let k = page.at(j).pk();
+        if (!seen.contains(k)) { seen = seen.add(k); }
+        if (str_len(page.at(j).version()) == 0) { ver_all = false; }
+        j = j + 1;
+      }
+      if (page.has_more()) {
+        tok = page.next_token();
+      } else {
+        done_walk = true;
+      }
     }
-  }
-  while (page.has_more() && guard < 10) {
-    guard = guard + 1;
-    tok = page.next_token();
-    page = cloud.item_scan(t, 2, tok);
-    j = 0;
-    while (j < page.len()) {
-      seen = seen.add(page.at(j).pk());
-      if (str_len(page.at(j).version()) == 0) { ver_all = false; }
-      j = j + 1;
-    }
+    if (done_walk && seen.len() == 3) { completed = true; }
   }
 
-  let found_all = seen.len() == 3 && seen.contains("u1") && seen.contains("u2") && seen.contains("u3");
+  let found_all = completed && seen.contains("u1") && seen.contains("u2") && seen.contains("u3");
 
   cloud.table_delete(t);
 
-  lmcode_return_put("seen_n", seen.len());
+  lmcode_return_put("attempts", attempt);
   lmcode_return_put("found_all", found_all);
   lmcode_return_put("ver_all", ver_all);
 end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "13 host execution failed");
-assert(r.result.found_all, "key-only scan must return exactly the 3 inserted items");
+assert(r.result.found_all, "key-only scan must return exactly the 3 inserted items (deduplicated, restart-per-poll)");
 assert(r.result.ver_all, "scanned items must carry non-empty version tokens");

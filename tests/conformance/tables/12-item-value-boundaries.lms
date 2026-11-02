@@ -1,7 +1,12 @@
 # Requires: tables
-# Scenario 12: Boundary values — int64 min/max, float round-trip (assert_close), bool, 255-byte keys,
-# the 262144-byte canonical item budget (exact boundary OK, +1 byte pre-flight INVALID_ARGUMENT),
-# and the 240-attribute cap (240 OK, 241st pre-flight INVALID_ARGUMENT).
+# Scenario 12: Portable boundary values:
+#  - int64 min/max (built by exact VM arithmetic), float round-trip (assert_close), bool
+#  - 255-byte keys
+#  - per-string limit 32768 UTF-16 code units (Azure Edm.String portable cap): ASCII at-limit OK,
+#    +1 unit pre-flight INVALID_ARGUMENT; UTF-16 unit counting proven with multi-byte chars
+#    (10922 x "3-byte char" = 32766 units fits; 10923 x = 32769 units fails even though bytes differ)
+#  - distributed 262144-byte canonical item budget (fit OK, +1 byte pre-flight INVALID_ARGUMENT)
+#  - 240-attribute cap (240 OK, 241st pre-flight INVALID_ARGUMENT)
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 t1 = "lmt12" + run_id + "a";
@@ -14,27 +19,68 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let t = ${t1};
   cloud.table_create(t);
 
-  # 255-byte keys accepted on both layouts (separate sorted probe via key-only here)
+  # 255-byte keys
   let k255 = str_repeat("k", 255);
   cloud.item_put(t, cloud.item_new(k255).set_int("n", 1));
-  let k255_it = cloud.item_get(t, k255);
-  let key_ok = k255_it.exists();
+  let key_ok = cloud.item_get(t, k255).exists();
 
-  # canonical item budget: attr "v" (1 byte) + 8-byte per-attr overhead => 262144 total at value=262135
-  let fit_val = str_repeat("v", 262135);
-  let big = cloud.item_put(t, cloud.item_new("bigfit").set_string("v", fit_val));
-  let big_ok = big.exists();
-  let big_back = cloud.item_get(t, "bigfit");
-  let big_rt = str_len(big_back.get_string("v")) == 262135;
+  # int64 extremes via exact VM integer arithmetic (literal limit 2^53)
+  let imax = 2147483647 * 4294967296 + 4294967295;
+  let imin = 0 - imax - 1;
+  cloud.item_put(t, cloud.item_new("ints").set_int("hi", imax).set_int("lo", imin));
+  let ints = cloud.item_get(t, "ints");
+  let ints_ok = ints.get_int("hi") == imax && ints.get_int("lo") == imin;
 
-  # 262136-byte value => canonical 262145 > budget -> pre-flight INVALID_ARGUMENT
+  # per-string UTF-16 unit cap: 32768 units OK, 32769 units INVALID (pre-flight, http_status 0)
+  let s_fit = str_repeat("u", 32768);
+  cloud.item_put(t, cloud.item_new("strfit").set_string("v", s_fit));
+  let strfit_ok = cloud.item_get(t, "strfit").get_string("v") == s_fit;
   cloud.set_abort_on_error(false);
-  cloud.item_put(t, cloud.item_new("toobig").set_string("v", fit_val + "x"));
-  let over_err = cloud.last_error();
-  let over_invalid = over_err.code() == ErrorCode.INVALID_ARGUMENT && over_err.http_status() == 0;
+  cloud.item_put(t, cloud.item_new("strover").set_string("v", s_fit + "u"));
+  let e_str = cloud.last_error();
+  let str_over_invalid = e_str.code() == ErrorCode.INVALID_ARGUMENT && e_str.http_status() == 0;
+
+  # UTF-16 unit counting with multi-byte characters: 10922*3byte-char = 32766 units (fits),
+  # 10923* = 32769 units (fails) — proves the cap counts units, not bytes
+  let uni = str_repeat("雪", 10922);
+  cloud.set_abort_on_error(true);
+  cloud.item_put(t, cloud.item_new("unifit").set_string("v", uni));
+  let unifit_ok = str_len(cloud.item_get(t, "unifit").get_string("v")) == str_len(uni);
+  cloud.set_abort_on_error(false);
+  cloud.item_put(t, cloud.item_new("uniover").set_string("v", uni + "雪"));
+  let e_uni = cloud.last_error();
+  let uni_over_invalid = e_uni.code() == ErrorCode.INVALID_ARGUMENT && e_uni.http_status() == 0;
   cloud.set_abort_on_error(true);
 
-  # 240-attribute cap: 240 attrs stored; the 241st set on the same item fails pre-flight
+  # canonical item budget distributed across legal properties:
+  # 8 attrs, names "a1".."a8" (2 bytes each = 16), overhead 8*8=64,
+  # 7 * 32768-byte values (229,376) + tail value 32688 -> total 16+64+229376+32688 = 262144 exactly.
+  let big = cloud.item_new("bigfit");
+  big = big.set_string("a1", str_repeat("1", 32768));
+  big = big.set_string("a2", str_repeat("2", 32768));
+  big = big.set_string("a3", str_repeat("3", 32768));
+  big = big.set_string("a4", str_repeat("4", 32768));
+  big = big.set_string("a5", str_repeat("5", 32768));
+  big = big.set_string("a6", str_repeat("6", 32768));
+  big = big.set_string("a7", str_repeat("7", 32768));
+  big = big.set_string("a8", str_repeat("8", 32688));
+  let bigw = cloud.item_put(t, big);
+  let big_ok = bigw.exists();
+  let big_rt = str_len(cloud.item_get(t, "bigfit").get_string("a8")) == 32688
+    && str_len(cloud.item_get(t, "bigfit").get_string("a1")) == 32768;
+
+  # +1 byte (tail 32689) -> canonical 262145 -> pre-flight INVALID_ARGUMENT
+  cloud.set_abort_on_error(false);
+  cloud.item_put(t, cloud.item_new("toobig").set_string("a1", str_repeat("1", 32768))
+    .set_string("a2", str_repeat("2", 32768)).set_string("a3", str_repeat("3", 32768))
+    .set_string("a4", str_repeat("4", 32768)).set_string("a5", str_repeat("5", 32768))
+    .set_string("a6", str_repeat("6", 32768)).set_string("a7", str_repeat("7", 32768))
+    .set_string("a8", str_repeat("8", 32689)));
+  let e_big = cloud.last_error();
+  let over_invalid = e_big.code() == ErrorCode.INVALID_ARGUMENT && e_big.http_status() == 0;
+  cloud.set_abort_on_error(true);
+
+  # 240-attribute cap
   let many = cloud.item_new("wide");
   let j = 0;
   while (j < 240) {
@@ -53,12 +99,16 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.item_put(t, cloud.item_new("vals").set_number("pi", 3.141592653589793).set_bool("ok", true));
   let vals = cloud.item_get(t, "vals");
   assert_close(vals.get_number("pi"), 3.141592653589793, 0.000000001);
-  lmcode_return_put("pi", vals.get_number("pi"));
   let bool_ok = vals.get_bool("ok");
 
   cloud.table_delete(t);
 
   lmcode_return_put("key_ok", key_ok);
+  lmcode_return_put("ints_ok", ints_ok);
+  lmcode_return_put("strfit_ok", strfit_ok);
+  lmcode_return_put("str_over_invalid", str_over_invalid);
+  lmcode_return_put("unifit_ok", unifit_ok);
+  lmcode_return_put("uni_over_invalid", uni_over_invalid);
   lmcode_return_put("big_ok", big_ok);
   lmcode_return_put("big_rt", big_rt);
   lmcode_return_put("over_invalid", over_invalid);
@@ -70,7 +120,10 @@ end _lmcode_
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "12 host execution failed");
 assert(r.result.key_ok, "255-byte key must be accepted");
-assert(r.result.big_ok && r.result.big_rt, "262144-byte canonical item must store and round-trip");
-assert(r.result.over_invalid, "262145-byte canonical item must fail pre-flight INVALID_ARGUMENT (http_status 0)");
+assert(r.result.ints_ok, "int64 min/max round-trip");
+assert(r.result.strfit_ok && r.result.str_over_invalid, "32768 UTF-16 units OK, 32769 units pre-flight INVALID_ARGUMENT");
+assert(r.result.unifit_ok && r.result.uni_over_invalid, "UTF-16 unit cap counts units not bytes (32766 units fit, 32769 fail)");
+assert(r.result.big_ok && r.result.big_rt, "distributed 262144-byte item stores and round-trips");
+assert(r.result.over_invalid, "+1 byte over budget fails pre-flight INVALID_ARGUMENT");
 assert(r.result.wide_ok && r.result.attr_invalid, "240 attributes accepted; 241st rejected pre-flight");
 assert(r.result.bool_ok, "bool round-trip");

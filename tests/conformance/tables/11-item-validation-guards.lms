@@ -14,7 +14,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.set_abort_on_error(false);
 
   let fails = 0;
-  let want = 18;
+  let want = 19;
 
   # invalid table names: "Bad_Name", "ab" (too short), "1abc" (leading digit),
   # "bad-hyphen-x" (hyphen — Azure-alnum intersection rule), 33-char name (too long)
@@ -49,11 +49,11 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let e5 = cloud.last_error();
   if (e5.code() == ErrorCode.INVALID_ARGUMENT && e5.http_status() == 0) { fails = fails + 1; }
 
-  # non-finite numbers (NaN and +Inf) rejected at set_number
+  # non-finite numbers (NaN and +Inf, both constructed by float division, no exponent literals)
   cloud.item_new("k1").set_number("x", 0.0 / 0.0);
   let e6 = cloud.last_error();
   if (e6.code() == ErrorCode.INVALID_ARGUMENT && e6.http_status() == 0) { fails = fails + 1; }
-  cloud.item_new("k1").set_number("x", 1.0e999);
+  cloud.item_new("k1").set_number("x", 1.0 / 0.0);
   let e7 = cloud.last_error();
   if (e7.code() == ErrorCode.INVALID_ARGUMENT && e7.http_status() == 0) { fails = fails + 1; }
 

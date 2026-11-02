@@ -294,30 +294,51 @@ adapter interface sits next to `ObjectStore` and `Queue`, and `Router`/`Endpoint
 `Tables` route the same way. Planned shape:
 
 ```go
+type PutMode int // PutUnconditional | PutIfAbsent | PutIfVersion (never conflated)
+
 type Tables interface {
-    CreateTable(ctx, name string, sorted bool) (created bool, err error) // CONFLICT only on layout mismatch (host probes)
-    DeleteTable(ctx, name string) error                                   // NOT_FOUND -> false/OK
-    HeadTable(ctx, name string) error                                     // nil / NOT_FOUND
+    CreateTable(ctx, name string, sorted bool) (created bool, err error) // CONFLICT on layout mismatch; host waits usable
+    DeleteTable(ctx, name string) error                                   // accepted-not-completed; NOT_FOUND -> false/OK
+    HeadTable(ctx, name string) error                                     // nil / NOT_FOUND (catalog or DescribeTable)
     ListTables(ctx, max int, token string) (names []string, next string, err error) // ListAll applies
-    PutItem(ctx, t string, it Item, expect string) (stored Item, err error)         // expect=="" absent; else version
-    GetItem(ctx, t, pk, sk string) (Item, error)                          // NOT_FOUND item -> AbsentItem-qualified
+    PutItem(ctx, t string, it Item, mode PutMode, expectVersion string) (stored Item, err error)
+    GetItem(ctx, t, pk, sk string) (Item, error)                          // strong read; NOT_FOUND item -> AbsentItem-qualified
     DeleteItem(ctx, t, pk, sk string) error                               // idempotent within existing table
     UpdateItem(ctx, t, pk, sk string, changes Item) (Item, error)         // NOT_FOUND on missing item
-    Query(ctx, t, pk, skFrom, skTo string, max int, token string) (TablePage, error) // half-open range, asc sk
-    Scan(ctx, t string, max int, token string) (TablePage, error)         // unordered, bounded
+    Query(ctx, t, pk, skFrom, skTo string, max int, token string) (TablePage, error) // strong read, asc sk, half-open
+    Scan(ctx, t string, max int, token string) (TablePage, error)         // eventual, unordered, bounded
 }
 ```
 
 - `Item` = hostkit value type: `map[string]Attr` with `Attr{S *string, I *int64, N *float64, B *bool}`,
-  plus `PK/SK/Version` strings and `Exists bool`. Validation (name/attr regexes, key charset, NaN/Inf,
+  plus `PK/SK/Version` strings and `Exists bool`. Validation (name/attr regexes with `pk`/`sk`/`__lm*`
+  reserved, key charset incl. `.`/`..`/`__..__` exclusions, key 255 bytes, UTF-16 unit cap 32768 per
+  string, NaN/Inf/out-of-range float rejection with portable range `0 or 1e-130..1e126`,
   240-attr and 262144-byte canonical budget with the 8-byte-per-attr rule) lives in hostkit pre-flight,
-  identical across providers — adapters receive only valid values.
-- Version plumbing: adapters for Azure/Firestore/OCI pass through the provider token; **DynamoDB**
-  adapters maintain `__lmcloud_v` (atomic bump under `ConditionExpression`) and classify
-  `ConditionalCheckFailedException` via a point `GetItem` probe (design 12 §4.4).
-- Key-layout state: DynamoDB via `DescribeTable`; Azure/Firestore read a reserved meta record
-  (`lmcloudmeta` table entity / `__lmcloud_meta__` collection doc) — fakeadapter keeps it in memory;
-  the host lists filter reserved names (`table_list`).
+  identical across providers — adapters receive only valid values; int64 values travel as decimal text,
+  never through float conversion.
+- **Write modes & version allocation:** mode is explicit (`PutMode`); the schema's 2-arg put maps to
+  `PutUnconditional`, `expect==""` to `PutIfAbsent`, else `PutIfVersion`. Each logical call generates
+  **one** fresh 128-bit token reused across byte-identical retries (unconditional mode only); conditional
+  modes are never blindly retried after an ambiguous reply. Azure/Firestore/OCI pass the native ETag/
+  updateTime token through; the **DynamoDB** adapter stamps `__lmcloud_v` (fresh token per write, stored
+  as `S`), maintains the float-type manifest `__lmt` for `type_of` fidelity, and classifies conditional
+  failures atomically via `ReturnValuesOnConditionCheckFailure=ALL_OLD` where supported (sim cert A3),
+  falling back to one bounded `GetItem` probe with ambiguity → `INTERNAL`.
+- **Strong reads:** `GetItem`/`Query` wire as `ConsistentRead=true` (DynamoDB), native strong (Azure,
+  Firestore), `ABSOLUTE` (OCI when O1 lands). `Scan` stays eventual; `ListTables`/`HeadTable` polls
+  tolerated (≤60 s create-ACTIVE wait lives in `cloudhost`, not adapters).
+- **Catalog authority (Azure/GCP):** reserved `lmcloudmeta` table/collection (plain alnum name, doc id =
+  plain table name) with conditional claim, immutable scope/token/layout fields, `deleting` tombstone
+  deleted last after bounded child deletion (Firestore child deletes are metered per document), and
+  never swept as run-owned. GCP adapters must route catalog traffic through the same loopback/auth
+  plumbing as data traffic. **Firestore is gRPC**: the shared HTTP `RetryPolicy`/endpoint router do not
+  cover it — the GCP adapter needs deadline/retry/credential interception for gRPC calls (wrap retryable
+  `UNAVAILABLE`/`RESOURCE_EXHAUSTED`/`INTERNAL` with the same 3-attempt + jitter policy and honor the
+  endpoint override and no-ambient-credentials rules).
+- Key-layout state: DynamoDB via `DescribeTable` (authoritative); Azure/Firestore read the catalog
+  record in `lmcloudmeta` (§"Catalog authority" above) — fakeadapter keeps it in memory; `table_list`
+  is catalog-driven and filters the catalog container itself from results.
 - Pagination tokens: reuse the existing opaque-token helper (`ListAll` + token invariant);
   `max_items` bounds (`0..500`, default 100) enforced once in `cloudhost`.
 - Dry runs: table/table-item mutators get explicit Dry slots with overlay previews (same pattern as

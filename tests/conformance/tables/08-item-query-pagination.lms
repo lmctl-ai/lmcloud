@@ -13,7 +13,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let t = ${t1};
   cloud.table_create(t, true);
 
-  let sks = str_list().push("i1").push("i2").push("i3").push("i4").push("i5");
+  let sks = str_list().add("i1").add("i2").add("i3").add("i4").add("i5");
   let i = 0;
   while (i < sks.len()) {
     cloud.item_put(t, cloud.item_new("P", sks.at(i)).set_int("n", i + 1));
@@ -33,7 +33,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let page = first_page;
   let j = 0;
   while (j < page.len()) {
-    collected = collected.push(page.at(j).sk());
+    collected = collected.add(page.at(j).sk());
     j = j + 1;
   }
   let guard = 0;
@@ -44,7 +44,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
     page = cloud.item_query(t, "P", "", "", 2, tok);
     j = 0;
     while (j < page.len()) {
-      collected = collected.push(page.at(j).sk());
+      collected = collected.add(page.at(j).sk());
       j = j + 1;
     }
   }

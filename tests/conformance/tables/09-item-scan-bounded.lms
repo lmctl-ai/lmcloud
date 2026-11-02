@@ -1,6 +1,8 @@
 # Requires: tables
-# Scenario 09: Bounded unordered scan with pagination — collect the exact inserted item set
-# (order NOT assumed), across partitions; max_items out-of-range pre-flight guards.
+# Scenario 09: Bounded unordered scan. Eventual-consistency polls RESTART the whole scan each attempt
+# (no partial-page accumulation across retries, design 12 §4.5/T8); duplicates removed by set check;
+# empty pages that still carry a continuation token are followed (legal on Azure);
+# max_items=1 tiny-page walk; out-of-range max_items pre-flight guards.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 t1 = "lmt09" + run_id + "a";   # sorted
@@ -13,62 +15,80 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let t = ${t1};
   cloud.table_create(t, true);
 
-  # 6 items across 2 partitions
-  let keys = str_list()
+  let want = str_list()
     .add("A:01").add("A:02").add("A:03")
     .add("B:01").add("B:02").add("B:03");
   let i = 0;
-  while (i < keys.len()) {
-    let kv = keys.at(i);
+  while (i < want.len()) {
+    let kv = want.at(i);
     let pk = str_substr(kv, 0, 1);
     let sk = str_substr(kv, 2, 2);
     cloud.item_put(t, cloud.item_new(pk, sk).set_string("c", kv));
     i = i + 1;
   }
 
-  # token-walked scan with max=2 (bounded poll until total seen)
+  # full restart-scan walk: returns deduplicated key list of one complete attempt
+  # (empty page with a non-empty token is followed, not treated as done)
   let seen = str_list();
-  let tok = "";
-  let guard = 0;
-  let page = cloud.item_scan(t, 2, "");
-  guard = guard + 1;
-  let j = 0;
-  while (j < page.len()) {
-    seen = seen.add(page.at(j).pk() + ":" + page.at(j).sk());
-    j = j + 1;
-  }
-  let polls = 0;
-  while (seen.len() < 6 && polls < 10 && !page.has_more()) {
-    polls = polls + 1;
-    page = cloud.item_scan(t, 2, tok);
-    j = 0;
-    while (j < page.len()) {
-      seen = seen.add(page.at(j).pk() + ":" + page.at(j).sk());
-      j = j + 1;
+  let completed = false;
+  let attempt = 0;
+  while (!completed && attempt < 12) {
+    attempt = attempt + 1;
+    seen = str_list();
+    let tok = "";
+    let guard = 0;
+    let done_walk = false;
+    while (!done_walk && guard < 30) {
+      guard = guard + 1;
+      let page = cloud.item_scan(t, 2, tok);
+      let j = 0;
+      while (j < page.len()) {
+        let k = page.at(j).pk() + ":" + page.at(j).sk();
+        if (!seen.contains(k)) { seen = seen.add(k); }
+        j = j + 1;
+      }
+      if (page.has_more()) {
+        tok = page.next_token();
+      } else {
+        done_walk = true;
+      }
     }
-  }
-  while (page.has_more() && guard < 12) {
-    guard = guard + 1;
-    tok = page.next_token();
-    page = cloud.item_scan(t, 2, tok);
-    j = 0;
-    while (j < page.len()) {
-      seen = seen.add(page.at(j).pk() + ":" + page.at(j).sk());
-      j = j + 1;
-    }
+    if (done_walk && seen.len() == 6) { completed = true; }
   }
 
-  let all_found = keys.len() == seen.len();
+  let all_found = completed;
   let k = 0;
-  while (k < keys.len()) {
-    if (seen.index_of(keys.at(k)) < 0) { all_found = false; }
+  while (k < want.len()) {
+    if (!seen.contains(want.at(k))) { all_found = false; }
     k = k + 1;
   }
 
+  # tiny pages: max_items=1 must still complete the full set
+  let seen1 = str_list();
+  let tok1 = "";
+  let g1 = 0;
+  let done1 = false;
+  while (!done1 && g1 < 30) {
+    g1 = g1 + 1;
+    let p1 = cloud.item_scan(t, 1, tok1);
+    let j1 = 0;
+    while (j1 < p1.len()) {
+      let k1 = p1.at(j1).pk() + ":" + p1.at(j1).sk();
+      if (!seen1.contains(k1)) { seen1 = seen1.add(k1); }
+      j1 = j1 + 1;
+    }
+    if (p1.has_more()) {
+      tok1 = p1.next_token();
+    } else {
+      done1 = true;
+    }
+  }
+  let tiny_ok = done1 && seen1.len() == 6;
+
   cloud.set_abort_on_error(false);
-  cloud.item_scan(t, 501, "");          # out of range
+  cloud.item_scan(t, 501, "");
   let hi_err = cloud.last_error();
-  cloud.item_scan(t, -1, "");           # out of range
+  cloud.item_scan(t, -1, "");
   let lo_err = cloud.last_error();
   let bounds_ok = hi_err.code() == ErrorCode.INVALID_ARGUMENT && hi_err.http_status() == 0
     && lo_err.code() == ErrorCode.INVALID_ARGUMENT && lo_err.http_status() == 0;
@@ -76,12 +96,14 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 
   cloud.table_delete(t);
 
-  lmcode_return_put("seen_n", seen.len());
+  lmcode_return_put("attempts", attempt);
   lmcode_return_put("all_found", all_found);
+  lmcode_return_put("tiny_ok", tiny_ok);
   lmcode_return_put("bounds_ok", bounds_ok);
 end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "09 host execution failed");
-assert(r.result.seen_n == 6 && r.result.all_found, "scan must collect the exact 6-item inserted set across partitions");
+assert(r.result.all_found, "restart-scan polls must collect the exact deduplicated 6-item set (whole scans are not snapshots; tolerate late rows by restarting)");
+assert(r.result.tiny_ok, "max_items=1 walk must complete all 6 items (pages may be short or empty-with-token)");
 assert(r.result.bounds_ok, "scan max_items outside 0..500 must fail pre-flight INVALID_ARGUMENT (http_status 0)");
