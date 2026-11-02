@@ -150,6 +150,44 @@
         ]
       }
     },
+    "QueueMessage": {
+      "methods": {
+        "id": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "body": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "receipt": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ]
+      }
+    },
+    "QueueMessageList": {
+      "methods": {
+        "len": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "at": [
+          {
+            "params": ["int"],
+            "returns": "QueueMessage"
+          }
+        ]
+      }
+    },
     "Cloud": {
       "methods": {
         "provider": [
@@ -254,6 +292,58 @@
           {
             "params": ["string", "string"],
             "returns": "StrList"
+          }
+        ],
+        "queue_create": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "queue_delete": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "queue_exists": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "queue_list": [
+          {
+            "params": [],
+            "returns": "StrList"
+          }
+        ],
+        "queue_send": [
+          {
+            "params": ["string", "string"],
+            "returns": "string"
+          }
+        ],
+        "queue_receive": [
+          {
+            "params": ["string"],
+            "returns": "QueueMessageList"
+          },
+          {
+            "params": ["string", "int", "int", "int"],
+            "returns": "QueueMessageList"
+          }
+        ],
+        "queue_ack": [
+          {
+            "params": ["string", "string"],
+            "returns": "void"
+          }
+        ],
+        "queue_nack": [
+          {
+            "params": ["string", "string", "int"],
+            "returns": "void"
           }
         ]
       }

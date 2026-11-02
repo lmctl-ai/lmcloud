@@ -1,0 +1,52 @@
+# Scenario 04: Empty, UTF-8, XML/JSON-special, and binary byte-preserving message bodies.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+qname = "lmcloud-q04-" + run_id + "-enc";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  let q = ${qname};
+  cloud.queue_create(q);
+
+  let expected = str_list()
+    .add("")
+    .add("こんにちは世界 🚀 café")
+    .add("<QueueMessage attr=\"1\">&amp;{\"k\":\"v\"}</QueueMessage>")
+    .add(str_hex_decode("0001027f80feff41424300"));
+
+  for (p in expected) {
+    cloud.queue_send(q, p);
+  }
+
+  let received = str_list();
+  let attempts = 0;
+  while (received.len() < expected.len() && attempts < 10) {
+    attempts = attempts + 1;
+    let batch = cloud.queue_receive(q, 10, 1, 30);
+    for (m in batch) {
+      received.add(m.body());
+      cloud.queue_ack(q, m.receipt());
+    }
+  }
+
+  let all_matched = received.len() == expected.len();
+  for (exp in expected) {
+    if (!received.contains(exp)) {
+      all_matched = false;
+    }
+  }
+
+  cloud.queue_delete(q);
+
+  lmcode_return_put("received_count", received.len());
+  lmcode_return_put("expected_count", expected.len());
+  lmcode_return_put("all_matched", all_matched);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "04-message-unicode-and-binary host execution failed");
+assert(r.result.received_count == r.result.expected_count, "must receive all 4 encoded test payloads");
+assert(r.result.all_matched, "empty, UTF-8, XML/JSON-special, and binary payloads must round-trip byte-for-byte");

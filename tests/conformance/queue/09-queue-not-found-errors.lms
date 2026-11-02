@@ -1,0 +1,54 @@
+# Scenario 09: NOT_FOUND errors on missing queue vs non-throwing queue_exists / queue_delete probes.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+missing_q = "lmcloud-q09-" + run_id + "-absent";
+
+# 1. Default abort mode: queue_send on missing queue must abort with [NOT_FOUND]
+abort_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  cloud.queue_send(${missing_q}, "should-abort");
+end _lmcode_
+
+r_abort = run_lmcode(abort_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(!r_abort.ok, "queue_send on non-existent queue must abort in default mode");
+
+# 2. Non-abort inspection: queue_exists is false + OK; queue_send / queue_receive / queue_ack / queue_nack set ErrorCode.NOT_FOUND
+inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  let mq = ${missing_q};
+
+  let exists = cloud.queue_exists(mq);
+  let exists_err = cloud.last_error();
+
+  cloud.set_abort_on_error(false);
+
+  cloud.queue_send(mq, "msg");
+  let send_err = cloud.last_error();
+
+  cloud.queue_receive(mq, 1, 0, 30);
+  let recv_err = cloud.last_error();
+
+  cloud.queue_ack(mq, "some-receipt");
+  let ack_err = cloud.last_error();
+
+  cloud.queue_nack(mq, "some-receipt", 10);
+  let nack_err = cloud.last_error();
+
+  lmcode_return_put("exists", exists);
+  lmcode_return_put("exists_ok", exists_err.code() == ErrorCode.OK);
+  lmcode_return_put("send_nf", send_err.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("recv_nf", recv_err.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("ack_nf", ack_err.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("nack_nf", nack_err.code() == ErrorCode.NOT_FOUND);
+end _lmcode_
+
+r = run_lmcode(inspect_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "09-queue-not-found-errors inspection run failed");
+assert(!r.result.exists && r.result.exists_ok, "queue_exists on missing queue must return false with ErrorCode.OK");
+assert(r.result.send_nf && r.result.recv_nf && r.result.ack_nf && r.result.nack_nf, "queue_send/receive/ack/nack on missing queue must set ErrorCode.NOT_FOUND");

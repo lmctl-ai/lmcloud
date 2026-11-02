@@ -1,0 +1,50 @@
+# Scenario 01: Queue create, exists, list (following all pages, sorted), and delete lifecycle.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+q1 = "lmcloud-q01-" + run_id + "-alpha";
+q2 = "lmcloud-q01-" + run_id + "-beta";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  let name1 = ${q1};
+  let name2 = ${q2};
+
+  let existed_before = cloud.queue_exists(name1) || cloud.queue_exists(name2);
+  let created2 = cloud.queue_create(name2);
+  let created1 = cloud.queue_create(name1);
+  let exists1 = cloud.queue_exists(name1);
+  let exists2 = cloud.queue_exists(name2);
+
+  let queues = cloud.queue_list();
+  let idx1 = queues.index_of(name1);
+  let idx2 = queues.index_of(name2);
+
+  let deleted1 = cloud.queue_delete(name1);
+  let deleted2 = cloud.queue_delete(name2);
+  let exists_after1 = cloud.queue_exists(name1);
+  let exists_after2 = cloud.queue_exists(name2);
+
+  lmcode_return_put("existed_before", existed_before);
+  lmcode_return_put("created1", created1);
+  lmcode_return_put("created2", created2);
+  lmcode_return_put("exists1", exists1);
+  lmcode_return_put("exists2", exists2);
+  lmcode_return_put("found_both", idx1 >= 0 && idx2 >= 0);
+  lmcode_return_put("sorted_order", idx1 < idx2);
+  lmcode_return_put("deleted1", deleted1);
+  lmcode_return_put("deleted2", deleted2);
+  lmcode_return_put("exists_after", exists_after1 || exists_after2);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "01-queue-lifecycle host execution failed");
+assert(!r.result.existed_before, "queues should not exist before create");
+assert(r.result.created1 && r.result.created2, "queue_create should return true for new queues");
+assert(r.result.exists1 && r.result.exists2, "queue_exists should return true after create");
+assert(r.result.found_both, "queue_list should include both created queues");
+assert(r.result.sorted_order, "queue_list should return queues in ascending lexicographical order");
+assert(r.result.deleted1 && r.result.deleted2, "queue_delete should return true for existing queues");
+assert(!r.result.exists_after, "queue_exists should return false after delete");

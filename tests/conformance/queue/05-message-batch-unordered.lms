@@ -1,0 +1,56 @@
+# Scenario 05: Multi-message send and unordered batch receive loop (comparing sets, not FIFO order).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+qname = "lmcloud-q05-" + run_id + "-batch";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  let q = ${qname};
+  cloud.queue_create(q);
+
+  let sent = str_list()
+    .add("item-alpha")
+    .add("item-bravo")
+    .add("item-charlie")
+    .add("item-delta")
+    .add("item-echo");
+
+  for (body in sent) {
+    cloud.queue_send(q, body);
+  }
+
+  let seen = str_map();
+  let attempts = 0;
+  while (seen.len() < sent.len() && attempts < 10) {
+    attempts = attempts + 1;
+    let batch = cloud.queue_receive(q, 5, 1, 30);
+    for (msg in batch) {
+      seen.set(msg.body(), msg.id());
+      cloud.queue_ack(q, msg.receipt());
+    }
+  }
+
+  let all_present = seen.len() == sent.len();
+  for (body in sent) {
+    if (!seen.has(body)) {
+      all_present = false;
+    }
+  }
+
+  let rem = cloud.queue_receive(q, 5, 0, 30);
+  let rem_len = rem.len();
+
+  cloud.queue_delete(q);
+
+  lmcode_return_put("unique_seen", seen.len());
+  lmcode_return_put("all_present", all_present);
+  lmcode_return_put("rem_len", rem_len);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "05-message-batch-unordered host execution failed");
+assert(r.result.unique_seen == 5 && r.result.all_present, "all 5 sent messages must be received across batch receive calls regardless of order");
+assert(r.result.rem_len == 0, "queue must be empty after acknowledging all 5 messages");

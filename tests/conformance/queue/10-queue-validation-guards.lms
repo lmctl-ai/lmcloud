@@ -1,0 +1,106 @@
+# Scenario 10: Pre-flight INVALID_ARGUMENT validation for queue names, receive bounds (max_messages, wait_seconds, visibility_timeout), and empty receipts.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+valid_q = "lmcloud-q10-" + run_id + "-valid";
+
+# 1. Default abort mode: invalid queue name aborts before network I/O
+abort_invalid = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  cloud.queue_create("Bad_Queue_Name");
+end _lmcode_
+
+r_abort = run_lmcode(abort_invalid, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(!r_abort.ok, "invalid queue name must abort in default mode");
+
+# 2. Pre-flight validation checks (http_status() == 0, code() == ErrorCode.INVALID_ARGUMENT)
+checks_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  let q = ${valid_q};
+  cloud.set_abort_on_error(false);
+
+  # Queue name validation rules
+  cloud.queue_create("ab");
+  let e_short = cloud.last_error();
+
+  cloud.queue_create("Bad_Queue");
+  let e_upper_under = cloud.last_error();
+
+  cloud.queue_create("bad--double-hyphen");
+  let e_double_hyphen = cloud.last_error();
+
+  cloud.queue_create("1starts-with-digit");
+  let e_leading_digit = cloud.last_error();
+
+  cloud.queue_create("goog-reserved-queue");
+  let e_goog = cloud.last_error();
+
+  cloud.queue_create("my-google-queue");
+  let e_google = cloud.last_error();
+
+  # Parameter bounds on queue_receive
+  cloud.queue_receive(q, 0, 0, 30);
+  let e_max_low = cloud.last_error();
+
+  cloud.queue_receive(q, 11, 0, 30);
+  let e_max_high = cloud.last_error();
+
+  cloud.queue_receive(q, 1, -1, 30);
+  let e_wait_low = cloud.last_error();
+
+  cloud.queue_receive(q, 1, 21, 30);
+  let e_wait_high = cloud.last_error();
+
+  cloud.queue_receive(q, 1, 0, -1);
+  let e_vis_low = cloud.last_error();
+
+  cloud.queue_receive(q, 1, 0, 601);
+  let e_vis_high = cloud.last_error();
+
+  # Empty receipt and nack visibility bounds
+  cloud.queue_ack(q, "");
+  let e_ack_empty = cloud.last_error();
+
+  cloud.queue_nack(q, "", 10);
+  let e_nack_empty = cloud.last_error();
+
+  cloud.queue_nack(q, "r", -1);
+  let e_nack_low = cloud.last_error();
+
+  cloud.queue_nack(q, "r", 601);
+  let e_nack_high = cloud.last_error();
+
+  let name_checks = e_short.code() == ErrorCode.INVALID_ARGUMENT && e_short.http_status() == 0
+    && e_upper_under.code() == ErrorCode.INVALID_ARGUMENT && e_upper_under.http_status() == 0
+    && e_double_hyphen.code() == ErrorCode.INVALID_ARGUMENT && e_double_hyphen.http_status() == 0
+    && e_leading_digit.code() == ErrorCode.INVALID_ARGUMENT && e_leading_digit.http_status() == 0
+    && e_goog.code() == ErrorCode.INVALID_ARGUMENT && e_goog.http_status() == 0
+    && e_google.code() == ErrorCode.INVALID_ARGUMENT && e_google.http_status() == 0;
+
+  let receive_bounds = e_max_low.code() == ErrorCode.INVALID_ARGUMENT && e_max_low.http_status() == 0
+    && e_max_high.code() == ErrorCode.INVALID_ARGUMENT && e_max_high.http_status() == 0
+    && e_wait_low.code() == ErrorCode.INVALID_ARGUMENT && e_wait_low.http_status() == 0
+    && e_wait_high.code() == ErrorCode.INVALID_ARGUMENT && e_wait_high.http_status() == 0
+    && e_vis_low.code() == ErrorCode.INVALID_ARGUMENT && e_vis_low.http_status() == 0
+    && e_vis_high.code() == ErrorCode.INVALID_ARGUMENT && e_vis_high.http_status() == 0;
+
+  let receipt_bounds = e_ack_empty.code() == ErrorCode.INVALID_ARGUMENT && e_ack_empty.http_status() == 0
+    && e_nack_empty.code() == ErrorCode.INVALID_ARGUMENT && e_nack_empty.http_status() == 0
+    && e_nack_low.code() == ErrorCode.INVALID_ARGUMENT && e_nack_low.http_status() == 0
+    && e_nack_high.code() == ErrorCode.INVALID_ARGUMENT && e_nack_high.http_status() == 0;
+
+  lmcode_return_put("name_checks", name_checks);
+  lmcode_return_put("receive_bounds", receive_bounds);
+  lmcode_return_put("receipt_bounds", receipt_bounds);
+end _lmcode_
+
+r = run_lmcode(checks_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "10-queue-validation-guards inspection run failed");
+assert(r.result.name_checks, "queue name validation guards must fail pre-flight with INVALID_ARGUMENT");
+assert(r.result.receive_bounds, "queue_receive parameter bounds (max_messages 1..10, wait_seconds 0..20, visibility_timeout 0..600) must fail pre-flight with INVALID_ARGUMENT");
+assert(r.result.receipt_bounds, "empty receipt and out-of-range queue_nack visibility_timeout must fail pre-flight with INVALID_ARGUMENT");

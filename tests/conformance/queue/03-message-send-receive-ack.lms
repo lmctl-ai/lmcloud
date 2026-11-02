@@ -1,0 +1,51 @@
+# Scenario 03: Single message send, receive, and ack round-trip.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+qname = "lmcloud-q03-" + run_id + "-msg";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  let q = ${qname};
+  cloud.queue_create(q);
+
+  let payload = "hello-lmcloud-queue-03";
+  let sent_id = cloud.queue_send(q, payload);
+
+  let batch = cloud.queue_receive(q, 1, 2, 30);
+  let count = batch.len();
+  let msg_id = "";
+  let msg_body = "";
+  let msg_receipt = "";
+
+  if (count == 1) {
+    let m = batch.at(0);
+    msg_id = m.id();
+    msg_body = m.body();
+    msg_receipt = m.receipt();
+    cloud.queue_ack(q, msg_receipt);
+  }
+
+  let after_ack = cloud.queue_receive(q, 1, 0, 30);
+  let after_ack_len = after_ack.len();
+
+  cloud.queue_delete(q);
+
+  lmcode_return_put("sent_id_nonempty", str_len(sent_id) > 0);
+  lmcode_return_put("received_count", count);
+  lmcode_return_put("msg_id_nonempty", str_len(msg_id) > 0);
+  lmcode_return_put("body_matches", msg_body == payload);
+  lmcode_return_put("receipt_nonempty", str_len(msg_receipt) > 0);
+  lmcode_return_put("after_ack_len", after_ack_len);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "03-message-send-receive-ack host execution failed");
+assert(r.result.sent_id_nonempty, "queue_send must return a non-empty message id");
+assert(r.result.received_count == 1, "queue_receive must return 1 message");
+assert(r.result.msg_id_nonempty, "received QueueMessage.id() must be non-empty");
+assert(r.result.body_matches, "received QueueMessage.body() must match sent payload");
+assert(r.result.receipt_nonempty, "received QueueMessage.receipt() must be non-empty");
+assert(r.result.after_ack_len == 0, "queue_receive after queue_ack must return 0 messages");

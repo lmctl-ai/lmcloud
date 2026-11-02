@@ -1,0 +1,31 @@
+# Scenario 07: Receiving from an empty existing queue returns len() == 0 with ErrorCode.OK (both 1-arg default and 4-arg with wait_seconds=1).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+qname = "lmcloud-q07-" + run_id + "-empty";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  let q = ${qname};
+  cloud.queue_create(q);
+
+  let b1 = cloud.queue_receive(q);
+  let err1 = cloud.last_error();
+
+  let b2 = cloud.queue_receive(q, 5, 1, 30);
+  let err2 = cloud.last_error();
+
+  cloud.queue_delete(q);
+
+  lmcode_return_put("len1", b1.len());
+  lmcode_return_put("ok1", err1.ok() && err1.code() == ErrorCode.OK);
+  lmcode_return_put("len2", b2.len());
+  lmcode_return_put("ok2", err2.ok() && err2.code() == ErrorCode.OK);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "07-receive-empty-queue host execution failed");
+assert(r.result.len1 == 0 && r.result.ok1, "1-arg queue_receive on empty queue must return len()==0 with ErrorCode.OK");
+assert(r.result.len2 == 0 && r.result.ok2, "4-arg queue_receive on empty queue must return len()==0 with ErrorCode.OK");

@@ -1,0 +1,43 @@
+# Scenario 08: Duplicate queue_ack idempotency and invalid receipt rejection on queue_nack.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+qname = "lmcloud-q08-" + run_id + "-rcpt";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  let q = ${qname};
+  cloud.queue_create(q);
+
+  cloud.queue_send(q, "ack-twice-message");
+  let batch = cloud.queue_receive(q, 1, 2, 30);
+  let got_one = batch.len() == 1;
+  let receipt = "";
+  if (got_one) {
+    receipt = batch.at(0).receipt();
+    cloud.queue_ack(q, receipt);
+    # Second ack of the same receipt handle is idempotent (no-op)
+    cloud.queue_ack(q, receipt);
+  }
+  let second_ack_ok = cloud.last_error().code() == ErrorCode.OK;
+
+  # Invalid receipt handle on queue_nack must fail with ErrorCode.INVALID_ARGUMENT
+  cloud.set_abort_on_error(false);
+  cloud.queue_nack(q, "invalid-receipt-handle-xyz", 15);
+  let bad_nack_err = cloud.last_error();
+
+  cloud.set_abort_on_error(true);
+  cloud.queue_delete(q);
+
+  lmcode_return_put("got_one", got_one);
+  lmcode_return_put("second_ack_ok", second_ack_ok);
+  lmcode_return_put("bad_nack_invalid", bad_nack_err.code() == ErrorCode.INVALID_ARGUMENT);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "08-ack-idempotency-and-invalid-receipt host execution failed");
+assert(r.result.got_one, "must receive the sent message");
+assert(r.result.second_ack_ok, "duplicate queue_ack on already-acknowledged receipt must be idempotent");
+assert(r.result.bad_nack_invalid, "queue_nack with an invalid receipt handle must set ErrorCode.INVALID_ARGUMENT");
