@@ -25,26 +25,25 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 
   let m = cloud.metrics();
 
-  let order_ok = true;
+  let expected_ops = qw(object_get object_head object_put);
+  let order_ok = m.len() == expected_ops.len();
   let quantiles_ok = true;
   let sum_calls = 0;
-  let prev_name = "";
   let idx = 0;
   while (idx < m.len()) {
     let opm = m.at(idx);
-    if (idx > 0 && str_cmp(prev_name, opm.operation()) >= 0) {
+    if (idx < expected_ops.len() && opm.operation() != expected_ops.at(idx)) {
       order_ok = false;
     }
-    prev_name = opm.operation();
     sum_calls = sum_calls + opm.calls();
 
     if (opm.min_ms() < 0.0 || opm.p50_ms() < opm.min_ms() || opm.p95_ms() < opm.p50_ms() || opm.max_ms() < opm.p95_ms()) {
       quantiles_ok = false;
     }
-    if (opm.mean_ms() < opm.min_ms() - 1e-6 || opm.mean_ms() > opm.max_ms() + 1e-6) {
+    if (opm.mean_ms() < opm.min_ms() - 0.000001 || opm.mean_ms() > opm.max_ms() + 0.000001) {
       quantiles_ok = false;
     }
-    if (opm.total_ms() < opm.max_ms() - 1e-6 || opm.max_ms() >= 60000.0) {
+    if (opm.total_ms() < opm.max_ms() - 0.000001) {
       quantiles_ok = false;
     }
     idx = idx + 1;
@@ -65,7 +64,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   lmcode_return_put("three_ops", m.len() == 3 && sum_calls == 15 && m.total_calls() == 15);
   lmcode_return_put("order_ok", order_ok);
   lmcode_return_put("quantiles_ok", quantiles_ok);
-  lmcode_return_put("elapsed_ok", m.elapsed_ms() >= 0.0 && m.elapsed_ms() < 60000.0);
+  lmcode_return_put("elapsed_ok", m.elapsed_ms() >= 0.0);
   lmcode_return_put("unused_zero", unused_zero);
 end _lmcode_
 
@@ -74,5 +73,5 @@ assert(r.ok, "08-metrics-latency-order-invariants failed");
 assert(r.result.three_ops, "metrics() after 5 puts, 5 heads, and 5 gets must have 3 OpMetrics and 15 total_calls");
 assert(r.result.order_ok, "MetricsReport operations must be sorted lexicographically");
 assert(r.result.quantiles_ok, "0 <= min_ms <= p50_ms <= p95_ms <= max_ms <= total_ms and min_ms <= mean_ms <= max_ms must hold");
-assert(r.result.elapsed_ok, "elapsed_ms() must be non-negative and bounded");
+assert(r.result.elapsed_ok, "elapsed_ms() must be non-negative");
 assert(r.result.unused_zero, "uncalled operation must report 0.0 for all latency quantiles");

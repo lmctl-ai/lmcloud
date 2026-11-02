@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LMSCRIPT_BIN="${LMSCRIPT_BIN:-/home/ubuntu/lmctl-mono/lmscript/bin/lmscript}"
 CONF_DIR="$ROOT/tests/conformance"
+SCHEMA_FILE="$ROOT/schema/lmcloud.dsl.json"
 
 usage() {
   echo "Usage: $0 <host-binary> [endpoint] [object-storage|queue|cost-perf|all] [run-id]" >&2
@@ -38,12 +39,91 @@ collect_scenarios() {
   esac
 }
 
+# --- Embedded _lmcode_ compile gate (11-cost-perf-conformance.md §1) ------------------
+# check_scenario verifies both the outer .lms syntax/splices AND compiles
+# every embedded _lmcode_ block against schema/lmcloud.dsl.json by replacing
+# outer ${...} splices with literal "probe" strings at the exact source line
+# numbers (since outer splices otherwise defer inner lmcode bytecode compilation
+# until runtime construction).
+check_scenario() {
+  local f="$1"
+  if ! "$LMSCRIPT_BIN" --check "$f"; then
+    return 1
+  fi
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/lmcloud-embed-check.XXXXXX.lms")"
+  python3 - "$f" "$SCHEMA_FILE" "$tmp" <<'PY'
+import re, sys
+
+src_path, schema_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(src_path, "r", encoding="utf-8") as fh:
+    lines = fh.readlines()
+
+out = []
+in_block = False
+block_idx = 0
+header_re = re.compile(r'^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*|.*\brun_lmcode\s*\(\s*)_lmcode_\b.*;\s*(?:#.*)?$')
+splice_re = re.compile(r'\$\{[^}]+\}')
+
+for line in lines:
+    stripped = line.strip()
+    if not in_block:
+        if "_lmcode_" in line and not stripped.startswith("#"):
+            m = header_re.match(line.rstrip("\r\n"))
+            if m:
+                in_block = True
+                block_idx += 1
+                out.append(f'_blk_{block_idx} = _lmcode_ schema="{schema_path}";\n')
+                continue
+        out.append("# " + line if line.endswith("\n") else "# " + line + "\n")
+    else:
+        if stripped == "end _lmcode_":
+            in_block = False
+            out.append("end _lmcode_\n")
+        else:
+            out.append(splice_re.sub('"probe"', line))
+
+with open(out_path, "w", encoding="utf-8") as fh:
+    fh.writelines(out)
+PY
+  local rc=0
+  if ! "$LMSCRIPT_BIN" --check "$tmp"; then
+    rc=1
+  fi
+  rm -f "$tmp"
+  return $rc
+}
+
+# Negative control: prove check_scenario rejects a spliced _lmcode_ block
+# containing invalid inner lmcode syntax (which plain `lmscript --check` defers).
+verify_embedded_gate_negative_control() {
+  local neg
+  neg="$(mktemp "${TMPDIR:-/tmp}/lmcloud-neg-ctrl.XXXXXX.lms")"
+  cat >"$neg" <<EOF
+endpoint = "http://127.0.0.1:4566";
+p = _lmcode_ schema="$SCHEMA_FILE";
+  let ep = \${endpoint};
+  let bad = 1e-9;
+  cloud.nonexistent_method(ep, bad);
+end _lmcode_
+EOF
+  if check_scenario "$neg" >/dev/null 2>&1; then
+    rm -f "$neg"
+    echo "error: embedded _lmcode_ negative control unexpectedly passed!" >&2
+    return 1
+  fi
+  rm -f "$neg"
+  return 0
+}
+# -------------------------------------------------------------------------------------
+
 pass=0
 fail=0
 skip=0
 idx=0
 
 if [[ "${1:-}" == "--check" ]]; then
+  verify_embedded_gate_negative_control
   SLICE="${2:-all}"
   mapfile -t SCENARIOS < <(collect_scenarios "$SLICE")
   total="${#SCENARIOS[@]}"
@@ -52,12 +132,12 @@ if [[ "${1:-}" == "--check" ]]; then
     idx=$((idx + 1))
     slice_name="$(basename "$(dirname "$f")")"
     name="$slice_name/$(basename "$f" .lms)"
-    if "$LMSCRIPT_BIN" --check "$f" >/dev/null 2>&1; then
-      echo "ok $idx - $name (--check)"
+    if err_out="$(check_scenario "$f" 2>&1)"; then
+      echo "ok $idx - $name (--check + embedded _lmcode_ compile)"
       pass=$((pass + 1))
     else
-      echo "not ok $idx - $name (--check)"
-      "$LMSCRIPT_BIN" --check "$f" >&2 || true
+      echo "not ok $idx - $name (--check + embedded _lmcode_ compile)"
+      printf '%s\n' "$err_out" >&2
       fail=$((fail + 1))
     fi
   done

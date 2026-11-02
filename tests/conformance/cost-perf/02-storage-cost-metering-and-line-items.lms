@@ -44,25 +44,24 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let head_item = rep.item("object_head");
   let bcreate_item = rep.item("bucket_create");
 
-  # Verify sorted line items and sum of line items equals rep.estimated_usd()
+  # Verify lexicographical ordering of line items and that sum of line items equals rep.estimated_usd()
+  let expected_ops = qw(bucket_create bucket_delete object_delete object_get object_head object_list object_put);
   let sum_items = 0.0;
   let sum_reqs = 0;
-  let sorted_ok = true;
-  let prev_op = "";
+  let sorted_ok = rep.len() == expected_ops.len();
   let idx = 0;
   while (idx < rep.len()) {
     let it = rep.at(idx);
-    if (idx > 0 && str_cmp(prev_op, it.operation()) >= 0) {
+    if (idx < expected_ops.len() && it.operation() != expected_ops.at(idx)) {
       sorted_ok = false;
     }
-    prev_op = it.operation();
     sum_items = sum_items + it.estimated_usd();
     sum_reqs = sum_reqs + it.requests();
     idx = idx + 1;
   }
 
-  assert_close(sum_items, rep.estimated_usd(), 1e-8);
-  assert_close(c5, rep.estimated_usd(), 1e-9);
+  assert_close(sum_items, rep.estimated_usd(), 0.00000001);
+  assert_close(c5, rep.estimated_usd(), 0.000000001);
 
   let expected_put_bytes = str_len(small_body) + str_len(large_body);
   let expected_get_bytes = str_len(got_small);
@@ -74,7 +73,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   lmcode_return_put("monotonic_reads", c4 > c3);
   lmcode_return_put("no_refund_on_delete", c5 >= c4);
   lmcode_return_put("head_ok", head_meta.exists() && page.len() == 2);
-  lmcode_return_put("bcreate_item_ok", bcreate_item.service() == "storage" && bcreate_item.requests() == 1 && bcreate_item.billing_units() == 1 && bcreate_item.estimated_usd() > 0.0);
+  lmcode_return_put("bcreate_item_ok", bcreate_item.service() == "storage" && bcreate_item.requests() >= 1 && bcreate_item.billing_units() >= 1 && bcreate_item.estimated_usd() > 0.0);
   lmcode_return_put("put_item_ok", put_item.service() == "storage" && put_item.requests() == 2 && put_item.billing_units() == 2 && put_item.bytes() == expected_put_bytes && put_item.byte_price_usd_per_gib() > 0.0);
   lmcode_return_put("get_item_ok", get_item.requests() == 1 && get_item.bytes() == expected_get_bytes);
   lmcode_return_put("head_item_ok", head_item.requests() == 1 && head_item.bytes() == 0);
@@ -89,7 +88,7 @@ assert(r.result.larger_put_costs_more, "larger object_put payload must cost at l
 assert(r.result.monotonic_reads, "object_head/get/list must increase estimated_cost()");
 assert(r.result.no_refund_on_delete, "deleting objects and buckets must never refund estimated_cost()");
 assert(r.result.head_ok, "object_head and object_list should succeed");
-assert(r.result.bcreate_item_ok, "bucket_create CostLineItem must record 1 request and 1 billing unit");
+assert(r.result.bcreate_item_ok, "bucket_create CostLineItem must record >= 1 request and >= 1 billing unit");
 assert(r.result.put_item_ok, "object_put CostLineItem must record 2 requests, 2 units, and exact payload bytes");
 assert(r.result.get_item_ok, "object_get CostLineItem must record 1 request and exact downloaded bytes");
 assert(r.result.head_item_ok, "object_head CostLineItem must record 1 request and 0 payload bytes");

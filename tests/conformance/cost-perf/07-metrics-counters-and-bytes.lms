@@ -1,4 +1,4 @@
-# Scenario 07: Performance metrics call counts, byte counters (bytes_in / bytes_out), and per-operation OpMetrics accuracy.
+# Scenario 07: Performance metrics call counts, byte counters (bytes_in / bytes_out), and per-operation OpMetrics accuracy with bounded queue polling.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 bkt = "lmcloud-cp07-" + run_id + "-bkt";
@@ -27,9 +27,23 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 
   cloud.queue_create(q);
   cloud.queue_send(q, q_body);
-  let batch = cloud.queue_receive(q, 1, 2, 30);
-  if (batch.len() > 0) {
-    cloud.queue_ack(q, batch.at(0).receipt());
+
+  let seen_ids = qw();
+  let delivered_q_bytes = 0;
+  let recv_attempts = 0;
+  while (seen_ids.len() < 1 && recv_attempts < 10) {
+    let batch = cloud.queue_receive(q, 1, 1, 30);
+    let idx = 0;
+    while (idx < batch.len()) {
+      let msg = batch.at(idx);
+      delivered_q_bytes = delivered_q_bytes + str_len(msg.body());
+      if (!seen_ids.contains(msg.id())) {
+        seen_ids.add(msg.id());
+      }
+      cloud.queue_ack(q, msg.receipt());
+      idx = idx + 1;
+    }
+    recv_attempts = recv_attempts + 1;
   }
 
   let m = cloud.metrics();
@@ -54,8 +68,8 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   lmcode_return_put("get_counts_ok", get_m.operation() == "object_get" && get_m.calls() == 2 && get_m.errors() == 0 && get_m.bytes_in() == exp_get_bytes && get_m.bytes_out() == 0);
   lmcode_return_put("head_counts_ok", head_a.exists() && head_m.calls() == 1 && head_m.bytes_in() == 0 && head_m.bytes_out() == 0);
   lmcode_return_put("qsend_counts_ok", qsend_m.calls() == 1 && qsend_m.bytes_out() == exp_q_bytes && qsend_m.bytes_in() == 0);
-  lmcode_return_put("qrecv_counts_ok", batch.len() == 1 && qrecv_m.calls() >= 1 && qrecv_m.bytes_in() == exp_q_bytes && qrecv_m.bytes_out() == 0);
-  lmcode_return_put("totals_ok", m.total_errors() == 0 && m.total_bytes_out() == (exp_put_bytes + exp_q_bytes) && m.total_bytes_in() == (exp_get_bytes + exp_q_bytes));
+  lmcode_return_put("qrecv_counts_ok", seen_ids.len() == 1 && qrecv_m.calls() == recv_attempts && qrecv_m.bytes_in() == delivered_q_bytes && delivered_q_bytes >= exp_q_bytes && qrecv_m.bytes_out() == 0);
+  lmcode_return_put("totals_ok", m.total_errors() == 0 && m.total_bytes_out() == (exp_put_bytes + exp_q_bytes) && m.total_bytes_in() == (exp_get_bytes + delivered_q_bytes));
   lmcode_return_put("uncalled_zero", uncalled_m.calls() == 0 && uncalled_m.bytes_in() == 0 && uncalled_m.bytes_out() == 0);
   lmcode_return_put("summary_ok", str_len(m.summary()) > 0 && head_a.exists());
 end _lmcode_
@@ -65,7 +79,7 @@ assert(r.ok, "07-metrics-counters-and-bytes failed");
 assert(r.result.put_counts_ok, "object_put OpMetrics must report 2 calls and exact bytes_out");
 assert(r.result.get_counts_ok, "object_get OpMetrics must report 2 calls and exact bytes_in");
 assert(r.result.qsend_counts_ok, "queue_send OpMetrics must report 1 call and exact bytes_out");
-assert(r.result.qrecv_counts_ok, "queue_receive OpMetrics must report exact bytes_in");
+assert(r.result.qrecv_counts_ok, "queue_receive OpMetrics must report exact delivered bytes_in");
 assert(r.result.totals_ok, "MetricsReport total_bytes_out and total_bytes_in must match sum of operations");
 assert(r.result.uncalled_zero, "uncalled operation must report 0 calls and 0 bytes");
 assert(r.result.summary_ok, "metrics().summary() must be non-empty");

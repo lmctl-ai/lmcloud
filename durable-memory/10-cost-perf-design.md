@@ -2,17 +2,20 @@
 
 ## 1. Goals & Architectural Alignment
 
-Slice 3 (`Perf & Cost` in [`05-roadmap.md`](05-roadmap.md)) adds **cross-cutting per-run cost estimation, budget cap enforcement, and per-operation performance telemetry** to `schema/lmcloud.dsl.json` on the existing `cloud` (`Cloud`) context object **without modifying any Slice 1 (Object Storage) or Slice 2 (Queue) method signature**.
+Slice 3 (`Perf & Cost` in [`05-roadmap.md`](05-roadmap.md)) adds **cross-cutting cost estimation, pre-attempt budget reservation, shared campaign budget authority, and per-operation performance telemetry** to `schema/lmcloud.dsl.json` on the existing `cloud` (`Cloud`) context object **without modifying any Slice 1 (Object Storage) or Slice 2 (Queue) method signature**.
 
-1. **Cost-aware scripting for real-cloud testing (`set_cost_cap_usd`, `estimated_cost`, `cost_report`):**
-   - Every `lm<provider>` host (`lmaws`, `lmazure`, `lmgcp`, `lmoci`) and the reference host (`lmcloud-ref`) embeds a versioned, provider-specific on-demand price table (`price_table_version() == "2026-11-v1"`).
-   - Every run defaults to a **`$0.05` USD** cost cap (`DefaultCostCapUSD = 0.05`) with an immutable **`$0.25` USD** hard ceiling (`HardCostCeilingUSD = 0.25`), matching the safety model established in `lmgcp` (`durable-memory/01-purpose-and-safety.md`), `lmaws` (`durable-memory/07-example-costs.md`), and `lmazure` (`durable-memory/05-cost-ledger.md`).
-   - **Pre-dispatch admission gate:** Before dispatching any billable non-teardown operation, the host computes the operation's incremental cost from the embedded price table. If the cumulative run cost would exceed `cloud.cost_cap_usd()`, the operation is refused **pre-flight** (`http_status() == 0`) with `ErrorCode.COST_CAP_EXCEEDED` (`provider_code() == "CostCapExceeded"`).
-   - **Teardown immunity:** Delete and acknowledgment operations (`bucket_delete`, `object_delete`, `queue_delete`, `queue_ack`) are **never** blocked by cost-cap exhaustion, guaranteeing that cleanup can always run after a cap refusal without leaking live cloud resources.
-2. **Per-operation performance telemetry (`metrics_reset`, `metrics`):**
-   - Scripts can scope latency and throughput measurements around specific workload phases using `cloud.metrics_reset()` and inspect per-operation call counts, error counts, retry counts, HTTP `429` throttle counts (from `hostkit.RetryPolicy`), payload bytes (`bytes_in`, `bytes_out`), and latency quantiles (`min_ms`, `p50_ms`, `p95_ms`, `max_ms`, `mean_ms`, `total_ms`).
-3. **Zero external simulator or billing API dependency:**
-   - All cost and performance accounting lives in `hostkit` and `hostkit/cloudhost`. Simulators (`awssim`, `azuresim`, `gcpsim`, `ocisim`) require no new endpoints, and live hosts **never** call paid or external billing APIs (AWS Cost Explorer, Azure Cost Management, GCP Cloud Billing, or OCI Usage API).
+1. **Physical pre-attempt cost admission & reservation (`set_cost_cap_usd`, `estimated_cost`, `cost_report`):**
+   - Every physical cloud/simulator attempt—including initial requests, `hostkit.RetryPolicy` retry attempts, ownership/existence probes, and pagination page reads in `hostkit.ListAll`—is priced and reserved **before** the attempt is transmitted on the wire. Retries and multi-page reads are never collapsed into a single post-hoc charge.
+   - Operations with variable response sizes (`object_get`) or multi-step control-plane sequences (`bucket_create`, `queue_create`) reserve worst-case byte bounds (`limit` or `MaxObjectBytes = 16 MiB`), probe costs, and per-resource cleanup headroom **before dispatch**, then settle to actual observed usage upon completion.
+   - If reserving the next physical attempt, retry, probe, or page would exceed the active work budget (`cost_cap_usd()`), admission aborts **pre-flight** before transmitting that request with `ErrorCode.COST_CAP_EXCEEDED` (`http_status() == 0`, `provider_code() == "CostCapExceeded"`).
+2. **Shared campaign budget authority & monotone-decreasing script caps:**
+   - Across multi-invocation campaigns (`hostkit/safety.Supervisor` / shared `<run_id>.jsonl` journal under POSIX `flock`), budget state (`ChargedNanoUSD` and locked `ResourceCleanupNanoUSD`) is persisted across processes so child invocations share one authoritative campaign budget rather than resetting to `$0.05` per process.
+   - The operator's policy or environment establishes the initial work cap (`OperatorCapUSD`, default **`$0.05` USD**, hard ceiling **`$0.25` USD**). Scripts calling `cloud.set_cost_cap_usd(cap_usd)` may **only lower (narrow) or keep equal** the active cap (`estimated_cost() <= cap_usd <= cost_cap_usd() <= OperatorCapUSD <= 0.25`); any attempt to raise the cap fails pre-flight with `ErrorCode.INVALID_ARGUMENT`.
+   - **Reserved cleanup budget (bounded teardown, never unlimited):** Teardown operations (`bucket_delete`, `object_delete`, `queue_delete`, `queue_ack`) are **not** free or unlimited. They draw from a dedicated **Cleanup Reserve** (`DefaultCleanupReserveUSD = $0.01` plus per-resource cleanup reservations locked at creation time), are authorized only for verified run-owned resources (or active receipts), and are bounded by retry/poll limits. This guarantees that cleanup survives work-budget exhaustion (`set_cost_cap_usd(cloud.estimated_cost())`) while still failing closed with `ErrorCode.COST_CAP_EXCEEDED` if a runaway script or retry storm exhausts the cleanup reserve itself.
+3. **Per-operation performance telemetry (`metrics_reset`, `metrics`):**
+   - Scripts scope latency and throughput measurements around specific workload phases using `cloud.metrics_reset()` and inspect per-operation call counts, error counts, physical retry counts, HTTP `429` throttle counts, payload bytes (`bytes_in`, `bytes_out`), streaming all-call aggregates (`min_ms`, `max_ms`, `mean_ms`, `total_ms`), and bounded-window latency quantiles (`p50_ms`, `p95_ms`).
+4. **Zero external simulator or billing API dependency:**
+   - Simulators (`awssim`, `azuresim`, `gcpsim`, `ocisim`) require no new endpoints, and live hosts **never** call paid or delayed external billing APIs (AWS Cost Explorer, Azure Cost Management, GCP Cloud Billing, or OCI Usage API).
 
 ---
 
@@ -21,22 +24,14 @@ Slice 3 (`Perf & Cost` in [`05-roadmap.md`](05-roadmap.md)) adds **cross-cutting
 ### 2.1 `ErrorCode` Enum Addition & Impact Analysis
 
 Slice 3 adds one value to `ErrorCode`:
-- **`COST_CAP_EXCEEDED`** — Pre-flight cost admission guard refused the operation because its incremental estimated cost would push `cloud.estimated_cost()` above `cloud.cost_cap_usd()` (`http_status() == 0`, `provider_code() == "CostCapExceeded"`).
+- **`COST_CAP_EXCEEDED`** — Pre-attempt cost admission guard refused the operation (or its next physical retry/page) because reserving its worst-case attempt and cleanup cost would exceed the active budget cap (`http_status() == 0`, `provider_code() == "CostCapExceeded"`).
 
 #### Why Add `COST_CAP_EXCEEDED` Instead of Reusing one of the 8 Existing Codes?
 | Candidate | Evaluation |
 |---|---|
-| **`COST_CAP_EXCEEDED` (Adopted, 9th enum value)** | Unambiguous in scripts (`cloud.last_error().code() == ErrorCode.COST_CAP_EXCEEDED`) and abort logs (`[COST_CAP_EXCEEDED] object_put (b/k): ...`). Cleanly separates malformed caller arguments (`set_cost_cap_usd(-1.0)` -> `INVALID_ARGUMENT`) and IAM policy denials (`403` -> `PERMISSION_DENIED`) from run budget exhaustion. |
-| Reuse `INVALID_ARGUMENT` (Rejected) | Conflates a valid operation (`object_put("b", "k", "data")`) that hit the cumulative run budget with a malformed bucket/key name. |
-| Reuse `PRECONDITION_FAILED` or `PERMISSION_DENIED` (Rejected) | Conflates client-side budget exhaustion with HTTP `412 If-Match` failures or HTTP `403` IAM/RBAC denials. |
-
-#### Impact of Changing `schema/lmcloud.dsl.json` Bytes in Slice 3
-Because Slice 3 adds new domain types and `Cloud` methods to `schema/lmcloud.dsl.json`, the raw schema SHA-256 changes regardless of whether `ErrorCode` has 8 or 9 values. The exact downstream impact when `hostkit` and the 4 hosts adopt Slice 3 is:
-1. **`schema/lmcloud.dsl.json` & `schema/schema.go`:** Embedded automatically via `//go:embed lmcloud.dsl.json`.
-2. **`hostkit/errors.go`:** Add `CostCapExceeded Code = "COST_CAP_EXCEEDED"` to `const (...)` and `var Codes = []Code{...}` (2 lines).
-3. **`hostkit/cloudhost/register.go`:** `declareEnums(reg)` derives the enum list directly from `hostkit.Codes`, so `lmcode-go` `Registry.Enum("ErrorCode", ...)` automatically supports `ErrorCode.COST_CAP_EXCEEDED` in `--dry-run` mode with zero extra code.
-4. **Provider host repositories (`lmaws`, `lmazure`, `lmgcp`, `lmoci`):** Copy updated `schema/lmcloud.dsl.json` and update the SHA-256 pin in `lmcloud.lock`. No adapter error classification switch needs to change because `COST_CAP_EXCEEDED` is raised exclusively by `cloudhost` pre-flight admission.
-5. **Existing Slice 1 & Slice 2 conformance suites (25 scenarios):** Zero changes required; every existing scenario accrues `< $0.0005` against the default `$0.05` cap.
+| **`COST_CAP_EXCEEDED` (Adopted, 9th enum value)** | Unambiguous in scripts (`cloud.last_error().code() == ErrorCode.COST_CAP_EXCEEDED`) and abort logs (`[COST_CAP_EXCEEDED] object_put (b/k): ...`). Cleanly separates malformed caller arguments (`set_cost_cap_usd(-1.0)` -> `INVALID_ARGUMENT`) and IAM policy denials (`403` -> `PERMISSION_DENIED`) from budget exhaustion. |
+| Reuse `INVALID_ARGUMENT` (Rejected) | Conflates a valid operation (`object_put("b", "k", "data")`) that hit the run budget with a malformed bucket/key name. |
+| Reuse `PRECONDITION_FAILED` or `PERMISSION_DENIED` (Rejected) | Conflates budget exhaustion with HTTP `412 If-Match` failures or HTTP `403` IAM/RBAC denials. |
 
 ### 2.2 Domain Types
 
@@ -46,29 +41,29 @@ Immutable per-operation cost breakdown entry inside `CostReport`:
 |---|---|---|
 | `operation` | `() -> string` | Shared schema operation name (e.g. `"bucket_create"`, `"object_put"`, `"queue_send"`). |
 | `service` | `() -> string` | Service slice identifier (`"storage"`, `"queue"`, etc.). |
-| `requests` | `() -> int` | Number of admitted calls to this operation during the run (`>= 0`). |
-| `billing_units` | `() -> int` | Number of billing units charged (`>= 0`; e.g., 1 per storage call/page, or `ceil(max(bytes, 1) / 65536)` 64 KiB chunks for queue messages). |
-| `bytes` | `() -> int` | Total payload bytes processed by this operation (`>= 0`). |
-| `unit_price_usd` | `() -> float` | Price per billing unit in USD from the active provider's embedded price table. |
-| `byte_price_usd_per_gib` | `() -> float` | Marginal data/storage allowance per GiB (`1,073,741,824` bytes) in USD from the embedded price table. |
-| `estimated_usd` | `() -> float` | Cumulative estimated cost in USD for this operation (`billing_units * unit_price_usd + bytes * (byte_price_usd_per_gib / 1073741824.0)`). |
+| `requests` | `() -> int` | Number of admitted physical requests/attempts transmitted for this operation (`>= 0`; includes retries, probes, and pages). |
+| `billing_units` | `() -> int` | Number of billing units charged (`>= 0`; 1 per storage attempt/page, or `ceil(max(bytes, 1) / 65536)` 64 KiB chunks per queue attempt). |
+| `bytes` | `() -> int` | Total settled payload bytes processed by this operation (`>= 0`). |
+| `unit_price_usd` | `() -> float` | Price per billing unit in USD from the active regional/reference price table. |
+| `byte_price_usd_per_gib` | `() -> float` | Marginal storage-horizon or egress/transfer tariff per GiB (`1,073,741,824` bytes) in USD from the active price table. |
+| `estimated_usd` | `() -> float` | Cumulative estimated cost in USD for this operation (`billing_units * unit_price_usd + ceil_ns(bytes * byte_price_usd_per_gib / 1073741824.0)`). |
 
 #### `CostReport`
 Immutable snapshot returned by `cloud.cost_report()`, iterable in `lmscript` via `for (item in report) { ... }` (`len` / `at`):
 | Method | Signature | Description |
 |---|---|---|
 | `provider` | `() -> string` | Active provider identifier (`"aws"`, `"azure"`, `"gcp"`, `"oci"`, or `"ref"`). |
-| `price_table_version` | `() -> string` | Embedded price table version identifier (`"2026-11-v1"`). |
-| `cap_usd` | `() -> float` | Active per-run cost cap in USD (default `0.05`). |
-| `ceiling_usd` | `() -> float` | Hard per-run cost ceiling in USD (`0.25`). |
-| `estimated_usd` | `() -> float` | Cumulative estimated run cost in USD (identical to `cloud.estimated_cost()`). |
-| `total_requests` | `() -> int` | Sum of `requests()` across all metered operations (`>= 0`). |
+| `price_table_version` | `() -> string` | Active price table version and region/mode identifier (e.g. `"2026-04-aws-us-east-1-v1"` in live mode or `"2026-11-sim-v1"` in simulator/offline mode). |
+| `cap_usd` | `() -> float` | Active work cost cap in USD (default `0.05`). |
+| `ceiling_usd` | `() -> float` | Hard cost ceiling in USD (`0.25`). |
+| `estimated_usd` | `() -> float` | Cumulative settled + committed estimated cost in USD (identical to `cloud.estimated_cost()`). |
+| `total_requests` | `() -> int` | Sum of physical `requests()` across all metered operations (`>= 0`). |
 | `total_units` | `() -> int` | Sum of `billing_units()` across all metered operations (`>= 0`). |
 | `total_bytes` | `() -> int` | Sum of `bytes()` across all metered operations (`>= 0`). |
-| `cap_exceeded_count` | `() -> int` | Number of operations refused pre-flight due to `COST_CAP_EXCEEDED` (`>= 0`). |
+| `cap_exceeded_count` | `() -> int` | Number of operations or retry attempts refused due to `COST_CAP_EXCEEDED` (`>= 0`). |
 | `len` | `() -> int` | Number of operations with `requests() > 0` in this report, sorted lexicographically by `operation()`. |
 | `at` | `(index: int) -> CostLineItem` | Line item at `0 <= index < len()`. |
-| `item` | `(operation: string) -> CostLineItem` | Line item for `operation` (returns a zero-valued `CostLineItem` with `requests() == 0`, `estimated_usd() == 0.0`, and the provider's configured unit prices if `operation` has 0 calls). |
+| `item` | `(operation: string) -> CostLineItem` | Line item for `operation` (returns a zero-valued `CostLineItem` with `requests() == 0`, `estimated_usd() == 0.0`, and the active table's unit/byte prices if `operation` has 0 calls). |
 | `summary` | `() -> string` | Canonical single-line summary, e.g. `"estimated cost: $0.00000540 (provider=aws, requests=2, units=2, bytes=1024, cap=$0.05)"` or `"estimated cost: $0.00 (read-only; provider=aws, requests=0, cap=$0.05)"`. |
 
 #### `OpMetrics`
@@ -76,18 +71,18 @@ Immutable per-operation performance statistics inside `MetricsReport`:
 | Method | Signature | Description |
 |---|---|---|
 | `operation` | `() -> string` | Shared schema operation name (e.g. `"object_put"`, `"queue_receive"`). |
-| `calls` | `() -> int` | Total invocations of this operation since host start or last `metrics_reset()` (`>= 0`, includes both succeeded and failed calls). |
+| `calls` | `() -> int` | Total logical invocations of this operation since host start or last `metrics_reset()` (`>= 0`, includes both succeeded and failed calls). |
 | `errors` | `() -> int` | Invocations of this operation that ended with `code() != ErrorCode.OK` (`0 <= errors() <= calls()`). |
 | `retries` | `() -> int` | Total retry attempts executed by `hostkit.RetryPolicy` during calls to this operation (`>= 0`). |
 | `throttles` | `() -> int` | Total HTTP `429` (or provider throttle) responses observed by `hostkit.RetryPolicy` during calls to this operation (`>= 0`). |
-| `bytes_in` | `() -> int` | Total payload bytes received by this operation (`object_get` body bytes, `queue_receive` decoded message body bytes). |
+| `bytes_in` | `() -> int` | Total payload bytes received across all deliveries/calls of this operation (`object_get` body bytes, `queue_receive` decoded message body bytes). |
 | `bytes_out` | `() -> int` | Total payload bytes sent by this operation (`object_put` body bytes, `queue_send` raw message body bytes). |
-| `min_ms` | `() -> float` | Minimum call latency in milliseconds (`0.0` when `calls() == 0`). |
-| `p50_ms` | `() -> float` | 50th percentile (nearest-rank median) call latency in milliseconds (`0.0` when `calls() == 0`). |
-| `p95_ms` | `() -> float` | 95th percentile (nearest-rank) call latency in milliseconds (`0.0` when `calls() == 0`). |
-| `max_ms` | `() -> float` | Maximum call latency in milliseconds (`0.0` when `calls() == 0`). |
-| `mean_ms` | `() -> float` | Arithmetic mean call latency in milliseconds (`0.0` when `calls() == 0`). |
-| `total_ms` | `() -> float` | Sum of call latencies for this operation in milliseconds (`0.0` when `calls() == 0`). |
+| `min_ms` | `() -> float` | Exact all-call minimum latency in milliseconds over the current window (`0.0` when `calls() == 0`). |
+| `p50_ms` | `() -> float` | 50th percentile (nearest-rank median) latency in milliseconds over the retained sliding sample window (`0.0` when `calls() == 0`). |
+| `p95_ms` | `() -> float` | 95th percentile (nearest-rank) latency in milliseconds over the retained sliding sample window (`0.0` when `calls() == 0`). |
+| `max_ms` | `() -> float` | Exact all-call maximum latency in milliseconds over the current window (`0.0` when `calls() == 0`). |
+| `mean_ms` | `() -> float` | Exact all-call arithmetic mean latency (`total_ms() / float(calls())`, `0.0` when `calls() == 0`). |
+| `total_ms` | `() -> float` | Exact all-call sum of latencies for this operation in milliseconds (`0.0` when `calls() == 0`). |
 
 #### `MetricsReport`
 Immutable snapshot returned by `cloud.metrics()`, iterable in `lmscript` via `for (opm in m) { ... }` (`len` / `at`):
@@ -109,178 +104,134 @@ Immutable snapshot returned by `cloud.metrics()`, iterable in `lmscript` via `fo
 
 | Method | Signature | Return | Semantics & `last_error()` Behavior |
 |---|---|---|---|
-| `cost_cap_usd` | `() -> float` | `float` | Returns the active per-run cost cap in USD (default `0.05`). **Does not modify `cloud.last_error()`**. |
-| `set_cost_cap_usd` | `(cap_usd: float) -> self` | `Cloud` | Sets the per-run cost cap in USD. Requires finite `0.0 < cap_usd <= 0.25` (`HardCostCeilingUSD`) and `cap_usd >= cloud.estimated_cost()`. If violated, fails pre-flight with `ErrorCode.INVALID_ARGUMENT` (`http_status() == 0`) without changing the active cap. On success, sets `cloud.last_error()` to `ErrorCode.OK`. |
-| `estimated_cost` | `() -> float` | `float` | Returns cumulative estimated cost in USD for the current run (`>= 0.0`). Never reset by `metrics_reset()` and never reduced by deletes. **Does not modify `cloud.last_error()`**. |
-| `cost_report` | `() -> CostReport` | `CostReport` | Returns an immutable `CostReport` snapshot of all metered operations and totals for the current run. **Does not modify `cloud.last_error()`**. |
+| `cost_cap_usd` | `() -> float` | `float` | Returns the active work cost cap in USD (default `0.05`). **Does not modify `cloud.last_error()`**. |
+| `set_cost_cap_usd` | `(cap_usd: float) -> self` | `Cloud` | Narrows the active work cost cap in USD. Requires finite `0.0 < cap_usd <= cloud.cost_cap_usd() <= OperatorCapUSD <= 0.25` (`HardCostCeilingUSD`) and `cap_usd >= cloud.estimated_cost()`. Scripts can **only lower (or keep equal)** the active cap, never raise it above the operator's cap or a previously narrowed cap. If violated, fails pre-flight with `ErrorCode.INVALID_ARGUMENT` (`http_status() == 0`) without changing the active cap. On success, sets `cloud.last_error()` to `ErrorCode.OK`. |
+| `estimated_cost` | `() -> float` | `float` | Returns cumulative estimated cost in USD for the current run/campaign (`>= 0.0`). Never reset by `metrics_reset()` and never reduced by deletes. **Does not modify `cloud.last_error()`**. |
+| `cost_report` | `() -> CostReport` | `CostReport` | Returns an immutable `CostReport` snapshot of all metered operations and totals for the current run/campaign. **Does not modify `cloud.last_error()`**. |
 | `metrics_reset` | `() -> self` | `Cloud` | Clears all performance counters, byte counters, retry/throttle counters, and latency samples, and restarts the `elapsed_ms()` timer. **Does NOT reset `estimated_cost()` or `cost_report()`, and does NOT modify `cloud.last_error()`**. |
 | `metrics` | `() -> MetricsReport` | `MetricsReport` | Returns an immutable `MetricsReport` snapshot for the window since host start or the last `metrics_reset()`. **Does not modify `cloud.last_error()`**. |
 
 ---
 
-## 3. Cost Model, Embedded Price Tables & Determinism Rules
+## 3. Cost Admission, Regional Price Validation & Campaign Budget Authority
 
-### 3.1 What Is Measured in Sim/Offline vs Live vs `--dry-run`
+### 3.1 Physical Pre-Attempt Reservation & Settlement Model
 
-| Execution Mode | How Operations & Bytes Are Metered | Actual Cloud Bill | `estimated_cost()` / `cost_report()` |
-|---|---|---|---|
-| **Offline Fake (`fakeadapter`) & Loopback Sims (`awssim`, `azuresim`, `gcpsim`, `ocisim`)** | `cloudhost` meters every admitted operation's request count, billing units (pages / 64 KiB chunks), and payload bytes (`len(data)` / `len(body)`), applying the active provider's embedded price table. | `$0.00` (local process) | Non-zero deterministic estimate from the provider's embedded price table. |
-| **Live Cloud (`aws`, `azure`, `gcp`, `oci`)** | Exact same `cloudhost` metering and embedded price table. **No billing or Cost Explorer API is ever called.** | Billed by provider according to account/free-tier/region | Same deterministic estimate (serves as a pre-dispatch safety cap and planning estimate, never an invoice). |
-| **Compiler Dry Run (`lmscript --dry-run`)** | `cloudhost` dry slots run the same cost admission and metering over the dry overlay, allowing scripts to preview estimated cost and catch `COST_CAP_EXCEEDED` during `--dry-run`. | `$0.00` (zero mutations) | Same deterministic estimate for the dry-previewed operations. |
+Unlike a post-hoc logical estimator, `hostkit`'s cost meter gates **every physical cloud attempt** before it is transmitted:
 
-### 3.2 Embedded Per-Provider Price Tables (`2026-11-v1`)
+1. **Pre-Attempt Reservation (`ReserveAttempt`):**
+   - Before each physical HTTP/RPC attempt (the initial request, each retry in `hostkit.RetryPolicy.Do`, each ownership/existence probe, and each page request in `hostkit.ListAll`), the host computes an `AttemptQuote`:
+     - **Request / chunk units:** `1` unit for storage requests/pages; `max(1, ceil(payload_bytes / 65536))` chunks for queue requests.
+     - **Byte-horizon / egress bound:**
+       - For `object_put`: payload bytes `len(body)` priced over the table's minimum retention horizon (`min_duration_seconds`, e.g., `3600` seconds in live mode, or the synthetic per-GiB allowance in simulator mode) with ceiling nanodollar rounding.
+       - For `object_get`: reserves the maximum bounded response size (`limit` or `MaxObjectBytes = 16 MiB`) at the table's egress/read rate before the `GET` is sent.
+     - **Cleanup reservation (`CleanupReserveNanoUSD`):** Creating a resource (`bucket_create`, `object_put`, `queue_create`, `queue_send`) reserves the tariff required to delete/ack that resource during teardown (`cleanup_reserve_nano_usd`).
+   - If `ChargedNanoUSD + InFlightNanoUSD + ResourceCleanupNanoUSD + Quote.AttemptNanoUSD + Quote.CleanupReserveNanoUSD > ActiveWorkCapNanoUSD`, `ReserveAttempt` rejects the attempt **before dispatch** with `ErrorCode.COST_CAP_EXCEEDED`, increments `cap_exceeded_count()`, and leaves the network untouched.
+2. **Post-Attempt Settlement (`Commit`):**
+   - When the physical attempt completes:
+     - For `object_get`, if the response completed cleanly with `N = len(body)` bytes, the in-flight `16 MiB` byte reservation settles to the actual `N` bytes received; if the stream failed mid-transfer after bytes were sent, the full reserved byte bound is charged.
+     - If a resource creation succeeded, its `CleanupReserveNanoUSD` remains locked in `ResourceCleanupNanoUSD` until the resource is deleted (`ReleaseResourceCleanup`).
+3. **Multi-Page & Retry Exhaustion:**
+   - Because `hostkit.RetryPolicy.Do` and `hostkit.ListAll` call `ReserveAttempt` before **each** retry and **each** page fetch:
+     - A `429 -> 503 -> 200` retry sequence reserves and charges **3 physical attempts** (`requests() == 3` in `CostReport`, `calls() == 1`, `retries() == 2`, `throttles() == 1` in `MetricsReport`).
+     - If the remaining budget after attempt 2 cannot cover attempt 3, `RetryPolicy.Do` aborts before attempt 3 with `ErrorCode.COST_CAP_EXCEEDED` (`requests() == 2`, `retries() == 1`, `cap_exceeded_count() == 1`).
 
-All four hosts embed their provider price table in `hostkit` (keyed by `cloud.provider()`: `"aws"`, `"azure"`, `"gcp"`, `"oci"`, with `"ref"` aliasing `"aws"`). Internally, `hostkit` stores all prices and accumulates all charges in **integer nanodollars (`int64`, `1 USD = 1,000,000,000 nanodollars`)** so floating-point rounding never depends on operation order.
+### 3.2 Regional Price Validation vs Synthetic Simulator Reference Tables
 
-#### Slice 1 (Object Storage) & Slice 2 (Queue) Embedded Unit Tariffs
+1. **Regional Live Price Tables (`hostkit/safety/prices/<provider>/<region>.json`):**
+   - Live mode (`LMCLOUD_LIVE=1`) **never** uses provider-only price lookup. It loads `prices/<provider>/<region>.json` matching the attested target region and validates:
+     - `schema_version == 1`, `provider`, `region`, `currency == "USD"`, non-empty `source_url`, `effective_date` (`YYYY-MM-DD`), and `max_age_days > 0`.
+     - **Freshness gate:** If `now - effective_date > max_age_days * 24h`, or if `<provider>/<region>` has no verified price table, the host **fails closed** before any network call.
+     - **No free-tier reliance:** Provider free tiers (e.g., AWS S3/SQS monthly free tier, GCP Pub/Sub free tier) are never assumed (`$0` free tier never funds admission).
+   - **Stage 1 Verified Live Table (`aws/us-east-1`, `2026-04-01`):**
+     - Source: [Amazon S3 Pricing (`us-east-1` Standard)](https://aws.amazon.com/s3/pricing/) and [Amazon SQS Pricing (`us-east-1` Standard)](https://aws.amazon.com/sqs/pricing/).
+     - S3 Tier 1 (`PUT`/`COPY`/`POST`/`LIST`, `PutBucketTagging`): `$0.005 / 1,000` = `5,000 ns` (`$0.00000500`) per physical request.
+     - S3 Tier 2 (`GET`/`HEAD`, `GetBucketTagging`): `$0.0004 / 1,000` = `400 ns` (`$0.00000040`) per physical request.
+     - S3 Standard Storage (`us-east-1`): `$0.023 / GiB-month` (`23,000,000 ns / GiB-month`), prorated over `min_duration_seconds = 3600` (`1 hour` minimum live run horizon; `86,400` seconds for retained resources) with ceiling nanodollar rounding.
+     - S3 Data Transfer / Egress (`object_get`): `$0.09 / GiB` (`90,000,000 ns / GiB`, worst-case internet egress rate unless intra-region EC2-to-S3 is attested).
+     - S3 Delete (`DeleteObject`, `DeleteBucket`): `$0.00` request fee, plus `10,000 ns` (`bucket`) / `5,000 ns` (`object`) cleanup reserve for ownership readback probes (`GetBucketTagging` / `HeadObject`) before delete.
+     - SQS Standard (`CreateQueue`, `DeleteQueue`, `GetQueueUrl`, `ListQueues`, `ListQueueTags`, `SendMessage`, `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`): `$0.40 / 1,000,000` = `400 ns` (`$0.00000040`) per 64 KiB chunk (`chunk_bytes = 65536`), with `10,000 ns` cleanup reserve per queue.
 
-| Operation | Service | Billing Unit Rule | AWS (`us-east-1`) | Azure (`East US` LRS Hot) | GCP (`us-central1` Standard) | OCI (`us-ashburn-1` Standard) |
+2. **Synthetic Simulator Reference Tariffs (`2026-11-sim-v1`, Offline & Loopback Sim Mode Only):**
+   - For deterministic offline (`fakeadapter`) and loopback simulator (`awssim`, `azuresim`, `gcpsim`, `ocisim`) conformance testing where no real cloud region is billed, `hostkit` provides a **Synthetic Simulator Reference Table (`price_table_version() == "2026-11-sim-v1"`)**.
+   - **Important distinction:** The simulator reference table is **explicitly refused in live mode (`LMCLOUD_LIVE=1`)**. In particular:
+     - Real GCP Cloud Pub/Sub bills by throughput (`$40 / TiB`) with a **`1,000`-byte minimum billable size per request** including message attributes/metadata ([Cloud Pub/Sub Pricing](https://cloud.google.com/pubsub/pricing)), whereas the simulator reference table uses a conservative synthetic 64 KiB chunk allowance (`2,400 ns` per 64 KiB >= `40 ns` per 1 KB) so cross-provider 64 KiB chunk unit tests behave uniformly in simulator runs.
+     - Azure (`azuresim`) and OCI (`ocisim`) tariffs in the table below are synthetic simulator reference rates; live Azure and OCI regional price tables remain unpopulated (failing closed in live mode) until Stage 2+ SKU verification.
+
+| Operation | Service | Physical Billing Unit Rule | `aws` / `ref` (`us-east-1`) | `azure` *(synthetic sim)* | `gcp` *(synthetic sim)* | `oci` *(synthetic sim)* |
 |---|---|---|---|---|---|---|
-| `bucket_create` | `storage` | `1` per call | `$0.00000500` (`5,000 ns`) | `$0.00000500` (`5,000 ns`) | `$0.00000500` (`5,000 ns`) | `$0.00000500` (`5,000 ns`) |
-| `bucket_delete` *(teardown-immune)* | `storage` | `1` per call | `$0.00000000` (`0 ns`) | `$0.00000040` (`400 ns`) | `$0.00000000` (`0 ns`) | `$0.00000000` (`0 ns`) |
-| `bucket_exists` | `storage` | `1` per call | `$0.00000040` (`400 ns`) | `$0.00000040` (`400 ns`) | `$0.00000040` (`400 ns`) | `$0.00000040` (`400 ns`) |
-| `bucket_list` | `storage` | `max(1, pages)` | `$0.00000500` / page | `$0.00000500` / page | `$0.00000500` / page | `$0.00000500` / page |
-| `object_put` | `storage` | `1` per call + `bytes` (`$0.023`–`$0.025`/GiB) | `$0.00000500` + `$0.023`/GiB | `$0.00000500` + `$0.0184`/GiB | `$0.00000500` + `$0.020`/GiB | `$0.00000500` + `$0.0255`/GiB |
-| `object_get` | `storage` | `1` per call + `bytes` (`$0.004`–`$0.010`/GiB) | `$0.00000040` + `$0.009`/GiB | `$0.00000040` + `$0.007`/GiB | `$0.00000040` + `$0.012`/GiB | `$0.00000040` + `$0.0085`/GiB |
-| `object_head` | `storage` | `1` per call | `$0.00000040` (`400 ns`) | `$0.00000040` (`400 ns`) | `$0.00000040` (`400 ns`) | `$0.00000040` (`400 ns`) |
-| `object_delete` *(teardown-immune)* | `storage` | `1` per call | `$0.00000000` (`0 ns`) | `$0.00000040` (`400 ns`) | `$0.00000000` (`0 ns`) | `$0.00000000` (`0 ns`) |
-| `object_list` | `storage` | `1` per call | `$0.00000500` (`5,000 ns`) | `$0.00000500` (`5,000 ns`) | `$0.00000500` (`5,000 ns`) | `$0.00000500` (`5,000 ns`) |
-| `object_list_all` | `storage` | `max(1, pages)` | `$0.00000500` / page | `$0.00000500` / page | `$0.00000500` / page | `$0.00000500` / page |
-| `queue_create` | `queue` | `1` per call (`2` on GCP topic+sub) | `$0.00000040` (`400 ns`) | `$0.00000050` (`500 ns`) | `$0.00000100` (`1,000 ns`) | `$0.00000100` (`1,000 ns`) |
-| `queue_delete` *(teardown-immune)* | `queue` | `1` per call | `$0.00000000` (`0 ns`) | `$0.00000040` (`400 ns`) | `$0.00000000` (`0 ns`) | `$0.00000000` (`0 ns`) |
-| `queue_exists` | `queue` | `1` per call | `$0.00000040` (`400 ns`) | `$0.00000040` (`400 ns`) | `$0.00000040` (`400 ns`) | `$0.00000040` (`400 ns`) |
-| `queue_list` | `queue` | `max(1, pages)` | `$0.00000040` / page | `$0.00000050` / page | `$0.00000040` / page | `$0.00000100` / page |
-| `queue_send` | `queue` | `max(1, ceil(bytes / 65536))` | `$0.00000040` / 64 KiB | `$0.00000040` / 64 KiB | `$0.00000240` / 64 KiB (`$40/TiB`) | `$0.00000100` / 64 KiB |
-| `queue_receive` | `queue` | `max(1, ceil(bytes / 65536))` | `$0.00000040` / 64 KiB | `$0.00000040` / 64 KiB | `$0.00000240` / 64 KiB | `$0.00000100` / 64 KiB |
-| `queue_ack` *(teardown-immune)* | `queue` | `1` per call | `$0.00000040` (`400 ns`) | `$0.00000040` (`400 ns`) | `$0.00000000` (`0 ns`) | `$0.00000100` (`1,000 ns`) |
-| `queue_nack` | `queue` | `1` per call | `$0.00000040` (`400 ns`) | `$0.00000040` (`400 ns`) | `$0.00000040` (`400 ns`) | `$0.00000100` (`1,000 ns`) |
+| `bucket_create` | `storage` | `1` per physical attempt | `5,000 ns` | `5,000 ns` | `5,000 ns` | `5,000 ns` |
+| `bucket_delete` *(cleanup-reserve)* | `storage` | `1` per physical attempt | `0 ns` | `400 ns` | `0 ns` | `0 ns` |
+| `bucket_exists` | `storage` | `1` per physical attempt | `400 ns` | `400 ns` | `400 ns` | `400 ns` |
+| `bucket_list` | `storage` | `1` per physical page attempt | `5,000 ns` / page | `5,000 ns` / page | `5,000 ns` / page | `5,000 ns` / page |
+| `object_put` | `storage` | `1` per attempt + `bytes` | `5,000 ns` + `$0.023`/GiB | `5,000 ns` + `$0.0184`/GiB | `5,000 ns` + `$0.020`/GiB | `5,000 ns` + `$0.0255`/GiB |
+| `object_get` | `storage` | `1` per attempt + `bytes` | `400 ns` + `$0.09`/GiB | `400 ns` + `$0.007`/GiB | `400 ns` + `$0.012`/GiB | `400 ns` + `$0.0085`/GiB |
+| `object_head` | `storage` | `1` per physical attempt | `400 ns` | `400 ns` | `400 ns` | `400 ns` |
+| `object_delete` *(cleanup-reserve)* | `storage` | `1` per physical attempt | `0 ns` | `400 ns` | `0 ns` | `0 ns` |
+| `object_list` | `storage` | `1` per physical attempt | `5,000 ns` | `5,000 ns` | `5,000 ns` | `5,000 ns` |
+| `object_list_all` | `storage` | `1` per physical page attempt | `5,000 ns` / page | `5,000 ns` / page | `5,000 ns` / page | `5,000 ns` / page |
+| `queue_create` | `queue` | `1` per physical attempt | `400 ns` | `500 ns` | `1,000 ns` | `1,000 ns` |
+| `queue_delete` *(cleanup-reserve)* | `queue` | `1` per physical attempt | `400 ns` | `400 ns` | `0 ns` | `0 ns` |
+| `queue_exists` | `queue` | `1` per physical attempt | `400 ns` | `400 ns` | `400 ns` | `400 ns` |
+| `queue_list` | `queue` | `1` per physical page attempt | `400 ns` / page | `500 ns` / page | `400 ns` / page | `1,000 ns` / page |
+| `queue_send` | `queue` | `max(1, ceil(bytes / 65536))` | `400 ns` / 64 KiB | `400 ns` / 64 KiB | `2,400 ns` / 64 KiB | `1,000 ns` / 64 KiB |
+| `queue_receive` | `queue` | `max(1, ceil(bytes / 65536))` | `400 ns` / 64 KiB | `400 ns` / 64 KiB | `2,400 ns` / 64 KiB | `1,000 ns` / 64 KiB |
+| `queue_ack` *(cleanup-reserve)* | `queue` | `1` per physical attempt | `400 ns` | `400 ns` | `0 ns` | `1,000 ns` |
+| `queue_nack` | `queue` | `1` per physical attempt | `400 ns` | `400 ns` | `400 ns` | `1,000 ns` |
 
-#### Sourcing & Update Procedure
-1. **Primary sources:**
-   - **AWS (`us-east-1`):** [Amazon S3 Pricing](https://aws.amazon.com/s3/pricing/) (`$0.005 / 1,000` PUT/LIST, `$0.0004 / 1,000` GET/HEAD, `$0.023 / GB-month` Standard storage) and [Amazon SQS Pricing](https://aws.amazon.com/sqs/pricing/) (`$0.40 / 1,000,000` requests per 64 KiB chunk), aligned with `lmaws/src/main/java/ai/lmctl/lmaws/CostLedger.java:17–29`.
-   - **Azure (`East US` LRS Hot):** [Azure Blob Storage Pricing](https://azure.microsoft.com/en-us/pricing/details/storage/blobs/) (`$0.05 / 10,000` Write/List, `$0.004 / 10,000` Read, `$0.0184 / GB-month`) and [Azure Queue Storage Pricing](https://azure.microsoft.com/en-us/pricing/details/storage/queues/) (`$0.004 / 10,000` operations per 64 KiB), aligned with `lmazure/docs/COSTS.md`.
-   - **GCP (`us-central1` Standard):** [Google Cloud Storage Pricing](https://cloud.google.com/storage/pricing) (`$0.05 / 10,000` Class A, `$0.004 / 10,000` Class B, `$0.020 / GB-month`) and [Cloud Pub/Sub Pricing](https://cloud.google.com/pubsub/pricing) (`$40 / TiB` throughput -> `~$0.0000024` per 64 KiB chunk, minimum 1 chunk), aligned with `lmgcp/internal/safety/safety.go:128–206`.
-   - **OCI (`us-ashburn-1` Standard):** [OCI Object Storage Pricing](https://www.oracle.com/cloud/storage/pricing/) (`$0.005 / 1,000` Write/List, `$0.0004 / 1,000` Read, `$0.0255 / GB-month`) and [OCI Queue Pricing](https://www.oracle.com/cloud/queue/pricing/) (`$1.00 / 1,000,000` requests per 64 KiB chunk), aligned with `lmoci/src/main/java/ai/lmctl/lmoci/CostLedger.java:63–74`.
-2. **How to update the embedded price tables:**
-   - All four provider tables live in a single declarative Go table in `hostkit/meter.go` (`PriceTables`).
-   - When updating tariffs or adding a new slice (Slices 4–10), bump `PriceTableVersion` (e.g., `"2026-11-v1"` -> `"2027-01-v1"`), update the nanodollar constants in `hostkit/meter.go`, and run `scripts/test-hostkit.sh` plus `./tests/run-conformance.sh`. Conformance scenarios derive their cap thresholds dynamically from `cloud.cost_report().item(op).unit_price_usd()` or `cloud.estimated_cost()` after a calibration call, so tariff updates never break conformance tests.
+### 3.3 Shared Campaign Authority & Bounded Cleanup Reserve
 
-### 3.3 Cost Determinism Rules
-
-1. **Integer nanodollar accumulation:**
-   - Each call's cost in nanodollars is:
-     `cost_ns = units * unit_price_ns + (bytes * byte_price_per_gib_ns + (1<<30 - 1)) / (1 << 30)` (using integer ceiling division when `bytes > 0` and `byte_price_per_gib_ns > 0` so any non-zero byte transfer with a non-zero byte tariff adds at least `1 ns`).
-   - `estimated_usd()` converts `total_ns` to `float64(total_ns) / 1e9`.
-2. **Pre-flight validation failures are not billed:**
-   - If an operation fails client-side validation before reaching the adapter (e.g., invalid bucket name, invalid key, invalid `max_messages`, or `COST_CAP_EXCEEDED`), `requests()` and `estimated_cost()` are **not** incremented (though `metrics()` records the call and error in `total_calls()` / `total_errors()`, and `cost_report().cap_exceeded_count()` records cap refusals).
-3. **Admitted provider calls are billed once per logical operation (retries do not multiply `estimated_cost()`):**
-   - Once an operation passes pre-flight validation and cost-cap admission, its logical request unit is charged even if the provider returns `403`, `404`, or `409` (because the cloud request was transmitted).
-   - If `hostkit.RetryPolicy` retries a transient `429` or `503` under the hood, the extra attempts are recorded in **`metrics().total_retries()`** and **`metrics().total_throttles()`**, while **`cost_report()` charges 1 logical operation** so that `estimated_cost()` is 100% deterministic across runs regardless of transient network/simulator jitter.
+1. **Campaign-Wide Persistence (`hostkit/safety` integration):**
+   - When a campaign journal (`<run_id>.jsonl`) is active across multiple host invocations (`Supervisor.RunInvocation`), every committed charge (`ChargedNanoUSD`) and active resource cleanup reservation (`ResourceCleanupNanoUSD`) is fsynced to the journal and restored on the next invocation (`CostMeter.RestoreCharged`).
+2. **Monotone Cap Narrowing:**
+   - Let `OperatorCapNanoUSD` be the initial cap from `live-policy.json` or `LMCLOUD_MAX_COST_USD` (default `50,000,000 ns` = `$0.05`, ceiling `250,000,000 ns` = `$0.25`).
+   - `set_cost_cap_usd(newCap)` checks `newCap > 0 && newCap <= ActiveCapUSD && newCap <= OperatorCapUSD && newCap <= 0.25 && newCap >= EstimatedCostUSD`. Attempting to raise the cap above `ActiveCapUSD` or `OperatorCapUSD` is rejected with `ErrorCode.INVALID_ARGUMENT`.
+3. **Reserved Cleanup Budget vs Work Cap:**
+   - A dedicated `CleanupReserveNanoUSD` (default `10,000,000 ns` = `$0.01`) is held outside the script-narrowable work cap (`cost_cap_usd()`).
+   - Non-teardown operations must fit within `cost_cap_usd()`.
+   - Teardown operations (`bucket_delete`, `object_delete`, `queue_delete`, `queue_ack`) are admitted against `cost_cap_usd() + CleanupReserveUSD` (and release any per-resource cleanup reservation upon deletion). Thus, even after `cloud.set_cost_cap_usd(cloud.estimated_cost())`, normal cleanup of created resources succeeds, while a runaway loop of paid deletes/acks that exceeds `CleanupReserveUSD` is still stopped with `ErrorCode.COST_CAP_EXCEEDED`.
 
 ---
 
-## 4. Performance Telemetry Model & Determinism Rules
+## 4. Performance Telemetry Model & Bounded Sample Window
 
-### 4.1 What `cloud.metrics()` Tracks
+### 4.1 Streaming All-Call Aggregates vs Bounded Quantile Window (`MaxLatencySamplesPerOp = 10,000`)
 
-1. **Which methods are metered:**
-   - All 20 domain operations across Slice 1 and Slice 2 (`bucket_create`, `bucket_delete`, `bucket_exists`, `bucket_list`, `object_put`, `object_get`, `object_head`, `object_delete`, `object_list`, `object_list_all`, `queue_create`, `queue_delete`, `queue_exists`, `queue_list`, `queue_send`, `queue_receive`, `queue_ack`, `queue_nack`) are metered in `cloud.metrics()`.
-   - Local configuration and inspection methods (`provider`, `endpoint`, `set_endpoint`, `abort_on_error`, `set_abort_on_error`, `last_error`, `cost_cap_usd`, `set_cost_cap_usd`, `estimated_cost`, `cost_report`, `metrics_reset`, `metrics`) are **not** metered as cloud operations so inspecting `cloud.metrics()` or `cloud.estimated_cost()` inside a loop never pollutes `total_calls()`.
-2. **Timer scoping via `cloud.metrics_reset()`:**
-   - Calling `cloud.metrics_reset()` zeroes all `OpMetrics` entries, resets `total_calls`, `total_errors`, `total_retries`, `total_throttles`, `total_bytes_in`, and `total_bytes_out` to `0`, and sets the window start time to `Now()`.
-   - Scripts use `cloud.metrics_reset()` after setup (e.g., after `bucket_create` / `queue_create`) to measure only the steady-state workload phase, and again before teardown.
-3. **Exact quantile calculation (`min_ms`, `p50_ms`, `p95_ms`, `max_ms`, `mean_ms`, `total_ms`):**
-   - Each metered operation records call duration `d_ms = float64(dur.Nanoseconds()) / 1e6` (`>= 0.0`).
-   - Up to `MaxLatencySamplesPerOp = 10,000` samples are retained per operation per reset window.
-   - For `N` sorted samples `s[0] <= s[1] <= ... <= s[N-1]`:
-     - `min_ms() = s[0]`
-     - `p50_ms() = s[ceil(0.50 * N) - 1]`
-     - `p95_ms() = s[ceil(0.95 * N) - 1]`
-     - `max_ms() = s[N - 1]`
-     - `total_ms() = sum(s[0..N-1])`
-     - `mean_ms() = total_ms() / float64(N)`
-   - **Guaranteed mathematical invariants for every operation (`N >= 0`):**
-     `0.0 <= min_ms() <= p50_ms() <= p95_ms() <= max_ms() <= total_ms()` and `min_ms() <= mean_ms() <= max_ms()`.
-4. **Conformance rules for performance assertions in sims:**
-   - Conformance scenarios **must** assert exact deterministic counters (`calls()`, `errors()`, `bytes_in()`, `bytes_out()`, `retries() >= 0`, `throttles() >= 0`) and mathematical order invariants (`0.0 <= min_ms() <= p50_ms() <= p95_ms() <= max_ms() < 60000.0`).
-   - Conformance scenarios **must never** assert fragile wall-clock lower bounds (`p50_ms() > 0.1` fails on in-memory `fakeadapter`) or tight upper bounds (`p95_ms() < 5.0` flakes on loaded CI runners).
+1. **Streaming All-Call Aggregates (`calls`, `errors`, `retries`, `throttles`, `bytes_in`, `bytes_out`, `min_ms`, `max_ms`, `total_ms`, `mean_ms`):**
+   - Maintained with `O(1)` streaming accumulators per operation across **all** calls since host start or the most recent `cloud.metrics_reset()`, with **no truncation** when `calls() > 10,000`:
+     - `calls` increments by `1` per logical invocation.
+     - `total_ns` accumulates the exact integer nanoseconds of every call (`total_ms() = float64(total_ns) / 1e6`).
+     - `min_ns` and `max_ns` track the exact all-call minimum and maximum (`min_ms() = float64(min_ns) / 1e6`, `max_ms() = float64(max_ns) / 1e6`).
+     - `mean_ms() = total_ms() / float64(calls)` (exact all-call arithmetic mean).
+2. **Bounded Sliding Ring Buffer for Quantiles (`p50_ms`, `p95_ms`):**
+   - Each operation retains a deterministic **FIFO ring buffer** of the most recent `MaxLatencySamplesPerOp = 10,000` call durations (`samples[calls % 10_000] = dur_ns`).
+   - When `calls() <= 10,000`, `W = calls()` samples are sorted (`s[0] <= ... <= s[W-1]`). When `calls() > 10,000`, the `W = 10,000` most recent samples in the ring buffer are sorted (`s[0] <= ... <= s[W-1]`):
+     - `p50_ms() = float64(s[ceil(0.50 * W) - 1]) / 1e6`
+     - `p95_ms() = float64(s[ceil(0.95 * W) - 1]) / 1e6`
+   - Because every sample in the ring buffer is one of the observed calls in the current window (`min_ns <= s[0] <= s[W-1] <= max_ns`), the ordering invariants:
+     - `0.0 <= min_ms() <= p50_ms() <= p95_ms() <= max_ms() <= total_ms()`
+     - `min_ms() <= mean_ms() <= max_ms()`
+     hold **unconditionally** for every `calls() >= 1`, including after sample-buffer wraparound (`calls() > 10,000`)!
+   - `cloud.metrics_reset()` zeroes both the streaming accumulators and the 10,000-sample ring buffer.
 
----
+### 4.2 Deterministic Retry, Delivery & Timing Rules in Conformance Tests
 
-## 5. `hostkit` Implementation Notes (Where Cost & Metrics Live — Do Not Implement Now)
-
-Because every `Cloud` method already flows through `hostkit/cloudhost.Host` and every HTTP/SDK retry already flows through `hostkit.RetryPolicy`, **adapters (`lmaws`, `lmazure`, `lmgcp`, `lmoci`, `fakeadapter`) require zero interface changes** to support Slice 3.
-
-### 5.1 Proposed Additions to `hostkit` (`hostkit/meter.go` & `hostkit/retry.go`)
-
-```go
-// In package hostkit (hostkit/meter.go):
-const (
-	DefaultCostCapUSD   = 0.05
-	HardCostCeilingUSD  = 0.25
-	PriceTableVersion   = "2026-11-v1"
-	MaxSamplesPerOp     = 10_000
-	CostCapProviderCode = "CostCapExceeded"
-)
-
-type OpTariff struct {
-	Service            string
-	UnitPriceNanoUSD   int64 // nanodollars per billing unit
-	BytePricePerGiBNano int64 // nanodollars per GiB (1<<30 bytes)
-	ChunkBytes         int64 // 0 = 1 unit/request; 65536 = 64 KiB chunks (queue_send/receive)
-	TeardownImmune     bool  // true for bucket_delete, object_delete, queue_delete, queue_ack
-}
-
-// RetryTracker is attached to context.Context by cloudhost before calling an
-// adapter method. RetryPolicy.Do automatically increments Retries, Throttles,
-// and Pages on every attempt without any adapter code changes.
-type RetryTracker struct {
-	Retries   atomic.Int64
-	Throttles atomic.Int64
-	Pages     atomic.Int64
-}
-
-func WithRetryTracker(ctx context.Context) (context.Context, *RetryTracker)
-func RetryTrackerFrom(ctx context.Context) *RetryTracker
-```
-
-- **How `RetryPolicy.Do` reports retries and throttles automatically (`hostkit/retry.go`):**
-  - Inside `RetryPolicy.Do(ctx, idempotent, fn)`:
-    - Whenever `last.Status == 429` (or `retry` is triggered after attempt `i > 0`), `RetryPolicy.Do` checks `if rt := RetryTrackerFrom(ctx); rt != nil`:
-      - If `last.Status == 429`: `rt.Throttles.Add(1)`
-      - If `i > 0`: `rt.Retries.Add(1)`
-  - Inside `hostkit.ListAll` (`hostkit/paginate.go`):
-    - Each page fetch calls `if rt := RetryTrackerFrom(ctx); rt != nil { rt.Pages.Add(1) }`, so multi-page `bucket_list`, `object_list_all`, and `queue_list` automatically charge the exact number of pages fetched!
-
-### 5.2 How `cloudhost.Host` Wraps Every Operation (`hostkit/cloudhost/host.go`)
-
-- `cloudhost.Host` owns a single `meter *hostkit.Meter` initialized with `PriceTableFor(cfg.Provider)` and initial cap from `LMCLOUD_MAX_COST_USD` / `<PREFIX>_MAX_COST_USD` (default `$0.05`).
-- Every metered method on `cloudhost.Host` (`BucketCreate`, `ObjectPut`, `QueueSend`, etc.) calls:
-  1. Pre-flight input validation (`Validator.Bucket`, etc.). If pre-flight validation fails, `h.meter.RecordFailure(op, dur, 0, 0)` increments `calls` and `errors` in `MetricsReport` without charging `CostReport`.
-  2. Cost admission check: `if err := h.meter.Admit(op, bytesOut); err != nil { return ..., h.fail(op, target, err) }`. If `Admit` sees `accrued + delta > cap` on a non-teardown operation, it increments `cap_exceeded_count` and returns `&CloudError{Code: CostCapExceeded, ProviderCode: "CostCapExceeded", Message: "...", Preflight: false}` (formatted by `FormatAbort` as `[COST_CAP_EXCEEDED] <op> (<target>): ... (http=0, provider_code=CostCapExceeded)`).
-  3. Attaches `ctx, rt := hostkit.WithRetryTracker(ctx)` and times the adapter call (`start := h.cfg.Now()`).
-  4. On completion, `h.meter.Commit(op, units, bytesIn, bytesOut, dur, rt, cerr)` atomically updates both `CostReport` (nanodollars, requests, billing units, bytes) and `MetricsReport` (`calls`, `errors`, `retries`, `throttles`, `bytes_in`, `bytes_out`, latency sample).
+1. **Deterministic Retry & Attempt Accounting (`hostkit/httpguard` & `sim_rules_v1`):**
+   - Unit and integration tests drive deterministic retry sequences (`429 -> 503 -> 200`, terminal `429 -> 503 -> 503 -> 503`, and mid-retry `COST_CAP_EXCEEDED` exhaustion) and assert exact counters:
+     - `429 -> 503 -> 200` on `object_get`: `calls() == 1`, `errors() == 0`, `retries() == 2`, `throttles() == 1`, and `cost_report().item("object_get").requests() == 3`.
+     - Terminal `429 -> 503 -> 503 -> 503`: `calls() == 1`, `errors() == 1`, `retries() == 3`, `throttles() == 1`, and `cost_report().item(op).requests() == 4`.
+     - Mid-retry cap exhaustion (work cap covers 2 attempts; attempt 1 returns `429`, attempt 2 returns `503`): attempt 3 is refused pre-dispatch with `ErrorCode.COST_CAP_EXCEEDED`, `requests() == 2`, `retries() == 1`, `throttles() == 1`, `cap_exceeded_count() == 1`.
+2. **At-Least-Once Queue Delivery:**
+   - Queue conformance scenarios (`03`, `04`, `07`) poll `queue_receive` in a bounded loop (`attempts < 10`), deduplicate received message IDs (`StrList.contains` / `StrList.add`), and compare `cost_report().item("queue_receive").bytes()` and `metrics().op("queue_receive").bytes_in()` against the **actual delivered byte sum** across all received batches rather than assuming single-poll or exactly-once delivery.
+3. **No Fragile Wall-Clock Upper Bounds:**
+   - Conformance scenarios assert mathematical invariants (`0.0 <= min_ms() <= p50_ms() <= p95_ms() <= max_ms() <= total_ms()` and `min_ms() <= mean_ms() <= max_ms()`) without arbitrary `< 60000.0` whole-window wall-clock ceilings that could flake under loaded CI runners.
 
 ---
 
-## 6. Explicit Exclusions (Not in Slice 3)
+## 5. `hostkit` & Adapter Integration Contract
 
-1. **Live cloud billing / invoice queries (AWS Cost Explorer, Azure Cost Management, GCP Cloud Billing / BigQuery billing export, OCI Cost Analysis):** Out of scope; hosts never query billing APIs in Slice 3.
-2. **Real-time dynamic pricing / Spot price feeds:** All prices come from the deterministic embedded price table (`price_table_version()`).
-3. **Cross-process shared cost budgets:** Each host invocation has its own independent cost ledger and `$0.05` default cap (`$0.25` hard ceiling).
-4. **Storage duration / wall-clock time-based billing (`GB-months` accrued over real sleep time):** To keep cost estimation 100% deterministic and independent of CPU/network speed, `object_put` charges a fixed per-GiB write/storage allowance based on byte size rather than multiplying by wall-clock seconds elapsed before `object_delete`.
-5. **Latency SLA aborts:** Performance metrics are observational (`cloud.metrics()`); slow operations are bounded by `OpTimeout` (`2m`), not by percentile SLA thresholds.
-
----
-
-## 7. Open Questions (With Adopted Defaults)
-
-1. **OQ-1 (`ErrorCode` for budget exhaustion — Adopted Default: Add `ErrorCode.COST_CAP_EXCEEDED`):**
-   - Should exceeding `cost_cap_usd()` report a dedicated 9th enum constant `ErrorCode.COST_CAP_EXCEEDED` (`provider_code() == "CostCapExceeded"`), or reuse `ErrorCode.PRECONDITION_FAILED` with `provider_code() == "CostCapExceeded"`?
-   - **Default adopted in this design & schema:** `ErrorCode.COST_CAP_EXCEEDED` (gives scripts a direct enum check `last_error().code() == ErrorCode.COST_CAP_EXCEEDED` distinct from HTTP `412` conditional failures and `INVALID_ARGUMENT` validation errors).
-2. **OQ-2 (Whether transient `RetryPolicy` retries multiply `estimated_cost()` — Adopted Default: Charge 1 logical operation in `CostReport`, count retries in `MetricsReport`):**
-   - When `hostkit.RetryPolicy` retries a transient `429` or `503`, should `cost_report()` charge per HTTP attempt or per logical operation?
-   - **Default adopted in this design:** Charge **1 logical operation** in `cost_report()` (and count every retry/throttle in `cloud.metrics().total_retries()` / `total_throttles()`) so `estimated_cost()` and cost-cap boundaries remain 100% deterministic even under transient simulator or live-cloud retries.
-3. **OQ-3 (Behavior of `cloud.set_cost_cap_usd` in `--dry-run` mode — Adopted Default: Enforce cost cap identically in `--dry-run`):**
-   - Should `lmscript --dry-run` accumulate estimated costs and enforce `set_cost_cap_usd` against the dry overlay?
-   - **Default adopted in this design:** Yes — dry runs meter the previewed operations against the same embedded price table and enforce `COST_CAP_EXCEEDED`, allowing operators to preview script cost and catch budget overflows before running against a live cloud.
+1. **`RetryPolicy.Do` and `ListAll` Pre-Attempt Admission Hook:**
+   - `hostkit.RetryPolicy.Do` invokes an optional `BeforeAttempt func(ctx context.Context, attempt int) error` attached to `ctx` before **every** attempt (`attempt == 0, 1, ...`). If `BeforeAttempt` returns a `COST_CAP_EXCEEDED` `*CloudError`, `RetryPolicy.Do` aborts immediately without sleeping or transmitting the HTTP request.
+   - `hostkit.ListAll` invokes the page admission hook before each page call (`page == 0, 1, ...`), charging each page fetch as a distinct physical request.
+2. **Adapter `AttemptQuoter` & Multi-Step Probe Accounting:**
+   - Adapters that perform multi-step physical requests inside a single `ObjectStore` or `Queue` method (such as `lmaws` `HeadBucket` + `CreateBucket` + `ListQueueTags`, or `lmgcp` Pub/Sub topic + subscription creation) either route each HTTP request through `hostkit.DoHTTP` (which triggers `BeforeAttempt` per physical HTTP request) or implement `safety.AttemptQuoter` (`QuoteAttempt`) to reserve the exact multi-request tariff upfront.

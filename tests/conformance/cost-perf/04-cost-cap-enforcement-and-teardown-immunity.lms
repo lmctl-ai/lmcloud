@@ -1,4 +1,4 @@
-# Scenario 04: Cost cap enforcement (ErrorCode.COST_CAP_EXCEEDED) and teardown immunity for delete/ack operations.
+# Scenario 04: Cost cap enforcement (ErrorCode.COST_CAP_EXCEEDED) and reserved cleanup budget for delete/ack operations.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 bkt = "lmcloud-cp04-" + run_id + "-bkt";
@@ -18,10 +18,17 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.queue_create(q);
   cloud.queue_send(q, "msg-to-ack");
 
-  let msgs = cloud.queue_receive(q, 1, 2, 30);
-  let rcpt = msgs.len() > 0 ? msgs.at(0).receipt() : "";
+  let rcpt = "";
+  let poll = 0;
+  while (str_len(rcpt) == 0 && poll < 10) {
+    let msgs = cloud.queue_receive(q, 1, 1, 30);
+    if (msgs.len() > 0) {
+      rcpt = msgs.at(0).receipt();
+    }
+    poll = poll + 1;
+  }
 
-  # Lock the cost cap tightly to the current accrued cost so the next billable create/put is refused pre-flight.
+  # Narrow the work cost cap to the current accrued cost so the next billable non-teardown operation is refused pre-flight.
   let current_cost = cloud.estimated_cost();
   cloud.set_cost_cap_usd(current_cost);
 
@@ -40,7 +47,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let cost_after_refusals = cloud.estimated_cost();
   let rep_mid = cloud.cost_report();
 
-  # Teardown operations (queue_ack, object_delete, bucket_delete, queue_delete) MUST succeed even when cap is exhausted!
+  # Teardown operations (queue_ack, object_delete, bucket_delete, queue_delete) draw from the reserved cleanup headroom and succeed.
   if (str_len(rcpt) > 0) {
     cloud.queue_ack(q, rcpt);
   }
@@ -55,13 +62,13 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let qdel_ok = cloud.queue_delete(q);
   let err_qdel = cloud.last_error();
 
-  assert_close(cost_after_refusals, current_cost, 1e-9);
+  assert_close(cost_after_refusals, current_cost, 0.000000001);
 
   lmcode_return_put("put_refused", !put_blocked.exists() && err_put.code() == ErrorCode.COST_CAP_EXCEEDED && err_put.http_status() == 0 && err_put.provider_code() == "CostCapExceeded");
   lmcode_return_put("get_refused", str_len(get_blocked) == 0 && err_get.code() == ErrorCode.COST_CAP_EXCEEDED && err_get.http_status() == 0);
   lmcode_return_put("qsend_refused", str_len(qsend_blocked) == 0 && err_qsend.code() == ErrorCode.COST_CAP_EXCEEDED && err_qsend.http_status() == 0);
   lmcode_return_put("cap_exceeded_count_ok", rep_mid.cap_exceeded_count() == 3);
-  lmcode_return_put("teardown_immune_ok", err_ack.ok() && err_odel.ok() && bdel_ok && err_bdel.ok() && qdel_ok && err_qdel.ok());
+  lmcode_return_put("teardown_immune_ok", str_len(rcpt) > 0 && err_ack.ok() && err_odel.ok() && bdel_ok && err_bdel.ok() && qdel_ok && err_qdel.ok());
 end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
@@ -70,4 +77,4 @@ assert(r.result.put_refused, "object_put above cap must fail pre-flight with COS
 assert(r.result.get_refused, "object_get above cap must fail pre-flight with COST_CAP_EXCEEDED");
 assert(r.result.qsend_refused, "queue_send above cap must fail pre-flight with COST_CAP_EXCEEDED");
 assert(r.result.cap_exceeded_count_ok, "cost_report().cap_exceeded_count() must equal 3 after 3 refused operations");
-assert(r.result.teardown_immune_ok, "queue_ack, object_delete, bucket_delete, and queue_delete must succeed even when cost cap is exhausted");
+assert(r.result.teardown_immune_ok, "queue_ack, object_delete, bucket_delete, and queue_delete must succeed using reserved cleanup headroom");

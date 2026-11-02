@@ -33,7 +33,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.object_delete(b, "phase1.txt");
   cloud.bucket_delete(b);
 
-  assert_close(cost_after_reset, cost1, 1e-9);
+  assert_close(cost_after_reset, cost1, 0.000000001);
 
   lmcode_return_put("phase1_recorded", m1.total_calls() == 2 && m1.op("bucket_create").calls() == 1 && m1.op("object_put").calls() == 1);
   lmcode_return_put("reset_cleared_metrics", m_after_reset.total_calls() == 0 && m_after_reset.total_bytes_out() == 0 && m_after_reset.len() == 0 && m_after_reset.op("object_put").calls() == 0);

@@ -17,11 +17,11 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let rep = cloud.cost_report();
   let met = cloud.metrics();
 
-  assert_close(cap, 0.05, 1e-9);
-  assert_close(rep.cap_usd(), 0.05, 1e-9);
-  assert_close(rep.ceiling_usd(), 0.25, 1e-9);
-  assert_close(est, 0.0, 1e-12);
-  assert_close(rep.estimated_usd(), 0.0, 1e-12);
+  assert_close(cap, 0.05, 0.000000001);
+  assert_close(rep.cap_usd(), 0.05, 0.000000001);
+  assert_close(rep.ceiling_usd(), 0.25, 0.000000001);
+  assert_close(est, 0.0, 0.000000000001);
+  assert_close(rep.estimated_usd(), 0.0, 0.000000000001);
 
   lmcode_return_put("provider_ok", str_len(p) > 0);
   lmcode_return_put("ep_ok", str_len(ep) == 0 || str_len(ep_s) > 0);
