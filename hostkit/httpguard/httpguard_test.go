@@ -148,3 +148,29 @@ func TestEnforceClient(t *testing.T) {
 		t.Fatal("must keep an explicit timeout and never mutate the input")
 	}
 }
+
+// EnforceClient keeps an adapter's stricter redirect hook (lmazure strips
+// Authorization on every redirect; v3 first replaced the hook, a regression).
+func TestEnforceClientKeepsStricterRedirectHook(t *testing.T) {
+	srv := httpguard.New(t)
+	srv.Script(httpguard.RedirectTo("/next"), httpguard.Status(200, "{}"))
+	strict := &http.Client{CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+		req.Header.Del("Authorization")
+		return nil
+	}}
+	resp, _, err := call(t, strict, "GET", srv.URL, true, "SharedKey acct:sig")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	reqs := srv.Requests()
+	if len(reqs) != 2 || reqs[0].Authorization == "" || reqs[1].Authorization != "" {
+		t.Fatalf("adapter hook lost: %+v", reqs)
+	}
+	foreign := httpguard.New(t)
+	srv.Script(httpguard.RedirectTo(foreign.URL))
+	if _, _, err := call(t, strict, "GET", srv.URL, true, "x"); err == nil {
+		t.Fatal("same-origin check must still run before the adapter hook")
+	}
+	httpguard.AssertCount(t, foreign, "", 0)
+}

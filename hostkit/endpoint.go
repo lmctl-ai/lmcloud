@@ -256,12 +256,26 @@ func NewHTTPClient(timeout time.Duration) *http.Client {
 // no proxy from the environment. A nil c yields NewHTTPClient(0). DoHTTP
 // applies it to every client it is given (v3), so an adapter that builds its
 // own client cannot bypass the bounds by accident through DoHTTP.
+//
+// An existing CheckRedirect is kept and runs after the same-origin check, so
+// an adapter's stricter policy (e.g. stripping Authorization on every
+// redirect) still applies; EnforceClient can only make redirects stricter.
 func EnforceClient(c *http.Client) *http.Client {
 	if c == nil {
 		return NewHTTPClient(0)
 	}
 	out := *c
-	out.CheckRedirect = SameOriginRedirects(3)
+	sameOrigin := SameOriginRedirects(3)
+	if own := c.CheckRedirect; own != nil {
+		out.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if err := sameOrigin(req, via); err != nil {
+				return err
+			}
+			return own(req, via)
+		}
+	} else {
+		out.CheckRedirect = sameOrigin
+	}
 	if out.Timeout <= 0 {
 		out.Timeout = DefaultHTTPTimeout
 	}
