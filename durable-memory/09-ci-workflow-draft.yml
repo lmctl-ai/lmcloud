@@ -1,0 +1,128 @@
+# DRAFT ONLY: CI Workflow for Multi-Cloud Simulators & Conformance
+# Location: durable-memory/09-ci-workflow-draft.yml (Do NOT move to .github/workflows until enabled)
+
+name: CI Sim Harness & Conformance (Draft)
+
+on:
+  push:
+    branches: [main, sim-harness]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  LMCLOUD_SIM_DIR: ${{ github.workspace }}/.cache/sims
+  LMCLOUD_CLIENT_DIR: ${{ github.workspace }}/.cache/clients
+
+jobs:
+  test-simulators:
+    name: Sim Harness (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x64
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+          # Linux arm64
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          # macOS arm64 (Apple Silicon)
+          - os: macos
+            arch: arm64
+            runner: macos-latest
+          # NOTE: Windows runner is intentionally excluded from the matrix:
+          # lmaws v0.1.27 has no release asset for Windows.
+
+    # Example valkey service container for the future valkey slice
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 2s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        timeout-minutes: 5
+
+      - name: Setup Node.js & provision LMScript compiler
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+        timeout-minutes: 5
+
+      - name: Install pinned LMScript compiler
+        timeout-minutes: 5
+        run: |
+          npm install -g @lmctl-ai/lmctl@0.2.453
+          echo "LMSCRIPT_BIN=$(which lmscript)" >> "$GITHUB_ENV"
+          lmscript --version
+
+      - name: Cache Simulator & Client Binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/sims
+            .cache/clients
+          key: sims-clients-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('scripts/sims.lock', 'scripts/clients.lock') }}
+          restore-keys: |
+            sims-clients-${{ matrix.os }}-${{ matrix.arch }}-
+
+      - name: Fetch and verify simulator binaries
+        timeout-minutes: 5
+        run: |
+          chmod +x scripts/*.sh
+          scripts/fetch-sims.sh
+
+      - name: Fetch and verify client binaries
+        timeout-minutes: 5
+        run: |
+          scripts/fetch-clients.sh
+
+      - name: Run simulator wire smoke tests (plain curl round-trips)
+        timeout-minutes: 5
+        run: |
+          scripts/smoke-sim-wire.sh
+
+      - name: Run LMScript simulator harness tests
+        timeout-minutes: 5
+        run: |
+          # Currently runs without --strict (exiting 0 on PENDING-GO-PORT).
+          # Once the Go host ports are released, add --strict:
+          # scripts/test-sims-lmscript.sh --strict
+          scripts/test-sims-lmscript.sh
+
+      - name: Teardown simulators
+        if: always()
+        timeout-minutes: 2
+        run: |
+          echo "Executing CI teardown: stopping all simulator instances..."
+          for provider in aws azure gcp oci; do
+            scripts/sim.sh stop "$provider" || true
+          done
+
+      - name: Upload simulator logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-logs-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            .cache/sims/run/**/*.log
+            .cache/sims/run/**/pid
+            .cache/sims/run/**/port
+          retention-days: 7

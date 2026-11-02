@@ -1,0 +1,49 @@
+{
+  "lmaws": {
+    "version": "0.1.27",
+    "tag": "v0.1.27",
+    "repository": "lmctl-ai/lmaws",
+    "sha256": {
+      "lmaws-linux-arm64": "1fe130e3f849d03a91b6b8a04d5626b5658fa2ccfface08c758b486b39630d02",
+      "lmaws-linux-x64": "92f6db93eef43f5bbbff202edd8247a3bd3e69a68cc4f7a51271ac8488601635",
+      "lmaws-macos-arm64": "b79fdebce5abb576b8a274b2604b686a5cf0ef83759ddbf5bc061033ab1a2be8",
+      "lmaws-macos-x64": "ca7863e3bcd866344dfbd6bf7154b4e171ce3b8c2db27cafe38e9360c5856565"
+    }
+  },
+  "lmazure": {
+    "version": "0.1.5",
+    "tag": "v0.1.5",
+    "repository": "lmctl-ai/lmazure",
+    "sha256": {
+      "lmazure-linux-arm64": "4026b955cf653b3f517e0257149a0898df5421b072ad4a1e8a80d3692fbbe5b3",
+      "lmazure-linux-x64": "204fdde92efb2349eff0d7a45a49a45f54da935118f8e0c21cbdddd15da3239f",
+      "lmazure-macos-arm64": "24d4dc13b0ffc5d85d9f133ab94e92ee383893e26c6af6256f888c521dccdaf7",
+      "lmazure-macos-x64": "b30c30ab9b9bbed0526d12a38303cc6ad34e7a37bfce614e4e4712d14f07b26d",
+      "lmazure-windows-x64.exe": "6fd19404bb0ae57bc9a096f29278777816b96bab16cf3046ebb933e70b01a4fa"
+    }
+  },
+  "lmgcp": {
+    "version": "0.1.9",
+    "tag": "v0.1.9",
+    "repository": "lmctl-ai/lmgcp",
+    "sha256": {
+      "lmgcp-linux-arm64": "375ef57cb65c25e061aecf43598a0624bb49d4cea158aed953de7350041eeb99",
+      "lmgcp-linux-x64": "71957c68e4317c9b33eb63fd8ade5747101e48fe299cd4b97a68d3824085f712",
+      "lmgcp-macos-arm64": "94a1eacff1f46abc7ee3f7bc1cf1ae056f7f4518fc6a15e33dcadf3596bf3ed4",
+      "lmgcp-macos-x64": "1aeb00e454684b07a21fcbb352ed4bd1ebd661cb08ca0f4262873e1d1044d9c7",
+      "lmgcp-windows-x64.exe": "bce5a8c5cfffa4a54b11838b6f9ff41c362f64023056655631e634dcc04e47e6"
+    }
+  },
+  "lmoci": {
+    "version": "0.1.0",
+    "tag": "v0.1.0",
+    "repository": "lmctl-ai/lmoci",
+    "sha256": {
+      "lmoci-linux-arm64": "de8b053c6ff8cf683f0fa079a332c8bd69569911b989263a88ca0506feca85f8",
+      "lmoci-linux-x64": "a22661745a682e6321cf61fabd6afbcbb10f77f188bae271c0c7db2b1870de65",
+      "lmoci-macos-arm64": "efa7de19c90e26adde453ecb5a0512308cea9c3fd47bc6fa7d300f277217106a",
+      "lmoci-macos-x64": "5e565afbaf590f63f553bb5cdda7dd854c1d2df7ff8507ae12383452a00015f9",
+      "lmoci-windows-x64.exe": "3f5419d4049928bd6ae1738e7b5ad0ad25ee43f73dfb5b7380b0f2d3779f2326"
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "awssim": {
+    "version": "0.2.0",
+    "tag": "v0.2.0",
+    "repository": "lmctl-ai/awssim",
+    "sha256": {
+      "awssim-linux-arm64": "55aa8a5b0d8205728ea7219b96b1a89502cc0c453577a4f42abf67fbb897e1ff",
+      "awssim-linux-x64": "0497a99365442eca5ebbe5b218197ea7a3cc9f77a0400af5b173db91b6ee0436",
+      "awssim-macos-arm64": "8d9ada33de3dca03fa1d319ed916f1fd59b89054b1037adcd58c167361c2d443",
+      "awssim-macos-x64": "f382acb81b01c113a05395c98523e9f2855b69aaad2b8b8481b52a708f521f50",
+      "awssim-windows-x64.exe": "8a95452550fb96f93bfdbea3a3aebd99320ffea83ef44b24ec86055a2936faff"
+    }
+  },
+  "azuresim": {
+    "version": "0.2.0",
+    "tag": "v0.2.0",
+    "repository": "lmctl-ai/azuresim",
+    "sha256": {
+      "azuresim-linux-arm64": "d75ee47511292a63f07efded091aac7159c82107e1d86f5198510621381e308b",
+      "azuresim-linux-x64": "05b24456cc5b7f8aebe676f55aba4415c5357157b6bb7e48c71f40d809511147",
+      "azuresim-macos-arm64": "c80c5665634658a590883311504362fc37c8a3d54d7b7330c2a61ee0eabe85c2",
+      "azuresim-macos-x64": "9b60ec1370dc12862cbb92a099f916b3b6234cf05d6674555de73d2c5fa311c1",
+      "azuresim-windows-x64.exe": "954bce2f9976c7aef1d7d01f2986b218d7da368ae93307a191ad94c10d38aeb5"
+    }
+  },
+  "gcpsim": {
+    "version": "0.2.0",
+    "tag": "v0.2.0",
+    "repository": "lmctl-ai/gcpsim",
+    "sha256": {
+      "gcpsim-linux-arm64": "c5f131260e2f19d7f74f338680360be747e38f70f9c04b26fd023e246d756c15",
+      "gcpsim-linux-x64": "87e038066bbc681ab1a12c6ff55bd42f7a79866fe187754466940ffd6a47bea6",
+      "gcpsim-macos-arm64": "6dccc3e6a3de913e163e991b993571215fe66d82d0488e4fd411d920d77ac8cb",
+      "gcpsim-macos-x64": "fcd5a15a884c22d10633d9c53878c8fe3a2c427527b1f65eb2c7d84c1050f89f",
+      "gcpsim-windows-x64.exe": "9ca8de76814f4244b7c6b075d8eafed30213f3e2d07c0c2c37fb5f90f7ad4f37"
+    }
+  },
+  "ocisim": {
+    "version": "0.1.0",
+    "tag": "v0.1.0",
+    "repository": "lmctl-ai/ocisim",
+    "sha256": {
+      "ocisim-linux-arm64": "24c37f00e86a0903396a7c518bfba1f70a3a3376d155eeb3ae5dab63641d7add",
+      "ocisim-linux-x64": "fb71496c5d2aaa6d4a26e4d97520d83933632236acf6f2baa7b9d3fe7bf44f3d",
+      "ocisim-macos-arm64": "c0211631afe784591c5f6138bc3b280b97c5224e0b09730f988416f6f05399d6",
+      "ocisim-macos-x64": "c850533ebb0fdf2028704bdf84a1e91e1782cb696a6a2d3783eb29ab5715e926",
+      "ocisim-windows-x64.exe": "7c8fcf94b540d829b3a7973d41984ef404b499389cb44d66e792b6cb27b4ffe4"
+    }
+  }
+}
