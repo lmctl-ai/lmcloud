@@ -1,0 +1,47 @@
+# Scenario 05: Object overwrite and normalized ETag updates.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+bucket = "lmcloud-conf-05-etag";
+key = "state/version.txt";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint(ep);
+  }
+  let b = ${bucket};
+  let k = ${key};
+
+  if (cloud.bucket_exists(b)) {
+    cloud.object_delete(b, k);
+    cloud.bucket_delete(b);
+  }
+  cloud.bucket_create(b);
+
+  let put1 = cloud.object_put(b, k, "v1-initial");
+  let head1 = cloud.object_head(b, k);
+  let etag1 = head1.etag();
+
+  let put2 = cloud.object_put(b, k, "v2-updated-payload");
+  let head2 = cloud.object_head(b, k);
+  let etag2 = head2.etag();
+  let body2 = cloud.object_get(b, k);
+
+  cloud.object_delete(b, k);
+  cloud.bucket_delete(b);
+
+  lmcode_return_put("size1", head1.size());
+  lmcode_return_put("size2", head2.size());
+  lmcode_return_put("etag1_nonempty", str_len(etag1) > 0 && str_len(put1.etag()) > 0);
+  lmcode_return_put("etag2_nonempty", str_len(etag2) > 0 && str_len(put2.etag()) > 0);
+  lmcode_return_put("etag_unquoted", !str_starts_with(etag1, "\"") && !str_ends_with(etag1, "\"") && !str_starts_with(etag2, "\"") && !str_ends_with(etag2, "\""));
+  lmcode_return_put("etag_changed", etag1 != etag2);
+  lmcode_return_put("body2", body2);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "05-object-overwrite-and-etag failed");
+assert(r.result.size1 == 10 && r.result.size2 == 18, "object size should update after overwrite");
+assert(r.result.etag1_nonempty && r.result.etag2_nonempty, "ETag must be non-empty on put and head");
+assert(r.result.etag_unquoted, "ETag must be normalized without surrounding double quotes");
+assert(r.result.etag_changed, "ETag must change when payload changes");
+assert(r.result.body2 == "v2-updated-payload", "object_get must return overwritten body");

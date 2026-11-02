@@ -34,6 +34,8 @@ r = run_lmcode(p, options={command: ["lmaws"]});
 | Provider identity | `cloud.provider() -> string` | Returns `"aws"`, `"azure"`, `"gcp"`, or `"oci"`. |
 | Endpoint config | `cloud.endpoint() -> string` | Active base endpoint URL (empty string when using default live cloud endpoints). |
 | Endpoint override | `cloud.set_endpoint(url: string) -> self` | Overrides the storage endpoint at runtime (e.g. `http://127.0.0.1:4566`). |
+| Error abort mode | `cloud.abort_on_error() -> bool` | Whether non-probe errors abort the `_lmcode_` block (`true` by default). |
+| Set abort mode | `cloud.set_abort_on_error(abort: bool) -> self` | Toggles whether failed operations abort (`true`, default) or return a sentinel value and record `cloud.last_error()` (`false`). |
 | Error inspection | `cloud.last_error() -> CloudError` | Structured error from the most recent operation (`ErrorCode.OK` if none). |
 | Bucket create | `cloud.bucket_create(bucket: string) -> bool` | Ensures `bucket` exists in the active scope. Returns `true` if newly created, `false` if already existed and owned by the caller's scope. Fails on invalid name or foreign bucket conflict. |
 | Bucket delete | `cloud.bucket_delete(bucket: string) -> bool` | Deletes an empty `bucket`. Returns `true` if deleted, `false` if already absent. Fails with `ErrorCode.CONFLICT` if the bucket is non-empty. |
@@ -202,3 +204,21 @@ The following features are excluded from the v1 `lmcloud` object storage slice b
 5. **Bucket ACLs, public-access blocks, CORS, lifecycle policies & KMS key management:** Declarative/IAM concerns outside the procedural data-plane slice.
 6. **Bucket-level tags:** Azure Blob containers use `x-ms-meta-*` headers, GCS buckets use lowercase labels, and S3/OCI use tag sets.
 7. **Byte-range `GET` and conditional `If-Match` / `If-None-Match` mutations:** Deferred to a future slice if required.
+
+---
+
+## 9. Decisions
+
+1. **Error signaling mode (abort-by-default + `set_abort_on_error`):**
+   - By default (`cloud.abort_on_error() == true`), failed operations (`NOT_FOUND` on `object_get` or missing bucket, `CONFLICT` on non-empty `bucket_delete` or foreign bucket, `INVALID_ARGUMENT`, `UNAUTHENTICATED`, `PERMISSION_DENIED`, `INTERNAL`) abort the `_lmcode_` program with a located `RUN_HOST` error (`r.ok == false`) whose message begins with the bracketed uniform code (`[NOT_FOUND] ...`, `[CONFLICT] ...`, `[INVALID_ARGUMENT] ...`, `[UNAUTHENTICATED] ...`, `[PERMISSION_DENIED] ...`).
+   - Existence probes (`bucket_exists`, and `object_head` when the bucket exists and the key is absent) and idempotent no-ops (`bucket_create` on an already-owned bucket, `bucket_delete` on a missing bucket, `object_delete` on a missing key in an existing bucket) succeed without aborting and set `cloud.last_error()` to `ErrorCode.OK`.
+   - Calling `cloud.set_abort_on_error(false)` allows `_lmcode_` programs to test multiple negative cases in a single run and inspect `cloud.last_error()` (`code()`, `http_status()`, `provider_code()`, `message()`) directly.
+2. **Flat method naming on `cloud`:**
+   - All object storage operations live directly on `cloud` with noun prefixes (`bucket_*`, `object_*`), matching the upcoming queue slice (`queue_*`).
+3. **Azure non-empty `bucket_delete` parity:**
+   - `lmazure` performs a pre-flight `maxresults=1` blob list check before container deletion and fails with `ErrorCode.CONFLICT` (`BucketNotEmpty`) if any blob is present, matching S3, GCS, and OCI.
+4. **Strict portable metadata key grammar:**
+   - All four hosts enforce `^[a-z][a-z0-9_]{0,62}$` pre-flight on custom metadata keys and fail with `ErrorCode.INVALID_ARGUMENT` (`http_status() == 0`) before any network I/O.
+5. **Simulator test boundary:**
+   - Simulators (`awssim`, `azuresim`, `gcpsim`, `ocisim`) are driven **exclusively** by `lmscript` programs through the `lmcode` host binary (`lm<provider>`), never via `curl` or out-of-band HTTP requests.
+

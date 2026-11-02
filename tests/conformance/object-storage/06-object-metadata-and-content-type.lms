@@ -1,0 +1,43 @@
+# Scenario 06: Explicit content_type and custom StrMap metadata normalization.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+bucket = "lmcloud-conf-06-meta";
+key = "meta/config.json";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint(ep);
+  }
+  let b = ${bucket};
+  let k = ${key};
+
+  if (cloud.bucket_exists(b)) {
+    cloud.object_delete(b, k);
+    cloud.bucket_delete(b);
+  }
+  cloud.bucket_create(b);
+
+  let m_in = str_map().set("env", "staging").set("build_id", "42");
+  cloud.object_put(b, k, "{\"ok\":true}", "application/json", m_in);
+
+  let h = cloud.object_head(b, k);
+  let m_out = h.metadata();
+
+  cloud.object_delete(b, k);
+  cloud.bucket_delete(b);
+
+  lmcode_return_put("content_type", h.content_type());
+  lmcode_return_put("meta_count", m_out.len());
+  lmcode_return_put("env", m_out.get_or("env", ""));
+  lmcode_return_put("build_id", m_out.get_or("build_id", ""));
+  lmcode_return_put("no_amz_prefix", !m_out.has("x-amz-meta-env"));
+  lmcode_return_put("no_ms_prefix", !m_out.has("x-ms-meta-env"));
+  lmcode_return_put("no_opc_prefix", !m_out.has("opc-meta-env"));
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "06-object-metadata-and-content-type failed");
+assert(r.result.content_type == "application/json", "content_type should round-trip as application/json");
+assert(r.result.meta_count == 2, "metadata map should contain 2 user entries");
+assert(r.result.env == "staging" && r.result.build_id == "42", "custom metadata values should match");
+assert(r.result.no_amz_prefix && r.result.no_ms_prefix && r.result.no_opc_prefix, "provider metadata header prefixes must be stripped");

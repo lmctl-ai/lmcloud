@@ -1,0 +1,53 @@
+# Scenario 01: Bucket create, exists, list (sorted), and delete lifecycle.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+b1 = "lmcloud-conf-01-alpha";
+b2 = "lmcloud-conf-01-beta";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint(ep);
+  }
+  let name1 = ${b1};
+  let name2 = ${b2};
+
+  # Ensure clean starting state
+  cloud.bucket_delete(name1);
+  cloud.bucket_delete(name2);
+
+  let existed_before = cloud.bucket_exists(name1);
+  let created2 = cloud.bucket_create(name2);
+  let created1 = cloud.bucket_create(name1);
+  let exists1 = cloud.bucket_exists(name1);
+  let exists2 = cloud.bucket_exists(name2);
+
+  let buckets = cloud.bucket_list();
+  let idx1 = buckets.index_of(name1);
+  let idx2 = buckets.index_of(name2);
+
+  let deleted1 = cloud.bucket_delete(name1);
+  let deleted2 = cloud.bucket_delete(name2);
+  let exists_after1 = cloud.bucket_exists(name1);
+  let exists_after2 = cloud.bucket_exists(name2);
+
+  lmcode_return_put("existed_before", existed_before);
+  lmcode_return_put("created1", created1);
+  lmcode_return_put("created2", created2);
+  lmcode_return_put("exists1", exists1);
+  lmcode_return_put("exists2", exists2);
+  lmcode_return_put("found_both", idx1 >= 0 && idx2 >= 0);
+  lmcode_return_put("sorted_order", idx1 < idx2);
+  lmcode_return_put("deleted1", deleted1);
+  lmcode_return_put("deleted2", deleted2);
+  lmcode_return_put("exists_after", exists_after1 || exists_after2);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "01-bucket-lifecycle host execution failed");
+assert(!r.result.existed_before, "bucket should not exist before create");
+assert(r.result.created1 && r.result.created2, "bucket_create should return true for new buckets");
+assert(r.result.exists1 && r.result.exists2, "bucket_exists should return true after create");
+assert(r.result.found_both, "bucket_list should include both created buckets");
+assert(r.result.sorted_order, "bucket_list should return buckets in ascending lexicographical order");
+assert(r.result.deleted1 && r.result.deleted2, "bucket_delete should return true for existing empty buckets");
+assert(!r.result.exists_after, "bucket_exists should return false after delete");

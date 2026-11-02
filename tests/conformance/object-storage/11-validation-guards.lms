@@ -1,0 +1,82 @@
+# Scenario 11: Pre-flight INVALID_ARGUMENT validation for bucket names, object keys, metadata keys, and max_keys.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+bucket = "lmcloud-conf-11-valid";
+
+# 1. Default abort mode: invalid bucket name aborts before network I/O
+abort_invalid = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint(ep);
+  }
+  cloud.bucket_create("Bad_Bucket_Name");
+end _lmcode_
+
+r_abort = run_lmcode(abort_invalid, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(!r_abort.ok, "invalid bucket name must abort in default mode");
+
+# 2. Detailed pre-flight validation checks (http_status() == 0, code() == ErrorCode.INVALID_ARGUMENT)
+checks_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint(ep);
+  }
+  let b = ${bucket};
+  cloud.set_abort_on_error(false);
+
+  cloud.bucket_create("Bad_Bucket");
+  let e_underscore = cloud.last_error();
+
+  cloud.bucket_create("bad--double-hyphen");
+  let e_double_hyphen = cloud.last_error();
+
+  cloud.bucket_create("ab");
+  let e_short = cloud.last_error();
+
+  cloud.object_put(b, "/leading-slash.txt", "x");
+  let e_leading_slash = cloud.last_error();
+
+  cloud.object_put(b, "empty//segment.txt", "x");
+  let e_double_slash = cloud.last_error();
+
+  cloud.object_put(b, "dot/../escape.txt", "x");
+  let e_dot_segment = cloud.last_error();
+
+  let bad_meta1 = str_map().set("bad-hyphen", "v");
+  cloud.object_put(b, "valid.txt", "x", "text/plain", bad_meta1);
+  let e_meta_hyphen = cloud.last_error();
+
+  let bad_meta2 = str_map().set("1leading_digit", "v");
+  cloud.object_put(b, "valid.txt", "x", "text/plain", bad_meta2);
+  let e_meta_digit = cloud.last_error();
+
+  cloud.object_list(b, "", 1001, "");
+  let e_max_keys = cloud.last_error();
+
+  let all_invalid = e_underscore.code() == ErrorCode.INVALID_ARGUMENT
+    && e_double_hyphen.code() == ErrorCode.INVALID_ARGUMENT
+    && e_short.code() == ErrorCode.INVALID_ARGUMENT
+    && e_leading_slash.code() == ErrorCode.INVALID_ARGUMENT
+    && e_double_slash.code() == ErrorCode.INVALID_ARGUMENT
+    && e_dot_segment.code() == ErrorCode.INVALID_ARGUMENT
+    && e_meta_hyphen.code() == ErrorCode.INVALID_ARGUMENT
+    && e_meta_digit.code() == ErrorCode.INVALID_ARGUMENT
+    && e_max_keys.code() == ErrorCode.INVALID_ARGUMENT;
+
+  let all_preflight = e_underscore.http_status() == 0
+    && e_double_hyphen.http_status() == 0
+    && e_short.http_status() == 0
+    && e_leading_slash.http_status() == 0
+    && e_double_slash.http_status() == 0
+    && e_dot_segment.http_status() == 0
+    && e_meta_hyphen.http_status() == 0
+    && e_meta_digit.http_status() == 0
+    && e_max_keys.http_status() == 0;
+
+  lmcode_return_put("all_invalid", all_invalid);
+  lmcode_return_put("all_preflight", all_preflight);
+end _lmcode_
+
+r = run_lmcode(checks_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "11-validation-guards inspection run failed");
+assert(r.result.all_invalid, "all non-portable names/keys/metadata/max_keys must report ErrorCode.INVALID_ARGUMENT");
+assert(r.result.all_preflight, "all pre-flight validation errors must report http_status() == 0");

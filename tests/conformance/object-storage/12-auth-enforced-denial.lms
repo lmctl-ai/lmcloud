@@ -1,0 +1,45 @@
+# Scenario 12: Auth-enforced denial (UNAUTHENTICATED vs PERMISSION_DENIED) must never masquerade as exists==false.
+# Note: When run against <provider>sim --auth enforce with a policy denying "lmcloud-conf-12-denied",
+# both bucket_create and bucket_exists must fail with UNAUTHENTICATED or PERMISSION_DENIED (never silently returning false).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+denied_bucket = "lmcloud-conf-12-denied";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint(ep);
+  }
+  let b = ${denied_bucket};
+  cloud.set_abort_on_error(false);
+
+  let created = cloud.bucket_create(b);
+  let create_err = cloud.last_error();
+
+  # If the simulator is running in --auth enforce mode with a deny policy on lmcloud-conf-12-denied,
+  # create_err.code() is UNAUTHENTICATED or PERMISSION_DENIED, and bucket_exists must also report an auth error.
+  let enforced = create_err.code() == ErrorCode.UNAUTHENTICATED || create_err.code() == ErrorCode.PERMISSION_DENIED;
+  let exists_probe = false;
+  let probe_auth_err = true;
+
+  if (enforced) {
+    exists_probe = cloud.bucket_exists(b);
+    let probe_err = cloud.last_error();
+    probe_auth_err = probe_err.code() == ErrorCode.UNAUTHENTICATED || probe_err.code() == ErrorCode.PERMISSION_DENIED;
+  } else {
+    # Open mode cleanup so the scenario leaves zero state behind when run in open mode
+    if (created || cloud.bucket_exists(b)) {
+      cloud.bucket_delete(b);
+    }
+  }
+
+  lmcode_return_put("enforced", enforced);
+  lmcode_return_put("exists_probe", exists_probe);
+  lmcode_return_put("probe_auth_err", probe_auth_err);
+  lmcode_return_put("clean_in_open_mode", enforced || create_err.code() == ErrorCode.OK);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "12-auth-enforced-denial failed");
+assert(!r.result.exists_probe, "denied bucket must not report exists == true");
+assert(r.result.probe_auth_err, "in enforce mode, bucket_exists on a denied bucket must set UNAUTHENTICATED or PERMISSION_DENIED");
+assert(r.result.clean_in_open_mode, "open mode execution must succeed and clean up");

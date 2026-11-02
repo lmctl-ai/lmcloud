@@ -1,0 +1,55 @@
+# Scenario 08: Object list pagination across multiple pages with max_keys and next_token.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+bucket = "lmcloud-conf-08-page";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint(ep);
+  }
+  let b = ${bucket};
+  let keys_in = str_list().add("items/k1").add("items/k2").add("items/k3").add("items/k4").add("items/k5");
+
+  if (cloud.bucket_exists(b)) {
+    for (k in keys_in) {
+      cloud.object_delete(b, k);
+    }
+    cloud.bucket_delete(b);
+  }
+  cloud.bucket_create(b);
+
+  for (k in keys_in) {
+    cloud.object_put(b, k, k);
+  }
+
+  let visited = str_list();
+  let pages = 0;
+  let token = "";
+  let more = true;
+  while (more && pages < 10) {
+    let page = cloud.object_list(b, "items/", 2, token);
+    pages = pages + 1;
+    for (item in page) {
+      visited.add(item.key());
+    }
+    more = page.has_more();
+    token = page.next_token();
+  }
+
+  for (k in keys_in) {
+    cloud.object_delete(b, k);
+  }
+  cloud.bucket_delete(b);
+
+  lmcode_return_put("pages", pages);
+  lmcode_return_put("visited_count", visited.len());
+  lmcode_return_put("visited_joined", visited.join(","));
+  lmcode_return_put("final_token_empty", str_len(token) == 0);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "08-object-list-pagination failed");
+assert(r.result.pages == 3, "5 objects with max_keys=2 should span 3 pages (2 + 2 + 1)");
+assert(r.result.visited_count == 5, "pagination must visit all 5 objects without duplicates");
+assert(r.result.visited_joined == "items/k1,items/k2,items/k3,items/k4,items/k5", "paginated keys must be in exact lexicographical order");
+assert(r.result.final_token_empty, "next_token on the final page must be empty");

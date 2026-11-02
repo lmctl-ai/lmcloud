@@ -170,6 +170,18 @@
             "returns": "self"
           }
         ],
+        "abort_on_error": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ],
+        "set_abort_on_error": [
+          {
+            "params": ["bool"],
+            "returns": "self"
+          }
+        ],
         "last_error": [
           {
             "params": [],

@@ -1,0 +1,49 @@
+# Scenario 04: Zero-byte empty object and raw binary payload (NUL + non-UTF-8 bytes) round-trip.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+bucket = "lmcloud-conf-04-binary";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint(ep);
+  }
+  let b = ${bucket};
+  let k_empty = "bin/empty.bin";
+  let k_raw = "bin/raw.bin";
+  let hex_in = "00fffe41007f80810a";
+  let raw_in = str_hex_decode(hex_in);
+
+  if (cloud.bucket_exists(b)) {
+    cloud.object_delete(b, k_empty);
+    cloud.object_delete(b, k_raw);
+    cloud.bucket_delete(b);
+  }
+  cloud.bucket_create(b);
+
+  let m_empty = cloud.object_put(b, k_empty, "");
+  let h_empty = cloud.object_head(b, k_empty);
+  let out_empty = cloud.object_get(b, k_empty);
+
+  let m_raw = cloud.object_put(b, k_raw, raw_in);
+  let h_raw = cloud.object_head(b, k_raw);
+  let out_raw = cloud.object_get(b, k_raw);
+  let hex_out = str_hex_encode(out_raw);
+
+  cloud.object_delete(b, k_empty);
+  cloud.object_delete(b, k_raw);
+  cloud.bucket_delete(b);
+
+  lmcode_return_put("empty_exists", h_empty.exists() && m_empty.exists());
+  lmcode_return_put("empty_size", h_empty.size());
+  lmcode_return_put("empty_len", str_len(out_empty));
+  lmcode_return_put("raw_size", h_raw.size());
+  lmcode_return_put("raw_len", str_len(out_raw));
+  lmcode_return_put("hex_in", hex_in);
+  lmcode_return_put("hex_out", hex_out);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "04-object-binary-and-empty-roundtrip failed");
+assert(r.result.empty_exists && r.result.empty_size == 0 && r.result.empty_len == 0, "zero-byte object should have size 0");
+assert(r.result.raw_size == 9 && r.result.raw_len == 9, "binary object should preserve 9-byte length");
+assert(r.result.hex_out == r.result.hex_in, "binary object should round-trip NUL and non-UTF-8 bytes verbatim");

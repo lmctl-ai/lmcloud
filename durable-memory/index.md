@@ -5,5 +5,5 @@
 - Initial scope: object storage and queue, the services all four emulators support.
 - Tests execute against `<provider>sim`; each `lm<provider>` additionally tests every function against its own sim.
 - Hosts are Go, built on `lmctl-ai/lmcode-go`; reference sample: `lmctl-ai/lmcode-go-sample`.
-- [02-object-storage-design.md](02-object-storage-design.md): shared object storage operations, types, per-provider/simulator mapping, naming/idempotency/error rules, and exclusions.
-- [03-object-storage-conformance.md](03-object-storage-conformance.md): 12 cross-provider conformance scenarios for object storage.
+- [02-object-storage-design.md](02-object-storage-design.md): shared object storage operations, types, per-provider/simulator mapping, naming/idempotency/error rules, exclusions, and operator decisions.
+- [03-object-storage-conformance.md](03-object-storage-conformance.md): 12 cross-provider conformance scenarios (`tests/conformance/object-storage/01..12-*.lms`), runner (`tests/run-conformance.sh`), and simulator enhancements. All `.lms` tests pass `lmscript --check` statically; runtime execution awaits implementation of the Go `lm<provider>` hosts.

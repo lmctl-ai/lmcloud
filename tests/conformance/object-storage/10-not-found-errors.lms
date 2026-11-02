@@ -1,0 +1,73 @@
+# Scenario 10: NOT_FOUND errors vs non-throwing existence probes (bucket_exists / object_head).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+bucket = "lmcloud-conf-10-notfound";
+missing_bucket = "lmcloud-conf-10-absent";
+
+# 1. Default abort mode: object_get on missing bucket must abort with [NOT_FOUND]
+abort_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint(ep);
+  }
+  cloud.bucket_delete(${missing_bucket});
+  cloud.object_get(${missing_bucket}, "no-such-key.txt");
+end _lmcode_
+
+r_abort = run_lmcode(abort_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(!r_abort.ok, "object_get on non-existent bucket must abort in default mode");
+
+# 2. Probe vs NOT_FOUND inspection across bucket and object operations
+inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint(ep);
+  }
+  let b = ${bucket};
+  let mb = ${missing_bucket};
+
+  cloud.bucket_delete(mb);
+  if (cloud.bucket_exists(b)) {
+    cloud.bucket_delete(b);
+  }
+  cloud.bucket_create(b);
+
+  # Probes on missing bucket / missing key in existing bucket do NOT fail
+  let mb_exists = cloud.bucket_exists(mb);
+  let mb_probe_err = cloud.last_error();
+
+  let missing_head = cloud.object_head(b, "missing-key.txt");
+  let head_probe_err = cloud.last_error();
+
+  # Operations on missing bucket or object_get on missing key record ErrorCode.NOT_FOUND
+  cloud.set_abort_on_error(false);
+  cloud.object_get(b, "missing-key.txt");
+  let get_missing_key_err = cloud.last_error();
+
+  cloud.object_head(mb, "any.txt");
+  let head_missing_bucket_err = cloud.last_error();
+
+  cloud.object_list(mb, "");
+  let list_missing_bucket_err = cloud.last_error();
+
+  cloud.object_delete(mb, "any.txt");
+  let del_missing_bucket_err = cloud.last_error();
+
+  cloud.set_abort_on_error(true);
+  cloud.bucket_delete(b);
+
+  lmcode_return_put("mb_exists", mb_exists);
+  lmcode_return_put("mb_probe_ok", mb_probe_err.code() == ErrorCode.OK);
+  lmcode_return_put("missing_head_exists", missing_head.exists());
+  lmcode_return_put("head_probe_ok", head_probe_err.code() == ErrorCode.OK);
+  lmcode_return_put("get_key_nf", get_missing_key_err.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("head_mb_nf", head_missing_bucket_err.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("list_mb_nf", list_missing_bucket_err.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("del_mb_nf", del_missing_bucket_err.code() == ErrorCode.NOT_FOUND);
+end _lmcode_
+
+r = run_lmcode(inspect_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "10-not-found-errors inspection run failed");
+assert(!r.result.mb_exists && r.result.mb_probe_ok, "bucket_exists on missing bucket must return false with ErrorCode.OK");
+assert(!r.result.missing_head_exists && r.result.head_probe_ok, "object_head on missing key in existing bucket must return exists()==false with ErrorCode.OK");
+assert(r.result.get_key_nf, "object_get on missing key must set ErrorCode.NOT_FOUND");
+assert(r.result.head_mb_nf && r.result.list_mb_nf && r.result.del_mb_nf, "operations on a missing bucket must set ErrorCode.NOT_FOUND");

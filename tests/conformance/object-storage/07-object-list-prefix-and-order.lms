@@ -1,0 +1,55 @@
+# Scenario 07: Object list with prefix filtering and lexicographical UTF-8 key order.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+bucket = "lmcloud-conf-07-prefix";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint(ep);
+  }
+  let b = ${bucket};
+
+  if (cloud.bucket_exists(b)) {
+    cloud.object_delete(b, "logs/2026/a.txt");
+    cloud.object_delete(b, "logs/2026/b.txt");
+    cloud.object_delete(b, "logs/2025/c.txt");
+    cloud.object_delete(b, "root.txt");
+    cloud.bucket_delete(b);
+  }
+  cloud.bucket_create(b);
+
+  # Insert out of lexicographical order to verify sorted output
+  cloud.object_put(b, "root.txt", "root-body");
+  cloud.object_put(b, "logs/2026/b.txt", "b26");
+  cloud.object_put(b, "logs/2025/c.txt", "c25");
+  cloud.object_put(b, "logs/2026/a.txt", "a26");
+
+  let sub_page = cloud.object_list(b, "logs/2026/");
+  let all_page = cloud.object_list(b, "");
+
+  let sub_joined = sub_page.keys().join(",");
+  let all_joined = all_page.keys().join(",");
+  let first_summary = sub_page.at(0);
+
+  cloud.object_delete(b, "logs/2026/a.txt");
+  cloud.object_delete(b, "logs/2026/b.txt");
+  cloud.object_delete(b, "logs/2025/c.txt");
+  cloud.object_delete(b, "root.txt");
+  cloud.bucket_delete(b);
+
+  lmcode_return_put("sub_len", sub_page.len());
+  lmcode_return_put("sub_joined", sub_joined);
+  lmcode_return_put("all_len", all_page.len());
+  lmcode_return_put("all_joined", all_joined);
+  lmcode_return_put("first_key", first_summary.key());
+  lmcode_return_put("first_size", first_summary.size());
+  lmcode_return_put("first_etag_ok", str_len(first_summary.etag()) > 0);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "07-object-list-prefix-and-order failed");
+assert(r.result.sub_len == 2, "prefix logs/2026/ should match 2 objects");
+assert(r.result.sub_joined == "logs/2026/a.txt,logs/2026/b.txt", "prefix list must be sorted lexicographically");
+assert(r.result.all_len == 4, "empty prefix should match all 4 objects");
+assert(r.result.all_joined == "logs/2025/c.txt,logs/2026/a.txt,logs/2026/b.txt,root.txt", "full list must be sorted lexicographically");
+assert(r.result.first_key == "logs/2026/a.txt" && r.result.first_size == 3 && r.result.first_etag_ok, "ObjectSummary fields must be populated");
