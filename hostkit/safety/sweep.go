@@ -168,7 +168,7 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 		ref := ResourceRef{
 			Kind:       entry.Kind,
 			Parent:     entry.Parent,
-			Location:    nonEmptyReason(entry.Location, meta.Region),
+			Location:   nonEmptyReason(entry.Location, meta.Region),
 			Name:       entry.Name,
 			ProviderID: entry.ProviderID,
 		}

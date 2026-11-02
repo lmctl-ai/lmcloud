@@ -48,12 +48,12 @@ func NanoToUSD(nano int64) float64 {
 
 // OperationTariff defines the worst-case pricing components for one cloud operation.
 type OperationTariff struct {
-	RequestNanoUSD          int64 `json:"request_nano_usd"`
-	ChunkBytes              int64 `json:"chunk_bytes,omitempty"`
-	StorageGiBMonthNanoUSD  int64 `json:"storage_gib_month_nano_usd,omitempty"`
-	MinDurationSeconds      int64 `json:"min_duration_seconds,omitempty"`
-	EgressGiBNanoUSD        int64 `json:"egress_gib_nano_usd,omitempty"`
-	CleanupReserveNanoUSD   int64 `json:"cleanup_reserve_nano_usd,omitempty"`
+	RequestNanoUSD         int64 `json:"request_nano_usd"`
+	ChunkBytes             int64 `json:"chunk_bytes,omitempty"`
+	StorageGiBMonthNanoUSD int64 `json:"storage_gib_month_nano_usd,omitempty"`
+	MinDurationSeconds     int64 `json:"min_duration_seconds,omitempty"`
+	EgressGiBNanoUSD       int64 `json:"egress_gib_nano_usd,omitempty"`
+	CleanupReserveNanoUSD  int64 `json:"cleanup_reserve_nano_usd,omitempty"`
 }
 
 // PriceTable holds the verified tariff schedule for one (provider, region).

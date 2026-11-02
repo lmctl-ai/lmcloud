@@ -20,3 +20,5 @@ func unlockJournalFile(_ *os.File) error {
 func verifyFileOwnerUID(_ os.FileInfo, _ string) error {
 	return errors.New("live journal ownership verification is not supported on Windows; live mode is refused on Windows")
 }
+
+func ignoreSIGXFSZ() {}

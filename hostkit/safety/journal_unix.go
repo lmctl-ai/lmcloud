@@ -8,8 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"syscall"
 )
+
+func ignoreSIGXFSZ() {
+	signal.Ignore(syscall.SIGXFSZ)
+}
 
 func lockJournalFile(f *os.File) error {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
