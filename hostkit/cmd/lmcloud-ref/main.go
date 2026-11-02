@@ -16,6 +16,7 @@
 //	LMCLOUD_REF_PAGE_SIZE  list page size (default 1000)
 //	LMCLOUD_REF_REPORT     if set, print adapter call counts and run hooks to stderr
 //	LMCLOUD_REF_FAIL_INIT  if set, Program.Init fails (exercises the exit-2 path)
+//	LMCLOUD_REF_ECHO_TOKEN if set, creates fail echoing the create token (redaction tests)
 package main
 
 import (
@@ -94,8 +95,9 @@ func newFake() *fakeadapter.Fake {
 	}
 	pageSize, _ := strconv.Atoi(os.Getenv("LMCLOUD_REF_PAGE_SIZE"))
 	return fakeadapter.New(fakeadapter.Options{
-		StatePath: state,
-		PageSize:  pageSize,
+		StatePath:       state,
+		PageSize:        pageSize,
+		EchoCreateToken: os.Getenv("LMCLOUD_REF_ECHO_TOKEN") != "",
 		Auth: fakeadapter.Auth{
 			Enforce:    os.Getenv("LMCLOUD_REF_AUTH") == "enforce",
 			Credential: func() string { return os.Getenv(tokenEnv) },

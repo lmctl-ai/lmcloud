@@ -198,3 +198,49 @@ println("DRY-ENUM-OK");
 		t.Fatalf("dry enum run: %v\n%s", err, out)
 	}
 }
+
+// hostkit v4: a provider error that echoes the create token never shows the
+// token through last_error().message(), provider_code() or the abort frame.
+func TestCreateTokenRedactedEndToEnd(t *testing.T) {
+	bin := lmscript(t)
+	ref := buildRef(t)
+	schemaPath := filepath.Join(repoRoot(t), "schema", "lmcloud.dsl.json")
+	prog := `
+s = load_schema(schema="` + schemaPath + `");
+inspect = _lmcode_ s;
+  cloud.set_abort_on_error(false);
+  let c = cloud.bucket_create("echo-bkt");
+  let e = cloud.last_error();
+  print("MESSAGE " + e.message());
+  print("PROVIDER_CODE " + e.provider_code());
+  let q = cloud.queue_create("echo-q");
+  print("QMESSAGE " + cloud.last_error().message());
+end _lmcode_
+r1 = run_lmcode(inspect, {command:["` + ref + `", "--lmcode", "$DSLFILE"]});
+abort = _lmcode_ s;
+  cloud.bucket_create("echo-bkt");
+end _lmcode_
+r2 = run_lmcode(abort, {command:["` + ref + `", "--lmcode", "$DSLFILE"]});
+println("ABORT " + r2.message);
+assert(r1.ok && !r2.ok, "expected inspect ok and abort failure");
+`
+	file := filepath.Join(t.TempDir(), "echo.lms")
+	if err := os.WriteFile(file, []byte(prog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, file)
+	cmd.Env = append(os.Environ(), "LMCLOUD_REF_STATE="+filepath.Join(t.TempDir(), "s.json"), "LMCLOUD_REF_ECHO_TOKEN=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run: %v\n%s", err, out)
+	}
+	text := string(out)
+	for _, want := range []string{"MESSAGE ", "PROVIDER_CODE CreateDenied.[create-token]", "QMESSAGE ", "[PERMISSION_DENIED] bucket_create (echo-bkt): bucket create rejected for client request token [create-token]"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in:\n%s", want, text)
+		}
+	}
+	if regexp.MustCompile(`(?i)[0-9a-f]{32}`).MatchString(text) || strings.Count(text, "[create-token]") < 4 {
+		t.Fatalf("create token leaked or not marked:\n%s", text)
+	}
+}

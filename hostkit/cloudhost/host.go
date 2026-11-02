@@ -249,6 +249,7 @@ func (h *Host) BucketCreate(dry bool, b string) (bool, error) {
 		return false, h.fail(op, b, missingStore())
 	}
 	token := newCreateToken()
+	h.errs.AddRedaction(token) // v4: never echoed into last_error/aborts
 	ctx = hostkit.WithCreateToken(ctx, token)
 	created, err := h.cfg.Store.CreateBucket(ctx, b)
 	if err == nil {
@@ -717,6 +718,7 @@ func (h *Host) QueueCreate(dry bool, q string) (bool, error) {
 		return false, h.fail(op, q, missingQueue())
 	}
 	token := newCreateToken()
+	h.errs.AddRedaction(token) // v4: never echoed into last_error/aborts
 	ctx = hostkit.WithCreateToken(ctx, token)
 	created, err := h.cfg.Queue.CreateQueue(ctx, q)
 	if err != nil {

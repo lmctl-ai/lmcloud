@@ -9,6 +9,7 @@ package hostkit
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -183,6 +184,35 @@ type ErrorState struct {
 	mu    sync.Mutex
 	last  CloudError
 	abort bool
+	// secrets are exact strings (this host's create tokens) replaced by
+	// CreateTokenMarker before last_error is stored or an abort is formatted.
+	secrets []string
+}
+
+// maxRedactions bounds the remembered exact strings (oldest dropped first).
+const maxRedactions = 256
+
+// AddRedaction registers an exact string (a create token issued by this host)
+// that must never appear in last_error, its provider_code, the abort message
+// or its target. Strings shorter than 8 bytes are ignored. Added in v4.
+func (s *ErrorState) AddRedaction(secret string) {
+	if len(secret) < 8 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.secrets = append(s.secrets, secret)
+	if len(s.secrets) > maxRedactions {
+		s.secrets = s.secrets[len(s.secrets)-maxRedactions:]
+	}
+}
+
+// scrubLocked replaces the registered exact strings, then applies RedactText.
+func (s *ErrorState) scrubLocked(text string) string {
+	for _, sec := range s.secrets {
+		text = strings.ReplaceAll(text, sec, CreateTokenMarker)
+	}
+	return RedactText(text)
 }
 
 // NewErrorState starts with OK and abort_on_error == true.
@@ -226,12 +256,13 @@ func (s *ErrorState) Fail(op, target string, e *CloudError) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := *e
-	c.Message = RedactText(c.Message)
-	c.ProviderCode = RedactText(c.ProviderCode)
+	c.Message = s.scrubLocked(c.Message)
+	c.ProviderCode = s.scrubLocked(c.ProviderCode)
 	c.Absent = AbsentUnknown
 	s.last = c
 	if !s.abort {
 		return nil
 	}
-	return &AbortError{Message: FormatAbort(op, target, &c), Err: &c}
+	msg := FormatAbort(s.scrubLocked(op), s.scrubLocked(target), &c)
+	return &AbortError{Message: s.scrubLocked(msg), Err: &c}
 }

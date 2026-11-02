@@ -70,6 +70,22 @@ type Options struct {
 	BinaryWire bool
 	// PollInterval is the LongPoll re-check interval (default 50ms).
 	PollInterval time.Duration
+	// EchoCreateToken makes CreateBucket/CreateQueue fail with 403 and echo
+	// the call's create token in the message and provider code, the way some
+	// providers echo request markers (tests the host's token redaction).
+	// The error is built as a struct literal, bypassing hostkit's constructors.
+	// Added in hostkit v4.
+	EchoCreateToken bool
+}
+
+func (f *Fake) echoToken(ctx context.Context, kind string) error {
+	tok := hostkit.CreateToken(ctx)
+	return &hostkit.CloudError{
+		Code:         hostkit.PermissionDenied,
+		HTTPStatus:   403,
+		ProviderCode: "CreateDenied." + tok,
+		Message:      kind + " create rejected for client request token " + tok + " (lmcloud-create-token=" + tok + ")",
+	}
 }
 
 // Fake implements hostkit.ObjectStore and hostkit.Queue.
@@ -235,6 +251,12 @@ func page(names []string, token string, max int) ([]string, string, error) {
 // ---- ObjectStore ----
 
 func (f *Fake) CreateBucket(ctx context.Context, b string) (bool, error) {
+	if f.opts.EchoCreateToken {
+		f.mu.Lock()
+		f.calls["CreateBucket"]++
+		f.mu.Unlock()
+		return false, f.echoToken(ctx, "bucket")
+	}
 	created := false
 	err := f.do("CreateBucket", func(s *state) error {
 		if _, ok := s.Buckets[b]; ok {
@@ -432,6 +454,12 @@ func (f *Fake) QueueCreateToken(_ context.Context, q string) (string, error) {
 }
 
 func (f *Fake) CreateQueue(ctx context.Context, q string) (bool, error) {
+	if f.opts.EchoCreateToken {
+		f.mu.Lock()
+		f.calls["CreateQueue"]++
+		f.mu.Unlock()
+		return false, f.echoToken(ctx, "queue")
+	}
 	created := false
 	err := f.do("CreateQueue", func(s *state) error {
 		if _, ok := s.Queues[q]; ok {

@@ -257,3 +257,27 @@ proof on scratch copies of each host's `hostkit-port` branch with only the two r
 (`{"dry":true,"ok":true}`). Without the lmcode-go replace every host still builds and shows the old
 `dry callback for ErrorCode returned string`. Invoke hosts as `HOST cloud --lmcode FILE` (lmgcp's
 top-level schema is not the shared one).
+
+## hostkit v4 (branch `hostkit-v4`) — create tokens never reach diagnostics
+
+SolReviewer (sol-final risk 5): provider errors can echo the create token (e.g. in a message that
+quotes the request's tags), and `last_error`/abort text carried it on all four hosts. v4 adds one
+central redaction; tokens stay fully usable inside adapters (`hostkit.CreateToken(ctx)` unchanged,
+same 32-hex format, so host tag/label code is unaffected).
+
+- **Format redaction (all diagnostics):** `RedactText` — used by every `CloudError` constructor
+  (`ProviderError`, `Preflightf`, `AsCloudError`), `FormatAbort` and `ErrorState.Fail` — and
+  `RedactURL`/`RedactTarget` replace any 32-hex token-format string with `[create-token]`
+  (`hostkit.CreateTokenMarker`, `hostkit.RedactCreateTokens`). Side effect: other 32-hex values in
+  error text (an MD5-style ETag or request id) are replaced too; error text is diagnostic only.
+- **Exact redaction (last_error and aborts):** `ErrorState.AddRedaction(secret)` registers exact
+  strings (cloudhost registers each create token it issues, bounded to the last 256). `Fail` replaces
+  them in message, provider_code, op and target before storing `last_error` and formatting the abort
+  message, so an echo in a non-hex form (encoded, prefixed, adapter-built struct literal) is caught too.
+- `fakeadapter.Options.EchoCreateToken` (and `LMCLOUD_REF_ECHO_TOKEN=1` on the reference host) makes
+  creates fail with the token in message and provider code, bypassing the constructors.
+- Tests: hostkit unit (format + exact + bounded list + constructors), cloudhost (bucket and queue,
+  non-abort and abort), reference-host end-to-end through lmscript (`message()`, `provider_code()`,
+  abort frame contain `[create-token]`, no 32-hex string anywhere in the output).
+- Not covered: provider-side copies (the token is a tag/label/metadata value on the resource,
+  visible to anyone authorized to read it), and adapter-private logging outside hostkit.
