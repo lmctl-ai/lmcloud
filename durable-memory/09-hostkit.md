@@ -156,6 +156,11 @@ the first constant; undeclared types stay strict. Branch `dry-enum-string` commi
 scratch clone `lmcode-go-dryenum`, patch file `lmcode-go-dry-enum-patch/0001-*.patch`, with tests
 `dry_enum_test.go`; `go test -race ./...` passes there.
 
+> **Update (v0.1.0):** `Registry.Enum` is merged upstream (lmcode-go `06cd9ae`, PR #1). hostkit's `go.mod`
+> now pins that commit and carries NO `replace`; hosts must also drop their `replace` of lmcode-go
+> (and, once they require a tagged `github.com/lmctl-ai/lmcloud`, their `replace` of lmcloud). The v3
+> text below describing the temporary local patch is kept for history.
+
 ## hostkit v3 (branch `hostkit-v3`) — SolReviewer cross-host review, risks 7–10
 
 Additive again: no exported identifier was renamed or removed. Deprecated (kept, no longer used by
