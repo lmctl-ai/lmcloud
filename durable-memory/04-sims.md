@@ -13,16 +13,27 @@ All simulators are standalone native executables (Quarkus / GraalVM native image
 | **gcpsim** | `v0.2.0` | floci-gcp 0.11.0 | `4588` | `GET /health` (HTTP 200) |
 | **ocisim** | `v0.1.0` | floci-oci 0.5.0 | `4599` | `GET /_floci-oci/health` (HTTP 200) |
 
+## Pinned Client Binaries
+
+Legacy released client binaries are pinned in [`scripts/clients.lock`](../scripts/clients.lock) for cross-platform execution:
+
+| Client | Release | Upstream Repo | Native Platform Assets |
+|---|---|---|---|
+| **lmaws** | `v0.1.27` | `lmctl-ai/lmaws` | `linux-arm64`, `linux-x64`, `macos-arm64`, `macos-x64` |
+| **lmazure** | `v0.1.5` | `lmctl-ai/lmazure` | `linux-arm64`, `linux-x64`, `macos-arm64`, `macos-x64`, `windows-x64.exe` |
+| **lmgcp** | `v0.1.9` | `lmctl-ai/lmgcp` | `linux-arm64`, `linux-x64`, `macos-arm64`, `macos-x64`, `windows-x64.exe` |
+| **lmoci** | `v0.1.0` | `lmctl-ai/lmoci` | `linux-arm64`, `linux-x64`, `macos-arm64`, `macos-x64`, `windows-x64.exe` |
+
 ## Harness Scripts
 
-### 1. `scripts/sims.lock`
-JSON manifest recording repository, release tag, version, and platform-specific SHA-256 digests for all release binary assets.
+### 1. `scripts/sims.lock` & `scripts/clients.lock`
+JSON manifests recording repository, release tag, version, and platform-specific SHA-256 digests for all simulator and client release binary assets.
 
-### 2. `scripts/fetch-sims.sh`
-Downloads the simulator binaries for the current host architecture (`uname -s` and `uname -m`) into `$LMCLOUD_SIM_DIR` (or `.cache/sims/`).
+### 2. `scripts/fetch-sims.sh` & `scripts/fetch-clients.sh`
+Downloads the simulator and client binaries for the current host architecture (`uname -s` and `uname -m`) into `$LMCLOUD_SIM_DIR` (default `.cache/sims/`) and `$LMCLOUD_CLIENT_DIR` (default `.cache/clients/`).
 - Idempotent and offline-friendly: skips download if binary exists and SHA-256 checksum matches.
-- Validates SHA-256 against `scripts/sims.lock` and fails loudly on mismatch.
-- Marks binaries executable (`chmod +x`) and symlinks canonical shorthand names (e.g. `awssim`, `azuresim`, `gcpsim`, `ocisim`).
+- Validates SHA-256 against lockfiles and fails loudly on mismatch.
+- Marks binaries executable (`chmod +x`) and symlinks canonical shorthand names.
 
 ### 3. `scripts/sim.sh`
 Manages the background server lifecycle for each simulator:
@@ -37,69 +48,143 @@ scripts/sim.sh url <aws|azure|gcp|oci>
 - **Graceful Shutdown:** `stop` sends `SIGTERM`, waits up to 5 seconds for clean exit, and escalates to `SIGKILL` only if the process fails to terminate.
 - **Orphan Prevention:** Uses bash error and termination traps (`ERR`, `INT`, `TERM`) during startup to ensure no zombie processes remain if startup or readiness polling fails.
 
-### 4. `scripts/test-sims.sh`
-Executes end-to-end provider-native object storage round trips with plain `curl` against all 4 simulators:
+### 4. `scripts/smoke-sim-wire.sh`
+Internal simulator wire smoke test (not the lmscript acceptance test). Executes end-to-end provider-native object storage round trips with plain `curl` against all 4 simulators:
 ```bash
-scripts/test-sims.sh [aws|azure|gcp|oci...]
+scripts/smoke-sim-wire.sh [aws|azure|gcp|oci...]
 ```
-For each simulator:
-1. Starts the simulator via `sim.sh start`.
-2. Creates a bucket or container using the provider's native HTTP API.
-3. Uploads binary payload via `PUT` or `POST`.
-4. Retrieves the object and verifies byte equality against the uploaded file using `cmp`.
-5. Deletes the object and bucket/container.
-6. Stops the simulator via `sim.sh stop`.
-7. Reports `PASS` or `FAIL`.
+All 4 pass cleanly (bucket create, object put, get & byte comparison, object delete, bucket delete).
 
-## Provider Wire Shapes & Curl Patterns (Open Mode)
+### 5. `scripts/test-sims-lmscript.sh`
+The primary LMScript harness runner. Per provider, starts the simulator, runs an LMScript program via the client using mono LMScript (`LMSCRIPT_BIN=/home/ubuntu/lmctl-mono/lmscript/bin/lmscript`) and the CURRENT API (`load_schema` / `_lmcode_` / `run_lmcode`), and stops the simulator.
 
-All simulators operate in `--auth open` by default. Every provider supports full object storage CRUD operations via standard `curl` commands without external SDKs:
+## Current Compiler Compatibility & Provider Status
 
-### AWS (`awssim`) — S3 Path-Style REST
-- **Create Bucket:** `curl -f -X PUT http://127.0.0.1:4566/<bucket>` (HTTP 200)
-- **Put Object:** `curl -f -X PUT --data-binary "@file" http://127.0.0.1:4566/<bucket>/<key>` (HTTP 200)
-- **Get Object:** `curl -f http://127.0.0.1:4566/<bucket>/<key> -o output` (HTTP 200)
-- **Delete Object:** `curl -f -X DELETE http://127.0.0.1:4566/<bucket>/<key>` (HTTP 204)
-- **Delete Bucket:** `curl -f -X DELETE http://127.0.0.1:4566/<bucket>` (HTTP 204)
+The current mono LMScript compiler (`lmscript 0.2.38`) implements the modern `lmcode` specification:
+- Generates **bytecode version 6** (loader rejects any other version).
+- Modern host discovery requires the host binary to support `load_schema(cli=...)` via CLI flags `--lmcode-schema --json`.
+- The execution contract (`run_lmcode`) requires the host binary to emit an execution return frame bounded by `LMCODE_RETURN_BEGIN` and `LMCODE_RETURN_END` framing lines.
+- Legacy directives (`savedsl`, `dsl_cli`, `_dsl_`) are removed.
 
-### Azure (`azuresim`) — Blob Storage REST
-- **Account:** Default local storage account is `devstoreaccount1`.
-- **Create Container:** `curl -f -X PUT "http://127.0.0.1:4577/devstoreaccount1/<container>?restype=container"` (HTTP 201)
-- **Put Block Blob:** `curl -f -X PUT -H 'x-ms-blob-type: BlockBlob' --data-binary "@file" http://127.0.0.1:4577/devstoreaccount1/<container>/<blob>` (HTTP 201)
-- **Get Blob:** `curl -f http://127.0.0.1:4577/devstoreaccount1/<container>/<blob> -o output` (HTTP 200)
-- **Delete Blob:** `curl -f -X DELETE http://127.0.0.1:4577/devstoreaccount1/<container>/<blob>` (HTTP 202)
-- **Delete Container:** `curl -f -X DELETE "http://127.0.0.1:4577/devstoreaccount1/<container>?restype=container"` (HTTP 202)
+All four pinned released clients (`lmaws v0.1.27`, `lmazure v0.1.5`, `lmgcp v0.1.9`, `lmoci v0.1.0`) were built against legacy compiler `0.2.420` (bytecode v5, `--dsl` execution flags). Consequently, none can be driven by the current mono compiler, and all are marked **`PENDING-GO-PORT`**.
 
-### GCP (`gcpsim`) — Cloud Storage JSON API
-- **Project:** Default local project is `gcpsim-local`.
-- **Create Bucket:** `curl -f -X POST -H 'Content-Type: application/json' -d '{"name": "<bucket>"}' "http://127.0.0.1:4588/storage/v1/b?project=gcpsim-local"` (HTTP 200)
-- **Upload Media:** `curl -f -X POST -H 'Content-Type: application/octet-stream' --data-binary "@file" "http://127.0.0.1:4588/upload/storage/v1/b/<bucket>/o?uploadType=media&name=<object>"` (HTTP 200)
-- **Download Media:** `curl -f "http://127.0.0.1:4588/storage/v1/b/<bucket>/o/<object>?alt=media" -o output` (HTTP 200)
-- **Delete Object:** `curl -f -X DELETE "http://127.0.0.1:4588/storage/v1/b/<bucket>/o/<object>"` (HTTP 204)
-- **Delete Bucket:** `curl -f -X DELETE "http://127.0.0.1:4588/storage/v1/b/<bucket>"` (HTTP 204)
+### Provider Status Matrix
 
-### OCI (`ocisim`) — Object Storage REST
-- **Namespace:** Resolved dynamically via `GET http://127.0.0.1:4599/n/` (defaults to `"floci-local"`).
-- **Tenancy Compartment:** Default tenancy OCID is `ocid1.tenancy.oc1..flocilocaltenancy0000000000000000000000000000000000000000`.
-- **Create Bucket:** `curl -f -X POST -H 'Content-Type: application/json' -d '{"name": "<bucket>", "compartmentId": "<tenancy>"}' http://127.0.0.1:4599/n/<ns>/b/` (HTTP 200)
-- **Put Object:** `curl -f -X PUT -H 'Content-Type: application/octet-stream' --data-binary "@file" http://127.0.0.1:4599/n/<ns>/b/<bucket>/o/<object>` (HTTP 200)
-- **Get Object:** `curl -f http://127.0.0.1:4599/n/<ns>/b/<bucket>/o/<object> -o output` (HTTP 200)
-- **Delete Object:** `curl -f -X DELETE http://127.0.0.1:4599/n/<ns>/b/<bucket>/o/<object>` (HTTP 204)
-- **Delete Bucket:** `curl -f -X DELETE http://127.0.0.1:4599/n/<ns>/b/<bucket>` (HTTP 204)
+| Provider | Client Version | Status | Primary Diagnostic / Failure Mode |
+|---|---|---|---|
+| **aws** | `lmaws v0.1.27` | **PENDING-GO-PORT** | Rejects bytecode v6 (`LOAD_BAD_BYTECODE`); lacks `--lmcode-schema`; missing return frame delimiters |
+| **azure** | `lmazure v0.1.5` | **PENDING-GO-PORT** | Rejects bytecode v6 (`LOAD_BAD_BYTECODE`); lacks `--lmcode-schema`; missing return frame delimiters |
+| **gcp** | `lmgcp v0.1.9` | **PENDING-GO-PORT** | Rejects bytecode v6 (`LOAD_BAD_BYTECODE`); lacks `--lmcode-schema`; missing return frame delimiters |
+| **oci** | `lmoci v0.1.0` | **PENDING-GO-PORT** | Wire frame protocol mismatch (`frame is not terminal`: no `LMCODE_RETURN_BEGIN/END`); lacks `--lmcode-schema` |
 
-## Simulator Quirks & Operational Notes
+### Detailed Failure Evidence
 
-1. **`awssim`:**
-   - In open mode, SigV4 authorization headers are completely optional; path-style S3 requests succeed anonymously.
-   - Sockets after shutdown may remain briefly in TCP `TIME_WAIT`. The harness sets `SO_REUSEADDR` when checking or binding ports.
-2. **`azuresim`:**
-   - Lacks a dedicated `/_floci/health` route. Readiness is signalled by the first HTTP 200 response (e.g. `GET /devstoreaccount1?comp=list`).
-   - Azure REST conventions require `?restype=container` on container operations, and the header `x-ms-blob-type: BlockBlob` on blob PUT requests.
-   - Azure returns HTTP `201 Created` for resource creation and `202 Accepted` for deletions.
-3. **`gcpsim`:**
-   - Object creation uses the `/upload/storage/v1/b/...` path with query parameter `uploadType=media&name=<object>`.
-   - Object content retrieval requires the query parameter `?alt=media`; omitting `alt=media` returns the JSON object metadata instead of the payload bytes.
-4. **`ocisim`:**
-   - In open mode, standard curl requests work without `Authorization` or `Date` headers.
-   - Object storage paths require the namespace prefix `/n/<namespace>/b/<bucket>/o/<object>`.
-   - Bucket creation requires specifying `compartmentId` in the JSON request body.
+#### 1. AWS (`lmaws v0.1.27`)
+- **Direct schema discovery attempt:**
+  ```bash
+  /home/ubuntu/lmctl-mono/lmscript/bin/lmscript -e 's = load_schema(cli="lmaws");'
+  ```
+  **Error output:**
+  ```
+  error:<inline>:1:5: _lmcode_: schema host exited 2: lmaws 0.1.27 — AWS SDK for Java v2 scripting host
+  usage: lmaws [--dry-run] [--apply] --dsl FILE | --dsl-schema [--json] | --dsl-signatures [--without-std]
+  ```
+  *Cause:* `lmaws` does not recognize `--lmcode-schema`.
+- **Execution attempt via schema file + `run_lmcode`:**
+  ```bash
+  lmaws --dsl-schema --json > schema.json
+  # Compiled _lmcode_ block with aws.region("us-east-1")
+  run_lmcode(p, {command: ["lmaws", "--dsl", "$DSLFILE"]})
+  ```
+  **Error output:**
+  ```
+  unsupported bytecode version 6 (this runtime reads version 5)
+  {"ok": false, "phase": "run", "code": "LOAD_BAD_BYTECODE", "message": "unsupported bytecode version 6 (this runtime reads version 5)"}
+  error: run_lmcode: lmcode host exited with code 3: lmcode return frame: frame is not terminal
+  ```
+
+#### 2. Azure (`lmazure v0.1.5`)
+- **Direct schema discovery attempt:**
+  ```bash
+  /home/ubuntu/lmctl-mono/lmscript/bin/lmscript -e 's = load_schema(cli="lmazure");'
+  ```
+  **Error output:**
+  ```
+  error:<inline>:1:5: _lmcode_: schema host exited 2: invalid arguments; use --help
+  ```
+  *Cause:* `lmazure` does not recognize `--lmcode-schema`.
+- **Execution attempt via schema file + `run_lmcode`:**
+  ```bash
+  lmazure --dsl-schema --json > schema.json
+  run_lmcode(p, {command: ["lmazure", "--dsl", "$DSLFILE"]})
+  ```
+  **Error output:**
+  ```
+  {"ok": false, "phase": "load", "code": "LOAD_BAD_BYTECODE", "message": "unsupported bytecode version 6 (this runtime reads version 5)"}
+  error: run_lmcode: lmcode host exited with code 3: lmcode return frame: frame is not terminal
+  ```
+
+#### 3. GCP (`lmgcp v0.1.9`)
+- **Direct schema discovery attempt:**
+  ```bash
+  /home/ubuntu/lmctl-mono/lmscript/bin/lmscript -e 's = load_schema(cli="lmgcp");'
+  ```
+  **Error output:**
+  ```
+  error:<inline>:1:5: _lmcode_: schema host exited 2: usage: lmgcp --version | --help | --notices | --dsl-schema [--json] ...
+  ```
+  *Cause:* `lmgcp` does not recognize `--lmcode-schema`.
+- **Execution attempt via schema file + `run_lmcode`:**
+  ```bash
+  lmgcp --dsl-schema --json > schema.json
+  run_lmcode(p, {command: ["lmgcp", "--dsl", "$DSLFILE"]})
+  ```
+  **Error output:**
+  ```
+  {"ok": false, "phase": "load", "code": "LOAD_BAD_BYTECODE", "message": "unsupported bytecode version 6 (this runtime reads version 5)"}
+  error: run_lmcode: lmcode host exited with code 3: lmcode return frame: frame is not terminal
+  ```
+
+#### 4. OCI (`lmoci v0.1.0`)
+- **Direct schema discovery attempt:**
+  ```bash
+  /home/ubuntu/lmctl-mono/lmscript/bin/lmscript -e 's = load_schema(cli="lmoci");'
+  ```
+  **Error output:**
+  ```
+  error:<inline>:1:5: _lmcode_: schema host exited 2: lmoci 0.1.0 — Oracle Cloud Infrastructure SDK for Java scripting host
+  usage: lmoci [--dry-run] [--apply] [--live] [--profile NAME] [--region NAME] [--endpoint URL] --dsl FILE
+  ```
+  *Cause:* `lmoci` does not recognize `--lmcode-schema`.
+- **Execution attempt via schema file + `run_lmcode`:**
+  ```bash
+  lmoci --dsl-schema --json > schema.json
+  run_lmcode(p, {command: ["lmoci", "--dsl", "$DSLFILE"]})
+  ```
+  **Error output:**
+  ```
+  {"ok": true, "result": null}
+  error: run_lmcode: lmcode return frame: frame is not terminal
+  ```
+  *Cause:* `lmoci` prints raw JSON instead of the `LMCODE_RETURN_BEGIN` and `LMCODE_RETURN_END` framing required by `lmscript/dist/lmcode-frame.js`.
+
+---
+
+## Proposed Simulator Enhancements
+
+Based on real observations from building the harness, inspecting the simulator sources, and driving wire/client operations:
+
+1. **`azuresim` (`lmctl-ai/azuresim`, `src/` / routing filter):**
+   - **Missing standard health endpoint:** Unlike `awssim` (`/_floci/health`), `gcpsim` (`/health`), and `ocisim` (`/_floci-oci/health`), `azuresim` has no dedicated HTTP GET endpoint to probe readiness without making a functional Blob or Queue storage call.
+   - **Proposal:** Add a lightweight `GET /_floci/health` route returning HTTP 200 `{"status": "UP"}` to eliminate the need for functional resource list queries (`/devstoreaccount1?comp=list`) during harness startup polling.
+
+2. **`ocisim` (`lmctl-ai/ocisim`, `src/main/java/io/flo/oci/lif/EmulatorLifecycle.java`):**
+   - **Health route path consistency:** `ocisim` serves health at `GET /_floci-oci/health`.
+   - **Proposal:** Add an alias route `GET /_floci/health` (consistent with `awssim`) so multi-cloud harnesses can use a unified health check path across all simulators.
+
+3. **`awssim` (`lmctl-ai/awssim`, `src/` & `durable-memory/auth-2026-10-30.md`):**
+   - **S3 Advanced APIs:** S3 multipart upload (`InitiateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`), S3 object copy (`CopyObject`), and bucket versioning are deferred.
+   - **Proposal:** Implement mock multipart upload and object copy in Floci S3 service handlers so object storage conformance tests covering large uploads or server-side copying can run locally.
+
+4. **`gcpsim` (`lmctl-ai/gcpsim`, `src/`):**
+   - **Delete Object Return Codes:** Ensure DELETE object media requests consistently return HTTP 204 No Content according to Google Cloud Storage JSON API specifications, and implement stubbed bucket lifecycle and uniform bucket-level access configuration endpoints for future conformance suites.
