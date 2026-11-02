@@ -1,0 +1,76 @@
+# Requires: tables
+# Scenario 07: Half-open sort-key range [sk_from, sk_to), empty bounds = whole partition,
+# reversed range and range-on-key-only-table pre-flight guards.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+t1 = "lmt07" + run_id + "a";   # sorted
+t2 = "lmt07" + run_id + "b";   # key-only
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  let ts = ${t1};
+  let tk = ${t2};
+  cloud.table_create(ts, true);
+  cloud.table_create(tk);
+
+  let sks = str_list().add("a").add("b").add("c").add("d").add("e");
+  let i = 0;
+  while (i < sks.len()) {
+    cloud.item_put(ts, cloud.item_new("P", sks.at(i)).set_int("n", i));
+    i = i + 1;
+  }
+  cloud.item_put(tk, cloud.item_new("solo").set_string("v", "1"));
+
+  # [b, d) -> {b, c}   (bounded poll on aggregate read)
+  let page = cloud.item_query(ts, "P", "b", "d", 0, "");
+  let polls = 0;
+  while (page.len() < 2 && polls < 10) {
+    polls = polls + 1;
+    page = cloud.item_query(ts, "P", "b", "d", 0, "");
+  }
+  let range_ok = page.len() == 2 && page.at(0).sk() == "b" && page.at(1).sk() == "c";
+
+  # empty bounds = whole partition
+  let whole = cloud.item_query(ts, "P", "", "", 0, "");
+  let wp = 0;
+  while (whole.len() < 5 && wp < 10) {
+    wp = wp + 1;
+    whole = cloud.item_query(ts, "P", "", "", 0, "");
+  }
+  let whole_ok = whole.len() == 5 && whole.at(0).sk() == "a" && whole.at(4).sk() == "e";
+
+  # [d, "") suffix -> {d, e}
+  let sfx = cloud.item_query(ts, "P", "d", "", 0, "");
+  let suffix_ok = sfx.len() == 2 && sfx.at(0).sk() == "d" && sfx.at(1).sk() == "e";
+
+  cloud.set_abort_on_error(false);
+  # reversed range (both non-empty) -> INVALID_ARGUMENT pre-flight
+  cloud.item_query(ts, "P", "d", "b", 0, "");
+  let rev_err = cloud.last_error();
+  let rev_invalid = rev_err.code() == ErrorCode.INVALID_ARGUMENT && rev_err.http_status() == 0;
+  # non-empty range on key-only table -> INVALID_ARGUMENT pre-flight
+  cloud.item_query(tk, "solo", "a", "b", 0, "");
+  let ko_err = cloud.last_error();
+  let ko_invalid = ko_err.code() == ErrorCode.INVALID_ARGUMENT && ko_err.http_status() == 0;
+  cloud.set_abort_on_error(true);
+
+  cloud.table_delete(ts);
+  cloud.table_delete(tk);
+
+  lmcode_return_put("range_ok", range_ok);
+  lmcode_return_put("whole_ok", whole_ok);
+  lmcode_return_put("suffix_ok", suffix_ok);
+  lmcode_return_put("rev_invalid", rev_invalid);
+  lmcode_return_put("ko_invalid", ko_invalid);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "07 host execution failed");
+assert(r.result.range_ok, "[b,d) must yield {b,c} in order");
+assert(r.result.whole_ok, "empty range bounds must return the whole partition");
+assert(r.result.suffix_ok, "[d,'') must yield {d,e}");
+assert(r.result.rev_invalid, "reversed range must fail pre-flight INVALID_ARGUMENT (http_status 0)");
+assert(r.result.ko_invalid, "range query on a key-only table must fail pre-flight INVALID_ARGUMENT");

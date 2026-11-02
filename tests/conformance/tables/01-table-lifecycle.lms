@@ -1,0 +1,65 @@
+# Requires: tables
+# Scenario 01: Table lifecycle for both key layouts (key-only and sorted): create, exists, list (sorted, bounded poll), delete, bounded-poll disappearance.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+t1 = "lmt01" + run_id + "a";   # key-only
+t2 = "lmt01" + run_id + "b";   # sorted
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  let name1 = ${t1};
+  let name2 = ${t2};
+
+  let existed_before = cloud.table_exists(name1) || cloud.table_exists(name2);
+  let created2 = cloud.table_create(name2, true);
+  let created1 = cloud.table_create(name1);
+  let exists1 = cloud.table_exists(name1);
+  let exists2 = cloud.table_exists(name2);
+
+  # Bounded poll for table_list eventual consistency (aggregate read, design 12 §4.5)
+  let idx1 = -1;
+  let idx2 = -1;
+  let list_polls = 0;
+  while ((idx1 < 0 || idx2 < 0) && list_polls < 10) {
+    list_polls = list_polls + 1;
+    let tables = cloud.table_list();
+    idx1 = tables.index_of(name1);
+    idx2 = tables.index_of(name2);
+  }
+
+  let deleted1 = cloud.table_delete(name1);
+  let deleted2 = cloud.table_delete(name2);
+
+  let exists_after1 = true;
+  let exists_after2 = true;
+  let del_polls = 0;
+  while ((exists_after1 || exists_after2) && del_polls < 10) {
+    del_polls = del_polls + 1;
+    exists_after1 = cloud.table_exists(name1);
+    exists_after2 = cloud.table_exists(name2);
+  }
+
+  lmcode_return_put("existed_before", existed_before);
+  lmcode_return_put("created1", created1);
+  lmcode_return_put("created2", created2);
+  lmcode_return_put("exists1", exists1);
+  lmcode_return_put("exists2", exists2);
+  lmcode_return_put("found_both", idx1 >= 0 && idx2 >= 0);
+  lmcode_return_put("sorted_order", idx1 < idx2);
+  lmcode_return_put("deleted1", deleted1);
+  lmcode_return_put("deleted2", deleted2);
+  lmcode_return_put("exists_after", exists_after1 || exists_after2);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "01-table-lifecycle host execution failed");
+assert(!r.result.existed_before, "tables should not exist before create");
+assert(r.result.created1 && r.result.created2, "table_create should return true for new tables (both layouts)");
+assert(r.result.exists1 && r.result.exists2, "table_exists should be true after create");
+assert(r.result.found_both, "table_list should include both created tables within bounded poll");
+assert(r.result.sorted_order, "table_list should be ascending lexicographical");
+assert(r.result.deleted1 && r.result.deleted2, "table_delete should return true for existing tables");
+assert(!r.result.exists_after, "table_exists should be false after delete within bounded poll");

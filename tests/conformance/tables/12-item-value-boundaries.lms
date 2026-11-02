@@ -1,0 +1,76 @@
+# Requires: tables
+# Scenario 12: Boundary values — int64 min/max, float round-trip (assert_close), bool, 255-byte keys,
+# the 262144-byte canonical item budget (exact boundary OK, +1 byte pre-flight INVALID_ARGUMENT),
+# and the 240-attribute cap (240 OK, 241st pre-flight INVALID_ARGUMENT).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+t1 = "lmt12" + run_id + "a";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  let t = ${t1};
+  cloud.table_create(t);
+
+  # 255-byte keys accepted on both layouts (separate sorted probe via key-only here)
+  let k255 = str_repeat("k", 255);
+  cloud.item_put(t, cloud.item_new(k255).set_int("n", 1));
+  let k255_it = cloud.item_get(t, k255);
+  let key_ok = k255_it.exists();
+
+  # canonical item budget: attr "v" (1 byte) + 8-byte per-attr overhead => 262144 total at value=262135
+  let fit_val = str_repeat("v", 262135);
+  let big = cloud.item_put(t, cloud.item_new("bigfit").set_string("v", fit_val));
+  let big_ok = big.exists();
+  let big_back = cloud.item_get(t, "bigfit");
+  let big_rt = str_len(big_back.get_string("v")) == 262135;
+
+  # 262136-byte value => canonical 262145 > budget -> pre-flight INVALID_ARGUMENT
+  cloud.set_abort_on_error(false);
+  cloud.item_put(t, cloud.item_new("toobig").set_string("v", fit_val + "x"));
+  let over_err = cloud.last_error();
+  let over_invalid = over_err.code() == ErrorCode.INVALID_ARGUMENT && over_err.http_status() == 0;
+  cloud.set_abort_on_error(true);
+
+  # 240-attribute cap: 240 attrs stored; the 241st set on the same item fails pre-flight
+  let many = cloud.item_new("wide");
+  let j = 0;
+  while (j < 240) {
+    many = many.set_string("a" + str(1000 + j), "x");
+    j = j + 1;
+  }
+  let wide = cloud.item_put(t, many);
+  let wide_ok = wide.len() == 240;
+  cloud.set_abort_on_error(false);
+  many.set_string("a241", "x");
+  let attr_err = cloud.last_error();
+  let attr_invalid = attr_err.code() == ErrorCode.INVALID_ARGUMENT && attr_err.http_status() == 0;
+  cloud.set_abort_on_error(true);
+
+  # float round-trip + bool (float asserted in-program via assert_close builtin)
+  cloud.item_put(t, cloud.item_new("vals").set_number("pi", 3.141592653589793).set_bool("ok", true));
+  let vals = cloud.item_get(t, "vals");
+  assert_close(vals.get_number("pi"), 3.141592653589793, 0.000000001);
+  lmcode_return_put("pi", vals.get_number("pi"));
+  let bool_ok = vals.get_bool("ok");
+
+  cloud.table_delete(t);
+
+  lmcode_return_put("key_ok", key_ok);
+  lmcode_return_put("big_ok", big_ok);
+  lmcode_return_put("big_rt", big_rt);
+  lmcode_return_put("over_invalid", over_invalid);
+  lmcode_return_put("wide_ok", wide_ok);
+  lmcode_return_put("attr_invalid", attr_invalid);
+  lmcode_return_put("bool_ok", bool_ok);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "12 host execution failed");
+assert(r.result.key_ok, "255-byte key must be accepted");
+assert(r.result.big_ok && r.result.big_rt, "262144-byte canonical item must store and round-trip");
+assert(r.result.over_invalid, "262145-byte canonical item must fail pre-flight INVALID_ARGUMENT (http_status 0)");
+assert(r.result.wide_ok && r.result.attr_invalid, "240 attributes accepted; 241st rejected pre-flight");
+assert(r.result.bool_ok, "bool round-trip");

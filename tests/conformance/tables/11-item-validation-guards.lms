@@ -1,0 +1,88 @@
+# Requires: tables
+# Scenario 11: Pre-flight validation guards — invalid table names, keys, attribute names, non-finite
+# numbers, page bounds and sk misuse: all fail locally with INVALID_ARGUMENT and http_status() == 0.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+t1 = "lmt11" + run_id + "a";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  cloud.table_create(${t1}, true);
+  cloud.set_abort_on_error(false);
+
+  let fails = 0;
+  let want = 18;
+
+  # invalid table names: "Bad_Name", "ab" (too short), "1abc" (leading digit),
+  # "bad-hyphen-x" (hyphen — Azure-alnum intersection rule), 33-char name (too long)
+  let bad_names = str_list().add("Bad_Name").add("ab").add("1abc").add("bad-hyphen-x").add("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  let i = 0;
+  while (i < bad_names.len()) {
+    cloud.table_create(bad_names.at(i));
+    let e1 = cloud.last_error();
+    if (e1.code() == ErrorCode.INVALID_ARGUMENT && e1.http_status() == 0) { fails = fails + 1; }
+    i = i + 1;
+  }
+
+  # invalid key values: "", "/bad", "has#hash", "has?qm", 256-byte key
+  let long_key = str_repeat("k", 256);
+  let bad_keys = str_list().add("").add("/bad").add("has#hash").add("has?qm").add(long_key);
+  let i2 = 0;
+  while (i2 < bad_keys.len()) {
+    cloud.item_new(bad_keys.at(i2));
+    let e2 = cloud.last_error();
+    if (e2.code() == ErrorCode.INVALID_ARGUMENT && e2.http_status() == 0) { fails = fails + 1; }
+    i2 = i2 + 1;
+  }
+
+  # invalid attribute names: "Bad", "x-y", "__lmv" (reserved __lm* prefix)
+  cloud.item_new("k1").set_string("Bad", "v");
+  let e3 = cloud.last_error();
+  if (e3.code() == ErrorCode.INVALID_ARGUMENT && e3.http_status() == 0) { fails = fails + 1; }
+  cloud.item_new("k1").set_string("x-y", "v");
+  let e4 = cloud.last_error();
+  if (e4.code() == ErrorCode.INVALID_ARGUMENT && e4.http_status() == 0) { fails = fails + 1; }
+  cloud.item_new("k1").set_string("__lmv", "v");
+  let e5 = cloud.last_error();
+  if (e5.code() == ErrorCode.INVALID_ARGUMENT && e5.http_status() == 0) { fails = fails + 1; }
+
+  # non-finite numbers (NaN and +Inf) rejected at set_number
+  cloud.item_new("k1").set_number("x", 0.0 / 0.0);
+  let e6 = cloud.last_error();
+  if (e6.code() == ErrorCode.INVALID_ARGUMENT && e6.http_status() == 0) { fails = fails + 1; }
+  cloud.item_new("k1").set_number("x", 1.0e999);
+  let e7 = cloud.last_error();
+  if (e7.code() == ErrorCode.INVALID_ARGUMENT && e7.http_status() == 0) { fails = fails + 1; }
+
+  # page bounds on query/scan
+  cloud.item_query(${t1}, "P", "", "", 501, "");
+  let e8 = cloud.last_error();
+  if (e8.code() == ErrorCode.INVALID_ARGUMENT && e8.http_status() == 0) { fails = fails + 1; }
+  cloud.item_scan(${t1}, -1, "");
+  let e9 = cloud.last_error();
+  if (e9.code() == ErrorCode.INVALID_ARGUMENT && e9.http_status() == 0) { fails = fails + 1; }
+
+  # empty sk on a sorted-table op
+  cloud.item_get(${t1}, "P", "");
+  let e10 = cloud.last_error();
+  if (e10.code() == ErrorCode.INVALID_ARGUMENT && e10.http_status() == 0) { fails = fails + 1; }
+
+  # typed getter for an absent local attribute
+  let it = cloud.item_new("k1");
+  it.get_string("missing");
+  let e11 = cloud.last_error();
+  if (e11.code() == ErrorCode.INVALID_ARGUMENT && e11.http_status() == 0) { fails = fails + 1; }
+
+  cloud.set_abort_on_error(true);
+  cloud.table_delete(${t1});
+
+  lmcode_return_put("fails", fails);
+  lmcode_return_put("want", want);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "11 host execution failed");
+assert(r.result.fails == r.result.want, "all 18 invalid inputs must fail pre-flight with INVALID_ARGUMENT and http_status()==0");

@@ -188,6 +188,140 @@
         ]
       }
     },
+    "TableItem": {
+      "methods": {
+        "set_string": [
+          {
+            "params": ["string", "string"],
+            "returns": "self"
+          }
+        ],
+        "set_int": [
+          {
+            "params": ["string", "int"],
+            "returns": "self"
+          }
+        ],
+        "set_number": [
+          {
+            "params": ["string", "float"],
+            "returns": "self"
+          }
+        ],
+        "set_bool": [
+          {
+            "params": ["string", "bool"],
+            "returns": "self"
+          }
+        ],
+        "remove": [
+          {
+            "params": ["string"],
+            "returns": "self"
+          }
+        ],
+        "has": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "type_of": [
+          {
+            "params": ["string"],
+            "returns": "string"
+          }
+        ],
+        "get_string": [
+          {
+            "params": ["string"],
+            "returns": "string"
+          }
+        ],
+        "get_int": [
+          {
+            "params": ["string"],
+            "returns": "int"
+          }
+        ],
+        "get_number": [
+          {
+            "params": ["string"],
+            "returns": "float"
+          }
+        ],
+        "get_bool": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "names": [
+          {
+            "params": [],
+            "returns": "StrList"
+          }
+        ],
+        "len": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "pk": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "sk": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "version": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "exists": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ]
+      }
+    },
+    "TablePage": {
+      "methods": {
+        "len": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "at": [
+          {
+            "params": ["int"],
+            "returns": "TableItem"
+          }
+        ],
+        "has_more": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ],
+        "next_token": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ]
+      }
+    },
     "Cloud": {
       "methods": {
         "provider": [
@@ -344,6 +478,104 @@
           {
             "params": ["string", "string", "int"],
             "returns": "string"
+          }
+        ],
+        "item_new": [
+          {
+            "params": ["string"],
+            "returns": "TableItem"
+          },
+          {
+            "params": ["string", "string"],
+            "returns": "TableItem"
+          }
+        ],
+        "table_create": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          },
+          {
+            "params": ["string", "bool"],
+            "returns": "bool"
+          }
+        ],
+        "table_delete": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "table_exists": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "table_list": [
+          {
+            "params": [],
+            "returns": "StrList"
+          }
+        ],
+        "item_put": [
+          {
+            "params": ["string", "TableItem"],
+            "returns": "TableItem"
+          },
+          {
+            "params": ["string", "TableItem", "string"],
+            "returns": "TableItem"
+          }
+        ],
+        "item_get": [
+          {
+            "params": ["string", "string"],
+            "returns": "TableItem"
+          },
+          {
+            "params": ["string", "string", "string"],
+            "returns": "TableItem"
+          }
+        ],
+        "item_delete": [
+          {
+            "params": ["string", "string"],
+            "returns": "void"
+          },
+          {
+            "params": ["string", "string", "string"],
+            "returns": "void"
+          }
+        ],
+        "item_update": [
+          {
+            "params": ["string", "string", "TableItem"],
+            "returns": "TableItem"
+          },
+          {
+            "params": ["string", "string", "string", "TableItem"],
+            "returns": "TableItem"
+          }
+        ],
+        "item_query": [
+          {
+            "params": ["string", "string"],
+            "returns": "TablePage"
+          },
+          {
+            "params": ["string", "string", "string", "string", "int", "string"],
+            "returns": "TablePage"
+          }
+        ],
+        "item_scan": [
+          {
+            "params": ["string"],
+            "returns": "TablePage"
+          },
+          {
+            "params": ["string", "int", "string"],
+            "returns": "TablePage"
           }
         ]
       }

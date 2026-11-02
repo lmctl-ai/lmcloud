@@ -14,8 +14,8 @@ fi
 CONF_DIR="$ROOT/tests/conformance"
 
 usage() {
-  echo "Usage: $0 [--live] [--name-prefix <prefix>] <host-binary> [endpoint] [object-storage|queue|all] [run-id]" >&2
-  echo "       $0 [--live] --check [object-storage|queue|all]" >&2
+  echo "Usage: $0 [--live] [--name-prefix <prefix>] <host-binary> [endpoint] [object-storage|queue|tables|all] [run-id]" >&2
+  echo "       $0 [--live] --check [object-storage|queue|tables|all]" >&2
   exit 2
 }
 
@@ -59,8 +59,16 @@ fi
 
 is_live_excluded_scenario() {
   local base
-  base="$(basename "$1")"
+  base="$(basename "$(dirname "$1")")/$(basename "$1")"
   case "$base" in
+    tables/*.lms)
+      # Slice 5 (tables) is excluded from the --live profile until naming/ownership
+      # policy for table names (Azure-alnum intersection) is designed for live runs.
+      return 0
+      ;;
+    */12-auth-enforced-denial.lms|*/13-queue-auth-enforced-denial.lms)
+      return 0
+      ;;
     12-auth-enforced-denial.lms|13-queue-auth-enforced-denial.lms)
       return 0
       ;;
@@ -73,11 +81,11 @@ is_live_excluded_scenario() {
 validate_slice() {
   local slice="$1"
   case "$slice" in
-    object-storage|queue|all|"")
+    object-storage|queue|tables|all|"")
       return 0
       ;;
     *)
-      echo "error: unknown slice '$slice' (expected: object-storage | queue | all)" >&2
+      echo "error: unknown slice '$slice' (expected: object-storage | queue | tables | all)" >&2
       exit 2
       ;;
   esac
@@ -88,17 +96,18 @@ collect_scenarios() {
   local filter="${LMCLOUD_SCENARIO_FILTER:-}"
   local raw=()
   case "$slice" in
-    object-storage|queue)
+    object-storage|queue|tables)
       mapfile -t raw < <(find "$CONF_DIR/$slice" -maxdepth 1 -name '*.lms' | sort)
       ;;
     all|"")
       mapfile -t raw < <(
         find "$CONF_DIR/object-storage" -maxdepth 1 -name '*.lms' | sort
         find "$CONF_DIR/queue" -maxdepth 1 -name '*.lms' | sort
+        find "$CONF_DIR/tables" -maxdepth 1 -name '*.lms' | sort
       )
       ;;
     *)
-      echo "error: unknown slice '$slice' (expected: object-storage | queue | all)" >&2
+      echo "error: unknown slice '$slice' (expected: object-storage | queue | tables | all)" >&2
       exit 2
       ;;
   esac
@@ -119,6 +128,25 @@ collect_scenarios() {
     printf '%s\n' "$f"
   done
 }
+
+# --- Capability skip gate (13-tables-conformance.md §1); single self-contained function ------
+# Echoes "reason (host:req pending)" if the scenario must be TAP-skipped for this host, else "".
+capability_skip_reason() {
+  local host_bin="$1" f="$2"
+  local host req line status
+  host="$(basename "$host_bin" | sed 's/\.exe$//')"
+  req="$(sed -n 's/^# Requires:[[:space:]]*//p' "$f" | head -n1 | tr -d '[:space:]')"
+  [[ -z "$req" ]] && req="$(basename "$(dirname "$f")")"
+  line="$(grep -E "^${host}:${req}=" "$ROOT/tests/capabilities.conf" 2>/dev/null | head -n1 || true)"
+  status="${line#*=}"
+  [[ -z "$line" ]] && status="supported"
+  if [[ "$status" == pending* ]]; then
+    local reason="${status#pending(}"
+    reason="${reason%)}"
+    echo "$reason ($host:$req pending)"
+  fi
+}
+# ---------------------------------------------------------------------------------------------
 
 pass=0
 fail=0
@@ -155,7 +183,7 @@ else
   if [[ "$LIVE_PROFILE" == "1" ]]; then
     DEFAULT_RUN_ID="run-$(date -u +%s)-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
   fi
-  if [[ "$ARG2" == "object-storage" || "$ARG2" == "queue" || "$ARG2" == "all" ]]; then
+  if [[ "$ARG2" == "object-storage" || "$ARG2" == "queue" || "$ARG2" == "tables" || "$ARG2" == "all" ]]; then
     ENDPOINT=""
     SLICE="$ARG2"
     RUN_ID="${3:-${LMCLOUD_RUN_ID:-${LMAWS_RUN_ID:-$DEFAULT_RUN_ID}}}"
@@ -179,6 +207,7 @@ else
   if [[ -n "$ENDPOINT" ]]; then
     export LMCLOUD_STORAGE_ENDPOINT="$ENDPOINT"
     export LMCLOUD_QUEUE_ENDPOINT="$ENDPOINT"
+    export LMCLOUD_TABLES_ENDPOINT="$ENDPOINT"
     export LMCLOUD_ENDPOINT="$ENDPOINT"
   fi
   validate_slice "$SLICE"
@@ -193,6 +222,12 @@ else
     idx=$((idx + 1))
     slice_name="$(basename "$(dirname "$f")")"
     name="$slice_name/$(basename "$f" .lms)"
+    reason="$(capability_skip_reason "$HOST_BIN" "$f")"
+    if [[ -n "$reason" ]]; then
+      echo "ok $idx - $name # SKIP $reason"
+      skip=$((skip + 1))
+      continue
+    fi
     if out="$("$LMSCRIPT_BIN" "$f" "$HOST_BIN" "$ENDPOINT" "$RUN_ID" 2>&1)"; then
       if [[ "$out" =~ ^SKIP:[[:space:]]*(.*)$ ]]; then
         echo "ok $idx - $name # SKIP ${BASH_REMATCH[1]}"

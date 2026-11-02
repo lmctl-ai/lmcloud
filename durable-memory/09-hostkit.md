@@ -286,3 +286,45 @@ same 32-hex format, so host tag/label code is unaffected).
   abort frame contain `[create-token]`, no 32-hex string anywhere in the output).
 - Not covered: provider-side copies (the token is a tag/label/metadata value on the resource,
   visible to anyone authorized to read it), and adapter-private logging outside hostkit.
+
+## hostkit v5 (planned, design only — DO NOT implement) — Slice 5 `Tables` adapter
+
+Design doc: `12-tables-design.md`. Additive again: no existing identifier changes; the `Tables`
+adapter interface sits next to `ObjectStore` and `Queue`, and `Router`/`EndpointRoutes` gain a
+`Tables` route the same way. Planned shape:
+
+```go
+type Tables interface {
+    CreateTable(ctx, name string, sorted bool) (created bool, err error) // CONFLICT only on layout mismatch (host probes)
+    DeleteTable(ctx, name string) error                                   // NOT_FOUND -> false/OK
+    HeadTable(ctx, name string) error                                     // nil / NOT_FOUND
+    ListTables(ctx, max int, token string) (names []string, next string, err error) // ListAll applies
+    PutItem(ctx, t string, it Item, expect string) (stored Item, err error)         // expect=="" absent; else version
+    GetItem(ctx, t, pk, sk string) (Item, error)                          // NOT_FOUND item -> AbsentItem-qualified
+    DeleteItem(ctx, t, pk, sk string) error                               // idempotent within existing table
+    UpdateItem(ctx, t, pk, sk string, changes Item) (Item, error)         // NOT_FOUND on missing item
+    Query(ctx, t, pk, skFrom, skTo string, max int, token string) (TablePage, error) // half-open range, asc sk
+    Scan(ctx, t string, max int, token string) (TablePage, error)         // unordered, bounded
+}
+```
+
+- `Item` = hostkit value type: `map[string]Attr` with `Attr{S *string, I *int64, N *float64, B *bool}`,
+  plus `PK/SK/Version` strings and `Exists bool`. Validation (name/attr regexes, key charset, NaN/Inf,
+  240-attr and 262144-byte canonical budget with the 8-byte-per-attr rule) lives in hostkit pre-flight,
+  identical across providers — adapters receive only valid values.
+- Version plumbing: adapters for Azure/Firestore/OCI pass through the provider token; **DynamoDB**
+  adapters maintain `__lmcloud_v` (atomic bump under `ConditionExpression`) and classify
+  `ConditionalCheckFailedException` via a point `GetItem` probe (design 12 §4.4).
+- Key-layout state: DynamoDB via `DescribeTable`; Azure/Firestore read a reserved meta record
+  (`lmcloudmeta` table entity / `__lmcloud_meta__` collection doc) — fakeadapter keeps it in memory;
+  the host lists filter reserved names (`table_list`).
+- Pagination tokens: reuse the existing opaque-token helper (`ListAll` + token invariant);
+  `max_items` bounds (`0..500`, default 100) enforced once in `cloudhost`.
+- Dry runs: table/table-item mutators get explicit Dry slots with overlay previews (same pattern as
+  buckets/queues); `item_query`/`item_scan` merge overlays over real pages.
+- Conditional-write abort codes: missing item under only-if-version = `NOT_FOUND`; existing with wrong
+  version = `PRECONDITION_FAILED`; only-if-absent on existing = `CONFLICT` (all probe-backed, no invented codes — contract rule 6).
+- Cost ledger: add `tables` category entries so the cross-cutting slice can meter per-op estimates.
+- Verification additions to `scripts/test-hostkit.sh`: conformance `tables` 14/14 open on the
+  reference host, auth scenario 14 against fakeadapter enforce mode (allow/deny credentials), and a
+  dry-run zero-mutator proof for the 14 programs.

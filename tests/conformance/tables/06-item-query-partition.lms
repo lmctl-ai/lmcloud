@@ -1,0 +1,69 @@
+# Requires: tables
+# Scenario 06: item_query on a sorted table returns exactly the partition's items in ascending sk order;
+# on a key-only table, query(pk) returns the single item.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+t1 = "lmt06" + run_id + "a";   # sorted
+t2 = "lmt06" + run_id + "b";   # key-only
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  let ts = ${t1};
+  let tk = ${t2};
+  cloud.table_create(ts, true);
+  cloud.table_create(tk);
+
+  # seed pk="P": sk a,b,c,d (inserted out of order); pk="Q": one item
+  cloud.item_put(ts, cloud.item_new("P", "c").set_string("v", "3"));
+  cloud.item_put(ts, cloud.item_new("P", "a").set_string("v", "1"));
+  cloud.item_put(ts, cloud.item_new("P", "d").set_string("v", "4"));
+  cloud.item_put(ts, cloud.item_new("P", "b").set_string("v", "2"));
+  cloud.item_put(ts, cloud.item_new("Q", "z").set_string("v", "9"));
+
+  cloud.item_put(tk, cloud.item_new("solo").set_string("v", "only"));
+
+  # aggregate read: bounded poll until partition has 4 items (eventual-consistency floor, design 12 §4.5)
+  let page = cloud.item_query(ts, "P");
+  let polls = 0;
+  while (page.len() < 4 && polls < 10) {
+    polls = polls + 1;
+    page = cloud.item_query(ts, "P");
+  }
+
+  let in_order = page.len() == 4
+    && page.at(0).sk() == "a"
+    && page.at(1).sk() == "b"
+    && page.at(2).sk() == "c"
+    && page.at(3).sk() == "d";
+  let no_more = !page.has_more() && str_len(page.next_token()) == 0;
+  let vals_ok = page.len() == 4 && page.at(0).get_string("v") == "1" && page.at(3).get_string("v") == "4";
+
+  # foreign partition excluded
+  let qp = cloud.item_query(ts, "Q");
+  let foreign_ok = qp.len() == 1 && qp.at(0).sk() == "z";
+
+  # key-only table query
+  let kp = cloud.item_query(tk, "solo");
+  let keyonly_ok = kp.len() == 1 && kp.at(0).pk() == "solo" && kp.at(0).sk() == "" && kp.at(0).get_string("v") == "only";
+
+  cloud.table_delete(ts);
+  cloud.table_delete(tk);
+
+  lmcode_return_put("polls", polls);
+  lmcode_return_put("in_order", in_order);
+  lmcode_return_put("no_more", no_more);
+  lmcode_return_put("vals_ok", vals_ok);
+  lmcode_return_put("foreign_ok", foreign_ok);
+  lmcode_return_put("keyonly_ok", keyonly_ok);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "06 host execution failed");
+assert(r.result.in_order, "item_query must return partition items in ascending sk order");
+assert(r.result.no_more, "single-page query must have has_more()==false and empty next_token");
+assert(r.result.vals_ok, "attribute values come back with queried items");
+assert(r.result.foreign_ok, "query returns only the requested partition");
+assert(r.result.keyonly_ok, "query on a key-only table returns the 0-or-1 item");

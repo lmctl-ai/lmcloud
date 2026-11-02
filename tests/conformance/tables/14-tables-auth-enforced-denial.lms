@@ -1,0 +1,107 @@
+# Requires: tables
+# Scenario 14: Auth-enforced denial for tables — runs ONLY under <provider>sim --auth enforce
+# (emits TAP SKIP in open mode). Pass 1 = wrong credentials -> UNAUTHENTICATED (route-independent:
+# the auth layer rejects the signature/token before any action mapping, so this leg holds even where
+# A2/G2 table route mappings are pending). Pass 2 = valid-but-denied principal -> PERMISSION_DENIED
+# on a table op AND on the table_exists probe. Azure/GCP pass-2 legs SKIP until sim enhancements
+# A2/G2 (13-tables-conformance.md §3.2/§3.3) land. OCI is skipped runner-side (capabilities.conf).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+denied_table = "lmt14" + run_id + "d";
+host = ARGV[0];
+is_azure = contains(host, "lmazure");
+is_gcp = contains(host, "lmgcp");
+
+# Save caller credentials, then override Pass 1 with bogus ones
+orig_aws_key = env("LMAWS_SIM_ACCESS_KEY_ID", "");
+orig_aws_sec = env("LMAWS_SIM_SECRET_ACCESS_KEY", "");
+orig_az_tok = env("LMAZURE_SIM_TOKEN", "");
+orig_az_key = env("LMAZURE_SIM_KEY", "");
+orig_gcp_tok = env("LMGCP_SIM_TOKEN", "");
+
+set_env("LMAWS_SIM_ACCESS_KEY_ID", "AKIAUNAUTH0000000000");
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", "wrong-secret-key-for-unauthenticated-pass");
+set_env("LMAZURE_SIM_TOKEN", "invalid-bearer-token-unauthenticated");
+set_env("LMAZURE_SIM_KEY", "d3JvbmdrZXl1bmF1dGhlbnRpY2F0ZWQ=");
+set_env("LMGCP_SIM_TOKEN", "invalid-bearer-token-unauthenticated");
+
+unauth_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  let tn = ${denied_table};
+  cloud.set_abort_on_error(false);
+
+  let created = cloud.table_create(tn);
+  let create_err = cloud.last_error();
+
+  # If table_create with bogus credentials succeeded, the simulator is in --auth open mode
+  let open_mode = create_err.code() == ErrorCode.OK;
+  let create_unauth = create_err.code() == ErrorCode.UNAUTHENTICATED;
+  let put_unauth = false;
+
+  if (open_mode) {
+    if (created || cloud.table_exists(tn)) {
+      cloud.table_delete(tn);
+    }
+  } else {
+    cloud.item_put(tn, cloud.item_new("probe").set_string("a", "1"));
+    let put_err = cloud.last_error();
+    put_unauth = put_err.code() == ErrorCode.UNAUTHENTICATED;
+  }
+
+  lmcode_return_put("open_mode", open_mode);
+  lmcode_return_put("create_unauth", create_unauth);
+  lmcode_return_put("put_unauth", put_unauth);
+end _lmcode_
+
+r_unauth = run_lmcode(unauth_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r_unauth.ok, "14 unauthenticated pass host execution failed");
+
+if (r_unauth.result.open_mode) {
+  println("SKIP: simulator is in --auth open mode; 14-tables-auth-enforced-denial requires --auth enforce");
+  exit(0);
+}
+
+assert(r_unauth.result.create_unauth, "Pass 1 (wrong creds): table_create must fail UNAUTHENTICATED");
+assert(r_unauth.result.put_unauth, "Pass 1 (wrong creds): item_put must fail UNAUTHENTICATED");
+
+if (is_azure || is_gcp) {
+  println("SKIP: " + host + " table enforce-mode route mapping pending (azuresim A2 / gcpsim G2, 13-tables-conformance.md)");
+  exit(0);
+}
+
+# Pass 2: valid restricted principal denied by policy -> PERMISSION_DENIED
+set_env("LMAWS_SIM_ACCESS_KEY_ID", env("LMCLOUD_ENFORCE_DENIED_AWS_ACCESS_KEY_ID", orig_aws_key));
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", env("LMCLOUD_ENFORCE_DENIED_AWS_SECRET_ACCESS_KEY", orig_aws_sec));
+
+denied_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  let tn = ${denied_table};
+  cloud.set_abort_on_error(false);
+
+  let exists_val = cloud.table_exists(tn);
+  let exists_err = cloud.last_error();
+
+  let created = cloud.table_create(tn);
+  let create_err = cloud.last_error();
+
+  cloud.item_put(tn, cloud.item_new("probe").set_string("a", "1"));
+  let put_err = cloud.last_error();
+
+  lmcode_return_put("created", created);
+  lmcode_return_put("exists_val", exists_val);
+  lmcode_return_put("exists_denied", exists_err.code() == ErrorCode.PERMISSION_DENIED);
+  lmcode_return_put("create_denied", create_err.code() == ErrorCode.PERMISSION_DENIED);
+  lmcode_return_put("put_denied", put_err.code() == ErrorCode.PERMISSION_DENIED);
+end _lmcode_
+
+r_denied = run_lmcode(denied_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r_denied.ok, "14 policy-denied pass host execution failed");
+assert(!r_denied.result.created && !r_denied.result.exists_val, "denied principal must not create or observe tables");
+assert(r_denied.result.exists_denied && r_denied.result.create_denied && r_denied.result.put_denied,
+  "Pass 2 (policy denied): table_exists/table_create/item_put must all fail PERMISSION_DENIED (probe never masked as false/OK)");

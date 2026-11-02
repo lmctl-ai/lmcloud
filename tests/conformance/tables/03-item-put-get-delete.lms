@@ -1,0 +1,91 @@
+# Requires: tables
+# Scenario 03: Item put/get/delete on both key layouts with all four value types (string, int, float,
+# bool), UTF-8 unicode, empty strings, and int64 boundaries; get-on-missing probe and delete idempotency.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+t1 = "lmt03" + run_id + "a";   # key-only
+t2 = "lmt03" + run_id + "b";   # sorted
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  let ta = ${t1};
+  let tb = ${t2};
+  cloud.table_create(ta);
+  cloud.table_create(tb, true);
+
+  # key-only item with every type + unicode + empty string + int64 bounds
+  let it = cloud.item_new("user01");
+  it = it.set_string("name", "雪 / 🚀 café");
+  it = it.set_string("note", "");
+  it = it.set_int("big", 9223372036854775807);
+  it = it.set_int("small", -9223372036854775808);
+  it = it.set_number("score", 0.1);
+  it = it.set_bool("active", true);
+  let stored = cloud.item_put(ta, it);
+
+  let got = cloud.item_get(ta, "user01");
+  let name_ok = got.get_string("name") == "雪 / 🚀 café";
+  let note_ok = got.get_string("note") == "";
+  let big_ok = got.get_int("big") == 9223372036854775807;
+  let small_ok = got.get_int("small") == -9223372036854775808;
+  let bool_ok = got.get_bool("active");
+  let types_ok = got.type_of("name") == "string"
+    && got.type_of("big") == "int"
+    && got.type_of("score") == "number"
+    && got.type_of("active") == "bool";
+  let exists_ok = got.exists();
+  let keys_ok = got.pk() == "user01" && got.sk() == "";
+  let ver_neon = str_len(got.version()) > 0 && str_len(stored.version()) > 0;
+
+  # sorted-table item
+  let st = cloud.item_new("orders", "0001").set_string("state", "new").set_int("qty", 3);
+  cloud.item_put(tb, st);
+  let got2 = cloud.item_get(tb, "orders", "0001");
+  let sort_ok = got2.exists() && got2.pk() == "orders" && got2.sk() == "0001" && got2.get_string("state") == "new";
+
+  # missing item probe: exists()==false with last_error OK
+  let miss = cloud.item_get(ta, "nope");
+  let miss_ok = !miss.exists() && cloud.last_error().code() == ErrorCode.OK;
+
+  # delete + idempotent re-delete
+  cloud.item_delete(ta, "user01");
+  let gone = cloud.item_get(ta, "user01");
+  let gone_ok = !gone.exists();
+  cloud.item_delete(ta, "user01");                 # idempotent, must not raise
+  cloud.item_delete(tb, "orders", "0001");
+  let gone2 = cloud.item_get(tb, "orders", "0001");
+
+  # float round-trip asserted in-program (assert_close is an _lmcode_ builtin)
+  assert_close(got.get_number("score"), 0.1, 0.000000001);
+
+  cloud.table_delete(ta);
+  cloud.table_delete(tb);
+
+  lmcode_return_put("score", got.get_number("score"));
+  lmcode_return_put("name_ok", name_ok);
+  lmcode_return_put("note_ok", note_ok);
+  lmcode_return_put("big_ok", big_ok);
+  lmcode_return_put("small_ok", small_ok);
+  lmcode_return_put("bool_ok", bool_ok);
+  lmcode_return_put("types_ok", types_ok);
+  lmcode_return_put("exists_ok", exists_ok);
+  lmcode_return_put("keys_ok", keys_ok);
+  lmcode_return_put("ver_neon", ver_neon);
+  lmcode_return_put("sort_ok", sort_ok);
+  lmcode_return_put("miss_ok", miss_ok);
+  lmcode_return_put("gone_ok", gone_ok);
+  lmcode_return_put("gone2_ok", !gone2.exists());
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "03 host execution failed (includes in-program assert_close on float round-trip)");
+assert(r.result.name_ok && r.result.note_ok, "unicode and empty string round-trip");
+assert(r.result.big_ok && r.result.small_ok, "int64 boundaries round-trip");
+assert(r.result.bool_ok && r.result.types_ok, "bool + type_of round-trip");
+assert(r.result.exists_ok && r.result.keys_ok && r.result.ver_neon, "exists/keys/version after put");
+assert(r.result.sort_ok, "sorted-table item round-trip");
+assert(r.result.miss_ok, "missing item -> exists()==false with ErrorCode.OK");
+assert(r.result.gone_ok && r.result.gone2_ok, "item_delete removes items on both layouts (idempotent)");

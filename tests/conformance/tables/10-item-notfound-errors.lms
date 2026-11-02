@@ -1,0 +1,77 @@
+# Requires: tables
+# Scenario 10: NOT_FOUND for all item/table ops on a missing table (abort-mode + inspection),
+# and non-throwing probes for missing items on an existing table.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+m = "lmt10" + run_id + "x";    # never created
+t = "lmt10" + run_id + "a";    # existing sorted table
+
+# 1. Abort mode: item_get on missing table must abort with [NOT_FOUND]
+abort_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  cloud.item_get(${m}, "x");
+end _lmcode_
+
+r_abort = run_lmcode(abort_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(!r_abort.ok, "item_get on missing table must abort in default mode");
+assert(contains(r_abort.error, "[NOT_FOUND]"), "abort message must carry [NOT_FOUND]");
+
+# 2. Inspection mode: every table op against the missing table sets NOT_FOUND;
+#    probes against an existing table behave (exists==false/OK, idempotent delete, update NOT_FOUND).
+inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  let mt = ${m};
+  cloud.table_create(${t}, true);
+
+  cloud.set_abort_on_error(false);
+  cloud.item_get(mt, "x");
+  let e_get = cloud.last_error();
+  cloud.item_put(mt, cloud.item_new("x").set_string("a", "1"));
+  let e_put = cloud.last_error();
+  cloud.item_update(mt, "x", cloud.item_new("x").set_string("a", "2"));
+  let e_upd = cloud.last_error();
+  cloud.item_delete(mt, "x");
+  let e_del = cloud.last_error();
+  cloud.item_query(mt, "x");
+  let e_qry = cloud.last_error();
+  cloud.item_scan(mt);
+  let e_sca = cloud.last_error();
+
+  # missing-item behaviour on the existing table
+  let miss = cloud.item_get(${t}, "P", "ghost");
+  let miss_ok = !miss.exists() && cloud.last_error().code() == ErrorCode.OK;
+  cloud.item_delete(${t}, "P", "ghost");
+  let del_ok = cloud.last_error().code() == ErrorCode.OK;
+  cloud.item_update(${t}, "P", "ghost", cloud.item_new("P", "ghost").set_string("a", "1"));
+  let upd_nf = cloud.last_error().code() == ErrorCode.NOT_FOUND;
+  let empty_q = cloud.item_query(${t}, "P");
+  let empty_ok = empty_q.len() == 0 && !empty_q.has_more();
+
+  cloud.set_abort_on_error(true);
+  cloud.table_delete(${t});
+
+  lmcode_return_put("get_nf", e_get.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("put_nf", e_put.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("upd_nf", e_upd.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("del_nf", e_del.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("qry_nf", e_qry.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("sca_nf", e_sca.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("miss_ok", miss_ok);
+  lmcode_return_put("del_ok", del_ok);
+  lmcode_return_put("upd_item_nf", upd_nf);
+  lmcode_return_put("empty_ok", empty_ok);
+end _lmcode_
+
+r = run_lmcode(inspect_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "10 inspection run failed");
+assert(r.result.get_nf && r.result.put_nf && r.result.upd_nf, "get/put/update on missing table must be NOT_FOUND");
+assert(r.result.del_nf && r.result.qry_nf && r.result.sca_nf, "delete/query/scan on missing table must be NOT_FOUND");
+assert(r.result.miss_ok && r.result.del_ok, "missing item on existing table: exists==false/OK, delete idempotent");
+assert(r.result.upd_item_nf, "update of missing item on existing table must be NOT_FOUND");
+assert(r.result.empty_ok, "query on empty partition returns empty page without error");

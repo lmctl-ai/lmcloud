@@ -1,0 +1,75 @@
+# Requires: tables
+# Scenario 02: Idempotent table_create/table_delete, and key-layout CONFLICT when creating the same
+# name with the other layout (key-only vs sorted), asserted in abort mode and inspection mode.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+t1 = "lmt02" + run_id + "a";   # created key-only
+t2 = "lmt02" + run_id + "b";   # created sorted (conflict in the other direction)
+t_missing = "lmt02" + run_id + "x";
+
+# 1. Abort mode: layout conflict must abort with [CONFLICT]
+abort_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  cloud.table_create(${t1});           # key-only first
+  cloud.table_create(${t1}, true);     # same name with sorted layout -> CONFLICT -> abort
+end _lmcode_
+
+r_abort = run_lmcode(abort_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(!r_abort.ok, "table_create with conflicting layout must abort in default mode");
+assert(contains(r_abort.error, "[CONFLICT]"), "abort message must carry [CONFLICT]");
+
+# 2. Inspection: idempotency booleans + both-direction conflict codes + cleanup
+inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  let a = ${t1};
+  let b = ${t2};
+  let m = ${t_missing};
+
+  # a already exists as key-only (from run 1)
+  let a_again_same = cloud.table_create(a);        # idempotent -> false
+
+  cloud.table_create(b, true);                     # sorted table
+  cloud.set_abort_on_error(false);
+
+  cloud.table_create(a, true);                     # conflict direction 1 (key-only -> sorted)
+  let ab_conflict = cloud.last_error();
+  cloud.table_create(b);                           # conflict direction 2 (sorted -> key-only)
+  let ba_conflict = cloud.last_error();
+  cloud.table_create(b, true);                     # idempotent sorted -> false
+  let b_again = cloud.last_error();
+  let b_again_ok = b_again.code() == ErrorCode.OK;
+
+  let del_missing = cloud.table_delete(m);         # never existed -> false, OK
+  let del_missing_err = cloud.last_error();
+  let del_missing_ok = del_missing_err.code() == ErrorCode.OK;
+
+  cloud.set_abort_on_error(true);
+  let del_a = cloud.table_delete(a);
+  let del_b = cloud.table_delete(b);
+  let del_a_again = cloud.table_delete(a);         # second delete -> false
+
+  lmcode_return_put("a_again_same", a_again_same);
+  lmcode_return_put("ab_conflict", ab_conflict.code() == ErrorCode.CONFLICT);
+  lmcode_return_put("ba_conflict", ba_conflict.code() == ErrorCode.CONFLICT);
+  lmcode_return_put("b_again_ok", b_again_ok);
+  lmcode_return_put("del_missing", del_missing);
+  lmcode_return_put("del_missing_ok", del_missing_ok);
+  lmcode_return_put("del_a", del_a);
+  lmcode_return_put("del_b", del_b);
+  lmcode_return_put("del_a_again", del_a_again);
+end _lmcode_
+
+r = run_lmcode(inspect_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "02 inspection run failed");
+assert(!r.result.a_again_same, "second table_create (same layout) must return false");
+assert(r.result.ab_conflict && r.result.ba_conflict, "layout mismatch must be CONFLICT in both directions");
+assert(r.result.b_again_ok, "idempotent sorted create must not error");
+assert(!r.result.del_missing && r.result.del_missing_ok, "delete of missing table returns false with OK");
+assert(r.result.del_a && r.result.del_b, "first delete returns true");
+assert(!r.result.del_a_again, "second delete returns false");

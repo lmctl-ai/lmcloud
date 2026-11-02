@@ -1,0 +1,69 @@
+# Requires: tables
+# Scenario 04: Conditional puts — only-if-absent (expect_version == "") and only-if-version,
+# with CONFLICT / PRECONDITION_FAILED / NOT_FOUND classification.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+t1 = "lmt04" + run_id + "a";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  let t = ${t1};
+  cloud.table_create(t);
+
+  # only-if-absent: first succeeds
+  let it1 = cloud.item_new("doc1").set_string("body", "v1");
+  let first = cloud.item_put(t, it1, "");
+  let first_ok = first.exists() && str_len(first.version()) > 0;
+
+  cloud.set_abort_on_error(false);
+
+  # only-if-absent retry -> CONFLICT
+  cloud.item_put(t, cloud.item_new("doc1").set_string("body", "other"), "");
+  let dup_err = cloud.last_error();
+  let dup_conflict = dup_err.code() == ErrorCode.CONFLICT;
+
+  # only-if-version with the CURRENT version -> success, version changes
+  cloud.set_abort_on_error(true);
+  let cur = cloud.item_get(t, "doc1");
+  let v1 = cur.version();
+  let bumped = cloud.item_put(t, cloud.item_new("doc1").set_string("body", "v2"), v1);
+  let v2 = bumped.version();
+  let ver_changed = str_len(v2) > 0 && v2 != v1;
+
+  cloud.set_abort_on_error(false);
+  # only-if-version with the STALE version -> PRECONDITION_FAILED
+  cloud.item_put(t, cloud.item_new("doc1").set_string("body", "v3"), v1);
+  let stale_err = cloud.last_error();
+  let stale_precond = stale_err.code() == ErrorCode.PRECONDITION_FAILED;
+
+  # only-if-version on a MISSING item -> NOT_FOUND
+  cloud.item_put(t, cloud.item_new("ghost").set_string("body", "x"), "some-version");
+  let miss_err = cloud.last_error();
+  let miss_nf = miss_err.code() == ErrorCode.NOT_FOUND;
+
+  # read still sees v2 body (the stale write must not have landed)
+  cloud.set_abort_on_error(true);
+  let fin = cloud.item_get(t, "doc1");
+  let kept = fin.get_string("body") == "v2";
+
+  cloud.table_delete(t);
+
+  lmcode_return_put("first_ok", first_ok);
+  lmcode_return_put("dup_conflict", dup_conflict);
+  lmcode_return_put("ver_changed", ver_changed);
+  lmcode_return_put("stale_precond", stale_precond);
+  lmcode_return_put("miss_nf", miss_nf);
+  lmcode_return_put("kept", kept);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "04 host execution failed");
+assert(r.result.first_ok, "only-if-absent put on new item must succeed");
+assert(r.result.dup_conflict, "only-if-absent on existing item must be CONFLICT");
+assert(r.result.ver_changed, "only-if-version with current version must succeed and change version");
+assert(r.result.stale_precond, "only-if-version with stale version must be PRECONDITION_FAILED");
+assert(r.result.miss_nf, "only-if-version on missing item must be NOT_FOUND");
+assert(r.result.kept, "failed conditional write must not modify the stored item");

@@ -1,0 +1,74 @@
+# Requires: tables
+# Scenario 08: Query pagination — 5 items in one partition, pages of max_items=2, following
+# next_token until has_more()==false; expect 5 distinct items, ascending sk order, no gaps/dups.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+t1 = "lmt08" + run_id + "a";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("tables", ep);
+  }
+  let t = ${t1};
+  cloud.table_create(t, true);
+
+  let sks = str_list().push("i1").push("i2").push("i3").push("i4").push("i5");
+  let i = 0;
+  while (i < sks.len()) {
+    cloud.item_put(t, cloud.item_new("P", sks.at(i)).set_int("n", i + 1));
+    i = i + 1;
+  }
+
+  # bounded wait until first page sees items (aggregate read eventual-consistency, design 12 §4.5)
+  let first_page = cloud.item_query(t, "P", "", "", 2, "");
+  let polls = 0;
+  while (first_page.len() == 0 && polls < 10) {
+    polls = polls + 1;
+    first_page = cloud.item_query(t, "P", "", "", 2, "");
+  }
+
+  # token walk across pages; collect sk sequence
+  let collected = str_list();
+  let page = first_page;
+  let j = 0;
+  while (j < page.len()) {
+    collected = collected.push(page.at(j).sk());
+    j = j + 1;
+  }
+  let guard = 0;
+  while (page.has_more() && guard < 10) {
+    guard = guard + 1;
+    let tok = page.next_token();
+    if (str_len(tok) == 0) { break; }
+    page = cloud.item_query(t, "P", "", "", 2, tok);
+    j = 0;
+    while (j < page.len()) {
+      collected = collected.push(page.at(j).sk());
+      j = j + 1;
+    }
+  }
+
+  let n_ok = collected.len() == 5;
+  let order_ok = collected.len() == 5
+    && collected.at(0) == "i1"
+    && collected.at(1) == "i2"
+    && collected.at(2) == "i3"
+    && collected.at(3) == "i4"
+    && collected.at(4) == "i5";
+  let final_empty = !page.has_more() && str_len(page.next_token()) == 0;
+
+  cloud.table_delete(t);
+
+  lmcode_return_put("n", collected.len());
+  lmcode_return_put("n_ok", n_ok);
+  lmcode_return_put("order_ok", order_ok);
+  lmcode_return_put("final_empty", final_empty);
+  lmcode_return_put("pages", guard + 1);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "08 host execution failed");
+assert(r.result.n_ok, "pagination must collect all 5 items (got: see result.n)");
+assert(r.result.order_ok, "pagination must preserve ascending sk order with no gaps/dups");
+assert(r.result.final_empty, "final page must have has_more()==false and next_token()==\"\"");
