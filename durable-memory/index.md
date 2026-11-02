@@ -14,6 +14,8 @@
 - [08-queue-conformance.md](08-queue-conformance.md): 13 cross-provider queue conformance scenarios (`tests/conformance/queue/01..13-*.lms`) and evidence-backed simulator enhancements across `awssim`, `azuresim`, `gcpsim`, and `ocisim`.
 - [09-hostkit.md](09-hostkit.md): shared Go module `github.com/lmctl-ai/lmcloud` — `hostkit` (error model, retry, endpoint policy, validation, codec, pagination, queue helpers, adapter interfaces), `hostkit/invoke`, `hostkit/cloudhost` (shared schema registered once with dry previews), `hostkit/fakeadapter`, the `lmcloud-ref` reference host, the provider adapter contract, and the verification gate (conformance 25/25 without any sim).
 - [09-ci-workflow-draft.yml](09-ci-workflow-draft.yml): GitHub Actions workflow DRAFT (not enabled; lives outside `.github/workflows`). Known fixes before activation: Linux-only job for the Valkey service container, a `permissions: contents: read` block, SHA-pinned actions.
+- [10-cost-perf-design.md](10-cost-perf-design.md): Slice 3 cross-cutting Cost & Performance design (`cost_cap_usd`, `set_cost_cap_usd`, `estimated_cost`, `cost_report`, `metrics_reset`, `metrics`; types `CostReport`, `CostLineItem`, `MetricsReport`, `OpMetrics`; `ErrorCode.COST_CAP_EXCEEDED` and teardown immunity; embedded per-provider price tables; `hostkit` meter interface proposal).
+- [11-cost-perf-conformance.md](11-cost-perf-conformance.md): 10 cross-provider cost & performance conformance scenarios (`tests/conformance/cost-perf/01..10-*.lms`) and `tests/run-conformance.sh` `cost-perf` slice support (35/35 pass `lmscript --check`).
 
 ## Status (integration branch)
 

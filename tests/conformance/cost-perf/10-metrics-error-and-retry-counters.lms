@@ -1,0 +1,57 @@
+# Scenario 10: Error, retry, and throttle counters in metrics(), and preservation of last_error() across inspection calls.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bkt = "lmcloud-cp10-" + run_id + "-bkt";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("all", ep);
+  }
+  let b = ${bkt};
+
+  cloud.bucket_create(b);
+  cloud.metrics_reset();
+  cloud.set_abort_on_error(false);
+
+  # 1. Pre-flight validation failure (invalid bucket name): increments metrics errors, does NOT charge cost_report()
+  let cost_before_preflight = cloud.estimated_cost();
+  let reqs_before_preflight = cloud.cost_report().total_requests();
+  cloud.bucket_create("Invalid_Bucket_Name");
+  let err_preflight = cloud.last_error();
+  let cost_after_preflight = cloud.estimated_cost();
+  let reqs_after_preflight = cloud.cost_report().total_requests();
+
+  # 2. Provider NOT_FOUND error (missing key in existing bucket on object_get)
+  cloud.object_get(b, "missing-key.txt");
+  let err_before_inspect = cloud.last_error();
+
+  # Calling metrics(), cost_report(), estimated_cost(), and cost_cap_usd() must NOT overwrite last_error()!
+  let m = cloud.metrics();
+  let rep = cloud.cost_report();
+  let est = cloud.estimated_cost();
+  let cap = cloud.cost_cap_usd();
+  let err_after_inspect = cloud.last_error();
+
+  let bcreate_m = m.op("bucket_create");
+  let oget_m = m.op("object_get");
+
+  # Clean up
+  cloud.bucket_delete(b);
+
+  assert_close(cost_after_preflight, cost_before_preflight, 1e-12);
+
+  lmcode_return_put("preflight_not_billed", err_preflight.code() == ErrorCode.INVALID_ARGUMENT && reqs_after_preflight == reqs_before_preflight);
+  lmcode_return_put("last_error_preserved", err_before_inspect.code() == ErrorCode.NOT_FOUND && err_after_inspect.code() == ErrorCode.NOT_FOUND && !err_after_inspect.ok());
+  lmcode_return_put("error_counts_ok", m.total_calls() == 2 && m.total_errors() == 2 && bcreate_m.calls() == 1 && bcreate_m.errors() == 1 && oget_m.calls() == 1 && oget_m.errors() == 1);
+  lmcode_return_put("retry_throttle_nonneg", m.total_retries() >= 0 && m.total_throttles() >= 0 && oget_m.retries() >= 0 && oget_m.throttles() >= 0);
+  lmcode_return_put("inspect_values_ok", rep.total_requests() >= 1 && est > 0.0 && cap > 0.0);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "10-metrics-error-and-retry-counters failed");
+assert(r.result.preflight_not_billed, "pre-flight INVALID_ARGUMENT must not increment cost_report().total_requests() or estimated_cost()");
+assert(r.result.last_error_preserved, "metrics(), cost_report(), estimated_cost(), and cost_cap_usd() must not overwrite cloud.last_error()");
+assert(r.result.error_counts_ok, "metrics() must count both pre-flight and provider errors in total_errors() and OpMetrics.errors()");
+assert(r.result.retry_throttle_nonneg, "retries() and throttles() counters must be non-negative");
+assert(r.result.inspect_values_ok, "cost_report(), estimated_cost(), and cost_cap_usd() must return valid values");

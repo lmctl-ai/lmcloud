@@ -1,0 +1,71 @@
+# Scenario 07: Performance metrics call counts, byte counters (bytes_in / bytes_out), and per-operation OpMetrics accuracy.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bkt = "lmcloud-cp07-" + run_id + "-bkt";
+qname = "lmcloud-cp07-" + run_id + "-q";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("all", ep);
+  }
+  let b = ${bkt};
+  let q = ${qname};
+
+  cloud.metrics_reset();
+
+  let body_a = "0123456789abcdef";
+  let body_b = "fedcba9876543210fedcba9876543210";
+  let q_body = "queue-payload-24-bytes!!";
+
+  cloud.bucket_create(b);
+  cloud.object_put(b, "a.txt", body_a);
+  cloud.object_put(b, "b.txt", body_b);
+  let got_a = cloud.object_get(b, "a.txt");
+  let got_b = cloud.object_get(b, "b.txt");
+  let head_a = cloud.object_head(b, "a.txt");
+
+  cloud.queue_create(q);
+  cloud.queue_send(q, q_body);
+  let batch = cloud.queue_receive(q, 1, 2, 30);
+  if (batch.len() > 0) {
+    cloud.queue_ack(q, batch.at(0).receipt());
+  }
+
+  let m = cloud.metrics();
+  let put_m = m.op("object_put");
+  let get_m = m.op("object_get");
+  let head_m = m.op("object_head");
+  let qsend_m = m.op("queue_send");
+  let qrecv_m = m.op("queue_receive");
+  let uncalled_m = m.op("queue_nack");
+
+  # Clean up after snapshot
+  cloud.object_delete(b, "a.txt");
+  cloud.object_delete(b, "b.txt");
+  cloud.bucket_delete(b);
+  cloud.queue_delete(q);
+
+  let exp_put_bytes = str_len(body_a) + str_len(body_b);
+  let exp_get_bytes = str_len(got_a) + str_len(got_b);
+  let exp_q_bytes = str_len(q_body);
+
+  lmcode_return_put("put_counts_ok", put_m.operation() == "object_put" && put_m.calls() == 2 && put_m.errors() == 0 && put_m.bytes_out() == exp_put_bytes && put_m.bytes_in() == 0);
+  lmcode_return_put("get_counts_ok", get_m.operation() == "object_get" && get_m.calls() == 2 && get_m.errors() == 0 && get_m.bytes_in() == exp_get_bytes && get_m.bytes_out() == 0);
+  lmcode_return_put("head_counts_ok", head_a.exists() && head_m.calls() == 1 && head_m.bytes_in() == 0 && head_m.bytes_out() == 0);
+  lmcode_return_put("qsend_counts_ok", qsend_m.calls() == 1 && qsend_m.bytes_out() == exp_q_bytes && qsend_m.bytes_in() == 0);
+  lmcode_return_put("qrecv_counts_ok", batch.len() == 1 && qrecv_m.calls() >= 1 && qrecv_m.bytes_in() == exp_q_bytes && qrecv_m.bytes_out() == 0);
+  lmcode_return_put("totals_ok", m.total_errors() == 0 && m.total_bytes_out() == (exp_put_bytes + exp_q_bytes) && m.total_bytes_in() == (exp_get_bytes + exp_q_bytes));
+  lmcode_return_put("uncalled_zero", uncalled_m.calls() == 0 && uncalled_m.bytes_in() == 0 && uncalled_m.bytes_out() == 0);
+  lmcode_return_put("summary_ok", str_len(m.summary()) > 0 && head_a.exists());
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "07-metrics-counters-and-bytes failed");
+assert(r.result.put_counts_ok, "object_put OpMetrics must report 2 calls and exact bytes_out");
+assert(r.result.get_counts_ok, "object_get OpMetrics must report 2 calls and exact bytes_in");
+assert(r.result.qsend_counts_ok, "queue_send OpMetrics must report 1 call and exact bytes_out");
+assert(r.result.qrecv_counts_ok, "queue_receive OpMetrics must report exact bytes_in");
+assert(r.result.totals_ok, "MetricsReport total_bytes_out and total_bytes_in must match sum of operations");
+assert(r.result.uncalled_zero, "uncalled operation must report 0 calls and 0 bytes");
+assert(r.result.summary_ok, "metrics().summary() must be non-empty");

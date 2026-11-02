@@ -1,0 +1,78 @@
+# Scenario 08: Performance latency quantile order invariants (0 <= min <= p50 <= p95 <= max <= total_ms) and sorted iteration.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bkt = "lmcloud-cp08-" + run_id + "-bkt";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("all", ep);
+  }
+  let b = ${bkt};
+
+  cloud.bucket_create(b);
+  cloud.metrics_reset();
+
+  # Execute 5 puts, 5 heads, and 5 gets so p50/p95/min/max/mean are exercised over multiple samples.
+  let i = 0;
+  while (i < 5) {
+    let k = "item-" + str(i) + ".txt";
+    cloud.object_put(b, k, "payload-" + str(i));
+    cloud.object_head(b, k);
+    cloud.object_get(b, k);
+    i = i + 1;
+  }
+
+  let m = cloud.metrics();
+
+  let order_ok = true;
+  let quantiles_ok = true;
+  let sum_calls = 0;
+  let prev_name = "";
+  let idx = 0;
+  while (idx < m.len()) {
+    let opm = m.at(idx);
+    if (idx > 0 && str_cmp(prev_name, opm.operation()) >= 0) {
+      order_ok = false;
+    }
+    prev_name = opm.operation();
+    sum_calls = sum_calls + opm.calls();
+
+    if (opm.min_ms() < 0.0 || opm.p50_ms() < opm.min_ms() || opm.p95_ms() < opm.p50_ms() || opm.max_ms() < opm.p95_ms()) {
+      quantiles_ok = false;
+    }
+    if (opm.mean_ms() < opm.min_ms() - 1e-6 || opm.mean_ms() > opm.max_ms() + 1e-6) {
+      quantiles_ok = false;
+    }
+    if (opm.total_ms() < opm.max_ms() - 1e-6 || opm.max_ms() >= 60000.0) {
+      quantiles_ok = false;
+    }
+    idx = idx + 1;
+  }
+
+  # Uncalled operation must have 0.0 for all latency quantiles
+  let unused = m.op("queue_send");
+  let unused_zero = unused.calls() == 0 && unused.min_ms() == 0.0 && unused.p50_ms() == 0.0 && unused.p95_ms() == 0.0 && unused.max_ms() == 0.0 && unused.mean_ms() == 0.0 && unused.total_ms() == 0.0;
+
+  # Cleanup
+  let j = 0;
+  while (j < 5) {
+    cloud.object_delete(b, "item-" + str(j) + ".txt");
+    j = j + 1;
+  }
+  cloud.bucket_delete(b);
+
+  lmcode_return_put("three_ops", m.len() == 3 && sum_calls == 15 && m.total_calls() == 15);
+  lmcode_return_put("order_ok", order_ok);
+  lmcode_return_put("quantiles_ok", quantiles_ok);
+  lmcode_return_put("elapsed_ok", m.elapsed_ms() >= 0.0 && m.elapsed_ms() < 60000.0);
+  lmcode_return_put("unused_zero", unused_zero);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "08-metrics-latency-order-invariants failed");
+assert(r.result.three_ops, "metrics() after 5 puts, 5 heads, and 5 gets must have 3 OpMetrics and 15 total_calls");
+assert(r.result.order_ok, "MetricsReport operations must be sorted lexicographically");
+assert(r.result.quantiles_ok, "0 <= min_ms <= p50_ms <= p95_ms <= max_ms <= total_ms and min_ms <= mean_ms <= max_ms must hold");
+assert(r.result.elapsed_ok, "elapsed_ms() must be non-negative and bounded");
+assert(r.result.unused_zero, "uncalled operation must report 0.0 for all latency quantiles");

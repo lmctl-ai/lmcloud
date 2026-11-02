@@ -6,8 +6,8 @@ LMSCRIPT_BIN="${LMSCRIPT_BIN:-/home/ubuntu/lmctl-mono/lmscript/bin/lmscript}"
 CONF_DIR="$ROOT/tests/conformance"
 
 usage() {
-  echo "Usage: $0 <host-binary> [endpoint] [object-storage|queue|all] [run-id]" >&2
-  echo "       $0 --check [object-storage|queue|all]" >&2
+  echo "Usage: $0 <host-binary> [endpoint] [object-storage|queue|cost-perf|all] [run-id]" >&2
+  echo "       $0 --check [object-storage|queue|cost-perf|all]" >&2
   exit 2
 }
 
@@ -23,15 +23,16 @@ fi
 collect_scenarios() {
   local slice="$1"
   case "$slice" in
-    object-storage|queue)
+    object-storage|queue|cost-perf)
       find "$CONF_DIR/$slice" -maxdepth 1 -name '*.lms' | sort
       ;;
     all|"")
       find "$CONF_DIR/object-storage" -maxdepth 1 -name '*.lms' | sort
       find "$CONF_DIR/queue" -maxdepth 1 -name '*.lms' | sort
+      find "$CONF_DIR/cost-perf" -maxdepth 1 -name '*.lms' | sort
       ;;
     *)
-      echo "error: unknown slice '$slice' (expected: object-storage | queue | all)" >&2
+      echo "error: unknown slice '$slice' (expected: object-storage | queue | cost-perf | all)" >&2
       exit 2
       ;;
   esac
@@ -63,7 +64,7 @@ if [[ "${1:-}" == "--check" ]]; then
 else
   HOST_BIN="$1"
   ARG2="${2:-}"
-  if [[ "$ARG2" == "object-storage" || "$ARG2" == "queue" || "$ARG2" == "all" ]]; then
+  if [[ "$ARG2" == "object-storage" || "$ARG2" == "queue" || "$ARG2" == "cost-perf" || "$ARG2" == "all" ]]; then
     ENDPOINT=""
     SLICE="$ARG2"
     RUN_ID="${3:-${LMCLOUD_RUN_ID:-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')}}"

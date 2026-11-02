@@ -1,0 +1,51 @@
+# Scenario 09: Timer scoping via cloud.metrics_reset() resets performance counters while preserving cumulative cost_report() and estimated_cost().
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bkt = "lmcloud-cp09-" + run_id + "-bkt";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("all", ep);
+  }
+  let b = ${bkt};
+
+  # Phase 1: Setup + initial upload
+  cloud.bucket_create(b);
+  cloud.object_put(b, "phase1.txt", "phase1-data");
+  let m1 = cloud.metrics();
+  let cost1 = cloud.estimated_cost();
+  let reqs1 = cloud.cost_report().total_requests();
+
+  # Reset performance metrics before Phase 2
+  cloud.metrics_reset();
+  let m_after_reset = cloud.metrics();
+  let cost_after_reset = cloud.estimated_cost();
+  let reqs_after_reset = cloud.cost_report().total_requests();
+
+  # Phase 2: Read-only workload
+  let body = cloud.object_get(b, "phase1.txt");
+  let m2 = cloud.metrics();
+  let cost2 = cloud.estimated_cost();
+  let reqs2 = cloud.cost_report().total_requests();
+
+  # Cleanup
+  cloud.object_delete(b, "phase1.txt");
+  cloud.bucket_delete(b);
+
+  assert_close(cost_after_reset, cost1, 1e-9);
+
+  lmcode_return_put("phase1_recorded", m1.total_calls() == 2 && m1.op("bucket_create").calls() == 1 && m1.op("object_put").calls() == 1);
+  lmcode_return_put("reset_cleared_metrics", m_after_reset.total_calls() == 0 && m_after_reset.total_bytes_out() == 0 && m_after_reset.len() == 0 && m_after_reset.op("object_put").calls() == 0);
+  lmcode_return_put("reset_preserved_cost", cost1 > 0.0 && reqs_after_reset == reqs1);
+  lmcode_return_put("phase2_isolated", m2.total_calls() == 1 && m2.op("object_get").calls() == 1 && m2.op("object_put").calls() == 0 && m2.total_bytes_in() == str_len(body));
+  lmcode_return_put("cost_accumulated", cost2 > cost1 && reqs2 == reqs1 + 1);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "09-metrics-reset-scoping-and-cost-persistence failed");
+assert(r.result.phase1_recorded, "Phase 1 metrics must record bucket_create and object_put");
+assert(r.result.reset_cleared_metrics, "metrics_reset() must zero total_calls, total_bytes_out, and per-op counters");
+assert(r.result.reset_preserved_cost, "metrics_reset() must NOT reset estimated_cost() or cost_report()");
+assert(r.result.phase2_isolated, "Phase 2 metrics must contain only operations executed after metrics_reset()");
+assert(r.result.cost_accumulated, "estimated_cost() and cost_report().total_requests() must continue accumulating across metrics_reset()");
