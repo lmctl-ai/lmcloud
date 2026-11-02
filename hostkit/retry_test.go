@@ -32,17 +32,19 @@ func TestRetryAttemptsAndBackoff(t *testing.T) {
 		name       string
 		statuses   []int
 		transport  bool
-		retryTrans bool
+		retryTrans bool // idempotent
 		wantN      int
 		wantSleeps []time.Duration
 		wantFinal  int
 	}{
-		{"503 exhausted", []int{503, 503, 503, 503}, false, false, 3, []time.Duration{100 * time.Millisecond, 250 * time.Millisecond}, 503},
-		{"429 then ok", []int{429, 200}, false, false, 2, []time.Duration{100 * time.Millisecond}, 200},
-		{"500 502 504 retried", []int{500, 502, 504}, false, false, 3, []time.Duration{100 * time.Millisecond, 250 * time.Millisecond}, 504},
-		{"404 not retried", []int{404, 200}, false, false, 1, nil, 404},
-		{"501 not retried", []int{501, 200}, false, false, 1, nil, 501},
-		{"transport not retried", nil, true, false, 1, nil, 0},
+		{"503 exhausted (idempotent)", []int{503, 503, 503, 503}, false, true, 3, []time.Duration{100 * time.Millisecond, 250 * time.Millisecond}, 503},
+		{"503 not retried for non-idempotent POST", []int{503, 200}, false, false, 1, nil, 503},
+		{"429 then ok (always retried)", []int{429, 200}, false, false, 2, []time.Duration{100 * time.Millisecond}, 200},
+		{"500 502 504 retried (idempotent)", []int{500, 502, 504}, false, true, 3, []time.Duration{100 * time.Millisecond, 250 * time.Millisecond}, 504},
+		{"500 not retried for non-idempotent", []int{500, 200}, false, false, 1, nil, 500},
+		{"404 not retried", []int{404, 200}, false, true, 1, nil, 404},
+		{"501 not retried", []int{501, 200}, false, true, 1, nil, 501},
+		{"transport not retried (non-idempotent)", nil, true, false, 1, nil, 0},
 		{"transport retried when idempotent", nil, true, true, 3, []time.Duration{100 * time.Millisecond, 250 * time.Millisecond}, 0},
 	}
 	for _, c := range cases {
@@ -75,7 +77,7 @@ func TestRetryAfterHonouredAndCapped(t *testing.T) {
 	p := testPolicy(rec)
 	p.Jitter = func(time.Duration) time.Duration { return 0 }
 	statuses := []Attempt{{Status: 429, RetryAfter: "1"}, {Status: 503, RetryAfter: "120"}, {Status: 200}}
-	_, n := p.Do(context.Background(), false, func(_ context.Context, i int) Attempt { return statuses[i] })
+	_, n := p.Do(context.Background(), true, func(_ context.Context, i int) Attempt { return statuses[i] })
 	if n != 3 || rec.slept[0] != time.Second || rec.slept[1] != 2*time.Second {
 		t.Fatalf("n=%d slept=%v; want 1s then the 2s cap", n, rec.slept)
 	}
@@ -142,5 +144,57 @@ func TestDoHTTP503MapsToInternalAfterThreeAttempts(t *testing.T) {
 	e := FinalStatusError(resp.StatusCode, "ServiceUnavailable", "service unavailable")
 	if e.Code != Internal || e.HTTPStatus != 503 || e.ProviderCode != "ServiceUnavailable" {
 		t.Fatalf("final error = %+v", e)
+	}
+}
+
+// v2: a non-idempotent request is retried after a transport error only when
+// the request provably never left the client (dial/DNS failure).
+func TestNotSentIsRetriedForNonIdempotent(t *testing.T) {
+	rec := &sleepRecorder{}
+	p := testPolicy(rec)
+	_, n := p.Do(context.Background(), false, func(_ context.Context, i int) Attempt {
+		if i < 2 {
+			return Attempt{Err: errors.New("dial tcp: connection refused"), NotSent: true}
+		}
+		return Attempt{Status: 200}
+	})
+	if n != 3 {
+		t.Fatalf("attempts = %d, want 3", n)
+	}
+	// Real dial failure against a closed port is classified as not sent.
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	addr := srv.URL
+	srv.Close()
+	_, err := http.Get(addr)
+	if err == nil || !RequestNotSent(err) {
+		t.Fatalf("closed port error %v not classified as not-sent", err)
+	}
+	if RequestNotSent(errors.New("read: connection reset by peer")) {
+		t.Fatal("an in-flight failure must not be classified as not sent")
+	}
+	for m, want := range map[string]bool{"GET": true, "head": true, "PUT": true, "DELETE": true, "POST": false, "PATCH": false} {
+		if IdempotentMethod(m) != want {
+			t.Fatalf("IdempotentMethod(%s) != %v", m, want)
+		}
+	}
+}
+
+func TestDoHTTPPostNotRetriedOn500(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(500)
+	}))
+	defer srv.Close()
+	rec := &sleepRecorder{}
+	resp, n, err := testPolicy(rec).DoHTTP(context.Background(), NewHTTPClient(5*time.Second), IdempotentMethod("POST"), func(ctx context.Context) (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodPost, srv.URL, nil)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if n != 1 || hits.Load() != 1 {
+		t.Fatalf("POST attempts=%d hits=%d, want 1", n, hits.Load())
 	}
 }

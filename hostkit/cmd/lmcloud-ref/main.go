@@ -14,7 +14,8 @@
 //	LMCLOUD_REF_ALLOW      credential accepted in enforce mode
 //	LMCLOUD_REF_DENY       credential authenticated but denied in enforce mode
 //	LMCLOUD_REF_PAGE_SIZE  list page size (default 1000)
-//	LMCLOUD_REF_REPORT     if set, print adapter call counts to stderr at exit
+//	LMCLOUD_REF_REPORT     if set, print adapter call counts and run hooks to stderr
+//	LMCLOUD_REF_FAIL_INIT  if set, Program.Init fails (exercises the exit-2 path)
 package main
 
 import (
@@ -27,18 +28,32 @@ import (
 	"github.com/lmctl-ai/lmcloud/hostkit"
 	"github.com/lmctl-ai/lmcloud/hostkit/cloudhost"
 	"github.com/lmctl-ai/lmcloud/hostkit/fakeadapter"
+	"github.com/lmctl-ai/lmcloud/hostkit/invoke"
 	"github.com/lmctl-ai/lmcloud/schema"
 )
 
 var version = "0.1.0"
 
 func main() {
-	args := os.Args[1:]
-	if len(args) > 0 && args[0] == "cloud" {
-		args = args[1:]
-	}
+	args := os.Args[1:] // Program.Main accepts the optional "cloud" word itself
 	var fake *fakeadapter.Fake
+	report := os.Getenv("LMCLOUD_REF_REPORT") != ""
+	hook := func(name string) func() {
+		return func() {
+			if report {
+				fmt.Fprintf(os.Stderr, "lmcloud-ref hook %s\n", name)
+			}
+		}
+	}
 	prog := cloudhost.Program{
+		Notices: "lmcloud-ref notices: github.com/lmctl-ai/lmcode-go (MIT), github.com/lmctl-ai/lmcloud (MIT)",
+		Hooks:   invoke.Hooks{BeforeRun: hook("before_run"), AfterRun: hook("after_run")},
+		Init: func() error {
+			if os.Getenv("LMCLOUD_REF_FAIL_INIT") != "" {
+				return fmt.Errorf("LMCLOUD_REF_FAIL_INIT is set")
+			}
+			return nil
+		},
 		Name:    "lmcloud-ref",
 		Version: version,
 		Schema:  schema.Bytes,
@@ -53,7 +68,7 @@ func main() {
 		},
 	}
 	code := prog.Main(args)
-	if fake != nil && os.Getenv("LMCLOUD_REF_REPORT") != "" {
+	if fake != nil && report {
 		calls := fake.Calls()
 		names := make([]string, 0, len(calls))
 		for n := range calls {

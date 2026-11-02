@@ -136,3 +136,28 @@ func TestSchemaAndSignatureParity(t *testing.T) {
 		t.Fatal("--lmcode-schema --json must serve the exact schema bytes")
 	}
 }
+
+// hostkit v2: Program.Hooks reach the run loop and Program.Init failures exit 2.
+func TestProgramHooksAndInitThroughCompiler(t *testing.T) {
+	bin := lmscript(t)
+	ref := buildRef(t)
+	path := filepath.Join(repoRoot(t), "tests", "conformance", "object-storage", "01-bucket-lifecycle.lms")
+	cmd := exec.Command(bin, filepath.Base(path), ref, "", "hooks")
+	cmd.Dir = filepath.Dir(path)
+	cmd.Env = append(os.Environ(), "LMCLOUD_REF_STATE="+filepath.Join(t.TempDir(), "s.json"), "LMCLOUD_REF_REPORT=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run failed: %v\n%s", err, out)
+	}
+	for _, want := range []string{"lmcloud-ref hook before_run", "lmcloud-ref hook after_run"} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+	init := exec.Command(ref, "cloud", "--lmcode", "/nonexistent.dslb")
+	init.Env = append(os.Environ(), "LMCLOUD_REF_FAIL_INIT=1")
+	frame, _ := init.Output()
+	if init.ProcessState.ExitCode() != 2 || !strings.Contains(string(frame), "CLI_USAGE") {
+		t.Fatalf("Init failure: exit %d frame %s", init.ProcessState.ExitCode(), frame)
+	}
+}

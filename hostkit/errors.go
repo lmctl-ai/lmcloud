@@ -122,10 +122,28 @@ func CodeForStatus(status int) Code {
 	}
 }
 
-// AsCloudError converts any adapter error into a CloudError. Unclassified
-// errors (transport failures, decode failures) become redacted INTERNAL.
-func AsCloudError(err error) *CloudError {
+// NilIfTyped returns nil for a nil error and for a typed-nil *CloudError
+// wrapped in a non-nil error interface (the classic Go trap: a function
+// declared to return error that returns a nil *CloudError variable). Every
+// place hostkit receives an adapter error goes through it, so a typed nil is
+// success, never "[INTERNAL] … OK".
+//
+// Adapter authors: still prefer `if cerr != nil { return cerr }; return nil`.
+func NilIfTyped(err error) error {
 	if err == nil {
+		return nil
+	}
+	if ce, ok := err.(*CloudError); ok && ce == nil {
+		return nil
+	}
+	return err
+}
+
+// AsCloudError converts any adapter error into a CloudError. Unclassified
+// errors (transport failures, decode failures) become redacted INTERNAL. A
+// nil or typed-nil error returns nil.
+func AsCloudError(err error) *CloudError {
+	if NilIfTyped(err) == nil {
 		return nil
 	}
 	var ce *CloudError

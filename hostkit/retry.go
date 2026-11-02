@@ -4,8 +4,10 @@ package hostkit
 
 import (
 	"context"
+	"errors"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -47,10 +49,51 @@ func RetryableStatus(status int) bool {
 }
 
 // Attempt is the outcome of one try. Err is a transport error (no response).
+// NotSent marks a transport error that happened before any byte of the
+// request reached the server (dial/DNS/TLS-handshake failure); such attempts
+// are safe to retry even for non-idempotent requests.
 type Attempt struct {
 	Status     int
 	RetryAfter string
 	Err        error
+	NotSent    bool
+}
+
+// IdempotentMethod is the default retry safety by HTTP method: GET, HEAD,
+// PUT, DELETE and OPTIONS are idempotent; POST and PATCH are not. An adapter
+// may still pass idempotent=true for a POST that carries a client token
+// (e.g. an idempotency key or client request id the provider de-duplicates).
+func IdempotentMethod(method string) bool {
+	switch strings.ToUpper(method) {
+	case "GET", "HEAD", "PUT", "DELETE", "OPTIONS":
+		return true
+	}
+	return false
+}
+
+// RequestNotSent reports whether err from http.Client.Do happened before the
+// request could have reached the server.
+func RequestNotSent(err error) bool {
+	var op *net.OpError
+	if errors.As(err, &op) && op.Op == "dial" {
+		return true
+	}
+	var dns *net.DNSError
+	return errors.As(err, &dns)
+}
+
+// retryable decides whether attempt a may be repeated (design 02 §5.2 plus
+// the idempotency rule): 429 always (the server refused before processing);
+// 500/502/503/504 and in-flight transport errors only for idempotent
+// requests; transport errors that provably happened before sending, always.
+func retryable(a Attempt, idempotent bool) bool {
+	if a.Err != nil {
+		return a.NotSent || idempotent
+	}
+	if a.Status == 429 {
+		return true
+	}
+	return idempotent && RetryableStatus(a.Status)
 }
 
 func (p RetryPolicy) normalized() RetryPolicy {
@@ -133,11 +176,15 @@ func (p RetryPolicy) Delay(i int, retryAfter string) time.Duration {
 	return d
 }
 
-// Do runs fn up to Attempts times. Retryable statuses are always retried;
-// transport errors only when retryTransport is set (idempotent requests).
+// Do runs fn up to Attempts times. idempotent says whether repeating the
+// request is safe after it may have been processed (see IdempotentMethod):
+// non-idempotent requests are retried only on 429 or when Attempt.NotSent.
 // It stops early when ctx ends or the next delay would pass ctx's deadline,
 // returning the last attempt and the number of attempts made.
-func (p RetryPolicy) Do(ctx context.Context, retryTransport bool, fn func(ctx context.Context, attempt int) Attempt) (Attempt, int) {
+//
+// v2 change: before hostkit v2 a non-idempotent request was also retried on
+// 5xx, which could turn a create that succeeded server-side into a 409.
+func (p RetryPolicy) Do(ctx context.Context, idempotent bool, fn func(ctx context.Context, attempt int) Attempt) (Attempt, int) {
 	p = p.normalized()
 	var last Attempt
 	n := 0
@@ -147,7 +194,7 @@ func (p RetryPolicy) Do(ctx context.Context, retryTransport bool, fn func(ctx co
 		}
 		last = fn(ctx, i)
 		n++
-		retry := (last.Err == nil && RetryableStatus(last.Status)) || (last.Err != nil && retryTransport && ctx.Err() == nil)
+		retry := retryable(last, idempotent) && (last.Err == nil || ctx.Err() == nil)
 		if !retry || i == p.Attempts-1 {
 			break
 		}
@@ -162,7 +209,9 @@ func (p RetryPolicy) Do(ctx context.Context, retryTransport bool, fn func(ctx co
 	return last, n
 }
 
-// DoHTTP sends a request built by build with the shared retry policy. Bodies
+// DoHTTP sends a request built by build with the shared retry policy;
+// idempotent follows Do (use IdempotentMethod(req.Method) unless the request
+// carries a provider-honoured client token). Bodies
 // of discarded responses are drained (bounded) and closed. The caller owns the
 // returned response body. Requests must be rebuilt per attempt so bodies replay.
 func (p RetryPolicy) DoHTTP(ctx context.Context, client *http.Client, idempotent bool, build func(ctx context.Context) (*http.Request, error)) (*http.Response, int, error) {
@@ -181,7 +230,7 @@ func (p RetryPolicy) DoHTTP(ctx context.Context, client *http.Client, idempotent
 		}
 		r, err := client.Do(req)
 		if err != nil {
-			return Attempt{Err: err}
+			return Attempt{Err: err, NotSent: RequestNotSent(err)}
 		}
 		resp = r
 		return Attempt{Status: r.StatusCode, RetryAfter: r.Header.Get("Retry-After")}

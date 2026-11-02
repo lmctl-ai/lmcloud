@@ -102,3 +102,56 @@ SKIP), enforce mode 25/25 (0 SKIP, allow/deny credentials via `LMCLOUD_REF_*`), 
 mutations, and schema/signature parity with `lmscript`.
 With `LMCLOUD_REF_PAGE_SIZE=2`, `object-storage/07` fails because it reads all 4 keys from one 2-arg
 `object_list` page; that scenario assumes a provider page holds ≥4 keys (spec M7 allows short pages).
+
+## hostkit v2 (branch `hostkit-v2`) — additive changes from the lmoci port
+
+All existing exported identifiers keep their names and signatures; v2 only adds. Two behaviour
+changes are deliberate and listed under "Behaviour changes".
+
+### Additions
+| Package | Addition | Purpose |
+|---|---|---|
+| `hostkit` | `NilIfTyped(err) error` | A typed-nil `*CloudError` returned through `error` is success. `AsCloudError` uses it; `cloudhost` wraps every adapter so all adapter errors pass through it. |
+| `hostkit` | `Router{Pick}`, `Backend`, `EndpointRoutes{Offline,Sim,Live,UseLive,Unavailable}.Pick`, `CapsFor` | One forwarding implementation of both adapter interfaces; a port writes one `Pick` instead of 17 routing methods. `EndpointRoutes`: no endpoint → Offline (or Live when `UseLive()`), loopback → Sim, other → Live; a missing backend returns `Unavailable(route)`. |
+| `hostkit` | `QueueCapsProvider{QueueCapsFor(ctx, queue)}` | Per-call/per-queue caps; preferred over the global `QueueCaps()` (kept). `Router` implements it from the routed backend. |
+| `hostkit` | `BucketCreationTimer`, `QueueCreationTimer` | Optional creation times to resolve CONFLICT-after-our-own-create (below). |
+| `hostkit` | `Attempt.NotSent`, `RequestNotSent(err)`, `IdempotentMethod(method)` | Retry safety for non-idempotent requests. |
+| `hostkit` | `ReadBoundedResponse(resp, limit)` | `ReadBounded` that records the response status in the error. |
+| `hostkit/invoke` | `Hooks.AfterRun` | Runs after each slot's `Program.Run` (watchdog stopped). |
+| `hostkit/cloudhost` | `Program.Hooks`, `Program.Init`, `Program.Help`, `Program.Notices`, `Program.Commands`; `Signatures(withoutStd)` | `Main` now handles no args/`--help`/`-h`, `--version`/`-V`, `--notices`, `--lmcode-schema [--json]`, `--lmcode-signatures [--without-std]`, host commands, and a leading `cloud` word. `Init` (e.g. memory budget) failing is CLI_USAGE exit 2. |
+
+### Behaviour changes
+1. **Retry idempotency.** `RetryPolicy.Do/DoHTTP(ctx, idempotent, …)`: the bool now governs
+   *all* retries, not only transport errors. 429 is always retried (refused before processing);
+   500/502/503/504 and in-flight transport errors only when `idempotent`; transport errors with
+   `NotSent` (dial/DNS failure) always. Pass `IdempotentMethod(req.Method)`; pass `true` for a POST
+   only when it carries a client token the provider de-duplicates (e.g. an idempotency key on a
+   message send). Before v2 a POST create was retried on 5xx and could turn a server-side success
+   into a 409.
+2. **Create idempotency decision.** When `CreateBucket`/`CreateQueue` reports CONFLICT and the
+   resource is accessible (`HeadBucket`/`LookupQueue`), the host returns `created=true` only if the
+   adapter implements the creation timer and the server-side creation time is at or after the start
+   of this call (an earlier attempt of the same call committed). Otherwise — no timer, timer error,
+   older creation time — it returns `false` ("already existed"): the host never claims a create it
+   cannot prove. Server/client clock skew can only turn a true into a false. `CreateQueue` CONFLICT
+   for a queue that is not accessible stays CONFLICT (previously any queue CONFLICT failed).
+
+### Port checklist (v2)
+- Replace hand-written routing with `hostkit.Router{Pick: hostkit.EndpointRoutes{...}.Pick}`.
+- Return per-route caps with `QueueCapsFor` when backends differ (e.g. offline fake vs long poll).
+- Build requests with `DoHTTP(ctx, client, hostkit.IdempotentMethod(method), …)`.
+- Implement `BucketCreatedAt`/`QueueCreatedAt` when the provider reports creation times.
+- Move CLI extras into `Program{Hooks, Init, Help, Notices, Commands}`.
+- After the lmcode-go pin includes `Registry.Enum` (proposed patch below), `cloudhost.Register`
+  should declare `reg.Enum("ErrorCode", codes)` so dry runs can evaluate `last_error().code()`.
+
+### lmcode-go dry enum limitation — proposed patch
+Repro (lmcode-go 77932bf): a host callback whose return type is an enum returns the constant
+name as a string (the wire form). In a dry run `validateDryResult` accepts only primitives or
+objects, so a `Dry` callback returning `String("OK")` for `ErrorCode` fails with
+`dry callback for ErrorCode returned string`; without a slot the dry-null dummy cannot be compared
+with `ErrorCode.OK`. Proposed patch (not pushed): `Registry.Enum(name, values)` declares a schema
+enum; a dry result for a declared enum must be one of its constant strings; the no-slot dummy is
+the first constant; undeclared types stay strict. Branch `dry-enum-string` commit `23ff76b` in the
+scratch clone `lmcode-go-dryenum`, patch file `lmcode-go-dry-enum-patch/0001-*.patch`, with tests
+`dry_enum_test.go`; `go test -race ./...` passes there.

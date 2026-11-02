@@ -4,6 +4,7 @@ package hostkit
 
 import (
 	"io"
+	"net/http"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -283,6 +284,16 @@ func ReadBounded(r io.Reader, limit int64) ([]byte, *CloudError) {
 		return nil, ProviderError(Internal, 0, "", "response body exceeds the "+itoa(limit)+"-byte limit; refusing to truncate")
 	}
 	return data, nil
+}
+
+// ReadBoundedResponse is ReadBounded for an HTTP response: any error carries
+// resp.StatusCode as its http_status. It does not close the body.
+func ReadBoundedResponse(resp *http.Response, limit int64) ([]byte, *CloudError) {
+	data, e := ReadBounded(resp.Body, limit)
+	if e != nil {
+		e.HTTPStatus = resp.StatusCode
+	}
+	return data, e
 }
 
 func itoa(n int64) string {

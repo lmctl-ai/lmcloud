@@ -111,7 +111,10 @@ func ParseArgs(args []string) (*Invocation, error) {
 
 // Hooks are the provider-specific edges of the run loop. All are optional.
 type Hooks struct {
-	BeforeRun     func()
+	BeforeRun func()
+	// AfterRun runs after each slot's Program.Run returns (watchdog stopped),
+	// before the slot is completed or failed. Added in hostkit v2.
+	AfterRun      func()
 	OnRunError    func(error)
 	Cleanup       func()
 	AuthError     func() string
@@ -201,6 +204,9 @@ func (r *Runner) Execute() int {
 		runErr := program.Run(r.Context, r.Registry)
 		if stopWatchdog != nil {
 			stopWatchdog()
+		}
+		if r.Hooks.AfterRun != nil {
+			r.Hooks.AfterRun()
 		}
 
 		if r.Hooks.AuthError != nil {

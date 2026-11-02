@@ -71,6 +71,13 @@ func New(cfg Config) *Host {
 	if cfg.Sleep == nil {
 		cfg.Sleep = hostkit.SleepContext
 	}
+	// Every adapter error passes through hostkit.NilIfTyped (typed-nil trap).
+	if cfg.Store != nil {
+		cfg.Store = guardStore{cfg.Store}
+	}
+	if cfg.Queue != nil {
+		cfg.Queue = guardQueue{cfg.Queue}
+	}
 	return &Host{cfg: cfg, errs: hostkit.NewErrorState(), dry: newOverlay()}
 }
 
@@ -240,6 +247,7 @@ func (h *Host) BucketCreate(dry bool, b string) (bool, error) {
 	if h.cfg.Store == nil {
 		return false, h.fail(op, b, missingStore())
 	}
+	start := h.cfg.Now()
 	created, err := h.cfg.Store.CreateBucket(ctx, b)
 	if err == nil {
 		h.ok()
@@ -250,7 +258,9 @@ func (h *Host) BucketCreate(dry bool, b string) (bool, error) {
 		// Design 02 §6.1: 409 is idempotent success only if the bucket is accessible in our scope.
 		if exists, perr := h.realBucketExists(ctx, b); perr == nil && exists {
 			h.ok()
-			return false, nil
+			return createdDuringCall(h.cfg.Store, start, func(t hostkit.BucketCreationTimer) (time.Time, error) {
+				return t.BucketCreatedAt(ctx, b)
+			}), nil
 		}
 	}
 	return false, h.fail(op, b, ce)
@@ -704,9 +714,19 @@ func (h *Host) QueueCreate(dry bool, q string) (bool, error) {
 	if h.cfg.Queue == nil {
 		return false, h.fail(op, q, missingQueue())
 	}
+	start := h.cfg.Now()
 	created, err := h.cfg.Queue.CreateQueue(ctx, q)
 	if err != nil {
-		return false, h.fail(op, q, hostkit.AsCloudError(err))
+		ce := hostkit.AsCloudError(err)
+		if ce.Code == hostkit.Conflict {
+			if exists, perr := h.realQueueExists(ctx, q); perr == nil && exists {
+				h.ok()
+				return createdDuringCall(h.cfg.Queue, start, func(t hostkit.QueueCreationTimer) (time.Time, error) {
+					return t.QueueCreatedAt(ctx, q)
+				}), nil
+			}
+		}
+		return false, h.fail(op, q, ce)
 	}
 	h.ok()
 	return created, nil
@@ -823,7 +843,7 @@ func (h *Host) QueueSend(dry bool, q, body string) (string, error) {
 	if h.cfg.Queue == nil {
 		return "", h.fail(op, q, missingQueue())
 	}
-	wire := hostkit.EncodeQueueBody(body, h.cfg.Queue.QueueCaps().TextOnlyWire)
+	wire := hostkit.EncodeQueueBody(body, hostkit.CapsFor(ctx, h.cfg.Queue, q).TextOnlyWire)
 	id, err := h.cfg.Queue.Send(ctx, q, wire)
 	if err != nil {
 		return "", h.fail(op, q, hostkit.AsCloudError(err))
@@ -864,7 +884,7 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 	if h.cfg.Queue == nil {
 		return nil, h.fail(op, q, missingQueue())
 	}
-	caps := h.cfg.Queue.QueueCaps()
+	caps := hostkit.CapsFor(ctx, h.cfg.Queue, q)
 	var raw []hostkit.RawMessage
 	var rerr error
 	if caps.LongPoll {
@@ -1139,3 +1159,19 @@ func (o *overlay) mergeQueues(names []string) []string {
 
 // errIndex is returned by list accessors for out-of-range indices.
 var errIndex = errors.New("index out of range")
+
+// createdDuringCall resolves "CONFLICT, but the resource is accessible" (see
+// durable-memory/09-hostkit.md, create idempotency): it returns true only when
+// the adapter reports a server-side creation time at or after the start of
+// this call, i.e. an earlier attempt of the same call (a retry, or a reply
+// lost after the server committed) created it. Without a timer, or when the
+// timer fails, the answer is false ("already existed"): the host never claims
+// a create it cannot prove. Clock skew can only turn a true into a false.
+func createdDuringCall[T any](adapter any, start time.Time, at func(T) (time.Time, error)) bool {
+	t, ok := adapter.(T)
+	if !ok {
+		return false
+	}
+	created, err := at(t)
+	return hostkit.NilIfTyped(err) == nil && !created.IsZero() && !created.Before(start)
+}

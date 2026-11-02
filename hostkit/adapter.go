@@ -2,7 +2,10 @@
 
 package hostkit
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // ObjectMeta is the normalized object metadata snapshot.
 type ObjectMeta struct {
@@ -97,4 +100,27 @@ type Queue interface {
 	Ack(ctx context.Context, queue, receipt string) error
 	// Nack changes visibility and returns the receipt valid from now on.
 	Nack(ctx context.Context, queue, receipt string, visibility int) (newReceipt string, err error)
+}
+
+// QueueCapsProvider is optional: a Queue that implements it reports caps per
+// call (for example per route or per queue) and the host uses it instead of
+// QueueCaps(). QueueCaps() stays for source compatibility.
+type QueueCapsProvider interface {
+	QueueCapsFor(ctx context.Context, queue string) QueueCaps
+}
+
+// BucketCreationTimer is optional: it returns a bucket's server-side creation
+// time. When CreateBucket reports CONFLICT and the bucket is accessible, the
+// host returns created=true if the bucket was created at or after the start
+// of this bucket_create call (a retried or interrupted create that the server
+// already completed), else false (it already existed). Without it the host
+// returns false.
+type BucketCreationTimer interface {
+	BucketCreatedAt(ctx context.Context, bucket string) (time.Time, error)
+}
+
+// QueueCreationTimer is the queue counterpart of BucketCreationTimer, used
+// when CreateQueue reports CONFLICT.
+type QueueCreationTimer interface {
+	QueueCreatedAt(ctx context.Context, queue string) (time.Time, error)
 }
