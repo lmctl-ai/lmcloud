@@ -8,6 +8,7 @@ SIM_CTL="$HERE/sim.sh"
 [ -x "$SIM_CTL" ] || { echo "ERROR: $SIM_CTL is not executable" >&2; exit 1; }
 
 current_sim=""
+# shellcheck disable=SC2317
 cleanup() {
   if [ -n "$current_sim" ]; then
     "$SIM_CTL" stop "$current_sim" >/dev/null 2>&1 || true
@@ -28,14 +29,14 @@ test_aws() {
   echo "  Started awssim at $url"
 
   local ts
-  ts="$(date +%s%N | cut -b1-13)"
+  ts="$(python3 -c 'import time; print(int(time.time() * 1000))')"
   local bucket="test-aws-bucket-$ts"
   local obj="test-file-$ts.txt"
   local payload="awssim S3 test payload $ts binary:\x00\x01\xfe\xff"
   local tmp_in
-  tmp_in="$(mktemp)"
+  tmp_in="$(mktemp "${TMPDIR:-/tmp}/lmcloud.XXXXXX")"
   local tmp_out
-  tmp_out="$(mktemp)"
+  tmp_out="$(mktemp "${TMPDIR:-/tmp}/lmcloud.XXXXXX")"
   printf "%b" "$payload" > "$tmp_in"
 
   echo "  Creating S3 bucket $bucket (PUT $url/$bucket)..."
@@ -75,15 +76,15 @@ test_azure() {
   echo "  Started azuresim at $url"
 
   local ts
-  ts="$(date +%s%N | cut -b1-13)"
+  ts="$(python3 -c 'import time; print(int(time.time() * 1000))')"
   local account="devstoreaccount1"
   local container="test-azure-container-$ts"
   local blob="test-blob-$ts.txt"
   local payload="azuresim Blob test payload $ts binary:\x00\x01\xfe\xff"
   local tmp_in
-  tmp_in="$(mktemp)"
+  tmp_in="$(mktemp "${TMPDIR:-/tmp}/lmcloud.XXXXXX")"
   local tmp_out
-  tmp_out="$(mktemp)"
+  tmp_out="$(mktemp "${TMPDIR:-/tmp}/lmcloud.XXXXXX")"
   printf "%b" "$payload" > "$tmp_in"
 
   echo "  Creating Blob container $container (PUT $url/$account/$container?restype=container)..."
@@ -123,15 +124,15 @@ test_gcp() {
   echo "  Started gcpsim at $url"
 
   local ts
-  ts="$(date +%s%N | cut -b1-13)"
+  ts="$(python3 -c 'import time; print(int(time.time() * 1000))')"
   local project="gcpsim-local"
   local bucket="test-gcp-bucket-$ts"
   local obj="test-obj-$ts.txt"
   local payload="gcpsim GCS test payload $ts binary:\x00\x01\xfe\xff"
   local tmp_in
-  tmp_in="$(mktemp)"
+  tmp_in="$(mktemp "${TMPDIR:-/tmp}/lmcloud.XXXXXX")"
   local tmp_out
-  tmp_out="$(mktemp)"
+  tmp_out="$(mktemp "${TMPDIR:-/tmp}/lmcloud.XXXXXX")"
   printf "%b" "$payload" > "$tmp_in"
 
   echo "  Creating GCS bucket $bucket (POST $url/storage/v1/b?project=$project)..."
@@ -175,15 +176,15 @@ test_oci() {
   echo "  Started ocisim at $url"
 
   local ts
-  ts="$(date +%s%N | cut -b1-13)"
+  ts="$(python3 -c 'import time; print(int(time.time() * 1000))')"
   local tenancy="ocid1.tenancy.oc1..flocilocaltenancy0000000000000000000000000000000000000000"
   local bucket="test-oci-bucket-$ts"
   local obj="test-obj-$ts.txt"
   local payload="ocisim Object Storage test payload $ts binary:\x00\x01\xfe\xff"
   local tmp_in
-  tmp_in="$(mktemp)"
+  tmp_in="$(mktemp "${TMPDIR:-/tmp}/lmcloud.XXXXXX")"
   local tmp_out
-  tmp_out="$(mktemp)"
+  tmp_out="$(mktemp "${TMPDIR:-/tmp}/lmcloud.XXXXXX")"
   printf "%b" "$payload" > "$tmp_in"
 
   echo "  Retrieving OCI namespace (GET $url/n/)..."

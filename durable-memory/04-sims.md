@@ -9,7 +9,7 @@ All simulators are standalone native executables (Quarkus / GraalVM native image
 | Simulator | Release | Upstream Engine | Default Port | Health / Readiness Probe |
 |---|---|---|---|---|
 | **awssim** | `v0.2.0` | Floci 2.3.0 | `4566` | `GET /_floci/health` (HTTP 200) |
-| **azuresim** | `v0.2.0` | Floci-AZ 0.15.0 | `4577` | `GET /devstoreaccount1?comp=list` (HTTP 200) |
+| **azuresim** | `v0.2.0` | Floci-AZ 0.15.0 | `4577` | `GET /_floci/health` (HTTP 200) |
 | **gcpsim** | `v0.2.0` | floci-gcp 0.11.0 | `4588` | `GET /health` (HTTP 200) |
 | **ocisim** | `v0.1.0` | floci-oci 0.5.0 | `4599` | `GET /_floci-oci/health` (HTTP 200) |
 
@@ -38,15 +38,30 @@ Downloads the simulator and client binaries for the current host architecture (`
 ### 3. `scripts/sim.sh`
 Manages the background server lifecycle for each simulator:
 ```bash
-scripts/sim.sh start <aws|azure|gcp|oci> [--port N] [--free-port] [--data-dir D] [--timeout S]
-scripts/sim.sh stop <aws|azure|gcp|oci>
-scripts/sim.sh status <aws|azure|gcp|oci>
-scripts/sim.sh url <aws|azure|gcp|oci>
+scripts/sim.sh start <aws|azure|gcp|oci> [--name NAME] [--port N] [--free-port] [--data-dir D] [--timeout S]
+scripts/sim.sh stop <aws|azure|gcp|oci> [--name NAME]
+scripts/sim.sh status <aws|azure|gcp|oci> [--name NAME]
+scripts/sim.sh url <aws|azure|gcp|oci> [--name NAME]
 ```
-- **Lifecycle & Process Management:** Starts process in background (`serve --port <port> --data-dir <data_dir>`), writes PID and port to `.cache/sims/run/<provider>/`, captures stdout and stderr to `sim.log`, and prints the loopback URL on stdout once healthy.
-- **Port Selection:** Uses the provider default port if available, or dynamically selects an unused loopback port (`--free-port` or when default port is busy).
-- **Graceful Shutdown:** `stop` sends `SIGTERM`, waits up to 5 seconds for clean exit, and escalates to `SIGKILL` only if the process fails to terminate.
-- **Orphan Prevention:** Uses bash error and termination traps (`ERR`, `INT`, `TERM`) during startup to ensure no zombie processes remain if startup or readiness polling fails.
+
+Key features and lifecycle semantics:
+- **Same-Provider Concurrency (`--name NAME` / `$LMCLOUD_SIM_NAME`):**
+  Each instance runs in an isolated directory (`.cache/sims/run/<provider>/<name>/`), allowing parallel tests to run multiple instances of the same simulator concurrently on separate ports without collision.
+- **Idempotent Start:**
+  Calling `start` for an instance that is already healthy and running simply prints its existing loopback URL and exits 0 without spawning duplicate processes.
+- **Data Directory Lifecycle & Residue Policy:**
+  - *Default:* When no `--data-dir` is specified, an ephemeral directory (`$SIM_RUNDIR/data`) is used. It is automatically purged when the simulator stops to ensure a clean slate.
+  - *Custom (`--data-dir PATH`):* When an explicit directory is provided by the caller, the harness preserves it after `stop`. This allows post-mortem inspection of sqlite/file state and enables persistent state reuse across runs.
+- **Log Truncate-on-Start:**
+  Starting a simulator truncates `$SIM_RUNDIR/sim.log` (rather than appending) so diagnostic output always corresponds strictly to the current instance run.
+- **Process Group Isolation (`setsid`):**
+  Simulators run in their own process group via `setsid` (with python `os.setsid` fallback on BSD/macOS). Termination signals target the negative PID group (`-$pid`), ensuring all child threads and sub-processes are terminated cleanly.
+- **PID Reuse Protection:**
+  Pidfiles record `PID=<pid>`, `EXE=<sim_bin>`, and start timestamp token `START=<lstart>` (via `ps -o lstart=`). Before `status` or `stop` acts on a PID, it verifies that `/proc/<pid>/cmdline` (or `ps -o comm=`) and start time match the recorded identity. If the process has died and the OS reused the PID for another process, `sim.sh` refuses to kill it, removes the stale pidfile, and reports status accurately.
+- **Signal Handling & Clean Exit Codes:**
+  Signal handlers trap `INT` (exits 130), `TERM` (exits 143), and `ERR` (exits `$ec`). All traps perform process group cleanup before exiting.
+  > [!NOTE]
+  > CI workflow runners often launch backgrounded subshells with `SIGINT` ignored. CI step teardown must explicitly call `sim.sh stop` (e.g. via `if: always()`) rather than relying on inherited signal propagation.
 
 ### 4. `scripts/smoke-sim-wire.sh`
 Internal simulator wire smoke test (not the lmscript acceptance test). Executes end-to-end provider-native object storage round trips with plain `curl` against all 4 simulators:
@@ -56,7 +71,27 @@ scripts/smoke-sim-wire.sh [aws|azure|gcp|oci...]
 All 4 pass cleanly (bucket create, object put, get & byte comparison, object delete, bucket delete).
 
 ### 5. `scripts/test-sims-lmscript.sh`
-The primary LMScript harness runner. Per provider, starts the simulator, runs an LMScript program via the client using mono LMScript (`LMSCRIPT_BIN=/home/ubuntu/lmctl-mono/lmscript/bin/lmscript`) and the CURRENT API (`load_schema` / `_lmcode_` / `run_lmcode`), and stops the simulator.
+The primary LMScript harness runner. Per provider, starts the simulator, runs an LMScript program via the client using mono LMScript (`LMSCRIPT_BIN=/home/ubuntu/lmctl-mono/lmscript/bin/lmscript`) and the CURRENT API (`load_schema` / `_lmcode_` / `run_lmcode`), and stops the simulator:
+```bash
+scripts/test-sims-lmscript.sh [--strict] [aws|azure|gcp|oci...]
+```
+- **Exit Codes:**
+  - *Default:* Exits `0` if all evaluated providers are either `PASS` or expected `PENDING-GO-PORT`. Exits `1` only if an unexpected failure (`FAIL`) occurs.
+  - *Strict (`--strict`):* Exits `1` if any provider is `PENDING-GO-PORT` or `FAIL`. Useful for CI enforcement once modern clients are deployed.
+- **Machine-Readable Output:**
+  Emits standard TAP (Test Anything Protocol) lines (`1..N`, `ok 1 - aws # PENDING-GO-PORT ...`) and provider summary lines (`PROVIDER <name> <status>`).
+
+---
+
+## Portability & macOS Compatibility
+
+All scripts are written to run portably on macOS (bash 3.2 / BSD userland) and Linux (Ubuntu bash 5 / GNU userland):
+- **No Bash 4+ Associative Arrays:** Replaced all `declare -A` constructs with POSIX-compatible indexed parallel arrays.
+- **Template-Required `mktemp`:** Uses `mktemp -d "${TMPDIR:-/tmp}/lmcloud.XXXXXX"` compatible with BSD `mktemp`.
+- **Millisecond Timestamps:** Uses `python3 -c 'import time; print(int(time.time() * 1000))'` rather than GNU-specific `date +%s%N`.
+- **Strict Linting:** All scripts pass `shellcheck` with zero warnings.
+
+---
 
 ## Current Compiler Compatibility & Provider Status
 
@@ -170,21 +205,24 @@ All four pinned released clients (`lmaws v0.1.27`, `lmazure v0.1.5`, `lmgcp v0.1
 
 ---
 
-## Proposed Simulator Enhancements
+## Proposed Simulator Enhancements & Compatibility Findings
 
-Based on real observations from building the harness, inspecting the simulator sources, and driving wire/client operations:
+### Verified Supported Capabilities (False Proposals Removed)
+During live verification on the release binaries, several features previously assumed missing were confirmed fully operational in current releases:
+- **`azuresim v0.2.0` Health Endpoint:**
+  `azuresim` already supports `GET /_floci/health` returning HTTP 200 `{"status":"UP","version":"dev","edition":"floci-az-always-free"}`. The harness probe was updated accordingly.
+- **`awssim v0.2.0` S3 Multipart, Versioning & Copy:**
+  Live wire testing confirmed that `POST /<bucket>/<key>?uploads` initializes multipart uploads (`InitiateMultipartUploadResult`), `PUT /<bucket>?versioning` configures bucket versioning, and `PUT /<bucket>/<target>` with `x-amz-copy-source` performs S3 object copies cleanly.
+- **`gcpsim v0.2.0` Delete Status Code:**
+  DELETE object and bucket requests consistently return HTTP 204 No Content per Google Cloud Storage JSON API specifications.
 
-1. **`azuresim` (`lmctl-ai/azuresim`, `src/` / routing filter):**
-   - **Missing standard health endpoint:** Unlike `awssim` (`/_floci/health`), `gcpsim` (`/health`), and `ocisim` (`/_floci-oci/health`), `azuresim` has no dedicated HTTP GET endpoint to probe readiness without making a functional Blob or Queue storage call.
-   - **Proposal:** Add a lightweight `GET /_floci/health` route returning HTTP 200 `{"status": "UP"}` to eliminate the need for functional resource list queries (`/devstoreaccount1?comp=list`) during harness startup polling.
-
-2. **`ocisim` (`lmctl-ai/ocisim`, `src/main/java/io/flo/oci/lif/EmulatorLifecycle.java`):**
-   - **Health route path consistency:** `ocisim` serves health at `GET /_floci-oci/health`.
-   - **Proposal:** Add an alias route `GET /_floci/health` (consistent with `awssim`) so multi-cloud harnesses can use a unified health check path across all simulators.
-
-3. **`awssim` (`lmctl-ai/awssim`, `src/` & `durable-memory/auth-2026-10-30.md`):**
-   - **S3 Advanced APIs:** S3 multipart upload (`InitiateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`), S3 object copy (`CopyObject`), and bucket versioning are deferred.
-   - **Proposal:** Implement mock multipart upload and object copy in Floci S3 service handlers so object storage conformance tests covering large uploads or server-side copying can run locally.
-
-4. **`gcpsim` (`lmctl-ai/gcpsim`, `src/`):**
-   - **Delete Object Return Codes:** Ensure DELETE object media requests consistently return HTTP 204 No Content according to Google Cloud Storage JSON API specifications, and implement stubbed bucket lifecycle and uniform bucket-level access configuration endpoints for future conformance suites.
+### Proposed Simulator Enhancements
+1. **`ocisim` (`lmctl-ai/ocisim`, `src/main/java/io/flo/oci/lif/EmulatorLifecycle.java`):**
+   - **Health route path alias:** `ocisim v0.1.0` serves its health endpoint only at `GET /_floci-oci/health`, while `GET /_floci/health` returns 404:
+     ```bash
+     $ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:4599/_floci/health
+     404
+     $ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:4599/_floci-oci/health
+     200
+     ```
+   - **Proposal (Cosmetic):** Add route alias `GET /_floci/health` in `EmulatorLifecycle.java` matching `awssim` and `azuresim`, allowing harnesses to use a uniform probe path across all Floci-based simulators.

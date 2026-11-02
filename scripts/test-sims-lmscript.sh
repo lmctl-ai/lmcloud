@@ -4,6 +4,10 @@
 # Released clients (lmaws v0.1.27, lmazure v0.1.5, lmgcp v0.1.9, lmoci v0.1.0) were built
 # against legacy compiler 0.2.420 (bytecode v5). If a client cannot be driven by the current
 # compiler, it records the exact command + error and marks the provider PENDING-GO-PORT.
+#
+# Flags:
+#   --strict    Exit non-zero if any provider is PENDING-GO-PORT (CI uses once Go hosts exist)
+#   Default:    Exit 0 for PENDING-GO-PORT, exit non-zero only for genuine failures (FAIL)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +20,21 @@ CLIENT_DIR="${LMCLOUD_CLIENT_DIR:-$ROOT/.cache/clients}"
 [ -x "$SIM_CTL" ] || { echo "ERROR: $SIM_CTL is not executable" >&2; exit 1; }
 [ -x "$LMSCRIPT_BIN" ] || { echo "ERROR: LMScript compiler not found or not executable at $LMSCRIPT_BIN" >&2; exit 1; }
 
+STRICT_MODE=false
+FILTERED_TARGETS=()
+for arg in "$@"; do
+  case "$arg" in
+    --strict)
+      STRICT_MODE=true
+      ;;
+    *)
+      FILTERED_TARGETS+=("$arg")
+      ;;
+  esac
+done
+
 current_sim=""
+# shellcheck disable=SC2317
 cleanup() {
   if [ -n "$current_sim" ]; then
     echo "Cleaning up running sim: $current_sim..." >&2
@@ -35,13 +53,13 @@ ensure_client() {
   fi
 }
 
-declare -A STATUS_MAP
-declare -A REASON_MAP
+RECORDED_PROVIDERS=()
+RECORDED_STATUSES=()
+RECORDED_REASONS=()
 
 test_provider() {
   local provider="$1"
   local client="$2"
-  local default_port="$3"
 
   echo "============================================================"
   echo "Testing $provider ($client) with LMScript harness"
@@ -56,7 +74,7 @@ test_provider() {
   echo "Simulator $provider started at $sim_url"
 
   local tmp_dir
-  tmp_dir="$(mktemp -d -t "lmtest-$provider-XXXXXX")"
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/lmtest-$provider.XXXXXX")"
   local schema_file="$tmp_dir/schema.json"
   local script_file="$tmp_dir/test.lms"
   local err_file="$tmp_dir/error.log"
@@ -152,48 +170,54 @@ EOF
   "$SIM_CTL" stop "$provider"
   current_sim=""
 
-  # Determine compatibility outcome
+  local outcome_status=""
+  local outcome_reason=""
+
   if [ "$exec_ok" -eq 1 ] && [ "$direct_ok" -eq 1 ]; then
     echo "Result for $provider: PASS"
-    STATUS_MAP["$provider"]="PASS"
-    REASON_MAP["$provider"]="Execution passed successfully"
+    outcome_status="PASS"
+    outcome_reason="Execution passed successfully"
   else
-    echo "Result for $provider: PENDING-GO-PORT"
-    STATUS_MAP["$provider"]="PENDING-GO-PORT"
-
-    # Identify primary diagnostic
-    local reason=""
+    # Distinguish expected PENDING-GO-PORT incompatibility from genuine test failure
     if echo "$exec_err" | grep -q "unsupported bytecode version 6"; then
-      reason="unsupported bytecode version 6 (client expects v5)"
+      outcome_status="PENDING-GO-PORT"
+      outcome_reason="unsupported bytecode version 6 (client expects v5)"
     elif echo "$exec_err" | grep -q "frame is not terminal"; then
-      reason="wire frame protocol mismatch (missing LMCODE_RETURN_BEGIN/END)"
+      outcome_status="PENDING-GO-PORT"
+      outcome_reason="wire frame protocol mismatch (missing LMCODE_RETURN_BEGIN/END)"
     elif [ "$direct_ok" -eq 0 ]; then
-      reason="client lacks --lmcode-schema CLI flag (schema host exited 2)"
+      outcome_status="PENDING-GO-PORT"
+      outcome_reason="client lacks --lmcode-schema CLI flag (schema host exited 2)"
     else
-      reason="client execution failed with current compiler"
+      outcome_status="FAIL"
+      outcome_reason="unexpected execution failure"
     fi
 
-    echo "  Diagnostic: $reason"
+    echo "Result for $provider: $outcome_status"
+    echo "  Diagnostic: $outcome_reason"
     echo "  Captured error tail:"
     echo "$exec_err" | head -n 4 | sed 's/^/    /'
-    REASON_MAP["$provider"]="$reason"
   fi
+
+  RECORDED_PROVIDERS+=("$provider")
+  RECORDED_STATUSES+=("$outcome_status")
+  RECORDED_REASONS+=("$outcome_reason")
 
   rm -rf "$tmp_dir"
   echo ""
 }
 
-targets=("$@")
+targets=("${FILTERED_TARGETS[@]}")
 if [ ${#targets[@]} -eq 0 ]; then
   targets=("aws" "azure" "gcp" "oci")
 fi
 
 for t in "${targets[@]}"; do
   case "$t" in
-    aws|awssim)     test_provider "aws" "lmaws" 4566 ;;
-    azure|azuresim) test_provider "azure" "lmazure" 4577 ;;
-    gcp|gcpsim)     test_provider "gcp" "lmgcp" 4588 ;;
-    oci|ocisim)     test_provider "oci" "lmoci" 4599 ;;
+    aws|awssim)     test_provider "aws" "lmaws" ;;
+    azure|azuresim) test_provider "azure" "lmazure" ;;
+    gcp|gcpsim)     test_provider "gcp" "lmgcp" ;;
+    oci|ocisim)     test_provider "oci" "lmoci" ;;
     *) echo "ERROR: Unknown provider $t" >&2; exit 2 ;;
   esac
 done
@@ -203,13 +227,51 @@ echo "SUMMARY: LMScript Sim Harness Test Results"
 echo "============================================================"
 printf "%-10s %-18s %s\n" "PROVIDER" "STATUS" "EVIDENCE / DETAILS"
 printf "%-10s %-18s %s\n" "--------" "------" "------------------"
-for t in "${targets[@]}"; do
-  case "$t" in
-    aws|awssim)     p="aws" ;;
-    azure|azuresim) p="azure" ;;
-    gcp|gcpsim)     p="gcp" ;;
-    oci|ocisim)     p="oci" ;;
-  esac
-  printf "%-10s %-18s %s\n" "$p" "${STATUS_MAP[$p]}" "${REASON_MAP[$p]}"
+
+total_count=${#RECORDED_PROVIDERS[@]}
+has_fail=false
+has_pending=false
+
+for i in $(seq 0 $((total_count - 1))); do
+  p="${RECORDED_PROVIDERS[$i]}"
+  s="${RECORDED_STATUSES[$i]}"
+  r="${RECORDED_REASONS[$i]}"
+  printf "%-10s %-18s %s\n" "$p" "$s" "$r"
+  if [ "$s" = "FAIL" ]; then
+    has_fail=true
+  elif [ "$s" = "PENDING-GO-PORT" ]; then
+    has_pending=true
+  fi
 done
 echo "============================================================"
+
+# Machine-readable TAP and provider status lines
+echo "1..$total_count"
+for i in $(seq 0 $((total_count - 1))); do
+  p="${RECORDED_PROVIDERS[$i]}"
+  s="${RECORDED_STATUSES[$i]}"
+  r="${RECORDED_REASONS[$i]}"
+  num=$((i + 1))
+  if [ "$s" = "PASS" ]; then
+    echo "ok $num - $p"
+    echo "PROVIDER $p PASS"
+  elif [ "$s" = "PENDING-GO-PORT" ]; then
+    echo "ok $num - $p # PENDING-GO-PORT $r"
+    echo "PROVIDER $p PENDING"
+  else
+    echo "not ok $num - $p # FAIL $r"
+    echo "PROVIDER $p FAIL"
+  fi
+done
+
+if [ "$has_fail" = true ]; then
+  echo "ERROR: One or more simulator tests failed." >&2
+  exit 1
+fi
+
+if [ "$STRICT_MODE" = true ] && [ "$has_pending" = true ]; then
+  echo "ERROR: Strict mode active and one or more providers are PENDING-GO-PORT." >&2
+  exit 1
+fi
+
+exit 0
