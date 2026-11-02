@@ -1,13 +1,14 @@
 # Scenario 10: NOT_FOUND errors vs non-throwing existence probes (bucket_exists / object_head).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
-bucket = "lmcloud-conf-10-notfound";
-missing_bucket = "lmcloud-conf-10-absent";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-c10-" + run_id + "-present";
+missing_bucket = "lmcloud-c10-" + run_id + "-absent";
 
 # 1. Default abort mode: object_get on missing bucket must abort with [NOT_FOUND]
 abort_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   cloud.bucket_delete(${missing_bucket});
   cloud.object_get(${missing_bucket}, "no-such-key.txt");
@@ -20,7 +21,7 @@ assert(!r_abort.ok, "object_get on non-existent bucket must abort in default mod
 inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let b = ${bucket};
   let mb = ${missing_bucket};
@@ -49,6 +50,9 @@ inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.object_list(mb, "");
   let list_missing_bucket_err = cloud.last_error();
 
+  cloud.object_list_all(mb, "");
+  let list_all_missing_bucket_err = cloud.last_error();
+
   cloud.object_delete(mb, "any.txt");
   let del_missing_bucket_err = cloud.last_error();
 
@@ -61,7 +65,7 @@ inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   lmcode_return_put("head_probe_ok", head_probe_err.code() == ErrorCode.OK);
   lmcode_return_put("get_key_nf", get_missing_key_err.code() == ErrorCode.NOT_FOUND);
   lmcode_return_put("head_mb_nf", head_missing_bucket_err.code() == ErrorCode.NOT_FOUND);
-  lmcode_return_put("list_mb_nf", list_missing_bucket_err.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("list_mb_nf", list_missing_bucket_err.code() == ErrorCode.NOT_FOUND && list_all_missing_bucket_err.code() == ErrorCode.NOT_FOUND);
   lmcode_return_put("del_mb_nf", del_missing_bucket_err.code() == ErrorCode.NOT_FOUND);
 end _lmcode_
 

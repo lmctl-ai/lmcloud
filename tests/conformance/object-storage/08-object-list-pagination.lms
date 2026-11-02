@@ -1,11 +1,12 @@
-# Scenario 08: Object list pagination across multiple pages with max_keys and next_token.
+# Scenario 08: Object list pagination and object_list_all (ordered, no duplicates or gaps, without assuming fixed page splits).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
-bucket = "lmcloud-conf-08-page";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-c08-" + run_id + "-page";
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let b = ${bucket};
   let keys_in = str_list().add("items/k1").add("items/k2").add("items/k3").add("items/k4").add("items/k5");
@@ -26,15 +27,25 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let pages = 0;
   let token = "";
   let more = true;
-  while (more && pages < 10) {
+  let token_invariant_ok = true;
+  let max_bound_ok = true;
+  while (more && pages < 20) {
     let page = cloud.object_list(b, "items/", 2, token);
     pages = pages + 1;
+    if (page.len() > 2) {
+      max_bound_ok = false;
+    }
     for (item in page) {
       visited.add(item.key());
     }
     more = page.has_more();
     token = page.next_token();
+    if (more != (str_len(token) > 0)) {
+      token_invariant_ok = false;
+    }
   }
+
+  let list_all_keys = cloud.object_list_all(b, "items/");
 
   for (k in keys_in) {
     cloud.object_delete(b, k);
@@ -42,14 +53,18 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.bucket_delete(b);
 
   lmcode_return_put("pages", pages);
+  lmcode_return_put("max_bound_ok", max_bound_ok);
+  lmcode_return_put("token_invariant_ok", token_invariant_ok);
   lmcode_return_put("visited_count", visited.len());
   lmcode_return_put("visited_joined", visited.join(","));
+  lmcode_return_put("list_all_joined", list_all_keys.join(","));
   lmcode_return_put("final_token_empty", str_len(token) == 0);
 end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "08-object-list-pagination failed");
-assert(r.result.pages == 3, "5 objects with max_keys=2 should span 3 pages (2 + 2 + 1)");
-assert(r.result.visited_count == 5, "pagination must visit all 5 objects without duplicates");
+assert(r.result.pages >= 1 && r.result.max_bound_ok, "each page must respect max_keys <= 2");
+assert(r.result.token_invariant_ok && r.result.final_token_empty, "has_more() must match non-empty next_token() and end empty");
+assert(r.result.visited_count == 5, "pagination must visit all 5 objects without duplicates or gaps");
 assert(r.result.visited_joined == "items/k1,items/k2,items/k3,items/k4,items/k5", "paginated keys must be in exact lexicographical order");
-assert(r.result.final_token_empty, "next_token on the final page must be empty");
+assert(r.result.list_all_joined == "items/k1,items/k2,items/k3,items/k4,items/k5", "object_list_all must follow all pages and return all keys in order");

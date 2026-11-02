@@ -1,11 +1,12 @@
 # Scenario 07: Object list with prefix filtering and lexicographical UTF-8 key order.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
-bucket = "lmcloud-conf-07-prefix";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-c07-" + run_id + "-prefix";
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let b = ${bucket};
 

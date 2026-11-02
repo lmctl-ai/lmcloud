@@ -1,12 +1,13 @@
 # Scenario 06: Explicit content_type and custom StrMap metadata normalization.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
-bucket = "lmcloud-conf-06-meta";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-c06-" + run_id + "-meta";
 key = "meta/config.json";
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let b = ${bucket};
   let k = ${key};

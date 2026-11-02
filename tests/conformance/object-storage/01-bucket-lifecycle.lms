@@ -1,12 +1,13 @@
-# Scenario 01: Bucket create, exists, list (sorted), and delete lifecycle.
+# Scenario 01: Bucket create, exists, list (following all pages, sorted), and delete lifecycle.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
-b1 = "lmcloud-conf-01-alpha";
-b2 = "lmcloud-conf-01-beta";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+b1 = "lmcloud-c01-" + run_id + "-alpha";
+b2 = "lmcloud-c01-" + run_id + "-beta";
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let name1 = ${b1};
   let name2 = ${b2};

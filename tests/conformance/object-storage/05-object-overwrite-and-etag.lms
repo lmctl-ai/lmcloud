@@ -1,12 +1,13 @@
-# Scenario 05: Object overwrite and normalized ETag updates.
+# Scenario 05: Object overwrite and opaque ETag inequality within the same provider.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
-bucket = "lmcloud-conf-05-etag";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-c05-" + run_id + "-etag";
 key = "state/version.txt";
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let b = ${bucket};
   let k = ${key};
@@ -31,8 +32,10 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 
   lmcode_return_put("size1", head1.size());
   lmcode_return_put("size2", head2.size());
-  lmcode_return_put("etag1_nonempty", str_len(etag1) > 0 && str_len(put1.etag()) > 0);
-  lmcode_return_put("etag2_nonempty", str_len(etag2) > 0 && str_len(put2.etag()) > 0);
+  lmcode_return_put("etag1_same", put1.etag() == etag1);
+  lmcode_return_put("etag2_same", put2.etag() == etag2);
+  lmcode_return_put("etag1_nonempty", str_len(etag1) > 0);
+  lmcode_return_put("etag2_nonempty", str_len(etag2) > 0);
   lmcode_return_put("etag_unquoted", !str_starts_with(etag1, "\"") && !str_ends_with(etag1, "\"") && !str_starts_with(etag2, "\"") && !str_ends_with(etag2, "\""));
   lmcode_return_put("etag_changed", etag1 != etag2);
   lmcode_return_put("body2", body2);
@@ -42,6 +45,7 @@ r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "05-object-overwrite-and-etag failed");
 assert(r.result.size1 == 10 && r.result.size2 == 18, "object size should update after overwrite");
 assert(r.result.etag1_nonempty && r.result.etag2_nonempty, "ETag must be non-empty on put and head");
+assert(r.result.etag1_same && r.result.etag2_same, "put and head ETags for the same object version within one provider must match");
 assert(r.result.etag_unquoted, "ETag must be normalized without surrounding double quotes");
-assert(r.result.etag_changed, "ETag must change when payload changes");
+assert(r.result.etag_changed, "ETag must change within the same provider when payload changes");
 assert(r.result.body2 == "v2-updated-payload", "object_get must return overwritten body");

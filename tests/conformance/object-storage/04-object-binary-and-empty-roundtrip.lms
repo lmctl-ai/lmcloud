@@ -1,11 +1,12 @@
-# Scenario 04: Zero-byte empty object and raw binary payload (NUL + non-UTF-8 bytes) round-trip.
+# Scenario 04: Zero-byte empty object and raw binary payload (via str_hex_decode: NUL + non-UTF-8 bytes) round-trip.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
-bucket = "lmcloud-conf-04-binary";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-c04-" + run_id + "-binary";
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let b = ${bucket};
   let k_empty = "bin/empty.bin";

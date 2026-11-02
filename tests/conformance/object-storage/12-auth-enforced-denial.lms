@@ -1,30 +1,44 @@
-# Scenario 12: Auth-enforced denial (UNAUTHENTICATED vs PERMISSION_DENIED) must never masquerade as exists==false.
-# Note: When run against <provider>sim --auth enforce with a policy denying "lmcloud-conf-12-denied",
-# both bucket_create and bucket_exists must fail with UNAUTHENTICATED or PERMISSION_DENIED (never silently returning false).
+# Scenario 12: Auth-enforced denial (UNAUTHENTICATED vs PERMISSION_DENIED) classified via body-bearing operations (H2),
+# and existence probes (bucket_exists / object_head) never masquerading as exists == false (H1, H2).
+# Note (H1): The OCI portion of this scenario is sim-only (live OCI returns 404 NotAuthorizedOrNotFound when lacking inspect permission,
+# which lmoci maps to PERMISSION_DENIED).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
-denied_bucket = "lmcloud-conf-12-denied";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+denied_bucket = "lmcloud-c12-" + run_id + "-denied";
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let b = ${denied_bucket};
   cloud.set_abort_on_error(false);
 
+  # Classify auth error via body-bearing operation (bucket_create, H2)
   let created = cloud.bucket_create(b);
   let create_err = cloud.last_error();
 
-  # If the simulator is running in --auth enforce mode with a deny policy on lmcloud-conf-12-denied,
-  # create_err.code() is UNAUTHENTICATED or PERMISSION_DENIED, and bucket_exists must also report an auth error.
   let enforced = create_err.code() == ErrorCode.UNAUTHENTICATED || create_err.code() == ErrorCode.PERMISSION_DENIED;
+  let body_op_auth_err = true;
   let exists_probe = false;
-  let probe_auth_err = true;
+  let head_probe_exists = false;
+  let probe_denied_ok = true;
 
   if (enforced) {
+    # Body-bearing object_put / object_list on denied bucket also classify UNAUTHENTICATED / PERMISSION_DENIED
+    cloud.object_put(b, "probe.txt", "denied");
+    let put_err = cloud.last_error();
+    body_op_auth_err = put_err.code() == ErrorCode.UNAUTHENTICATED || put_err.code() == ErrorCode.PERMISSION_DENIED;
+
+    # HEAD-based probes map 403 (and OCI 404 NotAuthorizedOrNotFound) to PERMISSION_DENIED (or UNAUTHENTICATED), never OK + false (H1, H2)
     exists_probe = cloud.bucket_exists(b);
-    let probe_err = cloud.last_error();
-    probe_auth_err = probe_err.code() == ErrorCode.UNAUTHENTICATED || probe_err.code() == ErrorCode.PERMISSION_DENIED;
+    let exists_err = cloud.last_error();
+    let h = cloud.object_head(b, "probe.txt");
+    head_probe_exists = h.exists();
+    let head_err = cloud.last_error();
+
+    probe_denied_ok = (exists_err.code() == ErrorCode.PERMISSION_DENIED || exists_err.code() == ErrorCode.UNAUTHENTICATED)
+      && (head_err.code() == ErrorCode.PERMISSION_DENIED || head_err.code() == ErrorCode.UNAUTHENTICATED);
   } else {
     # Open mode cleanup so the scenario leaves zero state behind when run in open mode
     if (created || cloud.bucket_exists(b)) {
@@ -33,13 +47,16 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   }
 
   lmcode_return_put("enforced", enforced);
+  lmcode_return_put("body_op_auth_err", body_op_auth_err);
   lmcode_return_put("exists_probe", exists_probe);
-  lmcode_return_put("probe_auth_err", probe_auth_err);
+  lmcode_return_put("head_probe_exists", head_probe_exists);
+  lmcode_return_put("probe_denied_ok", probe_denied_ok);
   lmcode_return_put("clean_in_open_mode", enforced || create_err.code() == ErrorCode.OK);
 end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "12-auth-enforced-denial failed");
-assert(!r.result.exists_probe, "denied bucket must not report exists == true");
-assert(r.result.probe_auth_err, "in enforce mode, bucket_exists on a denied bucket must set UNAUTHENTICATED or PERMISSION_DENIED");
+assert(r.result.body_op_auth_err, "body-bearing operations in enforce mode must classify UNAUTHENTICATED or PERMISSION_DENIED");
+assert(!r.result.exists_probe && !r.result.head_probe_exists, "denied bucket/object must not report exists == true");
+assert(r.result.probe_denied_ok, "in enforce mode, bucket_exists and object_head must set PERMISSION_DENIED (or UNAUTHENTICATED), never ErrorCode.OK");
 assert(r.result.clean_in_open_mode, "open mode execution must succeed and clean up");

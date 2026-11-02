@@ -1,12 +1,13 @@
-# Scenario 11: Pre-flight INVALID_ARGUMENT validation for bucket names, object keys, metadata keys, and max_keys.
+# Scenario 11: Pre-flight INVALID_ARGUMENT validation for bucket names (incl. S3/GCS reserved), Azure-unsafe keys, content_type, metadata keys, max_keys, and endpoint overrides.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
-bucket = "lmcloud-conf-11-valid";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-c11-" + run_id + "-valid";
 
 # 1. Default abort mode: invalid bucket name aborts before network I/O
 abort_invalid = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   cloud.bucket_create("Bad_Bucket_Name");
 end _lmcode_
@@ -18,11 +19,12 @@ assert(!r_abort.ok, "invalid bucket name must abort in default mode");
 checks_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let b = ${bucket};
   cloud.set_abort_on_error(false);
 
+  # Bucket name rules (L1)
   cloud.bucket_create("Bad_Bucket");
   let e_underscore = cloud.last_error();
 
@@ -32,6 +34,22 @@ checks_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.bucket_create("ab");
   let e_short = cloud.last_error();
 
+  cloud.bucket_create("sthree-reserved");
+  let e_sthree = cloud.last_error();
+
+  cloud.bucket_create("bad-s3alias");
+  let e_s3alias = cloud.last_error();
+
+  cloud.bucket_create("amzn-s3-demo-bucket");
+  let e_amzndemo = cloud.last_error();
+
+  cloud.bucket_create("goog-reserved");
+  let e_goog = cloud.last_error();
+
+  cloud.bucket_create("my-google-bucket");
+  let e_google = cloud.last_error();
+
+  # Object key rules incl. Azure-unsafe trailing dot and backslash (M6)
   cloud.object_put(b, "/leading-slash.txt", "x");
   let e_leading_slash = cloud.last_error();
 
@@ -41,6 +59,27 @@ checks_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.object_put(b, "dot/../escape.txt", "x");
   let e_dot_segment = cloud.last_error();
 
+  cloud.object_put(b, "trailing-dot.", "x");
+  let e_trailing_dot = cloud.last_error();
+
+  cloud.object_put(b, "seg./nested.txt", "x");
+  let e_seg_dot = cloud.last_error();
+
+  cloud.object_put(b, "back\\slash.txt", "x");
+  let e_backslash = cloud.last_error();
+
+  # Content-Type validation (M5)
+  let empty_meta = str_map();
+  cloud.object_put(b, "valid.txt", "x", "", empty_meta);
+  let e_ct_empty = cloud.last_error();
+
+  cloud.object_put(b, "valid.txt", "x", "text/plain\r\nx-injected: 1", empty_meta);
+  let e_ct_crlf = cloud.last_error();
+
+  cloud.object_put(b, "valid.txt", "x", "invalid-no-slash", empty_meta);
+  let e_ct_noslash = cloud.last_error();
+
+  # Metadata key rules
   let bad_meta1 = str_map().set("bad-hyphen", "v");
   cloud.object_put(b, "valid.txt", "x", "text/plain", bad_meta1);
   let e_meta_hyphen = cloud.last_error();
@@ -49,34 +88,52 @@ checks_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.object_put(b, "valid.txt", "x", "text/plain", bad_meta2);
   let e_meta_digit = cloud.last_error();
 
+  # Pagination bounds (L3)
   cloud.object_list(b, "", 1001, "");
   let e_max_keys = cloud.last_error();
 
-  let all_invalid = e_underscore.code() == ErrorCode.INVALID_ARGUMENT
-    && e_double_hyphen.code() == ErrorCode.INVALID_ARGUMENT
-    && e_short.code() == ErrorCode.INVALID_ARGUMENT
-    && e_leading_slash.code() == ErrorCode.INVALID_ARGUMENT
-    && e_double_slash.code() == ErrorCode.INVALID_ARGUMENT
-    && e_dot_segment.code() == ErrorCode.INVALID_ARGUMENT
-    && e_meta_hyphen.code() == ErrorCode.INVALID_ARGUMENT
-    && e_meta_digit.code() == ErrorCode.INVALID_ARGUMENT
-    && e_max_keys.code() == ErrorCode.INVALID_ARGUMENT;
+  # Endpoint & service validation (M2, M4)
+  cloud.set_endpoint("unknown_service", "http://127.0.0.1:4566");
+  let e_bad_service = cloud.last_error();
 
-  let all_preflight = e_underscore.http_status() == 0
-    && e_double_hyphen.http_status() == 0
-    && e_short.http_status() == 0
-    && e_leading_slash.http_status() == 0
-    && e_double_slash.http_status() == 0
-    && e_dot_segment.http_status() == 0
-    && e_meta_hyphen.http_status() == 0
-    && e_meta_digit.http_status() == 0
-    && e_max_keys.http_status() == 0;
+  cloud.set_endpoint("storage", "http://127.0.0.1.evil.example:4566");
+  let e_nonloopback_http = cloud.last_error();
 
-  lmcode_return_put("all_invalid", all_invalid);
-  lmcode_return_put("all_preflight", all_preflight);
+  let bucket_checks = e_underscore.code() == ErrorCode.INVALID_ARGUMENT && e_underscore.http_status() == 0
+    && e_double_hyphen.code() == ErrorCode.INVALID_ARGUMENT && e_double_hyphen.http_status() == 0
+    && e_short.code() == ErrorCode.INVALID_ARGUMENT && e_short.http_status() == 0
+    && e_sthree.code() == ErrorCode.INVALID_ARGUMENT && e_sthree.http_status() == 0
+    && e_s3alias.code() == ErrorCode.INVALID_ARGUMENT && e_s3alias.http_status() == 0
+    && e_amzndemo.code() == ErrorCode.INVALID_ARGUMENT && e_amzndemo.http_status() == 0
+    && e_goog.code() == ErrorCode.INVALID_ARGUMENT && e_goog.http_status() == 0
+    && e_google.code() == ErrorCode.INVALID_ARGUMENT && e_google.http_status() == 0;
+
+  let key_checks = e_leading_slash.code() == ErrorCode.INVALID_ARGUMENT && e_leading_slash.http_status() == 0
+    && e_double_slash.code() == ErrorCode.INVALID_ARGUMENT && e_double_slash.http_status() == 0
+    && e_dot_segment.code() == ErrorCode.INVALID_ARGUMENT && e_dot_segment.http_status() == 0
+    && e_trailing_dot.code() == ErrorCode.INVALID_ARGUMENT && e_trailing_dot.http_status() == 0
+    && e_seg_dot.code() == ErrorCode.INVALID_ARGUMENT && e_seg_dot.http_status() == 0
+    && e_backslash.code() == ErrorCode.INVALID_ARGUMENT && e_backslash.http_status() == 0;
+
+  let ct_and_meta_checks = e_ct_empty.code() == ErrorCode.INVALID_ARGUMENT && e_ct_empty.http_status() == 0
+    && e_ct_crlf.code() == ErrorCode.INVALID_ARGUMENT && e_ct_crlf.http_status() == 0
+    && e_ct_noslash.code() == ErrorCode.INVALID_ARGUMENT && e_ct_noslash.http_status() == 0
+    && e_meta_hyphen.code() == ErrorCode.INVALID_ARGUMENT && e_meta_hyphen.http_status() == 0
+    && e_meta_digit.code() == ErrorCode.INVALID_ARGUMENT && e_meta_digit.http_status() == 0
+    && e_max_keys.code() == ErrorCode.INVALID_ARGUMENT && e_max_keys.http_status() == 0;
+
+  let endpoint_checks = e_bad_service.code() == ErrorCode.INVALID_ARGUMENT && e_bad_service.http_status() == 0
+    && e_nonloopback_http.code() == ErrorCode.INVALID_ARGUMENT && e_nonloopback_http.http_status() == 0;
+
+  lmcode_return_put("bucket_checks", bucket_checks);
+  lmcode_return_put("key_checks", key_checks);
+  lmcode_return_put("ct_and_meta_checks", ct_and_meta_checks);
+  lmcode_return_put("endpoint_checks", endpoint_checks);
 end _lmcode_
 
 r = run_lmcode(checks_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "11-validation-guards inspection run failed");
-assert(r.result.all_invalid, "all non-portable names/keys/metadata/max_keys must report ErrorCode.INVALID_ARGUMENT");
-assert(r.result.all_preflight, "all pre-flight validation errors must report http_status() == 0");
+assert(r.result.bucket_checks, "bucket validation guards (incl. S3/GCS reserved names) must fail pre-flight with INVALID_ARGUMENT");
+assert(r.result.key_checks, "object key validation guards (incl. trailing dot and backslash) must fail pre-flight with INVALID_ARGUMENT");
+assert(r.result.ct_and_meta_checks, "content_type, metadata key, and max_keys validation guards must fail pre-flight with INVALID_ARGUMENT");
+assert(r.result.endpoint_checks, "unknown service and non-loopback http:// endpoint overrides must fail pre-flight with INVALID_ARGUMENT");

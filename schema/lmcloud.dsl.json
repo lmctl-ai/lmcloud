@@ -160,13 +160,13 @@
         ],
         "endpoint": [
           {
-            "params": [],
+            "params": ["string"],
             "returns": "string"
           }
         ],
         "set_endpoint": [
           {
-            "params": ["string"],
+            "params": ["string", "string"],
             "returns": "self"
           }
         ],
@@ -237,7 +237,7 @@
         "object_delete": [
           {
             "params": ["string", "string"],
-            "returns": "bool"
+            "returns": "void"
           }
         ],
         "object_list": [
@@ -248,6 +248,12 @@
           {
             "params": ["string", "string", "int", "string"],
             "returns": "ObjectListPage"
+          }
+        ],
+        "object_list_all": [
+          {
+            "params": ["string", "string"],
+            "returns": "StrList"
           }
         ]
       }

@@ -6,7 +6,7 @@ LMSCRIPT_BIN="${LMSCRIPT_BIN:-/home/ubuntu/lmctl-mono/lmscript/bin/lmscript}"
 SUITE_DIR="$ROOT/tests/conformance/object-storage"
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <host-binary> [endpoint]" >&2
+  echo "Usage: $0 <host-binary> [endpoint] [run-id]" >&2
   echo "       $0 --check" >&2
   exit 2
 fi
@@ -40,18 +40,20 @@ if [[ "${1:-}" == "--check" ]]; then
 else
   HOST_BIN="$1"
   ENDPOINT="${2:-}"
+  RUN_ID="${3:-${LMCLOUD_RUN_ID:-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')}}"
   if [[ -n "$ENDPOINT" ]]; then
+    export LMCLOUD_STORAGE_ENDPOINT="$ENDPOINT"
     export LMCLOUD_ENDPOINT="$ENDPOINT"
   fi
   for f in "${SCENARIOS[@]}"; do
     idx=$((idx + 1))
     name="$(basename "$f" .lms)"
-    if "$LMSCRIPT_BIN" "$f" "$HOST_BIN" "$ENDPOINT" >/dev/null 2>&1; then
+    if "$LMSCRIPT_BIN" "$f" "$HOST_BIN" "$ENDPOINT" "$RUN_ID" >/dev/null 2>&1; then
       echo "ok $idx - $name"
       pass=$((pass + 1))
     else
       echo "not ok $idx - $name"
-      "$LMSCRIPT_BIN" "$f" "$HOST_BIN" "$ENDPOINT" >&2 || true
+      "$LMSCRIPT_BIN" "$f" "$HOST_BIN" "$ENDPOINT" "$RUN_ID" >&2 || true
       fail=$((fail + 1))
     fi
   done

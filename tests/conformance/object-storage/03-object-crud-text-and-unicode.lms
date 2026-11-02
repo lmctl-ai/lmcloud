@@ -1,20 +1,24 @@
-# Scenario 03: Object CRUD with UTF-8 text, quotes, newlines, and multi-byte Unicode.
+# Scenario 03: Object CRUD with UTF-8 text, quotes, newlines, Unicode, and special-character keys (space, +, %, ?, #, Unicode).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
-bucket = "lmcloud-conf-03-utf8";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-c03-" + run_id + "-utf8";
 key = "docs/2026/greeting.json";
+special_key = "docs/2026/a b+c%d?e#f-雪.json";
 payload = "{\"msg\": \"hello \\\"lmcloud\\\"\\n雪 / 🚀\"}";
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let b = ${bucket};
   let k = ${key};
+  let sk = ${special_key};
   let body_in = ${payload};
 
   if (cloud.bucket_exists(b)) {
     cloud.object_delete(b, k);
+    cloud.object_delete(b, sk);
     cloud.bucket_delete(b);
   }
   cloud.bucket_create(b);
@@ -23,8 +27,15 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let head_meta = cloud.object_head(b, k);
   let body_out = cloud.object_get(b, k);
 
-  let deleted = cloud.object_delete(b, k);
+  # Also exercise per-segment percent-encoding on keys with space, +, %, ?, #, and Unicode (M6)
+  let sp_put = cloud.object_put(b, sk, body_in);
+  let sp_head = cloud.object_head(b, sk);
+  let sp_out = cloud.object_get(b, sk);
+
+  cloud.object_delete(b, k);
+  cloud.object_delete(b, sk);
   let head_after = cloud.object_head(b, k);
+  let sp_head_after = cloud.object_head(b, sk);
 
   cloud.set_abort_on_error(false);
   let missing_body = cloud.object_get(b, k);
@@ -33,20 +44,21 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.set_abort_on_error(true);
   cloud.bucket_delete(b);
 
-  lmcode_return_put("put_exists", put_meta.exists());
-  lmcode_return_put("head_exists", head_meta.exists());
-  lmcode_return_put("size_match", head_meta.size() == str_len(body_in));
-  lmcode_return_put("body_match", body_out == body_in);
-  lmcode_return_put("deleted", deleted);
-  lmcode_return_put("exists_after", head_after.exists());
+  lmcode_return_put("put_exists", put_meta.exists() && sp_put.exists());
+  lmcode_return_put("head_exists", head_meta.exists() && sp_head.exists());
+  lmcode_return_put("special_key_match", sp_head.key() == sk);
+  lmcode_return_put("size_match", head_meta.size() == str_len(body_in) && sp_head.size() == str_len(body_in));
+  lmcode_return_put("body_match", body_out == body_in && sp_out == body_in);
+  lmcode_return_put("exists_after", head_after.exists() || sp_head_after.exists());
   lmcode_return_put("missing_body_empty", str_len(missing_body) == 0);
   lmcode_return_put("get_not_found", get_err.code() == ErrorCode.NOT_FOUND);
 end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "03-object-crud-text-and-unicode failed");
-assert(r.result.put_exists && r.result.head_exists, "object should exist after put");
+assert(r.result.put_exists && r.result.head_exists, "objects should exist after put");
+assert(r.result.special_key_match, "special-character key (space, +, %, ?, #, Unicode) should round-trip");
 assert(r.result.size_match, "object_head size should equal UTF-8 byte length");
-assert(r.result.body_match, "object_get should return exact UTF-8 payload");
-assert(r.result.deleted && !r.result.exists_after, "object_head should report exists() == false after delete");
+assert(r.result.body_match, "object_get should return exact UTF-8 payload for both standard and special keys");
+assert(!r.result.exists_after, "object_head should report exists() == false after object_delete");
 assert(r.result.missing_body_empty && r.result.get_not_found, "object_get after delete should report ErrorCode.NOT_FOUND");

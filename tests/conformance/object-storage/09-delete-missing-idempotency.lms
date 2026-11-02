@@ -1,11 +1,12 @@
-# Scenario 09: Idempotent object_delete on missing keys in an existing bucket.
+# Scenario 09: Idempotent object_delete (void) on missing keys in an existing bucket.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
-bucket = "lmcloud-conf-09-delidem";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-c09-" + run_id + "-delidem";
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let b = ${bucket};
 
@@ -21,14 +22,17 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 
   # 2. Put, delete once, then delete a second time
   cloud.object_put(b, "ephemeral.txt", "temp");
-  let del_first = cloud.object_delete(b, "ephemeral.txt");
+  let exists_before = cloud.object_head(b, "ephemeral.txt").exists();
+  cloud.object_delete(b, "ephemeral.txt");
   let err2 = cloud.last_error();
+  let exists_after = cloud.object_head(b, "ephemeral.txt").exists();
   cloud.object_delete(b, "ephemeral.txt");
   let err3 = cloud.last_error();
 
   cloud.bucket_delete(b);
 
-  lmcode_return_put("del_first", del_first);
+  lmcode_return_put("exists_before", exists_before);
+  lmcode_return_put("exists_after", exists_after);
   lmcode_return_put("err1_ok", err1.code() == ErrorCode.OK);
   lmcode_return_put("err2_ok", err2.code() == ErrorCode.OK);
   lmcode_return_put("err3_ok", err3.code() == ErrorCode.OK);
@@ -36,5 +40,5 @@ end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "09-delete-missing-idempotency failed");
-assert(r.result.del_first, "deleting an existing object should return true");
+assert(r.result.exists_before && !r.result.exists_after, "object_delete must remove the object");
 assert(r.result.err1_ok && r.result.err2_ok && r.result.err3_ok, "deleting missing keys in an existing bucket must succeed with ErrorCode.OK");

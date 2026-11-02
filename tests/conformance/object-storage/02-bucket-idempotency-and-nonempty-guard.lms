@@ -1,11 +1,12 @@
-# Scenario 02: Bucket create idempotency, non-empty delete CONFLICT guard, and missing bucket delete idempotency.
+# Scenario 02: Bucket create idempotency (incl. S3 us-east-1 HEAD-before-PUT), non-empty delete CONFLICT guard, and missing bucket delete idempotency.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
-bucket = "lmcloud-conf-02-idem";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-c02-" + run_id + "-idem";
 
 setup_and_idem = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let b = ${bucket};
   if (cloud.bucket_exists(b)) {
@@ -34,7 +35,7 @@ assert(r1.result.idem_ok, "second bucket_create should leave last_error == Error
 nonempty_abort = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   cloud.bucket_delete(${bucket});
 end _lmcode_
@@ -46,7 +47,7 @@ assert(!r2.ok, "deleting a non-empty bucket must fail with CONFLICT");
 cleanup_and_missing = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
-    cloud.set_endpoint(ep);
+    cloud.set_endpoint("storage", ep);
   }
   let b = ${bucket};
   cloud.set_abort_on_error(false);
@@ -54,14 +55,13 @@ cleanup_and_missing = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let conflict_err = cloud.last_error();
 
   cloud.set_abort_on_error(true);
-  let obj_deleted = cloud.object_delete(b, "guard.txt");
+  cloud.object_delete(b, "guard.txt");
   let first_del = cloud.bucket_delete(b);
   let second_del = cloud.bucket_delete(b);
   let err_after_missing_del = cloud.last_error();
 
   lmcode_return_put("blocked", blocked);
   lmcode_return_put("is_conflict", conflict_err.code() == ErrorCode.CONFLICT);
-  lmcode_return_put("obj_deleted", obj_deleted);
   lmcode_return_put("first_del", first_del);
   lmcode_return_put("second_del", second_del);
   lmcode_return_put("missing_del_ok", err_after_missing_del.code() == ErrorCode.OK);
@@ -70,5 +70,5 @@ end _lmcode_
 r3 = run_lmcode(cleanup_and_missing, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r3.ok, "02 cleanup and missing-bucket delete failed");
 assert(!r3.result.blocked && r3.result.is_conflict, "non-empty bucket_delete must report ErrorCode.CONFLICT");
-assert(r3.result.obj_deleted && r3.result.first_del, "cleaning object and empty bucket should succeed");
+assert(r3.result.first_del, "cleaning empty bucket should succeed");
 assert(!r3.result.second_del && r3.result.missing_del_ok, "deleting an already-deleted bucket should return false with ErrorCode.OK");
