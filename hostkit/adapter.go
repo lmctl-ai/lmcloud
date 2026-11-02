@@ -109,18 +109,50 @@ type QueueCapsProvider interface {
 	QueueCapsFor(ctx context.Context, queue string) QueueCaps
 }
 
-// BucketCreationTimer is optional: it returns a bucket's server-side creation
-// time. When CreateBucket reports CONFLICT and the bucket is accessible, the
-// host returns created=true if the bucket was created at or after the start
-// of this bucket_create call (a retried or interrupted create that the server
-// already completed), else false (it already existed). Without it the host
-// returns false.
+// BucketCreationTimer returns a bucket's server-side creation time.
+//
+// Deprecated: since hostkit v3 the host no longer uses creation times as
+// proof of ownership (clock skew and concurrent creators make it unsound);
+// implement BucketCreateTokenReader instead. Kept for source compatibility.
 type BucketCreationTimer interface {
 	BucketCreatedAt(ctx context.Context, bucket string) (time.Time, error)
 }
 
-// QueueCreationTimer is the queue counterpart of BucketCreationTimer, used
-// when CreateQueue reports CONFLICT.
+// QueueCreationTimer is the queue counterpart of BucketCreationTimer.
+//
+// Deprecated: ignored since hostkit v3; implement QueueCreateTokenReader.
 type QueueCreationTimer interface {
 	QueueCreatedAt(ctx context.Context, queue string) (time.Time, error)
+}
+
+type createTokenKey struct{}
+
+// WithCreateToken attaches the per-call create token (the host does this for
+// every bucket_create/queue_create before calling the adapter).
+func WithCreateToken(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, createTokenKey{}, token)
+}
+
+// CreateToken returns the token of the create call in ctx ("" if none). An
+// adapter implementing a CreateTokenReader must store it on the resource
+// atomically, in the same provider request that creates the resource (a tag,
+// label or metadata field of the create call), so that reading it back proves
+// which create request made the resource.
+func CreateToken(ctx context.Context) string {
+	v, _ := ctx.Value(createTokenKey{}).(string)
+	return v
+}
+
+// BucketCreateTokenReader is optional. When CreateBucket reports CONFLICT and
+// the bucket is accessible, the host reads the token stored at creation: it
+// returns created=true only if it equals this call's CreateToken (an earlier
+// attempt of the same call created it); in every other case created=false.
+// Return ("", nil) when the bucket carries no token.
+type BucketCreateTokenReader interface {
+	BucketCreateToken(ctx context.Context, bucket string) (string, error)
+}
+
+// QueueCreateTokenReader is the queue counterpart of BucketCreateTokenReader.
+type QueueCreateTokenReader interface {
+	QueueCreateToken(ctx context.Context, queue string) (string, error)
 }

@@ -100,3 +100,21 @@ func (g guardQueue) QueueCreatedAt(ctx context.Context, q string) (time.Time, er
 	}
 	return time.Time{}, errNoTimer
 }
+
+func (g guardStore) BucketCreateToken(ctx context.Context, b string) (string, error) {
+	if r, ok := g.s.(hostkit.BucketCreateTokenReader); ok {
+		v, err := r.BucketCreateToken(ctx, b)
+		return v, hostkit.NilIfTyped(err)
+	}
+	return "", errNoToken
+}
+
+func (g guardQueue) QueueCreateToken(ctx context.Context, q string) (string, error) {
+	if r, ok := g.q.(hostkit.QueueCreateTokenReader); ok {
+		v, err := r.QueueCreateToken(ctx, q)
+		return v, hostkit.NilIfTyped(err)
+	}
+	return "", errNoToken
+}
+
+var errNoToken = hostkit.ProviderError(hostkit.Internal, 0, "", "adapter does not store create tokens")

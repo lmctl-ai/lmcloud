@@ -140,6 +140,7 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 		r.must(reg.Function("print", []string{t}, "void", fn, lmcode.Dry(fn)))
 	}
 	r.must(reg.Context("cloud", "Cloud"))
+	r.must(declareEnums(reg))
 
 	// Configuration and status: local state, identical in dry runs.
 	r.pure("Cloud", "provider", nil, "string", func(self any, _ []lmcode.Value) (lmcode.Value, error) {
@@ -333,4 +334,31 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 		return lmcode.Object("QueueMessage", &message{m: items[a[0].Int]}), nil
 	})
 	return r.first
+}
+
+// enumDeclarer is lmcode-go's Registry.Enum (proposed patch, branch
+// dry-enum-string). It is called through an interface so hostkit still
+// builds against an lmcode-go without it; such builds keep the old dry-run
+// limitation for enum results (last_error().code() in --dry-run).
+type enumDeclarer interface {
+	Enum(name string, values []string) error
+}
+
+// EnumsDeclared reports whether the linked lmcode-go can declare the schema's
+// ErrorCode enum, i.e. whether dry runs can evaluate last_error().code().
+func EnumsDeclared() bool {
+	_, ok := any(lmcode.NewRegistryWithoutStd()).(enumDeclarer)
+	return ok
+}
+
+func declareEnums(reg *lmcode.Registry) error {
+	d, ok := any(reg).(enumDeclarer)
+	if !ok {
+		return nil
+	}
+	codes := make([]string, len(hostkit.Codes))
+	for i, c := range hostkit.Codes {
+		codes[i] = string(c)
+	}
+	return d.Enum("ErrorCode", codes)
 }

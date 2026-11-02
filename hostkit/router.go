@@ -5,6 +5,7 @@ package hostkit
 import (
 	"context"
 	"net/url"
+	"reflect"
 	"time"
 )
 
@@ -17,9 +18,9 @@ type Backend interface {
 // Router forwards every adapter call to the backend chosen per call, so a
 // host that keeps several backends (an offline fake, a simulator client, a
 // live client) writes one Pick function instead of one router method per
-// operation. It implements ObjectStore, Queue, QueueCapsProvider,
-// BucketCreationTimer and QueueCreationTimer (the optional ones forward when
-// the chosen backend implements them).
+// operation. It implements ObjectStore, Queue, QueueCapsProvider and the
+// optional create-token readers (and the deprecated creation timers); optional
+// interfaces forward when the chosen backend implements them.
 type Router struct {
 	// Pick chooses the backend for this call, usually from EndpointFrom(ctx).
 	// Returning an error fails the call with that error.
@@ -74,7 +75,7 @@ func (r Router) pick(ctx context.Context) (Backend, error) {
 	if err = NilIfTyped(err); err != nil {
 		return nil, err
 	}
-	if b == nil {
+	if b == nil || isNilPointer(b) {
 		return nil, ProviderError(Internal, 0, "", "router picked no backend")
 	}
 	return b, nil
@@ -260,4 +261,35 @@ func (r Router) QueueCreatedAt(ctx context.Context, q string) (time.Time, error)
 		return t.QueueCreatedAt(ctx, q)
 	}
 	return time.Time{}, errNoTimer
+}
+
+var errNoToken = ProviderError(Internal, 0, "", "backend does not store create tokens")
+
+func (r Router) BucketCreateToken(ctx context.Context, b string) (string, error) {
+	be, err := r.pick(ctx)
+	if err != nil {
+		return "", err
+	}
+	if t, ok := be.(BucketCreateTokenReader); ok {
+		return t.BucketCreateToken(ctx, b)
+	}
+	return "", errNoToken
+}
+
+func (r Router) QueueCreateToken(ctx context.Context, q string) (string, error) {
+	be, err := r.pick(ctx)
+	if err != nil {
+		return "", err
+	}
+	if t, ok := be.(QueueCreateTokenReader); ok {
+		return t.QueueCreateToken(ctx, q)
+	}
+	return "", errNoToken
+}
+
+// isNilPointer catches a typed-nil backend (e.g. a nil *Client stored in a
+// Backend), which would otherwise panic on the first method call.
+func isNilPointer(v any) bool {
+	rv := reflect.ValueOf(v)
+	return rv.Kind() == reflect.Pointer && rv.IsNil()
 }

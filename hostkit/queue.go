@@ -9,7 +9,9 @@ import (
 
 // WaitLoop implements wait_seconds for providers without server-side long
 // polling: poll runs at least once and repeats every interval until it returns
-// a non-zero count, an error, or the client deadline now+wait passes.
+// a non-zero count, an error, or the client deadline now+wait passes. If ctx
+// ends before that deadline it returns an INTERNAL error (since v3; earlier
+// versions returned nil, turning a cancellation into an empty receive).
 func WaitLoop(ctx context.Context, wait, interval time.Duration, now func() time.Time, sleep func(context.Context, time.Duration) error, poll func(ctx context.Context) (int, error)) error {
 	if now == nil {
 		now = time.Now
@@ -31,7 +33,9 @@ func WaitLoop(ctx context.Context, wait, interval time.Duration, now func() time
 			return nil
 		}
 		if err := sleep(ctx, min(interval, remaining)); err != nil {
-			return nil
+			// The caller's context ended before the requested wait: that is a
+			// failure, not an empty successful receive (v3).
+			return ProviderError(Internal, 0, "", "receive wait interrupted: "+err.Error())
 		}
 	}
 }

@@ -209,12 +209,14 @@ func (p RetryPolicy) Do(ctx context.Context, idempotent bool, fn func(ctx contex
 	return last, n
 }
 
-// DoHTTP sends a request built by build with the shared retry policy;
+// DoHTTP sends a request built by build with the shared retry policy over
+// EnforceClient(client) (same-origin redirects, timeout, no env proxy);
 // idempotent follows Do (use IdempotentMethod(req.Method) unless the request
 // carries a provider-honoured client token). Bodies
 // of discarded responses are drained (bounded) and closed. The caller owns the
 // returned response body. Requests must be rebuilt per attempt so bodies replay.
 func (p RetryPolicy) DoHTTP(ctx context.Context, client *http.Client, idempotent bool, build func(ctx context.Context) (*http.Request, error)) (*http.Response, int, error) {
+	client = EnforceClient(client)
 	var resp *http.Response
 	var buildErr error
 	last, n := p.Do(ctx, idempotent, func(ctx context.Context, _ int) Attempt {

@@ -61,6 +61,15 @@ type Options struct {
 	// VagueNotFound omits Absent hints so the host must disambiguate by probing.
 	VagueNotFound bool
 	Now           func() time.Time
+	// LongPoll makes Receive honour waitSeconds itself (polling the state until
+	// a message is visible or the wait passes) and report LongPoll=true, so an
+	// offline route can simulate a long-polling provider route. Default false:
+	// the host runs its client-side wait loop. Added in hostkit v3.
+	LongPoll bool
+	// BinaryWire reports TextOnlyWire=false (the fake then accepts any bytes).
+	BinaryWire bool
+	// PollInterval is the LongPoll re-check interval (default 50ms).
+	PollInterval time.Duration
 }
 
 // Fake implements hostkit.ObjectStore and hostkit.Queue.
@@ -89,6 +98,9 @@ type state struct {
 	Seq     int64
 	Buckets map[string]map[string]*object
 	Queues  map[string][]*message
+	// Create tokens stored atomically with each create (hostkit.CreateToken).
+	BucketTokens map[string]string `json:",omitempty"`
+	QueueTokens  map[string]string `json:",omitempty"`
 }
 
 func newState() *state {
@@ -222,13 +234,14 @@ func page(names []string, token string, max int) ([]string, string, error) {
 
 // ---- ObjectStore ----
 
-func (f *Fake) CreateBucket(_ context.Context, b string) (bool, error) {
+func (f *Fake) CreateBucket(ctx context.Context, b string) (bool, error) {
 	created := false
 	err := f.do("CreateBucket", func(s *state) error {
 		if _, ok := s.Buckets[b]; ok {
 			return hostkit.ProviderError(hostkit.Conflict, 409, "BucketAlreadyExists", "bucket already exists")
 		}
 		s.Buckets[b] = map[string]*object{}
+		setToken(&s.BucketTokens, b, hostkit.CreateToken(ctx))
 		created = true
 		return nil
 	})
@@ -245,6 +258,7 @@ func (f *Fake) DeleteBucket(_ context.Context, b string) error {
 			return hostkit.ProviderError(hostkit.Conflict, 409, "BucketNotEmpty", "bucket is not empty")
 		}
 		delete(s.Buckets, b)
+		delete(s.BucketTokens, b)
 		return nil
 	})
 }
@@ -375,16 +389,56 @@ func (f *Fake) ListObjects(_ context.Context, b, prefix string, max int, token s
 // QueueCaps: no long polling (the host runs the wait loop) and a text-only
 // wire (the host applies the base64 envelope to unsafe bytes).
 func (f *Fake) QueueCaps() hostkit.QueueCaps {
-	return hostkit.QueueCaps{LongPoll: false, TextOnlyWire: true}
+	return hostkit.QueueCaps{LongPoll: f.opts.LongPoll, TextOnlyWire: !f.opts.BinaryWire}
 }
 
-func (f *Fake) CreateQueue(_ context.Context, q string) (bool, error) {
+// QueueCapsFor reports the same caps per call (hostkit.QueueCapsProvider).
+func (f *Fake) QueueCapsFor(context.Context, string) hostkit.QueueCaps { return f.QueueCaps() }
+
+func setToken(m *map[string]string, name, token string) {
+	if token == "" {
+		return
+	}
+	if *m == nil {
+		*m = map[string]string{}
+	}
+	(*m)[name] = token
+}
+
+// BucketCreateToken returns the create token stored with the bucket.
+func (f *Fake) BucketCreateToken(_ context.Context, b string) (string, error) {
+	var tok string
+	err := f.do("BucketCreateToken", func(s *state) error {
+		if _, ok := s.Buckets[b]; !ok {
+			return f.notFound(hostkit.AbsentBucket, "NoSuchBucket", "bucket not found")
+		}
+		tok = s.BucketTokens[b]
+		return nil
+	})
+	return tok, err
+}
+
+// QueueCreateToken returns the create token stored with the queue.
+func (f *Fake) QueueCreateToken(_ context.Context, q string) (string, error) {
+	var tok string
+	err := f.do("QueueCreateToken", func(s *state) error {
+		if _, ok := s.Queues[q]; !ok {
+			return f.notFound(hostkit.AbsentQueue, "QueueNotFound", "queue not found")
+		}
+		tok = s.QueueTokens[q]
+		return nil
+	})
+	return tok, err
+}
+
+func (f *Fake) CreateQueue(ctx context.Context, q string) (bool, error) {
 	created := false
 	err := f.do("CreateQueue", func(s *state) error {
 		if _, ok := s.Queues[q]; ok {
 			return nil
 		}
 		s.Queues[q] = []*message{}
+		setToken(&s.QueueTokens, q, hostkit.CreateToken(ctx))
 		created = true
 		return nil
 	})
@@ -397,6 +451,7 @@ func (f *Fake) DeleteQueue(_ context.Context, q string) error {
 			return f.notFound(hostkit.AbsentQueue, "QueueNotFound", "queue not found")
 		}
 		delete(s.Queues, q)
+		delete(s.QueueTokens, q)
 		return nil
 	})
 }
@@ -432,7 +487,7 @@ func (f *Fake) Send(_ context.Context, q, wire string) (string, error) {
 		if !ok {
 			return f.notFound(hostkit.AbsentQueue, "QueueNotFound", "queue not found")
 		}
-		if wire == "" || !hostkit.TextSafe(wire) {
+		if wire == "" || (!f.opts.BinaryWire && !hostkit.TextSafe(wire)) {
 			return hostkit.ProviderError(hostkit.InvalidArgument, 400, "InvalidMessageContents", "message body must be non-empty text")
 		}
 		s.Seq++
@@ -443,7 +498,24 @@ func (f *Fake) Send(_ context.Context, q, wire string) (string, error) {
 	return id, err
 }
 
-func (f *Fake) Receive(_ context.Context, q string, max, _ int, visibility int) ([]hostkit.RawMessage, error) {
+func (f *Fake) Receive(ctx context.Context, q string, max, wait int, visibility int) ([]hostkit.RawMessage, error) {
+	if !f.opts.LongPoll || wait <= 0 {
+		return f.receiveOnce(q, max, visibility)
+	}
+	interval := f.opts.PollInterval
+	if interval <= 0 {
+		interval = 50 * time.Millisecond
+	}
+	var out []hostkit.RawMessage
+	err := hostkit.WaitLoop(ctx, time.Duration(wait)*time.Second, interval, f.opts.Now, nil, func(context.Context) (int, error) {
+		msgs, err := f.receiveOnce(q, max, visibility)
+		out = msgs
+		return len(msgs), err
+	})
+	return out, err
+}
+
+func (f *Fake) receiveOnce(q string, max, visibility int) ([]hostkit.RawMessage, error) {
 	var out []hostkit.RawMessage
 	err := f.do("Receive", func(s *state) error {
 		msgs, ok := s.Queues[q]

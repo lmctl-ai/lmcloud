@@ -3,6 +3,7 @@
 package main
 
 import (
+	"github.com/lmctl-ai/lmcloud/hostkit/cloudhost"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -159,5 +160,41 @@ func TestProgramHooksAndInitThroughCompiler(t *testing.T) {
 	frame, _ := init.Output()
 	if init.ProcessState.ExitCode() != 2 || !strings.Contains(string(frame), "CLI_USAGE") {
 		t.Fatalf("Init failure: exit %d frame %s", init.ProcessState.ExitCode(), frame)
+	}
+}
+
+// hostkit v3 (risk 7): a dry run that evaluates last_error().code() works
+// when the linked lmcode-go declares enums (Registry.Enum, local replace).
+func TestDryRunEvaluatesErrorCode(t *testing.T) {
+	bin := lmscript(t)
+	if !cloudhost.EnumsDeclared() {
+		t.Skip("linked lmcode-go has no Registry.Enum (needs the lmcode-go-patched replace)")
+	}
+	ref := buildRef(t)
+	schemaPath := filepath.Join(repoRoot(t), "schema", "lmcloud.dsl.json")
+	prog := `
+s = load_schema(schema="` + schemaPath + `");
+p = _lmcode_ s;
+  cloud.set_abort_on_error(false);
+  let ex = cloud.bucket_exists("dry-enum-bucket");
+  let ok_code = cloud.last_error().code() == ErrorCode.OK;
+  cloud.object_get("dry-enum-missing", "k");
+  let nf = cloud.last_error().code() == ErrorCode.NOT_FOUND;
+  lmcode_return_put("ok_code", ok_code);
+  lmcode_return_put("nf", nf);
+end _lmcode_
+r = run_lmcode(p, {command:["` + ref + `", "--lmcode", "$DSLFILE"]});
+assert(r.ok && r.result.ok_code && r.result.nf, "dry ErrorCode evaluation failed");
+println("DRY-ENUM-OK");
+`
+	file := filepath.Join(t.TempDir(), "dry-enum.lms")
+	if err := os.WriteFile(file, []byte(prog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "--dry-run", file)
+	cmd.Env = append(os.Environ(), "LMCLOUD_REF_STATE="+filepath.Join(t.TempDir(), "s.json"))
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), `"dry":true`) || !strings.Contains(string(out), `"ok_code":true`) {
+		t.Fatalf("dry enum run: %v\n%s", err, out)
 	}
 }

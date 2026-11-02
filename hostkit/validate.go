@@ -275,6 +275,10 @@ func EscapeKeyWhole(key string) string { return EscapeSegment(key) }
 
 // ReadBounded reads at most limit bytes and fails (never truncates) when the
 // stream holds more. The returned error is INTERNAL with the observed bound.
+//
+// Typed-nil footgun: the result is *CloudError. In a function that returns
+// error, `data, e := ReadBounded(...); return data, e` returns a NON-nil error
+// on success. Use ReadBoundedErr there, or `if e != nil { return nil, e }`.
 func ReadBounded(r io.Reader, limit int64) ([]byte, *CloudError) {
 	data, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
@@ -294,6 +298,26 @@ func ReadBoundedResponse(resp *http.Response, limit int64) ([]byte, *CloudError)
 		e.HTTPStatus = resp.StatusCode
 	}
 	return data, e
+}
+
+// ReadBoundedErr is ReadBounded with a plain error result: nil on success,
+// never a typed-nil *CloudError. Prefer it in adapter methods that return
+// error, so `return data, err` cannot hit the typed-nil trap (v3).
+func ReadBoundedErr(r io.Reader, limit int64) ([]byte, error) {
+	data, e := ReadBounded(r, limit)
+	if e != nil {
+		return nil, e
+	}
+	return data, nil
+}
+
+// ReadBoundedResponseErr is ReadBoundedResponse with a plain error result.
+func ReadBoundedResponseErr(resp *http.Response, limit int64) ([]byte, error) {
+	data, e := ReadBoundedResponse(resp, limit)
+	if e != nil {
+		return nil, e
+	}
+	return data, nil
 }
 
 func itoa(n int64) string {

@@ -155,3 +155,94 @@ enum; a dry result for a declared enum must be one of its constant strings; the 
 the first constant; undeclared types stay strict. Branch `dry-enum-string` commit `23ff76b` in the
 scratch clone `lmcode-go-dryenum`, patch file `lmcode-go-dry-enum-patch/0001-*.patch`, with tests
 `dry_enum_test.go`; `go test -race ./...` passes there.
+
+## hostkit v3 (branch `hostkit-v3`) — SolReviewer cross-host review, risks 7–10
+
+Additive again: no exported identifier was renamed or removed. Deprecated (kept, no longer used by
+the host): `BucketCreationTimer`, `QueueCreationTimer`.
+
+### 1. Dry runs can evaluate `last_error().code()` (risk 7) — needs a go.mod line in every host
+`cloudhost.Register` declares `ErrorCode` through lmcode-go `Registry.Enum` when the linked SDK has
+it (interface assertion; `cloudhost.EnumsDeclared()` reports it). Upstream lmcode-go 77932bf does
+not, so hostkit's go.mod carries a **temporary** replace to `../lmcode-go-patched` (a clone of the
+unpublished branch `dry-enum-string`, commit 23ff76b, proposed patch from v2).
+**Replace directives do not propagate to dependents.** Each host that wants the fix adds, next to its
+existing `replace github.com/lmctl-ai/lmcloud => ../lmcloud`:
+
+```
+// TEMPORARY: lmcode-go Registry.Enum (dry enum results) is not published yet.
+// Remove when it is merged upstream and the lmcode-go pin is bumped.
+replace github.com/lmctl-ai/lmcode-go => ../lmcode-go-patched
+```
+
+Without it the host still builds (hostkit calls `Enum` only if present) and keeps the old
+limitation: a dry run reaching `last_error().code()` fails with
+`dry callback for ErrorCode returned string`. **Removal condition:** when `Registry.Enum` (or an
+equivalent enum-aware dry check) is merged into github.com/lmctl-ai/lmcode-go and the lmcode-go pin
+in hostkit and every host go.mod + sdk.lock is bumped to a commit that contains it, delete the
+replace lines; `EnumsDeclared()` then becomes true everywhere without local patches.
+
+### 2. Offline receive timing follows the route (risk 8)
+- `fakeadapter.Options.LongPoll` (honour `waitSeconds` inside Receive), `BinaryWire`, `PollInterval`;
+  the fake implements `QueueCapsFor`. Default caps stay short-poll/text-only, so the host's
+  `WaitLoop` makes an empty offline `queue_receive(q, 1, 1, 30)` take ~1 s.
+- With `Router{Pick: EndpointRoutes{Offline: fake, Sim: ..}.Pick}` the caps of the **routed**
+  backend are used per call. Hosts must not advertise their remote route's `LongPoll=true` from a
+  global `QueueCaps()` while routing to the fake (Sol: OCI/AWS/GCP did); use `Router`/`QueueCapsFor`.
+- `WaitLoop` now returns an INTERNAL error when its context ends before the requested wait;
+  earlier versions turned a cancellation into an empty successful receive.
+
+### 3. Dry previews are scoped per endpoint (risk 9)
+The dry overlay is keyed by the per-service resolved endpoint attached to ctx (`""` = offline/live
+default route). A preview at endpoint A is invisible at B and still visible when switching back to A.
+Provider scope that is not part of the endpoint (account/project chosen by env) is not separated.
+
+### 4. Create ownership after CONFLICT: token proof only (risk 10)
+v2 accepted "server creation time ≥ call start" as proof; that is unsound (a server clock ahead of
+the client, or a concurrent creator, satisfies it). **v3 decision:** when `CreateBucket`/`CreateQueue`
+returns CONFLICT and the resource is accessible, the host returns `created=true` **only** if the
+adapter implements `BucketCreateTokenReader`/`QueueCreateTokenReader` and reads back this call's
+`hostkit.CreateToken(ctx)` — a random 128-bit token the host attaches per call, which the adapter
+must store **atomically in the create request itself** (tag/label/metadata of the create call). Any
+other case — no reader, read error, missing or different token — returns `false`. Timers are ignored.
+
+Provider notes (adapter work, not done in hostkit): GCS bucket labels, S3 `CreateBucket` has no tag
+parameter (tagging is a second request, so it is NOT atomic — S3 cannot prove), Azure container
+metadata on `PUT ?restype=container` (atomic), OCI `freeformTags` in `CreateBucket`/`CreateQueue`
+body (atomic); SQS `CreateQueue` tags (atomic), Pub/Sub labels on topic/subscription create.
+
+**Limitation vs spec.** Design 02 §2.1 says `bucket_create` returns `true` "if newly created". With a
+lost reply after a committed create (or a retried create), a host whose provider cannot store an
+atomic token will return `false` although this call created the bucket. Nothing is lost (the bucket
+exists, `last_error` is OK), but the boolean is "created and proven by this call".
+**Proposed amendment to design 02 §2.1 / §6.1 (for the design owner, not applied):**
+> `bucket_create`/`queue_create` return `true` when this call is known to have created the resource:
+> a direct success response, or — after a conflict — a provider-stored creation token written by this
+> call. A conflict on an accessible resource without such proof returns `false` with `ErrorCode.OK`.
+> Scripts must not treat `false` as "someone else created it"; use it only as "no new resource was
+> proven".
+
+### 5. Error-typed bounded reads
+`ReadBoundedErr(r, limit)` and `ReadBoundedResponseErr(resp, limit)` return `([]byte, error)` with a
+nil interface on success. **Footgun:** `ReadBounded`/`ReadBoundedResponse` return `*CloudError`;
+`data, e := ReadBounded(..); return data, e` in a function returning `error` is a non-nil error on
+success. Use the `Err` variants in adapter methods (hostkit still neutralises typed nils at the
+boundary via `NilIfTyped`).
+
+### 6. HTTP guard rails
+- `NewHTTPClient(timeout)` is the constructor to use (pass it to provider SDKs); `timeout<=0` now means
+  `DefaultHTTPTimeout` (60 s).
+- `EnforceClient(c)` returns a hardened copy of any client (same-origin redirects only, a timeout, no
+  environment proxy). **`DoHTTP` applies it to every client it is given**, so an adapter that builds
+  its own `http.Client` cannot forward credentials cross-origin through `DoHTTP` by accident. SDK
+  pipelines that bypass `DoHTTP` must be given `NewHTTPClient`/`EnforceClient` explicitly.
+- `hostkit/httpguard`: fault-injecting loopback server for adapter tests —
+  `New(t)`, `Script(steps...)`, steps `Status`, `RetryAfter`, `Oversize`, `Delay`, `RedirectTo`,
+  `HangUp` (request received, connection closed: a possibly committed POST), and
+  `Requests/Count/AssertCount/AssertNoCredentials`. hostkit's own HTTP path is tested with it: 503
+  retried 3×, POST 429 retried, POST 5xx and post-commit hang-up not retried, PUT hang-up retried,
+  deadline, oversize with http status, cross-origin redirect refused for hostkit, plain and nil
+  clients with no credentials reaching the foreign origin.
+
+### Also fixed
+`Router` rejects a typed-nil backend from `Pick` (error instead of a panic).

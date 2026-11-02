@@ -76,64 +76,81 @@ func TestTypedNilAdapterErrorsAreSuccess(t *testing.T) {
 	}
 }
 
-// creationTimed reports a fixed creation time and answers CONFLICT on create.
-type creationTimed struct {
+// conflictAfterCommit models a create whose first attempt committed server-side
+// (storing the call's create token) but whose reply was lost: it reports CONFLICT.
+// It also exposes a creation timer claiming "just now" to prove timers are ignored.
+type conflictAfterCommit struct {
 	*fakeadapter.Fake
-	at time.Time
+	commit bool // false: the resource pre-exists, created by someone else
 }
 
-func (c creationTimed) CreateBucket(ctx context.Context, b string) (bool, error) {
-	_, _ = c.Fake.CreateBucket(ctx, b) // the "earlier attempt" committed server-side
+func (c conflictAfterCommit) CreateBucket(ctx context.Context, b string) (bool, error) {
+	if c.commit {
+		_, _ = c.Fake.CreateBucket(ctx, b)
+	}
 	return false, hostkit.ProviderError(hostkit.Conflict, 409, "BucketAlreadyExists", "exists")
 }
-func (c creationTimed) BucketCreatedAt(context.Context, string) (time.Time, error) { return c.at, nil }
-func (c creationTimed) CreateQueue(ctx context.Context, q string) (bool, error) {
-	_, _ = c.Fake.CreateQueue(ctx, q)
+func (c conflictAfterCommit) CreateQueue(ctx context.Context, q string) (bool, error) {
+	if c.commit {
+		_, _ = c.Fake.CreateQueue(ctx, q)
+	}
 	return false, hostkit.ProviderError(hostkit.Conflict, 409, "QueueAlreadyExists", "exists")
 }
-func (c creationTimed) QueueCreatedAt(context.Context, string) (time.Time, error) { return c.at, nil }
+func (c conflictAfterCommit) BucketCreatedAt(context.Context, string) (time.Time, error) {
+	return time.Now().Add(time.Hour), nil
+}
+func (c conflictAfterCommit) QueueCreatedAt(context.Context, string) (time.Time, error) {
+	return time.Now().Add(time.Hour), nil
+}
 
-// Design decision (09-hostkit.md, create idempotency): CONFLICT + accessible
-// resource is created=true only when the adapter proves creation during this call.
-func TestCreateConflictResolvedByCreationTime(t *testing.T) {
-	now := time.Unix(1_800_000_000, 0)
-	cases := []struct {
-		name string
-		at   time.Time
-		want bool
-	}{
-		{"created during this call", now.Add(time.Second), true},
-		{"created exactly at start", now, true},
-		{"pre-existing", now.Add(-time.Hour), false},
-		{"unknown time", time.Time{}, false},
+// hostkit v3 decision (09-hostkit.md): CONFLICT + accessible resource is
+// created=true only when the adapter reads back this call's create token.
+func TestCreateConflictResolvedByToken(t *testing.T) {
+	env := &hostkit.EndpointResolver{Getenv: func(string) string { return "" }}
+	// 1. Our earlier attempt committed with this call's token -> true.
+	a := conflictAfterCommit{fakeadapter.New(fakeadapter.Options{}), true}
+	h := New(Config{Store: a, Queue: a, Endpoints: env})
+	h.SetAbortOnError(false)
+	if got, _ := h.BucketCreate(false, "own-bkt"); !got || h.LastError().Code != hostkit.OK {
+		t.Fatalf("own bucket: %v %+v", got, h.LastError())
 	}
-	for _, c := range cases {
-		a := creationTimed{fakeadapter.New(fakeadapter.Options{}), c.at}
-		h := New(Config{Store: a, Queue: a, Now: func() time.Time { return now }, Endpoints: &hostkit.EndpointResolver{Getenv: func(string) string { return "" }}})
-		h.SetAbortOnError(false)
-		if got, _ := h.BucketCreate(false, "ct-bkt"); got != c.want || h.LastError().Code != hostkit.OK {
-			t.Errorf("%s bucket: got %v last=%+v", c.name, got, h.LastError())
-		}
-		if got, _ := h.QueueCreate(false, "ct-q"); got != c.want || h.LastError().Code != hostkit.OK {
-			t.Errorf("%s queue: got %v last=%+v", c.name, got, h.LastError())
-		}
+	if got, _ := h.QueueCreate(false, "own-q"); !got || h.LastError().Code != hostkit.OK {
+		t.Fatalf("own queue: %v %+v", got, h.LastError())
 	}
-	// Without a timer the answer stays "already existed".
-	f := fakeadapter.New(fakeadapter.Options{})
-	_, _ = f.CreateBucket(context.Background(), "nt-bkt")
-	h := New(Config{Store: f, Queue: f, Endpoints: &hostkit.EndpointResolver{Getenv: func(string) string { return "" }}})
+	// 2. Pre-existing (another call's token, or none) -> false even though the
+	//    deprecated creation timer claims a recent time (a skewed server clock).
+	pre := fakeadapter.New(fakeadapter.Options{})
+	ctx := hostkit.WithCreateToken(context.Background(), "someone-elses-token")
+	_, _ = pre.CreateBucket(ctx, "pre-bkt")
+	_, _ = pre.CreateQueue(context.Background(), "pre-q")
+	b := conflictAfterCommit{pre, false}
+	h = New(Config{Store: b, Queue: b, Endpoints: env})
+	h.SetAbortOnError(false)
+	if got, _ := h.BucketCreate(false, "pre-bkt"); got || h.LastError().Code != hostkit.OK {
+		t.Fatalf("pre-existing bucket: %v %+v", got, h.LastError())
+	}
+	if got, _ := h.QueueCreate(false, "pre-q"); got || h.LastError().Code != hostkit.OK {
+		t.Fatalf("pre-existing queue: %v %+v", got, h.LastError())
+	}
+	// 3. No token reader -> false.
+	f := noTokenStore{fakeadapter.New(fakeadapter.Options{})}
+	_, _ = f.Fake.CreateBucket(context.Background(), "nt-bkt")
+	h = New(Config{Store: f, Queue: f.Fake, Endpoints: env})
 	if got, _ := h.BucketCreate(false, "nt-bkt"); got {
-		t.Fatal("no timer: must be false")
+		t.Fatal("no reader: must be false")
 	}
-	// A queue CONFLICT for a queue we cannot see stays CONFLICT.
-	cq := creationTimed{fakeadapter.New(fakeadapter.Options{}), now}
-	cq.Fake = fakeadapter.New(fakeadapter.Options{})
-	h = New(Config{Store: cq, Queue: conflictOnly{cq.Fake}, Endpoints: &hostkit.EndpointResolver{Getenv: func(string) string { return "" }}})
+	// 4. A queue CONFLICT for a queue we cannot see stays CONFLICT.
+	h = New(Config{Store: f.Fake, Queue: conflictOnly{fakeadapter.New(fakeadapter.Options{})}, Endpoints: env})
 	h.SetAbortOnError(false)
 	if _, _ = h.QueueCreate(false, "foreign-q"); h.LastError().Code != hostkit.Conflict {
 		t.Fatalf("foreign queue: %+v", h.LastError())
 	}
 }
+
+// noTokenStore hides the fake's token reader.
+type noTokenStore struct{ *fakeadapter.Fake }
+
+func (noTokenStore) BucketCreateToken() {}
 
 type conflictOnly struct{ *fakeadapter.Fake }
 

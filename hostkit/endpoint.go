@@ -234,10 +234,48 @@ func SameOriginRedirects(maxHops int) func(req *http.Request, via []*http.Reques
 	}
 }
 
+// DefaultHTTPTimeout bounds a request when a client has no timeout.
+const DefaultHTTPTimeout = 60 * time.Second
+
 // NewHTTPClient returns a client with no proxy from the environment, a total
-// timeout and the same-origin redirect policy.
+// timeout and the same-origin redirect policy. It is the only constructor
+// adapters should use; pass the result to provider SDKs as their HTTP client.
+// A timeout <= 0 means DefaultHTTPTimeout.
 func NewHTTPClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = DefaultHTTPTimeout
+	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.Proxy = nil
 	return &http.Client{Transport: tr, Timeout: timeout, CheckRedirect: SameOriginRedirects(3)}
+}
+
+// EnforceClient returns a copy of c with the hostkit safety bounds applied:
+// same-origin redirects only (credentials never reach another origin), a
+// timeout (DefaultHTTPTimeout when c has none) and, for an *http.Transport,
+// no proxy from the environment. A nil c yields NewHTTPClient(0). DoHTTP
+// applies it to every client it is given (v3), so an adapter that builds its
+// own client cannot bypass the bounds by accident through DoHTTP.
+func EnforceClient(c *http.Client) *http.Client {
+	if c == nil {
+		return NewHTTPClient(0)
+	}
+	out := *c
+	out.CheckRedirect = SameOriginRedirects(3)
+	if out.Timeout <= 0 {
+		out.Timeout = DefaultHTTPTimeout
+	}
+	switch tr := out.Transport.(type) {
+	case nil:
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.Proxy = nil
+		out.Transport = t
+	case *http.Transport:
+		if tr.Proxy != nil {
+			t := tr.Clone()
+			t.Proxy = nil
+			out.Transport = t
+		}
+	}
+	return &out
 }

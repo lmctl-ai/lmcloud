@@ -9,6 +9,7 @@ package cloudhost
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -42,7 +43,7 @@ type Config struct {
 type Host struct {
 	cfg  Config
 	errs *hostkit.ErrorState
-	dry  *overlay
+	dry  *dryScopes
 }
 
 // New returns a host for cfg. Missing optional fields get defaults.
@@ -78,7 +79,7 @@ func New(cfg Config) *Host {
 	if cfg.Queue != nil {
 		cfg.Queue = guardQueue{cfg.Queue}
 	}
-	return &Host{cfg: cfg, errs: hostkit.NewErrorState(), dry: newOverlay()}
+	return &Host{cfg: cfg, errs: hostkit.NewErrorState(), dry: &dryScopes{m: map[string]*overlay{}}}
 }
 
 // ---- small helpers ----
@@ -191,7 +192,7 @@ func (h *Host) realBucketExists(ctx context.Context, b string) (bool, *hostkit.C
 
 func (h *Host) bucketExists(ctx context.Context, dry bool, b string) (bool, *hostkit.CloudError) {
 	if dry {
-		if v, ok := h.dry.bucket(b); ok {
+		if v, ok := h.ov(ctx).bucket(b); ok {
 			return v, nil
 		}
 	}
@@ -215,7 +216,7 @@ func (h *Host) realQueueExists(ctx context.Context, q string) (bool, *hostkit.Cl
 
 func (h *Host) queueExists(ctx context.Context, dry bool, q string) (bool, *hostkit.CloudError) {
 	if dry {
-		if v, ok := h.dry.queue(q); ok {
+		if v, ok := h.ov(ctx).queue(q); ok {
 			return v, nil
 		}
 	}
@@ -240,14 +241,15 @@ func (h *Host) BucketCreate(dry bool, b string) (bool, error) {
 		if e != nil {
 			return false, h.fail(op, b, e)
 		}
-		h.dry.setBucket(b, true, !exists)
+		h.ov(ctx).setBucket(b, true, !exists)
 		h.ok()
 		return !exists, nil
 	}
 	if h.cfg.Store == nil {
 		return false, h.fail(op, b, missingStore())
 	}
-	start := h.cfg.Now()
+	token := newCreateToken()
+	ctx = hostkit.WithCreateToken(ctx, token)
 	created, err := h.cfg.Store.CreateBucket(ctx, b)
 	if err == nil {
 		h.ok()
@@ -258,8 +260,8 @@ func (h *Host) BucketCreate(dry bool, b string) (bool, error) {
 		// Design 02 §6.1: 409 is idempotent success only if the bucket is accessible in our scope.
 		if exists, perr := h.realBucketExists(ctx, b); perr == nil && exists {
 			h.ok()
-			return createdDuringCall(h.cfg.Store, start, func(t hostkit.BucketCreationTimer) (time.Time, error) {
-				return t.BucketCreatedAt(ctx, b)
+			return provenByToken(h.cfg.Store, token, func(r hostkit.BucketCreateTokenReader) (string, error) {
+				return r.BucketCreateToken(ctx, b)
 			}), nil
 		}
 	}
@@ -293,7 +295,7 @@ func (h *Host) BucketDelete(dry bool, b string) (bool, error) {
 		if len(keys) > 0 {
 			return false, h.fail(op, b, hostkit.ProviderError(hostkit.Conflict, 409, "BucketNotEmpty", "bucket is not empty (dry-run preview)"))
 		}
-		h.dry.setBucket(b, false, false)
+		h.ov(ctx).setBucket(b, false, false)
 		h.ok()
 		return true, nil
 	}
@@ -348,7 +350,7 @@ func (h *Host) BucketList(dry bool) ([]string, error) {
 		return nil, h.fail(op, "", e)
 	}
 	if dry {
-		names = h.dry.mergeBuckets(names)
+		names = h.ov(ctx).mergeBuckets(names)
 	}
 	h.ok()
 	return hostkit.SortedUnique(names), nil
@@ -379,7 +381,7 @@ func (h *Host) ObjectPut(dry bool, b, k, body, ct string, meta map[string]string
 			return none, h.fail(op, target(b, k), notFound(hostkit.AbsentBucket, "bucket does not exist (dry-run preview)"))
 		}
 		m := &hostkit.ObjectMeta{Exists: true, Bucket: b, Key: k, Size: int64(len(body)), ETag: dryETag(body), ContentType: ct, Metadata: copyMap(meta)}
-		h.dry.putObject(b, k, body, m)
+		h.ov(ctx).putObject(b, k, body, m)
 		h.ok()
 		return m, nil
 	}
@@ -416,7 +418,7 @@ func (h *Host) ObjectGet(dry bool, b, k string) (string, error) {
 	}
 	defer cancel()
 	if dry {
-		if state, body, _ := h.dry.object(b, k); state != dryUnknown {
+		if state, body, _ := h.ov(ctx).object(b, k); state != dryUnknown {
 			if state == dryPresent {
 				h.ok()
 				return body, nil
@@ -460,7 +462,7 @@ func (h *Host) ObjectHead(dry bool, b, k string) (*hostkit.ObjectMeta, error) {
 	}
 	defer cancel()
 	if dry {
-		if state, _, m := h.dry.object(b, k); state != dryUnknown {
+		if state, _, m := h.ov(ctx).object(b, k); state != dryUnknown {
 			switch state {
 			case dryPresent:
 				h.ok()
@@ -534,7 +536,7 @@ func (h *Host) ObjectDelete(dry bool, b, k string) error {
 		if !exists {
 			return h.fail(op, target(b, k), notFound(hostkit.AbsentBucket, "bucket does not exist (dry-run preview)"))
 		}
-		h.dry.deleteObject(b, k)
+		h.ov(ctx).deleteObject(b, k)
 		h.ok()
 		return nil
 	}
@@ -589,7 +591,7 @@ func (h *Host) ObjectList(dry bool, b, prefix string, maxKeys int64, token strin
 		return empty, h.fail(op, b, e)
 	}
 	defer cancel()
-	if dry && h.dry.touchesBucket(b) {
+	if dry && h.ov(ctx).touchesBucket(b) {
 		keys, e := h.dryKeys(ctx, b, prefix)
 		if e != nil {
 			return empty, h.fail(op, b, e)
@@ -603,7 +605,7 @@ func (h *Host) ObjectList(dry bool, b, prefix string, maxKeys int64, token strin
 				p.NextToken = p.Items[len(p.Items)-1].Key
 				break
 			}
-			_, body, m := h.dry.object(b, k)
+			_, body, m := h.ov(ctx).object(b, k)
 			s := hostkit.ObjectSummary{Key: k}
 			if m != nil {
 				s.Size, s.ETag = int64(len(body)), m.ETag
@@ -655,14 +657,14 @@ func (h *Host) realKeys(ctx context.Context, b, prefix string) ([]string, *hostk
 // dryKeys merges the real listing with the dry overlay for bucket b.
 func (h *Host) dryKeys(ctx context.Context, b, prefix string) ([]string, *hostkit.CloudError) {
 	var real []string
-	if !h.dry.bucketCreatedInDry(b) {
+	if !h.ov(ctx).bucketCreatedInDry(b) {
 		keys, e := h.realKeys(ctx, b, prefix)
 		if e != nil {
 			return nil, e
 		}
 		real = keys
 	}
-	return h.dry.mergeKeys(b, prefix, real), nil
+	return h.ov(ctx).mergeKeys(b, prefix, real), nil
 }
 
 // ObjectListAll implements object_list_all: all pages or an error, never partial.
@@ -677,7 +679,7 @@ func (h *Host) ObjectListAll(dry bool, b, prefix string) ([]string, error) {
 	}
 	defer cancel()
 	var keys []string
-	if dry && h.dry.touchesBucket(b) {
+	if dry && h.ov(ctx).touchesBucket(b) {
 		keys, e = h.dryKeys(ctx, b, prefix)
 	} else {
 		keys, e = h.realKeys(ctx, b, prefix)
@@ -707,22 +709,23 @@ func (h *Host) QueueCreate(dry bool, q string) (bool, error) {
 		if e != nil {
 			return false, h.fail(op, q, e)
 		}
-		h.dry.setQueue(q, true)
+		h.ov(ctx).setQueue(q, true)
 		h.ok()
 		return !exists, nil
 	}
 	if h.cfg.Queue == nil {
 		return false, h.fail(op, q, missingQueue())
 	}
-	start := h.cfg.Now()
+	token := newCreateToken()
+	ctx = hostkit.WithCreateToken(ctx, token)
 	created, err := h.cfg.Queue.CreateQueue(ctx, q)
 	if err != nil {
 		ce := hostkit.AsCloudError(err)
 		if ce.Code == hostkit.Conflict {
 			if exists, perr := h.realQueueExists(ctx, q); perr == nil && exists {
 				h.ok()
-				return createdDuringCall(h.cfg.Queue, start, func(t hostkit.QueueCreationTimer) (time.Time, error) {
-					return t.QueueCreatedAt(ctx, q)
+				return provenByToken(h.cfg.Queue, token, func(r hostkit.QueueCreateTokenReader) (string, error) {
+					return r.QueueCreateToken(ctx, q)
 				}), nil
 			}
 		}
@@ -748,7 +751,7 @@ func (h *Host) QueueDelete(dry bool, q string) (bool, error) {
 		if e != nil {
 			return false, h.fail(op, q, e)
 		}
-		h.dry.setQueue(q, false)
+		h.ov(ctx).setQueue(q, false)
 		h.ok()
 		return exists, nil
 	}
@@ -803,7 +806,7 @@ func (h *Host) QueueList(dry bool) ([]string, error) {
 		return nil, h.fail(op, "", e)
 	}
 	if dry {
-		names = h.dry.mergeQueues(names)
+		names = h.ov(ctx).mergeQueues(names)
 	}
 	h.ok()
 	return hostkit.SortedUnique(names), nil
@@ -1160,18 +1163,47 @@ func (o *overlay) mergeQueues(names []string) []string {
 // errIndex is returned by list accessors for out-of-range indices.
 var errIndex = errors.New("index out of range")
 
-// createdDuringCall resolves "CONFLICT, but the resource is accessible" (see
-// durable-memory/09-hostkit.md, create idempotency): it returns true only when
-// the adapter reports a server-side creation time at or after the start of
-// this call, i.e. an earlier attempt of the same call (a retry, or a reply
-// lost after the server committed) created it. Without a timer, or when the
-// timer fails, the answer is false ("already existed"): the host never claims
-// a create it cannot prove. Clock skew can only turn a true into a false.
-func createdDuringCall[T any](adapter any, start time.Time, at func(T) (time.Time, error)) bool {
-	t, ok := adapter.(T)
-	if !ok {
+// newCreateToken returns a random per-call create token (128 bits, hex).
+func newCreateToken() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// provenByToken resolves "CONFLICT, but the resource is accessible" (design
+// decision, durable-memory/09-hostkit.md v3): created=true only when the
+// adapter reads back the exact create token of this call, which it stored
+// atomically in the create request. No reader, a read error, a missing or a
+// different token all mean false ("already existed"): the host never claims a
+// create it cannot prove. Creation timestamps are deliberately not used.
+func provenByToken[R any](adapter any, token string, read func(R) (string, error)) bool {
+	r, ok := adapter.(R)
+	if !ok || token == "" {
 		return false
 	}
-	created, err := at(t)
-	return hostkit.NilIfTyped(err) == nil && !created.IsZero() && !created.Before(start)
+	got, err := read(r)
+	return hostkit.NilIfTyped(err) == nil && got == token
+}
+
+// dryScopes keeps one dry overlay per resolved endpoint, so a preview made
+// against endpoint A (or the offline route "") never appears at endpoint B.
+// The endpoint is the per-service resolution attached to ctx; provider scope
+// (account/project) that is not part of the endpoint is out of reach here.
+type dryScopes struct {
+	mu sync.Mutex
+	m  map[string]*overlay
+}
+
+func (h *Host) ov(ctx context.Context) *overlay {
+	key := hostkit.EndpointFrom(ctx)
+	h.dry.mu.Lock()
+	defer h.dry.mu.Unlock()
+	o, ok := h.dry.m[key]
+	if !ok {
+		o = newOverlay()
+		h.dry.m[key] = o
+	}
+	return o
 }
