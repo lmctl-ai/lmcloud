@@ -1,4 +1,4 @@
-# Scenario 03: Single message send, receive, and ack round-trip.
+# Scenario 03: Single message send, receive, and ack round-trip (using wait_seconds >= 1 for post-ack empty check, H3/L2).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 qname = "lmcloud-q03-" + run_id + "-msg";
@@ -28,7 +28,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
     cloud.queue_ack(q, msg_receipt);
   }
 
-  let after_ack = cloud.queue_receive(q, 1, 0, 30);
+  let after_ack = cloud.queue_receive(q, 1, 1, 30);
   let after_ack_len = after_ack.len();
 
   cloud.queue_delete(q);
@@ -48,4 +48,4 @@ assert(r.result.received_count == 1, "queue_receive must return 1 message");
 assert(r.result.msg_id_nonempty, "received QueueMessage.id() must be non-empty");
 assert(r.result.body_matches, "received QueueMessage.body() must match sent payload");
 assert(r.result.receipt_nonempty, "received QueueMessage.receipt() must be non-empty");
-assert(r.result.after_ack_len == 0, "queue_receive after queue_ack must return 0 messages");
+assert(r.result.after_ack_len == 0, "queue_receive(q, 1, 1, 30) after queue_ack must return 0 messages");

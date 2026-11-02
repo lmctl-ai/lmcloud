@@ -37,7 +37,7 @@ r = run_lmcode(program, {command:["lmaws", "--lmcode", "$DSLFILE"]});
 |---|---|---|
 | Provider identity | `cloud.provider() -> string` | Returns `"aws"`, `"azure"`, `"gcp"`, or `"oci"`. |
 | Endpoint query (M4) | `cloud.endpoint(service: string) -> string` | Active base endpoint URL for `service` (e.g. `"storage"`, `"queue"`; empty string when using default live cloud endpoints). Any userinfo is stripped (M2). |
-| Endpoint override (M4) | `cloud.set_endpoint(service: string, url: string) -> self` | Overrides the endpoint URL for `service` (`"storage"`, `"queue"`, `"tables"`, `"vm"`, `"container"`, `"lambda"`, `"valkey"`, `"userpool"`, `"permissions"`, `"cost"`, or `"*"` for all services). Unknown service or non-loopback `http://` fails pre-flight with `ErrorCode.INVALID_ARGUMENT` (M2, M4). |
+| Endpoint override (M4, L1) | `cloud.set_endpoint(service: string, url: string) -> self` | Overrides the endpoint URL for `service` (`"storage"`, `"queue"`, `"tables"`, `"vm"`, `"container"`, `"lambda"`, `"valkey"`, `"userpool"`, `"permissions"`, `"cost"`, or `"all"` for all services). Unknown service or non-loopback `http://` fails pre-flight with `ErrorCode.INVALID_ARGUMENT` (M2, M4). |
 | Error abort mode | `cloud.abort_on_error() -> bool` | Whether non-probe errors abort the `_lmcode_` block (`true` by default). |
 | Set abort mode | `cloud.set_abort_on_error(abort: bool) -> self` | Toggles whether failed operations abort (`true`, default) or return a sentinel value and record `cloud.last_error()` (`false`). |
 | Error inspection | `cloud.last_error() -> CloudError` | Structured error from the most recent operation (`ErrorCode.OK` if none). |
@@ -120,13 +120,17 @@ When connecting to a **live cloud** (no loopback endpoint override), each host r
 | **GCP (`lmgcp`)** | 1. Explicit OAuth2 access token: `LMGCP_TOKEN` or `GOOGLE_OAUTH_ACCESS_TOKEN`.<br>2. Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS` service-account JSON key file, or `~/.config/gcloud/application_default_credentials.json`).<br>3. GCE metadata server.<br>Project from `GOOGLE_CLOUD_PROJECT` / `CLOUDSDK_CORE_PROJECT`; location from `LMGCP_LOCATION` (default `"US"`). | Project: `LMGCP_SIM_PROJECT` (default `"gcpsim-local"`), Location: `"US"`.<br>Auth: `LMGCP_SIM_TOKEN` (`Authorization: Bearer <token>` when set; omitted in open mode). |
 | **OCI (`lmoci`)** | 1. Env vars: `OCI_TENANCY_OCID`, `OCI_USER_OCID`, `OCI_FINGERPRINT`, `OCI_PRIVATE_KEY_PATH` (or `OCI_PRIVATE_KEY`), `OCI_REGION`, `OCI_COMPARTMENT_ID`, `OCI_NAMESPACE`.<br>2. Config file: `OCI_CONFIG_FILE` (default `~/.oci/config`) with profile `OCI_CONFIG_PROFILE` (default `"DEFAULT"`). | Namespace: `LMOCI_SIM_NAMESPACE` or discovered via `GET /n/` (fallback `"floci-local"`).<br>Compartment: `LMOCI_SIM_COMPARTMENT_ID` (default `"ocid1.tenancy.oc1..flocilocaltenancy0000000000000000000000000000000000000000"`).<br>Region: `"us-ashburn-1"`.<br>Auth: synthetic `keyId` for `floci-local` in open mode; RSA-SHA256 signature from `LMOCI_SIM_KEY_ID` + `LMOCI_SIM_PRIVATE_KEY_PATH` in enforce mode. |
 
-### 3.3 Per-Service Endpoint Override & URL Sanitization (M2, M4)
+### 3.3 Canonical Per-Service Endpoint Override Precedence & URL Sanitization (M2, M4, L1)
 
-Hosts resolve the active endpoint for a `service` (here `"storage"`) in precedence order:
-1. Explicit runtime call `cloud.set_endpoint("storage", url)` (or `cloud.set_endpoint("*", url)`)
-2. Per-service environment variable: `LMCLOUD_STORAGE_ENDPOINT`, then provider-specific `LMAWS_STORAGE_ENDPOINT`, `LMAZURE_STORAGE_ENDPOINT`, `LMGCP_STORAGE_ENDPOINT`, `LMOCI_STORAGE_ENDPOINT`
-3. Shared fallback environment variable: `LMCLOUD_ENDPOINT`, then `LMAWS_ENDPOINT`, `LMAZURE_ENDPOINT`, `LMGCP_ENDPOINT`, `LMOCI_ENDPOINT`
-4. Default cloud production endpoint (when unset)
+All slices (`storage`, `queue`, etc.) resolve the active endpoint for `<service>` in the following single canonical precedence order (highest to lowest):
+
+| Priority | Source | Storage (`service = "storage"`) | Queue (`service = "queue"`) | All Other Slices |
+|---|---|---|---|---|
+| **1 (Highest)** | Explicit runtime call | `cloud.set_endpoint("storage", url)`, then `cloud.set_endpoint("all", url)` | `cloud.set_endpoint("queue", url)`, then `cloud.set_endpoint("all", url)` | `cloud.set_endpoint("<service>", url)`, then `cloud.set_endpoint("all", url)` |
+| **2** | Per-service `lmcloud` / host env | `LMCLOUD_STORAGE_ENDPOINT`, then `LM<PROVIDER>_STORAGE_ENDPOINT` | `LMCLOUD_QUEUE_ENDPOINT`, then `LM<PROVIDER>_QUEUE_ENDPOINT` | `LMCLOUD_<SERVICE>_ENDPOINT`, then `LM<PROVIDER>_<SERVICE>_ENDPOINT` |
+| **3** | Global `lmcloud` / host env | `LMCLOUD_ENDPOINT`, then `LM<PROVIDER>_ENDPOINT` | `LMCLOUD_ENDPOINT`, then `LM<PROVIDER>_ENDPOINT` | `LMCLOUD_ENDPOINT`, then `LM<PROVIDER>_ENDPOINT` |
+| **4** | Provider-native service / global env | AWS: `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`<br>Azure: `AZURE_BLOB_ENDPOINT`, `AZURE_STORAGE_ENDPOINT`<br>GCP: `STORAGE_EMULATOR_HOST`<br>OCI: `OCI_OBJECT_STORAGE_ENDPOINT`, `OCI_ENDPOINT` | AWS: `AWS_ENDPOINT_URL_SQS`, `AWS_ENDPOINT_URL`<br>Azure: `AZURE_QUEUE_ENDPOINT`, `AZURE_STORAGE_ENDPOINT`<br>GCP: `PUBSUB_EMULATOR_HOST`<br>OCI: `OCI_QUEUE_ENDPOINT`, `OCI_ENDPOINT` | Provider-native service env, then provider-native global env |
+| **5 (Lowest)** | Default live cloud endpoint | Regional S3 / Blob / GCS / OCI Object Storage endpoint | Regional SQS / Queue Storage / Pub/Sub / OCI Queue endpoint | Regional live cloud endpoint |
 
 **Endpoint security rules (M2):**
 - Plain `http://` URLs are accepted **only** when the parsed hostname is a loopback address (`127.0.0.1`, `localhost`, or `[::1]`). Any non-loopback `http://` URL (including `http://127.0.0.1.evil.example`) is rejected pre-flight with `ErrorCode.INVALID_ARGUMENT` (`http_status() == 0`).

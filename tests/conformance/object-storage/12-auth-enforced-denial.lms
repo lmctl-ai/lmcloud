@@ -1,12 +1,34 @@
-# Scenario 12: Auth-enforced denial (UNAUTHENTICATED vs PERMISSION_DENIED) classified via body-bearing operations (H2),
-# and existence probes (bucket_exists / object_head) never masquerading as exists == false (H1, H2).
-# Note (H1): The OCI portion of this scenario is sim-only (live OCI returns 404 NotAuthorizedOrNotFound when lacking inspect permission,
-# which lmoci maps to PERMISSION_DENIED).
+# Scenario 12: Auth-enforced denial (M6) — runs ONLY under --auth enforce (emits TAP SKIP in open mode)
+# and executes two separate passes asserting the distinct codes:
+#   Pass 1 (wrong secret / invalid token): body-bearing ops (bucket_create, object_put) fail with ErrorCode.UNAUTHENTICATED.
+#     Note (H2): S3 HEAD has no response body on the wire, so 403 on S3 HEAD maps to PERMISSION_DENIED;
+#     UNAUTHENTICATED vs PERMISSION_DENIED is classified via body-bearing operations (or by re-issuing HEAD as GET).
+#   Pass 2 (valid restricted principal denied by policy): body-bearing ops AND probes (bucket_exists, object_head)
+#     fail with ErrorCode.PERMISSION_DENIED (never exists == false with ErrorCode.OK).
+#     Note (H1): The OCI portion of this scenario is sim-only (live OCI returns 404 NotAuthorizedOrNotFound when lacking
+#     inspect permission, which lmoci maps to PERMISSION_DENIED).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 denied_bucket = "lmcloud-c12-" + run_id + "-denied";
 
-program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+# Save caller's configured policy-restricted credentials before overriding for Pass 1
+orig_aws_key = env("LMAWS_SIM_ACCESS_KEY_ID", "");
+orig_aws_sec = env("LMAWS_SIM_SECRET_ACCESS_KEY", "");
+orig_az_tok = env("LMAZURE_SIM_TOKEN", "");
+orig_az_key = env("LMAZURE_SIM_KEY", "");
+orig_gcp_tok = env("LMGCP_SIM_TOKEN", "");
+orig_oci_kid = env("LMOCI_SIM_KEY_ID", "");
+orig_oci_key = env("LMOCI_SIM_PRIVATE_KEY_PATH", "");
+
+# Pass 1: Unauthenticated (wrong secret / unknown credential)
+set_env("LMAWS_SIM_ACCESS_KEY_ID", "AKIAUNAUTH0000000000");
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", "wrong-secret-key-for-unauthenticated-pass");
+set_env("LMAZURE_SIM_TOKEN", "invalid-bearer-token-unauthenticated");
+set_env("LMAZURE_SIM_KEY", "d3JvbmdrZXl1bmF1dGhlbnRpY2F0ZWQ=");
+set_env("LMGCP_SIM_TOKEN", "invalid-bearer-token-unauthenticated");
+set_env("LMOCI_SIM_KEY_ID", "ocid1.tenancy.oc1..invalid/ocid1.user.oc1..invalid/00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00");
+
+unauth_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
     cloud.set_endpoint("storage", ep);
@@ -14,49 +36,91 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let b = ${denied_bucket};
   cloud.set_abort_on_error(false);
 
-  # Classify auth error via body-bearing operation (bucket_create, H2)
   let created = cloud.bucket_create(b);
   let create_err = cloud.last_error();
 
-  let enforced = create_err.code() == ErrorCode.UNAUTHENTICATED || create_err.code() == ErrorCode.PERMISSION_DENIED;
-  let body_op_auth_err = true;
-  let exists_probe = false;
-  let head_probe_exists = false;
-  let probe_denied_ok = true;
+  # If bucket_create with bogus credentials succeeded, the simulator is running in --auth open mode
+  let open_mode = create_err.code() == ErrorCode.OK;
+  let create_unauth = create_err.code() == ErrorCode.UNAUTHENTICATED;
+  let put_unauth = false;
+  let head_not_ok = false;
 
-  if (enforced) {
-    # Body-bearing object_put / object_list on denied bucket also classify UNAUTHENTICATED / PERMISSION_DENIED
-    cloud.object_put(b, "probe.txt", "denied");
-    let put_err = cloud.last_error();
-    body_op_auth_err = put_err.code() == ErrorCode.UNAUTHENTICATED || put_err.code() == ErrorCode.PERMISSION_DENIED;
-
-    # HEAD-based probes map 403 (and OCI 404 NotAuthorizedOrNotFound) to PERMISSION_DENIED (or UNAUTHENTICATED), never OK + false (H1, H2)
-    exists_probe = cloud.bucket_exists(b);
-    let exists_err = cloud.last_error();
-    let h = cloud.object_head(b, "probe.txt");
-    head_probe_exists = h.exists();
-    let head_err = cloud.last_error();
-
-    probe_denied_ok = (exists_err.code() == ErrorCode.PERMISSION_DENIED || exists_err.code() == ErrorCode.UNAUTHENTICATED)
-      && (head_err.code() == ErrorCode.PERMISSION_DENIED || head_err.code() == ErrorCode.UNAUTHENTICATED);
-  } else {
-    # Open mode cleanup so the scenario leaves zero state behind when run in open mode
+  if (open_mode) {
     if (created || cloud.bucket_exists(b)) {
       cloud.bucket_delete(b);
     }
+  } else {
+    cloud.object_put(b, "probe.txt", "unauth-body");
+    let put_err = cloud.last_error();
+    put_unauth = put_err.code() == ErrorCode.UNAUTHENTICATED;
+
+    # H2 exception: S3 HEAD has no body so 403 on HEAD maps to PERMISSION_DENIED (or UNAUTHENTICATED if re-issued as GET);
+    # it must never return ErrorCode.OK.
+    let exists_val = cloud.bucket_exists(b);
+    let exists_err = cloud.last_error();
+    head_not_ok = !exists_val && (exists_err.code() == ErrorCode.UNAUTHENTICATED || exists_err.code() == ErrorCode.PERMISSION_DENIED);
   }
 
-  lmcode_return_put("enforced", enforced);
-  lmcode_return_put("body_op_auth_err", body_op_auth_err);
-  lmcode_return_put("exists_probe", exists_probe);
-  lmcode_return_put("head_probe_exists", head_probe_exists);
-  lmcode_return_put("probe_denied_ok", probe_denied_ok);
-  lmcode_return_put("clean_in_open_mode", enforced || create_err.code() == ErrorCode.OK);
+  lmcode_return_put("open_mode", open_mode);
+  lmcode_return_put("create_unauth", create_unauth);
+  lmcode_return_put("put_unauth", put_unauth);
+  lmcode_return_put("head_not_ok", head_not_ok);
 end _lmcode_
 
-r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
-assert(r.ok, "12-auth-enforced-denial failed");
-assert(r.result.body_op_auth_err, "body-bearing operations in enforce mode must classify UNAUTHENTICATED or PERMISSION_DENIED");
-assert(!r.result.exists_probe && !r.result.head_probe_exists, "denied bucket/object must not report exists == true");
-assert(r.result.probe_denied_ok, "in enforce mode, bucket_exists and object_head must set PERMISSION_DENIED (or UNAUTHENTICATED), never ErrorCode.OK");
-assert(r.result.clean_in_open_mode, "open mode execution must succeed and clean up");
+r_unauth = run_lmcode(unauth_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r_unauth.ok, "12-auth-enforced-denial unauthenticated pass host execution failed");
+
+if (r_unauth.result.open_mode) {
+  println("SKIP: simulator is in --auth open mode; 12-auth-enforced-denial requires --auth enforce");
+  exit(0);
+}
+
+assert(r_unauth.result.create_unauth, "Pass 1 (wrong secret): bucket_create must fail with ErrorCode.UNAUTHENTICATED");
+assert(r_unauth.result.put_unauth, "Pass 1 (wrong secret): body-bearing object_put must fail with ErrorCode.UNAUTHENTICATED");
+assert(r_unauth.result.head_not_ok, "Pass 1 (wrong secret): bucket_exists must fail with UNAUTHENTICATED or PERMISSION_DENIED (H2), never OK");
+
+# Pass 2: Authenticated principal denied by IAM/RBAC/OCI policy -> ErrorCode.PERMISSION_DENIED
+set_env("LMAWS_SIM_ACCESS_KEY_ID", env("LMCLOUD_ENFORCE_DENIED_AWS_ACCESS_KEY_ID", orig_aws_key));
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", env("LMCLOUD_ENFORCE_DENIED_AWS_SECRET_ACCESS_KEY", orig_aws_sec));
+set_env("LMAZURE_SIM_TOKEN", env("LMCLOUD_ENFORCE_DENIED_AZURE_TOKEN", orig_az_tok));
+set_env("LMAZURE_SIM_KEY", env("LMCLOUD_ENFORCE_DENIED_AZURE_KEY", orig_az_key));
+set_env("LMGCP_SIM_TOKEN", env("LMCLOUD_ENFORCE_DENIED_GCP_TOKEN", orig_gcp_tok));
+set_env("LMOCI_SIM_KEY_ID", env("LMCLOUD_ENFORCE_DENIED_OCI_KEY_ID", orig_oci_kid));
+set_env("LMOCI_SIM_PRIVATE_KEY_PATH", env("LMCLOUD_ENFORCE_DENIED_OCI_PRIVATE_KEY_PATH", orig_oci_key));
+
+denied_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("storage", ep);
+  }
+  let b = ${denied_bucket};
+  cloud.set_abort_on_error(false);
+
+  let created = cloud.bucket_create(b);
+  let create_err = cloud.last_error();
+
+  cloud.object_put(b, "probe.txt", "denied-body");
+  let put_err = cloud.last_error();
+
+  let exists_probe = cloud.bucket_exists(b);
+  let exists_err = cloud.last_error();
+
+  let h = cloud.object_head(b, "probe.txt");
+  let head_probe_exists = h.exists();
+  let head_err = cloud.last_error();
+
+  lmcode_return_put("created", created);
+  lmcode_return_put("create_denied", create_err.code() == ErrorCode.PERMISSION_DENIED);
+  lmcode_return_put("put_denied", put_err.code() == ErrorCode.PERMISSION_DENIED);
+  lmcode_return_put("exists_probe", exists_probe);
+  lmcode_return_put("head_probe_exists", head_probe_exists);
+  lmcode_return_put("exists_denied", exists_err.code() == ErrorCode.PERMISSION_DENIED);
+  lmcode_return_put("head_denied", head_err.code() == ErrorCode.PERMISSION_DENIED);
+end _lmcode_
+
+r_denied = run_lmcode(denied_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r_denied.ok, "12-auth-enforced-denial policy-denied pass host execution failed");
+assert(!r_denied.result.created && r_denied.result.create_denied, "Pass 2 (policy denied): bucket_create must fail with ErrorCode.PERMISSION_DENIED");
+assert(r_denied.result.put_denied, "Pass 2 (policy denied): object_put must fail with ErrorCode.PERMISSION_DENIED");
+assert(!r_denied.result.exists_probe && !r_denied.result.head_probe_exists, "Pass 2 (policy denied): probes must not report exists == true");
+assert(r_denied.result.exists_denied && r_denied.result.head_denied, "Pass 2 (policy denied): bucket_exists and object_head must set ErrorCode.PERMISSION_DENIED, never ErrorCode.OK");

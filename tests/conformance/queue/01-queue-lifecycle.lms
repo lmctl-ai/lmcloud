@@ -1,4 +1,5 @@
 # Scenario 01: Queue create, exists, list (following all pages, sorted), and delete lifecycle.
+# Uses bounded polling for queue_list inclusion and post-delete disappearance (SQS eventual consistency, M3).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 q1 = "lmcloud-q01-" + run_id + "-alpha";
@@ -18,14 +19,29 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let exists1 = cloud.queue_exists(name1);
   let exists2 = cloud.queue_exists(name2);
 
-  let queues = cloud.queue_list();
-  let idx1 = queues.index_of(name1);
-  let idx2 = queues.index_of(name2);
+  # Bounded poll for queue_list eventual consistency (M3)
+  let idx1 = -1;
+  let idx2 = -1;
+  let list_polls = 0;
+  while ((idx1 < 0 || idx2 < 0) && list_polls < 10) {
+    list_polls = list_polls + 1;
+    let queues = cloud.queue_list();
+    idx1 = queues.index_of(name1);
+    idx2 = queues.index_of(name2);
+  }
 
   let deleted1 = cloud.queue_delete(name1);
   let deleted2 = cloud.queue_delete(name2);
-  let exists_after1 = cloud.queue_exists(name1);
-  let exists_after2 = cloud.queue_exists(name2);
+
+  # Bounded poll for post-delete disappearance (M3)
+  let exists_after1 = true;
+  let exists_after2 = true;
+  let del_polls = 0;
+  while ((exists_after1 || exists_after2) && del_polls < 10) {
+    del_polls = del_polls + 1;
+    exists_after1 = cloud.queue_exists(name1);
+    exists_after2 = cloud.queue_exists(name2);
+  }
 
   lmcode_return_put("existed_before", existed_before);
   lmcode_return_put("created1", created1);
@@ -44,7 +60,7 @@ assert(r.ok, "01-queue-lifecycle host execution failed");
 assert(!r.result.existed_before, "queues should not exist before create");
 assert(r.result.created1 && r.result.created2, "queue_create should return true for new queues");
 assert(r.result.exists1 && r.result.exists2, "queue_exists should return true after create");
-assert(r.result.found_both, "queue_list should include both created queues");
+assert(r.result.found_both, "queue_list should include both created queues within bounded poll");
 assert(r.result.sorted_order, "queue_list should return queues in ascending lexicographical order");
 assert(r.result.deleted1 && r.result.deleted2, "queue_delete should return true for existing queues");
-assert(!r.result.exists_after, "queue_exists should return false after delete");
+assert(!r.result.exists_after, "queue_exists should return false after delete within bounded poll");

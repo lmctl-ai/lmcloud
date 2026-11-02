@@ -1,7 +1,8 @@
-# Scenario 09: NOT_FOUND errors on missing queue vs non-throwing queue_exists / queue_delete probes.
+# Scenario 10: NOT_FOUND errors on missing queue vs non-throwing queue_exists / queue_delete probes,
+# and error precedence: missing queue (ErrorCode.NOT_FOUND) precedes malformed non-empty receipt (ErrorCode.INVALID_ARGUMENT) (M5).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-missing_q = "lmcloud-q09-" + run_id + "-absent";
+missing_q = "lmcloud-q10-" + run_id + "-absent";
 
 # 1. Default abort mode: queue_send on missing queue must abort with [NOT_FOUND]
 abort_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
@@ -15,7 +16,8 @@ end _lmcode_
 r_abort = run_lmcode(abort_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(!r_abort.ok, "queue_send on non-existent queue must abort in default mode");
 
-# 2. Non-abort inspection: queue_exists is false + OK; queue_send / queue_receive / queue_ack / queue_nack set ErrorCode.NOT_FOUND
+# 2. Non-abort inspection: queue_exists is false + OK; queue_send / queue_receive / queue_ack / queue_nack
+#    (including malformed non-empty receipts, M5) set ErrorCode.NOT_FOUND
 inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
@@ -31,13 +33,14 @@ inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.queue_send(mq, "msg");
   let send_err = cloud.last_error();
 
-  cloud.queue_receive(mq, 1, 0, 30);
+  cloud.queue_receive(mq, 1, 1, 30);
   let recv_err = cloud.last_error();
 
-  cloud.queue_ack(mq, "some-receipt");
+  # M5: even when receipt is malformed (not valid base64url / composite token), missing queue (NOT_FOUND) takes precedence over INVALID_ARGUMENT
+  cloud.queue_ack(mq, "malformed-not-base64!!!");
   let ack_err = cloud.last_error();
 
-  cloud.queue_nack(mq, "some-receipt", 10);
+  cloud.queue_nack(mq, "malformed-not-base64!!!", 10);
   let nack_err = cloud.last_error();
 
   lmcode_return_put("exists", exists);
@@ -49,6 +52,7 @@ inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 end _lmcode_
 
 r = run_lmcode(inspect_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
-assert(r.ok, "09-queue-not-found-errors inspection run failed");
+assert(r.ok, "10-queue-not-found-errors inspection run failed");
 assert(!r.result.exists && r.result.exists_ok, "queue_exists on missing queue must return false with ErrorCode.OK");
-assert(r.result.send_nf && r.result.recv_nf && r.result.ack_nf && r.result.nack_nf, "queue_send/receive/ack/nack on missing queue must set ErrorCode.NOT_FOUND");
+assert(r.result.send_nf && r.result.recv_nf, "queue_send and queue_receive on missing queue must set ErrorCode.NOT_FOUND");
+assert(r.result.ack_nf && r.result.nack_nf, "queue_ack and queue_nack on missing queue must set ErrorCode.NOT_FOUND even with a malformed non-empty receipt (M5)");

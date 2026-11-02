@@ -1,0 +1,105 @@
+# Scenario 13: Auth-enforced denial on queue operations (M6) — runs ONLY under --auth enforce (emits TAP SKIP in open mode)
+# and executes two separate passes asserting the distinct codes:
+#   Pass 1 (wrong secret / invalid token): queue_create and queue_send fail with ErrorCode.UNAUTHENTICATED.
+#   Pass 2 (valid restricted principal denied by policy): queue_create, queue_send, and queue_exists probe
+#     fail with ErrorCode.PERMISSION_DENIED (never exists == false with ErrorCode.OK).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+denied_q = "lmcloud-q13-" + run_id + "-denied";
+
+orig_aws_key = env("LMAWS_SIM_ACCESS_KEY_ID", "");
+orig_aws_sec = env("LMAWS_SIM_SECRET_ACCESS_KEY", "");
+orig_az_tok = env("LMAZURE_SIM_TOKEN", "");
+orig_az_key = env("LMAZURE_SIM_KEY", "");
+orig_gcp_tok = env("LMGCP_SIM_TOKEN", "");
+orig_oci_kid = env("LMOCI_SIM_KEY_ID", "");
+orig_oci_key = env("LMOCI_SIM_PRIVATE_KEY_PATH", "");
+
+# Pass 1: Unauthenticated (wrong secret / unknown credential)
+set_env("LMAWS_SIM_ACCESS_KEY_ID", "AKIAUNAUTH0000000000");
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", "wrong-secret-key-for-unauthenticated-pass");
+set_env("LMAZURE_SIM_TOKEN", "invalid-bearer-token-unauthenticated");
+set_env("LMAZURE_SIM_KEY", "d3JvbmdrZXl1bmF1dGhlbnRpY2F0ZWQ=");
+set_env("LMGCP_SIM_TOKEN", "invalid-bearer-token-unauthenticated");
+set_env("LMOCI_SIM_KEY_ID", "ocid1.tenancy.oc1..invalid/ocid1.user.oc1..invalid/00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00");
+
+unauth_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  let q = ${denied_q};
+  cloud.set_abort_on_error(false);
+
+  let created = cloud.queue_create(q);
+  let create_err = cloud.last_error();
+
+  # If queue_create with bogus credentials succeeded, the simulator is running in --auth open mode
+  let open_mode = create_err.code() == ErrorCode.OK;
+  let create_unauth = create_err.code() == ErrorCode.UNAUTHENTICATED;
+  let send_unauth = false;
+
+  if (open_mode) {
+    if (created || cloud.queue_exists(q)) {
+      cloud.queue_delete(q);
+    }
+  } else {
+    cloud.queue_send(q, "unauth-message");
+    let send_err = cloud.last_error();
+    send_unauth = send_err.code() == ErrorCode.UNAUTHENTICATED;
+  }
+
+  lmcode_return_put("open_mode", open_mode);
+  lmcode_return_put("create_unauth", create_unauth);
+  lmcode_return_put("send_unauth", send_unauth);
+end _lmcode_
+
+r_unauth = run_lmcode(unauth_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r_unauth.ok, "13-queue-auth-enforced-denial unauthenticated pass host execution failed");
+
+if (r_unauth.result.open_mode) {
+  println("SKIP: simulator is in --auth open mode; 13-queue-auth-enforced-denial requires --auth enforce");
+  exit(0);
+}
+
+assert(r_unauth.result.create_unauth, "Pass 1 (wrong secret): queue_create must fail with ErrorCode.UNAUTHENTICATED");
+assert(r_unauth.result.send_unauth, "Pass 1 (wrong secret): queue_send must fail with ErrorCode.UNAUTHENTICATED");
+
+# Pass 2: Authenticated principal denied by IAM/RBAC/OCI policy -> ErrorCode.PERMISSION_DENIED
+set_env("LMAWS_SIM_ACCESS_KEY_ID", env("LMCLOUD_ENFORCE_DENIED_AWS_ACCESS_KEY_ID", orig_aws_key));
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", env("LMCLOUD_ENFORCE_DENIED_AWS_SECRET_ACCESS_KEY", orig_aws_sec));
+set_env("LMAZURE_SIM_TOKEN", env("LMCLOUD_ENFORCE_DENIED_AZURE_TOKEN", orig_az_tok));
+set_env("LMAZURE_SIM_KEY", env("LMCLOUD_ENFORCE_DENIED_AZURE_KEY", orig_az_key));
+set_env("LMGCP_SIM_TOKEN", env("LMCLOUD_ENFORCE_DENIED_GCP_TOKEN", orig_gcp_tok));
+set_env("LMOCI_SIM_KEY_ID", env("LMCLOUD_ENFORCE_DENIED_OCI_KEY_ID", orig_oci_kid));
+set_env("LMOCI_SIM_PRIVATE_KEY_PATH", env("LMCLOUD_ENFORCE_DENIED_OCI_PRIVATE_KEY_PATH", orig_oci_key));
+
+denied_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  let q = ${denied_q};
+  cloud.set_abort_on_error(false);
+
+  let created = cloud.queue_create(q);
+  let create_err = cloud.last_error();
+
+  cloud.queue_send(q, "denied-message");
+  let send_err = cloud.last_error();
+
+  let exists_probe = cloud.queue_exists(q);
+  let exists_err = cloud.last_error();
+
+  lmcode_return_put("created", created);
+  lmcode_return_put("create_denied", create_err.code() == ErrorCode.PERMISSION_DENIED);
+  lmcode_return_put("send_denied", send_err.code() == ErrorCode.PERMISSION_DENIED);
+  lmcode_return_put("exists_probe", exists_probe);
+  lmcode_return_put("exists_denied", exists_err.code() == ErrorCode.PERMISSION_DENIED);
+end _lmcode_
+
+r_denied = run_lmcode(denied_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r_denied.ok, "13-queue-auth-enforced-denial policy-denied pass host execution failed");
+assert(!r_denied.result.created && r_denied.result.create_denied, "Pass 2 (policy denied): queue_create must fail with ErrorCode.PERMISSION_DENIED");
+assert(r_denied.result.send_denied, "Pass 2 (policy denied): queue_send must fail with ErrorCode.PERMISSION_DENIED");
+assert(!r_denied.result.exists_probe && r_denied.result.exists_denied, "Pass 2 (policy denied): queue_exists must return false with ErrorCode.PERMISSION_DENIED, never ErrorCode.OK");

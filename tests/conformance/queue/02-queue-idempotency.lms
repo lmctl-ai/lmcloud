@@ -1,5 +1,6 @@
 # Scenario 02: Idempotent queue_create (returns false when already exists) and queue_delete (returns false when already absent).
-# Uses distinct queue names and never recreates a deleted queue (SQS 60s QueueDeletedRecently cooldown safe).
+# Uses distinct queue names, never recreates a deleted queue (SQS 60s QueueDeletedRecently safe),
+# and polls for post-delete disappearance before testing second delete (M3).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 q_active = "lmcloud-q02-" + run_id + "-active";
@@ -21,6 +22,13 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let create_second_ok = cloud.last_error().code() == ErrorCode.OK;
 
   let delete_first = cloud.queue_delete(q);
+
+  # Bounded poll until queue_exists(q) is false before testing idempotent second delete (M3)
+  let polls = 0;
+  while (cloud.queue_exists(q) && polls < 10) {
+    polls = polls + 1;
+  }
+
   let delete_second = cloud.queue_delete(q);
   let delete_second_ok = cloud.last_error().code() == ErrorCode.OK;
 

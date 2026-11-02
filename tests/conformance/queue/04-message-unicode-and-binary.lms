@@ -1,4 +1,4 @@
-# Scenario 04: Empty, UTF-8, XML/JSON-special, and binary byte-preserving message bodies.
+# Scenario 04: Empty (""), sentinel-escape ("__lmcloud_empty__"), UTF-8, XML/JSON-special, and binary byte-preserving message bodies (H2).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 qname = "lmcloud-q04-" + run_id + "-enc";
@@ -13,6 +13,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 
   let expected = str_list()
     .add("")
+    .add("__lmcloud_empty__")
     .add("こんにちは世界 🚀 café")
     .add("<QueueMessage attr=\"1\">&amp;{\"k\":\"v\"}</QueueMessage>")
     .add(str_hex_decode("0001027f80feff41424300"));
@@ -48,5 +49,5 @@ end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "04-message-unicode-and-binary host execution failed");
-assert(r.result.received_count == r.result.expected_count, "must receive all 4 encoded test payloads");
-assert(r.result.all_matched, "empty, UTF-8, XML/JSON-special, and binary payloads must round-trip byte-for-byte");
+assert(r.result.received_count == r.result.expected_count, "must receive all 5 encoded test payloads (including empty and sentinel literal)");
+assert(r.result.all_matched, "empty, sentinel-escaped, UTF-8, XML/JSON-special, and binary payloads must round-trip byte-for-byte");

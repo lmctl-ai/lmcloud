@@ -343,7 +343,7 @@
         "queue_nack": [
           {
             "params": ["string", "string", "int"],
-            "returns": "void"
+            "returns": "string"
           }
         ]
       }

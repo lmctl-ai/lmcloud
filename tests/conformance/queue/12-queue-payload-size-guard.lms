@@ -1,0 +1,72 @@
+# Scenario 12: Portable 48 KiB (49,152-byte) payload size limit for BOTH text and raw binary payloads (M2):
+#   - Exact 49,152-byte ASCII text payload round-trips; 49,153-byte text fails pre-flight with INVALID_ARGUMENT.
+#   - Exact 49,152-byte raw binary payload (\x00\xff\x7f\x80 * 12288) round-trips; 49,153-byte binary fails pre-flight with INVALID_ARGUMENT.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+q_txt = "lmcloud-q12-" + run_id + "-txt";
+q_bin = "lmcloud-q12-" + run_id + "-bin";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("queue", ep);
+  }
+  let qt = ${q_txt};
+  let qb = ${q_bin};
+  cloud.queue_create(qt);
+  cloud.queue_create(qb);
+
+  let max_txt = str_repeat("a", 49152);
+  let over_txt = max_txt + "z";
+
+  let max_bin = str_repeat(str_hex_decode("00ff7f80"), 12288);
+  let over_bin = max_bin + str_hex_decode("00");
+
+  # 1. Pre-flight rejection of 49,153-byte text and 49,153-byte binary payloads
+  cloud.set_abort_on_error(false);
+  cloud.queue_send(qt, over_txt);
+  let over_txt_err = cloud.last_error();
+  let over_txt_rejected = over_txt_err.code() == ErrorCode.INVALID_ARGUMENT && over_txt_err.http_status() == 0;
+
+  cloud.queue_send(qb, over_bin);
+  let over_bin_err = cloud.last_error();
+  let over_bin_rejected = over_bin_err.code() == ErrorCode.INVALID_ARGUMENT && over_bin_err.http_status() == 0;
+
+  # 2. Exact 49,152-byte (48 KiB) text payload succeeds and round-trips intact
+  cloud.set_abort_on_error(true);
+  let txt_id = cloud.queue_send(qt, max_txt);
+  let txt_batch = cloud.queue_receive(qt, 1, 2, 30);
+  let txt_got = txt_batch.len() == 1;
+  let txt_matches = false;
+  if (txt_got) {
+    let mt = txt_batch.at(0);
+    txt_matches = str_len(mt.body()) == 49152 && mt.body() == max_txt;
+    cloud.queue_ack(qt, mt.receipt());
+  }
+
+  # 3. Exact 49,152-byte (48 KiB) raw binary payload succeeds and round-trips intact (M2)
+  let bin_id = cloud.queue_send(qb, max_bin);
+  let bin_batch = cloud.queue_receive(qb, 1, 2, 30);
+  let bin_got = bin_batch.len() == 1;
+  let bin_matches = false;
+  if (bin_got) {
+    let mb = bin_batch.at(0);
+    bin_matches = str_len(mb.body()) == 49152 && str_hex_encode(mb.body()) == str_hex_encode(max_bin);
+    cloud.queue_ack(qb, mb.receipt());
+  }
+
+  cloud.queue_delete(qt);
+  cloud.queue_delete(qb);
+
+  lmcode_return_put("over_txt_rejected", over_txt_rejected);
+  lmcode_return_put("over_bin_rejected", over_bin_rejected);
+  lmcode_return_put("txt_ok", str_len(txt_id) > 0 && txt_got && txt_matches);
+  lmcode_return_put("bin_ok", str_len(bin_id) > 0 && bin_got && bin_matches);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "12-queue-payload-size-guard host execution failed");
+assert(r.result.over_txt_rejected, "text payload > 49,152 bytes (48 KiB) must fail pre-flight with ErrorCode.INVALID_ARGUMENT");
+assert(r.result.over_bin_rejected, "binary payload > 49,152 bytes (48 KiB) must fail pre-flight with ErrorCode.INVALID_ARGUMENT");
+assert(r.result.txt_ok, "exact 49,152-byte (48 KiB) text payload must round-trip intact");
+assert(r.result.bin_ok, "exact 49,152-byte (48 KiB) raw binary payload must round-trip intact across all providers");

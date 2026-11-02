@@ -1,7 +1,7 @@
-# Scenario 10: Pre-flight INVALID_ARGUMENT validation for queue names, receive bounds (max_messages, wait_seconds, visibility_timeout), and empty receipts.
+# Scenario 11: Pre-flight INVALID_ARGUMENT validation for queue names, receive bounds (max_messages, wait_seconds, visibility_timeout), and empty receipts.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-valid_q = "lmcloud-q10-" + run_id + "-valid";
+valid_q = "lmcloud-q11-" + run_id + "-valid";
 
 # 1. Default abort mode: invalid queue name aborts before network I/O
 abort_invalid = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
@@ -100,7 +100,7 @@ checks_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 end _lmcode_
 
 r = run_lmcode(checks_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
-assert(r.ok, "10-queue-validation-guards inspection run failed");
+assert(r.ok, "11-queue-validation-guards inspection run failed");
 assert(r.result.name_checks, "queue name validation guards must fail pre-flight with INVALID_ARGUMENT");
 assert(r.result.receive_bounds, "queue_receive parameter bounds (max_messages 1..10, wait_seconds 0..20, visibility_timeout 0..600) must fail pre-flight with INVALID_ARGUMENT");
 assert(r.result.receipt_bounds, "empty receipt and out-of-range queue_nack visibility_timeout must fail pre-flight with INVALID_ARGUMENT");

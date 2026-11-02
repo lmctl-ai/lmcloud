@@ -39,6 +39,7 @@ collect_scenarios() {
 
 pass=0
 fail=0
+skip=0
 idx=0
 
 if [[ "${1:-}" == "--check" ]]; then
@@ -83,16 +84,21 @@ else
     idx=$((idx + 1))
     slice_name="$(basename "$(dirname "$f")")"
     name="$slice_name/$(basename "$f" .lms)"
-    if "$LMSCRIPT_BIN" "$f" "$HOST_BIN" "$ENDPOINT" "$RUN_ID" >/dev/null 2>&1; then
-      echo "ok $idx - $name"
+    if out="$("$LMSCRIPT_BIN" "$f" "$HOST_BIN" "$ENDPOINT" "$RUN_ID" 2>&1)"; then
+      if [[ "$out" =~ ^SKIP:[[:space:]]*(.*)$ ]]; then
+        echo "ok $idx - $name # SKIP ${BASH_REMATCH[1]}"
+        skip=$((skip + 1))
+      else
+        echo "ok $idx - $name"
+      fi
       pass=$((pass + 1))
     else
       echo "not ok $idx - $name"
-      "$LMSCRIPT_BIN" "$f" "$HOST_BIN" "$ENDPOINT" "$RUN_ID" >&2 || true
+      printf '%s\n' "$out" >&2
       fail=$((fail + 1))
     fi
   done
 fi
 
-echo "# pass $pass / $total, fail $fail"
+echo "# pass $pass / $total, skip $skip, fail $fail"
 [[ $fail -eq 0 ]]

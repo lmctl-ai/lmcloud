@@ -1,4 +1,4 @@
-# Scenario 05: Multi-message send and unordered batch receive loop (comparing sets, not FIFO order).
+# Scenario 05: Multi-message send and unordered batch receive loop (comparing sets, not FIFO order, with wait_seconds >= 1, L2).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 qname = "lmcloud-q05-" + run_id + "-batch";
@@ -40,7 +40,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
     }
   }
 
-  let rem = cloud.queue_receive(q, 5, 0, 30);
+  let rem = cloud.queue_receive(q, 5, 1, 30);
   let rem_len = rem.len();
 
   cloud.queue_delete(q);
