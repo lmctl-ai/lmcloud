@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "provider": "aws",
+  "region": "us-east-1",
+  "currency": "USD",
+  "source_url": "https://aws.amazon.com/s3/pricing/ ; https://aws.amazon.com/sqs/pricing/",
+  "effective_date": "2026-04-01",
+  "max_age_days": 365,
+  "cleanup_reserve_per_resource_nano_usd": 10000,
+  "operations": {
+    "bucket_create": {
+      "request_nano_usd": 5000,
+      "cleanup_reserve_nano_usd": 10000
+    },
+    "bucket_delete": {
+      "request_nano_usd": 0
+    },
+    "bucket_exists": {
+      "request_nano_usd": 400
+    },
+    "bucket_list": {
+      "request_nano_usd": 5000
+    },
+    "bucket_read_ownership": {
+      "request_nano_usd": 400
+    },
+    "object_put": {
+      "request_nano_usd": 5000,
+      "storage_gib_month_nano_usd": 23000000,
+      "min_duration_seconds": 3600,
+      "cleanup_reserve_nano_usd": 5000
+    },
+    "object_get": {
+      "request_nano_usd": 400,
+      "egress_gib_nano_usd": 90000000
+    },
+    "object_head": {
+      "request_nano_usd": 400
+    },
+    "object_delete": {
+      "request_nano_usd": 0
+    },
+    "object_list": {
+      "request_nano_usd": 5000
+    },
+    "object_copy": {
+      "request_nano_usd": 5000,
+      "storage_gib_month_nano_usd": 23000000,
+      "min_duration_seconds": 3600,
+      "cleanup_reserve_nano_usd": 5000
+    },
+    "queue_create": {
+      "request_nano_usd": 400,
+      "chunk_bytes": 65536,
+      "cleanup_reserve_nano_usd": 10000
+    },
+    "queue_delete": {
+      "request_nano_usd": 400
+    },
+    "queue_exists": {
+      "request_nano_usd": 400
+    },
+    "queue_list": {
+      "request_nano_usd": 400
+    },
+    "queue_read_ownership": {
+      "request_nano_usd": 400
+    },
+    "queue_send": {
+      "request_nano_usd": 400,
+      "chunk_bytes": 65536,
+      "cleanup_reserve_nano_usd": 400
+    },
+    "queue_receive": {
+      "request_nano_usd": 400,
+      "chunk_bytes": 65536
+    },
+    "queue_ack": {
+      "request_nano_usd": 400
+    },
+    "queue_nack": {
+      "request_nano_usd": 400
+    }
+  }
+}
