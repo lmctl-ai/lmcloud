@@ -1,0 +1,261 @@
+{
+  "dsl.schema": 2,
+  "name": "lmcloud",
+  "enums": {
+    "ErrorCode": [
+      "OK",
+      "INVALID_ARGUMENT",
+      "NOT_FOUND",
+      "CONFLICT",
+      "PRECONDITION_FAILED",
+      "UNAUTHENTICATED",
+      "PERMISSION_DENIED",
+      "INTERNAL"
+    ]
+  },
+  "types": {
+    "CloudError": {
+      "methods": {
+        "ok": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ],
+        "code": [
+          {
+            "params": [],
+            "returns": "ErrorCode"
+          }
+        ],
+        "http_status": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "provider_code": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "message": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ]
+      }
+    },
+    "ObjectMeta": {
+      "methods": {
+        "exists": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ],
+        "bucket": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "key": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "size": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "etag": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "content_type": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "metadata": [
+          {
+            "params": [],
+            "returns": "StrMap"
+          }
+        ]
+      }
+    },
+    "ObjectSummary": {
+      "methods": {
+        "key": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "size": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "etag": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ]
+      }
+    },
+    "ObjectListPage": {
+      "methods": {
+        "len": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "at": [
+          {
+            "params": ["int"],
+            "returns": "ObjectSummary"
+          }
+        ],
+        "keys": [
+          {
+            "params": [],
+            "returns": "StrList"
+          }
+        ],
+        "has_more": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ],
+        "next_token": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ]
+      }
+    },
+    "Cloud": {
+      "methods": {
+        "provider": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "endpoint": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "set_endpoint": [
+          {
+            "params": ["string"],
+            "returns": "self"
+          }
+        ],
+        "last_error": [
+          {
+            "params": [],
+            "returns": "CloudError"
+          }
+        ],
+        "bucket_create": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "bucket_delete": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "bucket_exists": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "bucket_list": [
+          {
+            "params": [],
+            "returns": "StrList"
+          }
+        ],
+        "object_put": [
+          {
+            "params": ["string", "string", "string"],
+            "returns": "ObjectMeta"
+          },
+          {
+            "params": ["string", "string", "string", "string", "StrMap"],
+            "returns": "ObjectMeta"
+          }
+        ],
+        "object_get": [
+          {
+            "params": ["string", "string"],
+            "returns": "string"
+          }
+        ],
+        "object_head": [
+          {
+            "params": ["string", "string"],
+            "returns": "ObjectMeta"
+          }
+        ],
+        "object_delete": [
+          {
+            "params": ["string", "string"],
+            "returns": "bool"
+          }
+        ],
+        "object_list": [
+          {
+            "params": ["string", "string"],
+            "returns": "ObjectListPage"
+          },
+          {
+            "params": ["string", "string", "int", "string"],
+            "returns": "ObjectListPage"
+          }
+        ]
+      }
+    }
+  },
+  "functions": {
+    "print": [
+      { "params": ["string"], "returns": "void" },
+      { "params": ["int"], "returns": "void" },
+      { "params": ["float"], "returns": "void" },
+      { "params": ["bool"], "returns": "void" }
+    ],
+    "assert_close": [
+      {
+        "params": ["float", "float", "float"],
+        "returns": "void"
+      }
+    ]
+  },
+  "context": {
+    "cloud": "Cloud"
+  }
+}
