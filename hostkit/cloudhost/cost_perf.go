@@ -1100,6 +1100,13 @@ func (ct *costTracker) syncFromSafetyJournalLocked() {
 }
 
 func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey string) (*safety.AttemptReservation, string, *hostkit.CloudError) {
+	return ct.reserveForOp(in.Operation, in, resKind, resKey)
+}
+
+func (ct *costTracker) reserveForOp(recordOp string, in safety.AttemptPricingInput, resKind, resKey string) (*safety.AttemptReservation, string, *hostkit.CloudError) {
+	if recordOp == "" {
+		recordOp = in.Operation
+	}
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
 
@@ -1119,7 +1126,7 @@ func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey st
 		res, err := ct.meter.ReserveAttempt(in)
 		if err != nil {
 			if errors.Is(err, safety.ErrCostCapExceeded) {
-				if jerr := ct.journal.RecordCapExceeded(in.Operation); jerr != nil {
+				if jerr := ct.journal.RecordCapExceeded(recordOp); jerr != nil {
 					ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", jerr.Error())
 					return nil, "", ct.poisoned
 				}
@@ -1138,7 +1145,7 @@ func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey st
 			reservedBytes = in.EgressBytes
 		}
 		reservedNano := res.Quote().AttemptNanoUSD + res.Quote().CleanupReserveNanoUSD
-		attID, jerr := ct.journal.BeginAttempt(resKind, "", resKey, in.Operation, reservedNano, reservedBytes)
+		attID, jerr := ct.journal.BeginAttempt(resKind, "", resKey, recordOp, reservedNano, reservedBytes)
 		if jerr != nil {
 			res.Release()
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", jerr.Error())
@@ -1166,7 +1173,7 @@ func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey st
 				if errors.Is(rerr, safety.ErrCostCapExceeded) {
 					if aerr := appendRec(campaignJournalRecord{
 						Event:     safety.EventCapExceeded,
-						Operation: in.Operation,
+						Operation: recordOp,
 					}); aerr != nil {
 						return aerr
 					}
@@ -1185,7 +1192,7 @@ func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey st
 			if aerr := appendRec(campaignJournalRecord{
 				Event:                 safety.EventReserve,
 				AttemptID:             attID,
-				Operation:             in.Operation,
+				Operation:             recordOp,
 				ResKind:               resKind,
 				ResKey:                resKey,
 				IsCleanup:             in.IsCleanup,
@@ -1270,12 +1277,16 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
 
+	tariffOp := op
+	if qOp := res.Quote().Operation; qOp != "" {
+		tariffOp = qOp
+	}
 	pt := ct.meter.Table()
 	var actualNano int64 = -1
 	var units int64 = 1
 	if pt != nil {
-		t, ok := pt.Operations[op]
-		if !ok && op == "object_list_all" {
+		t, ok := pt.Operations[tariffOp]
+		if !ok && tariffOp == "object_list_all" {
 			t, ok = pt.Operations["object_list"]
 		}
 		if ok {
@@ -1283,10 +1294,10 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 				units = (chargeBytes + t.ChunkBytes - 1) / t.ChunkBytes
 			}
 			in := safety.AttemptPricingInput{
-				Operation: op,
+				Operation: tariffOp,
 				IsCleanup: res.Quote().IsCleanup,
 			}
-			if op == "object_get" {
+			if tariffOp == "object_get" {
 				in.EgressBytes = chargeBytes
 			} else {
 				in.PayloadSize = chargeBytes
@@ -1303,7 +1314,7 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 	var excessErr *hostkit.CloudError
 	if actualNano > res.Quote().AttemptNanoUSD {
 		excessErr = hostkit.ProviderError(hostkit.Internal, 0, "ReservationExceeded",
-			fmt.Sprintf("%s settled cost %d nano-USD exceeds admitted reservation %d nano-USD", op, actualNano, res.Quote().AttemptNanoUSD))
+			fmt.Sprintf("%s settled cost %d nano-USD exceeds admitted reservation %d nano-USD", tariffOp, actualNano, res.Quote().AttemptNanoUSD))
 	}
 
 	if ct.journal != nil {
@@ -1822,6 +1833,8 @@ type attemptScope struct {
 	ct              *costTracker
 	op              string
 	in              safety.AttemptPricingInput
+	baseCleanup     bool
+	hasSubOps       bool
 	resKind         string
 	resKey          string
 	res             *safety.AttemptReservation
@@ -1846,11 +1859,19 @@ func (s *attemptScope) settlePreviousAttemptLocked() *hostkit.CloudError {
 	if s.hasLastAttempt && s.lastAttempt.NotSent {
 		return s.ct.release(res, attID)
 	}
-	switch s.op {
-	case "object_put", "queue_send", "item_put", "item_update", "item_delete":
-		return s.ct.settle(res, attID, s.op, s.in.PayloadSize, s.in.PayloadSize, s.resKind, s.resKey, false, false)
+	tariffOp := s.op
+	if s.in.Operation != "" {
+		tariffOp = s.in.Operation
 	}
-	isPayloadRead := s.op == "object_get" || s.op == "queue_receive" || s.op == "item_get" || s.op == "item_query" || s.op == "item_scan" || s.in.PayloadSize > 0 || s.in.EgressBytes > 0
+	reportedBytes := s.in.PayloadSize
+	if s.hasSubOps {
+		reportedBytes = 0
+	}
+	switch tariffOp {
+	case "object_put", "queue_send", "item_put", "item_update", "item_delete":
+		return s.ct.settle(res, attID, s.op, s.in.PayloadSize, reportedBytes, s.resKind, s.resKey, false, false)
+	}
+	isPayloadRead := tariffOp == "object_get" || tariffOp == "queue_receive" || tariffOp == "item_get" || tariffOp == "item_query" || tariffOp == "item_scan" || s.in.PayloadSize > 0 || s.in.EgressBytes > 0
 	headerOnlyNoPayload := s.hasLastAttempt &&
 		s.lastAttempt.Err == nil &&
 		(!isPayloadRead || s.lastAttempt.Status >= 400)
@@ -1860,27 +1881,17 @@ func (s *attemptScope) settlePreviousAttemptLocked() *hostkit.CloudError {
 	}
 	// Completed 2xx GET/Receive/Query/Scan or mid-stream/ambiguous transport failure: preserve full reserved bound.
 	boundBytes := s.in.PayloadSize
-	if s.op == "object_get" || s.in.EgressBytes > boundBytes {
+	if tariffOp == "object_get" || s.in.EgressBytes > boundBytes {
 		boundBytes = s.in.EgressBytes
 	}
-	return s.ct.settle(res, attID, s.op, boundBytes, boundBytes, s.resKind, s.resKey, false, false)
+	if !s.hasSubOps {
+		reportedBytes = boundBytes
+	}
+	return s.ct.settle(res, attID, s.op, boundBytes, reportedBytes, s.resKind, s.resKey, false, false)
 }
 
-func (h *Host) beginAttemptScope(ctx context.Context, op string, in safety.AttemptPricingInput, resKind, resKey string) (context.Context, *attemptScope, *hostkit.CloudError) {
-	res, attID, cerr := h.cost.reserve(in, resKind, resKey)
-	if cerr != nil {
-		return ctx, nil, cerr
-	}
-	scope := &attemptScope{
-		ct:        h.cost,
-		op:        op,
-		in:        in,
-		resKind:   resKind,
-		resKey:    resKey,
-		res:       res,
-		attemptID: attID,
-	}
-	ctxWithHooks := hostkit.WithRetryHooks(ctx, hostkit.RetryHooks{
+func attachScopeHooks(ctx context.Context, scope *attemptScope) context.Context {
+	return hostkit.WithRetryHooks(ctx, hostkit.RetryHooks{
 		BeforeAttempt: func(_ context.Context, attempt int) error {
 			if scope.abortErr != nil {
 				return scope.abortErr
@@ -1893,7 +1904,7 @@ func (h *Host) beginAttemptScope(ctx context.Context, op string, in safety.Attem
 				scope.abortErr = scerr
 				return scerr
 			}
-			nextRes, nextAttID, cerr := scope.ct.reserve(scope.in, scope.resKind, scope.resKey)
+			nextRes, nextAttID, cerr := scope.ct.reserveForOp(scope.op, scope.in, scope.resKind, scope.resKey)
 			if cerr != nil {
 				scope.abortErr = cerr
 				return cerr
@@ -1926,6 +1937,83 @@ func (h *Host) beginAttemptScope(ctx context.Context, op string, in safety.Attem
 			}
 		},
 	})
+}
+
+func (h *Host) beginAttemptScope(ctx context.Context, op string, in safety.AttemptPricingInput, resKind, resKey string) (context.Context, *attemptScope, *hostkit.CloudError) {
+	res, attID, cerr := h.cost.reserveForOp(op, in, resKind, resKey)
+	if cerr != nil {
+		return ctx, nil, cerr
+	}
+	scope := &attemptScope{
+		ct:          h.cost,
+		op:          op,
+		in:          in,
+		baseCleanup: in.IsCleanup,
+		resKind:     resKind,
+		resKey:      resKey,
+		res:         res,
+		attemptID:   attID,
+	}
+	ctxWithHooks := attachScopeHooks(ctx, scope)
+	ctxWithHooks = hostkit.WithSubOperationRunner(ctxWithHooks, func(subCtx context.Context, spec hostkit.SubOperationSpec, fn func(ctx context.Context) error) error {
+		if scope.abortErr != nil {
+			return scope.abortErr
+		}
+		subIn := safety.AttemptPricingInput{
+			Operation:   spec.Operation,
+			PayloadSize: spec.PayloadBytes,
+			EgressBytes: spec.EgressBytes,
+			IsCleanup:   spec.IsCleanup || scope.baseCleanup,
+		}
+		if !scope.initialConsumed || scope.hasSubOps {
+			if !scope.initialConsumed {
+				scope.initialConsumed = true
+				scope.hasSubOps = true
+				if scope.res != nil {
+					if rerr := scope.ct.release(scope.res, scope.attemptID); rerr != nil {
+						scope.abortErr = rerr
+						scope.res = nil
+						scope.attemptID = ""
+						return rerr
+					}
+					scope.res = nil
+					scope.attemptID = ""
+				}
+			} else if scerr := scope.settlePreviousAttemptLocked(); scerr != nil {
+				scope.abortErr = scerr
+				return scerr
+			}
+			scope.in = subIn
+			scope.hasLastAttempt = false
+			return fn(subCtx)
+		}
+		// Parent scope has already consumed its initial reservation (for example,
+		// QueueReceive :pull followed by :modifyAckDeadline). Run the sub-operation
+		// in an independent child scope and settle it on completion while keeping
+		// the parent reservation open for scope.finish.
+		child := &attemptScope{
+			ct:              scope.ct,
+			op:              scope.op,
+			in:              subIn,
+			baseCleanup:     subIn.IsCleanup,
+			hasSubOps:       true,
+			resKind:         scope.resKind,
+			resKey:          scope.resKey,
+			initialConsumed: true,
+		}
+		childCtx := attachScopeHooks(subCtx, child)
+		fnErr := fn(childCtx)
+		r, t, abortErr := child.finish(0, 0, fnErr == nil, false)
+		scope.retries += r
+		scope.throttles += t
+		if abortErr != nil {
+			if scope.abortErr == nil {
+				scope.abortErr = abortErr
+			}
+			return abortErr
+		}
+		return fnErr
+	})
 	return ctxWithHooks, scope, nil
 }
 
@@ -1939,6 +2027,12 @@ func (s *attemptScope) finish(chargeBytes, reportedBytes int64, cleanSuccess, op
 				s.abortErr = rerr
 			}
 		} else {
+			if s.hasSubOps && chargeBytes == 0 {
+				chargeBytes = s.in.PayloadSize
+				if s.in.EgressBytes > chargeBytes {
+					chargeBytes = s.in.EgressBytes
+				}
+			}
 			if scerr := s.ct.settle(s.res, s.attemptID, s.op, chargeBytes, reportedBytes, s.resKind, s.resKey, cleanSuccess, opSucceeded); scerr != nil && s.abortErr == nil {
 				s.abortErr = scerr
 			}

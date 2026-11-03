@@ -1708,6 +1708,114 @@ func TestR4GcpProviderMaximumStillUnderAdmits(t *testing.T) {
 	}
 }
 
+type subOpPurgeTables struct {
+	*fakeadapter.Fake
+}
+
+func (a *subOpPurgeTables) DeleteTable(ctx context.Context, name string) error {
+	steps := []hostkit.SubOperationSpec{
+		{Operation: "item_get", PayloadBytes: 4096, IsCleanup: true},
+		{Operation: "item_put", PayloadBytes: 1024, IsCleanup: true},
+		{Operation: "item_query", PayloadBytes: 4096, IsCleanup: true},
+		{Operation: "item_delete", PayloadBytes: 1024, IsCleanup: true},
+		{Operation: "item_delete", PayloadBytes: 1024, IsCleanup: true},
+	}
+	for _, spec := range steps {
+		if err := hostkit.RunSubOperation(ctx, spec, func(subCtx context.Context) error {
+			last, _ := hostkit.DefaultRetryPolicy().Do(subCtx, true, func(context.Context, int) hostkit.Attempt {
+				return hostkit.Attempt{Status: 200}
+			})
+			return last.Err
+		}); err != nil {
+			return err
+		}
+	}
+	return a.Fake.DeleteTable(ctx, name)
+}
+
+type subOpReceiveQueue struct {
+	*fakeadapter.Fake
+}
+
+func (a *subOpReceiveQueue) Receive(ctx context.Context, q string, max, wait, vis int) ([]hostkit.RawMessage, error) {
+	var msgs []hostkit.RawMessage
+	last, _ := hostkit.DefaultRetryPolicy().Do(ctx, false, func(c context.Context, _ int) hostkit.Attempt {
+		var err error
+		msgs, err = a.Fake.Receive(c, q, max, wait, vis)
+		if err != nil {
+			return hostkit.Attempt{Err: err}
+		}
+		return hostkit.Attempt{Status: 200}
+	})
+	if last.Err != nil {
+		return nil, last.Err
+	}
+	if len(msgs) > 0 && vis != 10 {
+		if err := hostkit.RunSubOperation(ctx, hostkit.SubOperationSpec{Operation: "queue_nack"}, func(subCtx context.Context) error {
+			mLast, _ := hostkit.DefaultRetryPolicy().Do(subCtx, false, func(context.Context, int) hostkit.Attempt {
+				return hostkit.Attempt{Status: 200}
+			})
+			return mLast.Err
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return msgs, nil
+}
+
+func TestSubOperationsPurgeAndReceiveSettlement(t *testing.T) {
+	// 1. Multi-step table_delete via RunSubOperation settles all 5 sub-operations
+	// (250 + 1250 + 250 + 1250 + 1250 = 4250 nano-USD) without refunding the final
+	// step to the zero-cost table_delete parent tariff, and releases cleanup reserves.
+	statePath := filepath.Join(t.TempDir(), "campaign.jsonl")
+	base := fakeadapter.New(fakeadapter.Options{LongPoll: true, BinaryWire: true})
+	tables := &subOpPurgeTables{Fake: base}
+	queues := &subOpReceiveQueue{Fake: base}
+	h := New(Config{Provider: "gcp", Store: base, Queue: queues, Tables: tables, CampaignStatePath: statePath})
+	h.SetAbortOnError(false)
+
+	if _, err := h.TableCreate(false, "orders", false); err != nil {
+		t.Fatal(err)
+	}
+	it, err := h.ItemNew("p", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it.SetString("n", "v")
+	if _, err := h.ItemPut(false, "orders", it, hostkit.PutIfAbsent, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.TableDelete(false, "orders"); err != nil {
+		t.Fatal(err)
+	}
+	delLine := h.CostReport().Item("table_delete")
+	if delLine.Requests != 5 || delLine.BillingUnits != 5 || delLine.EstimatedUSD < 0.00000425 {
+		t.Fatalf("expected 5 requests/units and >= $0.00000425 for table_delete, got %+v", delLine)
+	}
+	if h.cost.meter.Snapshot().ResourceCleanupNanoUSD != 0 {
+		t.Fatalf("expected table and item cleanup reserves to be released after table_delete, got %+v", h.cost.meter.Snapshot())
+	}
+
+	// 2. QueueReceive with child queue_nack sub-operation (:modifyAckDeadline) settles
+	// both :pull (2400 nano-USD) and :modifyAckDeadline (400 nano-USD) into queue_receive
+	// while keeping reported Bytes equal to the delivered message payload size.
+	if _, err := h.QueueCreate(false, "jobs"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.QueueSend(false, "jobs", "hello"); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := h.QueueReceive(false, "jobs", 1, 0, 30)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive err=%v msgs=%+v", err, msgs)
+	}
+	recvLine := h.CostReport().Item("queue_receive")
+	if recvLine.Requests != 2 || recvLine.BillingUnits != 2 || recvLine.Bytes != 5 || recvLine.EstimatedUSD < 0.0000028 {
+		t.Fatalf("expected 2 requests/units, 5 bytes, and $0.0000028 for queue_receive+:modifyAckDeadline, got %+v", recvLine)
+	}
+}
+
+
 
 
 

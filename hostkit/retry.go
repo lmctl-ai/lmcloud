@@ -87,6 +87,38 @@ func RetryHooksFrom(ctx context.Context) RetryHooks {
 	return h
 }
 
+// SubOperationSpec describes a metered physical sub-operation executed within
+// a parent cloudhost operation scope (for example, Firestore catalog/query/delete
+// steps inside DeleteTable or Pub/Sub modifyAckDeadline inside QueueReceive).
+type SubOperationSpec struct {
+	Operation    string
+	PayloadBytes int64
+	EgressBytes  int64
+	IsCleanup    bool
+}
+
+// SubOperationRunner executes fn under a metered sub-operation scope when
+// attached to ctx by cloudhost, or directly with ctx when no runner is attached.
+type SubOperationRunner func(ctx context.Context, spec SubOperationSpec, fn func(ctx context.Context) error) error
+
+type subOperationRunnerKey struct{}
+
+// WithSubOperationRunner attaches runner to ctx for RunSubOperation.
+func WithSubOperationRunner(ctx context.Context, runner SubOperationRunner) context.Context {
+	return context.WithValue(ctx, subOperationRunnerKey{}, runner)
+}
+
+// RunSubOperation executes fn within a sub-operation scope configured by spec.
+// If ctx has no SubOperationRunner attached, it calls fn(ctx) directly.
+func RunSubOperation(ctx context.Context, spec SubOperationSpec, fn func(ctx context.Context) error) error {
+	if ctx != nil {
+		if runner, ok := ctx.Value(subOperationRunnerKey{}).(SubOperationRunner); ok && runner != nil {
+			return runner(ctx, spec, fn)
+		}
+	}
+	return fn(ctx)
+}
+
 // IdempotentMethod is the default retry safety by HTTP method: GET, HEAD,
 // PUT, DELETE and OPTIONS are idempotent; POST and PATCH are not. An adapter
 // may still pass idempotent=true for a POST that carries a client token
