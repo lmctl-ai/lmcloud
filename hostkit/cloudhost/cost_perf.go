@@ -1830,11 +1830,14 @@ func (ct *costTracker) report() CostReport {
 // attemptScope tracks reservations and retry/throttle counts across a single
 // physical adapter call (which may execute multiple attempts via RetryPolicy.Do).
 type attemptScope struct {
+	mu              sync.Mutex
 	ct              *costTracker
 	op              string
 	in              safety.AttemptPricingInput
 	baseCleanup     bool
+	isRoot          bool
 	hasSubOps       bool
+	finished        bool
 	resKind         string
 	resKey          string
 	res             *safety.AttemptReservation
@@ -1845,6 +1848,35 @@ type attemptScope struct {
 	abortErr        *hostkit.CloudError
 	retries         int64
 	throttles       int64
+}
+
+func (ct *costTracker) verifyActiveReservation(attemptID string) *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		return nil
+	}
+	if ct.statePath != "" {
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, _ func(campaignJournalRecord) error) error {
+			if attemptID != "" {
+				if _, ok := st.pending[attemptID]; !ok {
+					return fmt.Errorf("missing pending reservation %s in campaign journal", attemptID)
+				}
+			}
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+	}
+	return nil
 }
 
 func (s *attemptScope) settlePreviousAttemptLocked() *hostkit.CloudError {
@@ -1893,10 +1925,19 @@ func (s *attemptScope) settlePreviousAttemptLocked() *hostkit.CloudError {
 func attachScopeHooks(ctx context.Context, scope *attemptScope) context.Context {
 	return hostkit.WithRetryHooks(ctx, hostkit.RetryHooks{
 		BeforeAttempt: func(_ context.Context, attempt int) error {
+			scope.mu.Lock()
+			defer scope.mu.Unlock()
+			if scope.finished {
+				return hostkit.ProviderError(hostkit.Internal, 0, "ScopeFinished", "attempt hook invoked after scope finished")
+			}
 			if scope.abortErr != nil {
 				return scope.abortErr
 			}
 			if !scope.initialConsumed {
+				if cerr := scope.ct.verifyActiveReservation(scope.attemptID); cerr != nil {
+					scope.abortErr = cerr
+					return cerr
+				}
 				scope.initialConsumed = true
 				return nil
 			}
@@ -1918,6 +1959,8 @@ func attachScopeHooks(ctx context.Context, scope *attemptScope) context.Context 
 			return nil
 		},
 		AfterAttempt: func(_ context.Context, attempt int, a hostkit.Attempt) {
+			scope.mu.Lock()
+			defer scope.mu.Unlock()
 			scope.lastAttempt = a
 			scope.hasLastAttempt = true
 			if a.Status == 429 {
@@ -1939,6 +1982,134 @@ func attachScopeHooks(ctx context.Context, scope *attemptScope) context.Context 
 	})
 }
 
+func attachSubOperationRunner(ctx context.Context, parent *attemptScope) context.Context {
+	return hostkit.WithSubOperationRunner(ctx, func(subCtx context.Context, spec hostkit.SubOperationSpec, fn func(ctx context.Context) error) error {
+		if fn == nil {
+			return hostkit.ProviderError(hostkit.InvalidArgument, 0, "InvalidSubOperation", "sub-operation callback is nil")
+		}
+		opName := strings.TrimSpace(spec.Operation)
+		if opName == "" || spec.PayloadBytes < 0 || spec.EgressBytes < 0 {
+			return hostkit.ProviderError(hostkit.InvalidArgument, 0, "InvalidSubOperation", "invalid sub-operation specification")
+		}
+
+		parent.mu.Lock()
+		if parent.finished {
+			parent.mu.Unlock()
+			return hostkit.ProviderError(hostkit.Internal, 0, "SubOperationAfterFinish", "sub-operation invoked after parent scope finished")
+		}
+		if parent.abortErr != nil {
+			err := parent.abortErr
+			parent.mu.Unlock()
+			return err
+		}
+		// Only an authorized cleanup parent scope may charge against the cleanup ceiling.
+		subIn := safety.AttemptPricingInput{
+			Operation:   opName,
+			PayloadSize: spec.PayloadBytes,
+			EgressBytes: spec.EgressBytes,
+			IsCleanup:   parent.baseCleanup,
+		}
+		transferToRoot := false
+		if parent.isRoot && (!parent.initialConsumed || parent.hasSubOps) {
+			transferToRoot = true
+			if !parent.initialConsumed {
+				parent.initialConsumed = true
+				parent.hasSubOps = true
+				if parent.res != nil {
+					if rerr := parent.ct.release(parent.res, parent.attemptID); rerr != nil {
+						parent.abortErr = rerr
+						parent.res = nil
+						parent.attemptID = ""
+						parent.mu.Unlock()
+						return rerr
+					}
+					parent.res = nil
+					parent.attemptID = ""
+				}
+			} else if scerr := parent.settlePreviousAttemptLocked(); scerr != nil {
+				parent.abortErr = scerr
+				parent.mu.Unlock()
+				return scerr
+			}
+		}
+		// Reserve and durably record the initial sub-operation attempt BEFORE entering fn.
+		childRes, childAttID, cerr := parent.ct.reserveForOp(parent.op, subIn, parent.resKind, parent.resKey)
+		if cerr != nil {
+			parent.abortErr = cerr
+			parent.mu.Unlock()
+			return cerr
+		}
+		child := &attemptScope{
+			ct:          parent.ct,
+			op:          parent.op,
+			in:          subIn,
+			baseCleanup: parent.baseCleanup,
+			hasSubOps:   true,
+			resKind:     parent.resKind,
+			resKey:      parent.resKey,
+			res:         childRes,
+			attemptID:   childAttID,
+		}
+		parent.mu.Unlock()
+
+		childCtx := attachScopeHooks(subCtx, child)
+		childCtx = attachSubOperationRunner(childCtx, child)
+		fnErr := fn(childCtx)
+
+		if !transferToRoot {
+			r, t, abortErr := child.finish(0, 0, fnErr == nil, false)
+			parent.mu.Lock()
+			defer parent.mu.Unlock()
+			parent.retries += r
+			parent.throttles += t
+			if abortErr != nil && parent.abortErr == nil {
+				parent.abortErr = abortErr
+			}
+			if parent.abortErr != nil {
+				return parent.abortErr
+			}
+			return fnErr
+		}
+
+		parent.mu.Lock()
+		defer parent.mu.Unlock()
+
+		child.mu.Lock()
+		child.finished = true
+		parent.retries += child.retries
+		parent.throttles += child.throttles
+		if child.abortErr != nil && parent.abortErr == nil {
+			parent.abortErr = child.abortErr
+		}
+		if child.res != nil {
+			if child.hasLastAttempt && child.lastAttempt.NotSent {
+				if rerr := child.ct.release(child.res, child.attemptID); rerr != nil && parent.abortErr == nil {
+					parent.abortErr = rerr
+				}
+			} else {
+				if parent.res != nil {
+					if scerr := parent.settlePreviousAttemptLocked(); scerr != nil && parent.abortErr == nil {
+						parent.abortErr = scerr
+					}
+				}
+				parent.in = child.in
+				parent.res = child.res
+				parent.attemptID = child.attemptID
+				parent.lastAttempt = child.lastAttempt
+				parent.hasLastAttempt = child.hasLastAttempt
+			}
+			child.res = nil
+			child.attemptID = ""
+		}
+		child.mu.Unlock()
+
+		if parent.abortErr != nil {
+			return parent.abortErr
+		}
+		return fnErr
+	})
+}
+
 func (h *Host) beginAttemptScope(ctx context.Context, op string, in safety.AttemptPricingInput, resKind, resKey string) (context.Context, *attemptScope, *hostkit.CloudError) {
 	res, attID, cerr := h.cost.reserveForOp(op, in, resKind, resKey)
 	if cerr != nil {
@@ -1949,71 +2120,14 @@ func (h *Host) beginAttemptScope(ctx context.Context, op string, in safety.Attem
 		op:          op,
 		in:          in,
 		baseCleanup: in.IsCleanup,
+		isRoot:      true,
 		resKind:     resKind,
 		resKey:      resKey,
 		res:         res,
 		attemptID:   attID,
 	}
 	ctxWithHooks := attachScopeHooks(ctx, scope)
-	ctxWithHooks = hostkit.WithSubOperationRunner(ctxWithHooks, func(subCtx context.Context, spec hostkit.SubOperationSpec, fn func(ctx context.Context) error) error {
-		if scope.abortErr != nil {
-			return scope.abortErr
-		}
-		subIn := safety.AttemptPricingInput{
-			Operation:   spec.Operation,
-			PayloadSize: spec.PayloadBytes,
-			EgressBytes: spec.EgressBytes,
-			IsCleanup:   spec.IsCleanup || scope.baseCleanup,
-		}
-		if !scope.initialConsumed || scope.hasSubOps {
-			if !scope.initialConsumed {
-				scope.initialConsumed = true
-				scope.hasSubOps = true
-				if scope.res != nil {
-					if rerr := scope.ct.release(scope.res, scope.attemptID); rerr != nil {
-						scope.abortErr = rerr
-						scope.res = nil
-						scope.attemptID = ""
-						return rerr
-					}
-					scope.res = nil
-					scope.attemptID = ""
-				}
-			} else if scerr := scope.settlePreviousAttemptLocked(); scerr != nil {
-				scope.abortErr = scerr
-				return scerr
-			}
-			scope.in = subIn
-			scope.hasLastAttempt = false
-			return fn(subCtx)
-		}
-		// Parent scope has already consumed its initial reservation (for example,
-		// QueueReceive :pull followed by :modifyAckDeadline). Run the sub-operation
-		// in an independent child scope and settle it on completion while keeping
-		// the parent reservation open for scope.finish.
-		child := &attemptScope{
-			ct:              scope.ct,
-			op:              scope.op,
-			in:              subIn,
-			baseCleanup:     subIn.IsCleanup,
-			hasSubOps:       true,
-			resKind:         scope.resKind,
-			resKey:          scope.resKey,
-			initialConsumed: true,
-		}
-		childCtx := attachScopeHooks(subCtx, child)
-		fnErr := fn(childCtx)
-		r, t, abortErr := child.finish(0, 0, fnErr == nil, false)
-		scope.retries += r
-		scope.throttles += t
-		if abortErr != nil {
-			if scope.abortErr == nil {
-				scope.abortErr = abortErr
-			}
-			return abortErr
-		}
-		return fnErr
-	})
+	ctxWithHooks = attachSubOperationRunner(ctxWithHooks, scope)
 	return ctxWithHooks, scope, nil
 }
 
@@ -2021,6 +2135,9 @@ func (s *attemptScope) finish(chargeBytes, reportedBytes int64, cleanSuccess, op
 	if s == nil {
 		return 0, 0, nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finished = true
 	if s.res != nil {
 		if s.hasLastAttempt && s.lastAttempt.NotSent {
 			if rerr := s.ct.release(s.res, s.attemptID); rerr != nil && s.abortErr == nil {

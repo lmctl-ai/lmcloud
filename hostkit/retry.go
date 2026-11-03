@@ -90,6 +90,14 @@ func RetryHooksFrom(ctx context.Context) RetryHooks {
 // SubOperationSpec describes a metered physical sub-operation executed within
 // a parent cloudhost operation scope (for example, Firestore catalog/query/delete
 // steps inside DeleteTable or Pub/Sub modifyAckDeadline inside QueueReceive).
+//
+// When a cloudhost SubOperationRunner is attached to ctx:
+//   - RunSubOperation reserves and durably journals the initial sub-operation
+//     attempt before invoking fn, and settles the sub-operation when fn returns.
+//   - Each sub-operation executes in an isolated scope so nested sub-operations
+//     do not overwrite outer pricing inputs or reservations.
+//   - Cleanup ceiling eligibility is inherited from the parent operation scope
+//     (a non-cleanup parent scope never promotes a sub-operation to cleanup).
 type SubOperationSpec struct {
 	Operation    string
 	PayloadBytes int64
@@ -111,6 +119,9 @@ func WithSubOperationRunner(ctx context.Context, runner SubOperationRunner) cont
 // RunSubOperation executes fn within a sub-operation scope configured by spec.
 // If ctx has no SubOperationRunner attached, it calls fn(ctx) directly.
 func RunSubOperation(ctx context.Context, spec SubOperationSpec, fn func(ctx context.Context) error) error {
+	if fn == nil {
+		return ProviderError(InvalidArgument, 0, "InvalidSubOperation", "sub-operation callback is nil")
+	}
 	if ctx != nil {
 		if runner, ok := ctx.Value(subOperationRunnerKey{}).(SubOperationRunner); ok && runner != nil {
 			return runner(ctx, spec, fn)
