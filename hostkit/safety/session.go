@@ -252,6 +252,11 @@ func restoreMeterFromState(meter *CostMeter, pt *PriceTable, st LedgerState) {
 			}
 		}
 	}
+	for _, a := range st.PendingAttempts {
+		if a.ReservedNanoUSD > 0 {
+			chargedNano += a.ReservedNanoUSD
+		}
+	}
 	meter.RestoreCharged(chargedNano, activeCleanupNano)
 }
 

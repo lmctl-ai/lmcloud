@@ -38,6 +38,8 @@ const (
 	EventRetained  = "retained"
 	EventDeleted   = "deleted"
 	EventCost      = "cost"
+	EventReserve   = "reserve"
+	EventSettle    = "settle"
 
 	// Resource lifecycle states after journal replay.
 	StatePending   = "pending"
@@ -188,6 +190,7 @@ type JournalRecord struct {
 	IntentAtUnix        int64  `json:"intent_at_unix,omitempty"`
 	ConfirmedAtUnix     int64  `json:"confirmed_at_unix,omitempty"`
 	ServerCreatedAtUnix int64  `json:"server_created_at_unix,omitempty"`
+	AttemptID           string `json:"attempt_id,omitempty"`
 	ReservedNanoUSD     int64  `json:"reserved_nano_usd,omitempty"`
 	ChargedNanoUSD      int64  `json:"charged_nano_usd,omitempty"`
 	PayloadBytes        int64  `json:"payload_bytes,omitempty"`
@@ -236,6 +239,18 @@ type LedgerEntry struct {
 	Seq                 uint64
 }
 
+// AttemptLedgerEntry is an unresolved durable per-attempt cost/byte reservation.
+type AttemptLedgerEntry struct {
+	AttemptID       string
+	Kind            string
+	Parent          string
+	Name            string
+	Reason          string
+	ReservedNanoUSD int64
+	PayloadBytes    int64
+	Seq             uint64
+}
+
 func resourceKey(kind, parent, name string) string {
 	return kind + "\x00" + parent + "\x00" + name
 }
@@ -246,6 +261,7 @@ type LedgerState struct {
 	StartedAtUnix     int64
 	LastSeq           uint64
 	Entries           []LedgerEntry
+	PendingAttempts   []AttemptLedgerEntry
 	ReservedNanoUSD   int64
 	ChargedNanoUSD    int64
 	BucketsCreated    int
@@ -254,7 +270,8 @@ type LedgerState struct {
 	MessagesSent      int
 	TotalPayloadBytes int64
 
-	byKey map[string]int
+	byKey       map[string]int
+	byAttemptID map[string]int
 }
 
 // Lookup returns the current LedgerEntry for (kind, parent, name), if active.
@@ -269,6 +286,18 @@ func (s *LedgerState) Lookup(kind, parent, name string) (LedgerEntry, bool) {
 	return s.Entries[idx], true
 }
 
+// LookupAttempt returns the unresolved AttemptLedgerEntry for attemptID, if active.
+func (s *LedgerState) LookupAttempt(attemptID string) (AttemptLedgerEntry, bool) {
+	if s == nil || s.byAttemptID == nil {
+		return AttemptLedgerEntry{}, false
+	}
+	idx, ok := s.byAttemptID[attemptID]
+	if !ok || idx < 0 || idx >= len(s.PendingAttempts) {
+		return AttemptLedgerEntry{}, false
+	}
+	return s.PendingAttempts[idx], true
+}
+
 // CreateIntent holds the durably journaled tokens for a resource creation attempt.
 type CreateIntent struct {
 	Kind             string
@@ -277,6 +306,7 @@ type CreateIntent struct {
 	Name             string
 	OwnerNonce       string
 	CreateToken      string
+	AttemptID        string
 	IntentAtUnix     int64
 	AlreadyConfirmed bool
 }
@@ -287,6 +317,7 @@ type ConfirmDetails struct {
 	Location            string
 	ETag                string
 	Generation          string
+	AttemptID           string
 	ConfirmedAtUnix     int64
 	ServerCreatedAtUnix int64
 	ChargedNanoUSD      int64
@@ -470,6 +501,7 @@ func OpenJournal(dir string, meta JournalMeta) (*Journal, error) {
 			Meta:          j.meta,
 			StartedAtUnix: startedUnix,
 			byKey:         make(map[string]int),
+			byAttemptID:   make(map[string]int),
 		}
 		if err := j.appendLocked(JournalRecord{
 			Event:         EventMeta,
@@ -565,9 +597,14 @@ func (j *Journal) State() LedgerState {
 	defer j.mu.Unlock()
 	cp := *j.state
 	cp.Entries = append([]LedgerEntry(nil), j.state.Entries...)
+	cp.PendingAttempts = append([]AttemptLedgerEntry(nil), j.state.PendingAttempts...)
 	cp.byKey = make(map[string]int, len(j.state.byKey))
 	for k, v := range j.state.byKey {
 		cp.byKey[k] = v
+	}
+	cp.byAttemptID = make(map[string]int, len(j.state.byAttemptID))
+	for k, v := range j.state.byAttemptID {
+		cp.byAttemptID[k] = v
 	}
 	return cp
 }
@@ -577,6 +614,89 @@ func (j *Journal) Lookup(kind, parent, name string) (LedgerEntry, bool) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.state.Lookup(kind, parent, name)
+}
+
+// LookupAttempt returns the unresolved AttemptLedgerEntry for attemptID, if active.
+func (j *Journal) LookupAttempt(attemptID string) (AttemptLedgerEntry, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.state.LookupAttempt(attemptID)
+}
+
+// BeginAttempt durably appends an `EventReserve` record for a single operation
+// attempt BEFORE provider dispatch, reserving its worst-case cost and payload
+// bytes (and incrementing MessagesSent if reason == "queue_send").
+func (j *Journal) BeginAttempt(kind, parent, name, reason string, reservedNanoUSD, payloadBytes int64) (string, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return "", j.poisoned
+	}
+	attemptID := NewToken128()
+	rec := JournalRecord{
+		Event:           EventReserve,
+		Kind:            kind,
+		Parent:          parent,
+		Name:            name,
+		AttemptID:       attemptID,
+		ReservedNanoUSD: reservedNanoUSD,
+		PayloadBytes:    payloadBytes,
+		Reason:          reason,
+	}
+	if err := j.appendLocked(rec); err != nil {
+		return "", err
+	}
+	return attemptID, nil
+}
+
+// SettleAttempt durably settles an `EventReserve` (or pending create) attempt
+// by attemptID, clearing its pending reservation and recording actual
+// chargedNanoUSD. If refundBytes is true, any payloadBytes reserved by this
+// attempt are refunded from TotalPayloadBytes.
+func (j *Journal) SettleAttempt(attemptID string, chargedNanoUSD int64, refundBytes bool) error {
+	if strings.TrimSpace(attemptID) == "" {
+		return nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	if att, ok := j.state.LookupAttempt(attemptID); ok {
+		var refund int64
+		if refundBytes && att.PayloadBytes > 0 {
+			refund = att.PayloadBytes
+		}
+		return j.appendLocked(JournalRecord{
+			Event:          EventSettle,
+			Kind:           att.Kind,
+			Parent:         att.Parent,
+			Name:           att.Name,
+			AttemptID:      attemptID,
+			ChargedNanoUSD: chargedNanoUSD,
+			PayloadBytes:   refund,
+			Reason:         att.Reason,
+		})
+	}
+	for _, e := range j.state.Entries {
+		if e.CreateToken == attemptID {
+			var refund int64
+			if refundBytes && e.PayloadBytes > 0 {
+				refund = e.PayloadBytes
+			}
+			return j.appendLocked(JournalRecord{
+				Event:          EventSettle,
+				Kind:           e.Kind,
+				Parent:         e.Parent,
+				Name:           e.Name,
+				AttemptID:      attemptID,
+				ChargedNanoUSD: chargedNanoUSD,
+				PayloadBytes:   refund,
+				Reason:         e.Kind + "_attempt_settled",
+			})
+		}
+	}
+	return nil
 }
 
 // BeginCreate durably records an `intent` entry (with fsync) BEFORE a cloud
@@ -605,7 +725,37 @@ func (j *Journal) BeginCreateWithBytes(kind, parent, location, name string, rese
 	}
 
 	if existing, ok := j.state.Lookup(kind, parent, name); ok {
-		if existing.State == StateConfirmed || existing.State == StateRetained || existing.Retain {
+		if existing.State == StateConfirmed {
+			var attemptID string
+			if reservedNanoUSD > 0 || payloadBytes > 0 {
+				attemptID = NewToken128()
+				if err := j.appendLocked(JournalRecord{
+					Event:           EventReserve,
+					Kind:            kind,
+					Parent:          parent,
+					Location:        location,
+					Name:            name,
+					AttemptID:       attemptID,
+					ReservedNanoUSD: reservedNanoUSD,
+					PayloadBytes:    payloadBytes,
+					Reason:          kind + "_overwrite",
+				}); err != nil {
+					return CreateIntent{}, err
+				}
+			}
+			return CreateIntent{
+				Kind:             existing.Kind,
+				Parent:           existing.Parent,
+				Location:         existing.Location,
+				Name:             existing.Name,
+				OwnerNonce:       existing.OwnerNonce,
+				CreateToken:      existing.CreateToken,
+				AttemptID:        attemptID,
+				IntentAtUnix:     existing.IntentAtUnix,
+				AlreadyConfirmed: true,
+			}, nil
+		}
+		if existing.State == StateRetained || existing.Retain {
 			return CreateIntent{
 				Kind:             existing.Kind,
 				Parent:           existing.Parent,
@@ -634,6 +784,7 @@ func (j *Journal) BeginCreateWithBytes(kind, parent, location, name string, rese
 				Name:         existing.Name,
 				OwnerNonce:   existing.OwnerNonce,
 				CreateToken:  existing.CreateToken,
+				AttemptID:    existing.CreateToken,
 				IntentAtUnix: nowUnix,
 			}
 			rec := JournalRecord{
@@ -644,6 +795,7 @@ func (j *Journal) BeginCreateWithBytes(kind, parent, location, name string, rese
 				Name:            intent.Name,
 				OwnerNonce:      intent.OwnerNonce,
 				CreateToken:     intent.CreateToken,
+				AttemptID:       intent.AttemptID,
 				IntentAtUnix:    intent.IntentAtUnix,
 				ReservedNanoUSD: resNano,
 				PayloadBytes:    extraBytes,
@@ -656,13 +808,15 @@ func (j *Journal) BeginCreateWithBytes(kind, parent, location, name string, rese
 	}
 
 	nowUnix := j.nowTime().UTC().Unix()
+	createToken := NewToken128()
 	intent := CreateIntent{
 		Kind:         kind,
 		Parent:       parent,
 		Location:     location,
 		Name:         name,
 		OwnerNonce:   NewToken128(),
-		CreateToken:  NewToken128(),
+		CreateToken:  createToken,
+		AttemptID:    createToken,
 		IntentAtUnix: nowUnix,
 	}
 	rec := JournalRecord{
@@ -673,6 +827,7 @@ func (j *Journal) BeginCreateWithBytes(kind, parent, location, name string, rese
 		Name:            name,
 		OwnerNonce:      intent.OwnerNonce,
 		CreateToken:     intent.CreateToken,
+		AttemptID:       intent.AttemptID,
 		IntentAtUnix:    intent.IntentAtUnix,
 		ReservedNanoUSD: reservedNanoUSD,
 		PayloadBytes:    payloadBytes,
@@ -713,6 +868,7 @@ func (j *Journal) Confirm(kind, parent, name string, details ConfirmDetails) err
 		ProviderID:          details.ProviderID,
 		OwnerNonce:          existing.OwnerNonce,
 		CreateToken:         existing.CreateToken,
+		AttemptID:           details.AttemptID,
 		ETag:                details.ETag,
 		Generation:          details.Generation,
 		IntentAtUnix:        existing.IntentAtUnix,
@@ -767,17 +923,24 @@ func (j *Journal) Failed(kind, parent, name, reason string, chargedNanoUSD int64
 // Retain marks a resource as retained (either by policy or because cleanup/probe
 // encountered an ambiguous or mismatched state that forbids blind deletion).
 func (j *Journal) Retain(kind, parent, name, reason string) error {
+	return j.RetainWithCost(kind, parent, name, reason, 0)
+}
+
+// RetainWithCost marks a resource as retained and settles any pending create
+// reservation with chargedNanoUSD.
+func (j *Journal) RetainWithCost(kind, parent, name, reason string, chargedNanoUSD int64) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
 	existing, ok := j.state.Lookup(kind, parent, name)
 	rec := JournalRecord{
-		Event:  EventRetained,
-		Kind:   kind,
-		Parent: parent,
-		Name:   name,
-		Reason: reason,
-		Retain: true,
+		Event:          EventRetained,
+		Kind:           kind,
+		Parent:         parent,
+		Name:           name,
+		Reason:         reason,
+		Retain:         true,
+		ChargedNanoUSD: chargedNanoUSD,
 	}
 	if ok {
 		rec.Location = existing.Location
@@ -789,7 +952,9 @@ func (j *Journal) Retain(kind, parent, name, reason string) error {
 		rec.IntentAtUnix = existing.IntentAtUnix
 		rec.ConfirmedAtUnix = existing.ConfirmedAtUnix
 		rec.ServerCreatedAtUnix = existing.ServerCreatedAtUnix
-		rec.ReservedNanoUSD = existing.ReservedNanoUSD
+		if chargedNanoUSD <= 0 {
+			rec.ReservedNanoUSD = existing.ReservedNanoUSD
+		}
 	}
 	return j.appendLocked(rec)
 }
@@ -952,6 +1117,22 @@ func (j *Journal) Compact() error {
 	seq := uint64(1)
 	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 
+	var BasePayloadBytes int64
+	BasePayloadBytes = j.state.TotalPayloadBytes
+	for _, a := range j.state.PendingAttempts {
+		if a.PayloadBytes > 0 {
+			BasePayloadBytes -= a.PayloadBytes
+		}
+	}
+	for _, e := range j.state.Entries {
+		if e.State == StatePending && !e.Retain && e.PayloadBytes > 0 {
+			BasePayloadBytes -= e.PayloadBytes
+		}
+	}
+	if BasePayloadBytes < 0 {
+		BasePayloadBytes = 0
+	}
+
 	compacted = append(compacted, JournalRecord{
 		Version:        JournalVersion,
 		Seq:            seq,
@@ -968,7 +1149,7 @@ func (j *Journal) Compact() error {
 		Endpoint:       j.meta.Endpoint,
 		StartedAtUnix:  j.state.StartedAtUnix,
 		ChargedNanoUSD: j.state.ChargedNanoUSD,
-		PayloadBytes:   j.state.TotalPayloadBytes,
+		PayloadBytes:   BasePayloadBytes,
 		BucketsCreated: baseBuckets,
 		QueuesCreated:  baseQueues,
 		ObjectsCreated: baseObjects,
@@ -979,14 +1160,18 @@ func (j *Journal) Compact() error {
 		seq++
 		ev := EventIntent
 		retainFlag := e.Retain
+		resNano := e.ReservedNanoUSD
+		var entryBytes int64
 		switch {
 		case e.Retain || e.State == StateRetained:
 			ev = EventRetained
 			retainFlag = true
 		case e.State == StateConfirmed:
 			ev = EventConfirmed
+			resNano = 0
 		case e.State == StatePending:
 			ev = EventIntent
+			entryBytes = e.PayloadBytes
 		default:
 			continue
 		}
@@ -1016,9 +1201,41 @@ func (j *Journal) Compact() error {
 			IntentAtUnix:        e.IntentAtUnix,
 			ConfirmedAtUnix:     e.ConfirmedAtUnix,
 			ServerCreatedAtUnix: e.ServerCreatedAtUnix,
-			ReservedNanoUSD:     e.ReservedNanoUSD,
+			ReservedNanoUSD:     resNano,
+			PayloadBytes:        entryBytes,
 			Reason:              e.Reason,
 			Retain:              retainFlag,
+		})
+	}
+
+	for _, a := range j.state.PendingAttempts {
+		seq++
+		reason := a.Reason
+		if reason == "queue_send" {
+			// MessagesSent is already included in EventMeta.MessagesSent above.
+			reason = "queue_send_compacted"
+		}
+		compacted = append(compacted, JournalRecord{
+			Version:         JournalVersion,
+			Seq:             seq,
+			Time:            nowStr,
+			Event:           EventReserve,
+			RunID:           j.meta.RunID,
+			SessionID:       j.meta.SessionID,
+			PolicyHash:      j.meta.PolicyHash,
+			Provider:        j.meta.Provider,
+			Account:         j.meta.Account,
+			Tenant:          j.meta.Tenant,
+			Scope:           j.meta.Scope,
+			Region:          j.meta.Region,
+			Endpoint:        j.meta.Endpoint,
+			Kind:            a.Kind,
+			Parent:          a.Parent,
+			Name:            a.Name,
+			AttemptID:       a.AttemptID,
+			ReservedNanoUSD: a.ReservedNanoUSD,
+			PayloadBytes:    a.PayloadBytes,
+			Reason:          reason,
 		})
 	}
 
@@ -1202,6 +1419,7 @@ func ReplayJournal(records []JournalRecord) (*LedgerState, error) {
 		Meta:          meta,
 		StartedAtUnix: meta.StartedAtUnix,
 		byKey:         make(map[string]int),
+		byAttemptID:   make(map[string]int),
 	}
 	for i, rec := range records {
 		wantSeq := uint64(i + 1)
@@ -1247,6 +1465,14 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 		}
 		return nil
 	case EventCost:
+		return nil
+	case EventReserve, EventSettle:
+		if err := ValidateToken128(rec.AttemptID); err != nil {
+			return fmt.Errorf("attempt_id: %w", err)
+		}
+		if hasControlChars(rec.Parent) || hasControlChars(rec.Name) || hasControlChars(rec.Reason) {
+			return errors.New("attempt record contains control characters")
+		}
 		return nil
 	case EventIntent, EventConfirmed, EventFailed, EventRetained, EventDeleted:
 		if err := validateResourceIdentity(rec.RunID, rec.Kind, rec.Parent, rec.Name); err != nil {
@@ -1321,20 +1547,47 @@ func decrementKindCreated(state *LedgerState, kind string) {
 }
 
 func recomputeReservedNanoUSD(state *LedgerState) {
+	for i := range state.Entries {
+		if state.Entries[i].State == StateConfirmed && !state.Entries[i].Retain {
+			state.Entries[i].ReservedNanoUSD = 0
+		}
+	}
 	var total int64
+	for _, a := range state.PendingAttempts {
+		if a.ReservedNanoUSD > 0 {
+			total += a.ReservedNanoUSD
+			if idx, ok := state.byKey[resourceKey(a.Kind, a.Parent, a.Name)]; ok {
+				if state.Entries[idx].State == StateConfirmed && !state.Entries[idx].Retain {
+					state.Entries[idx].ReservedNanoUSD += a.ReservedNanoUSD
+				}
+			}
+		}
+	}
 	for _, e := range state.Entries {
-		if e.ReservedNanoUSD > 0 {
+		if (e.State != StateConfirmed || e.Retain) && e.ReservedNanoUSD > 0 {
 			total += e.ReservedNanoUSD
 		}
 	}
 	state.ReservedNanoUSD = total
 }
 
+func removeAttemptAt(state *LedgerState, idx int) {
+	removed := state.PendingAttempts[idx]
+	delete(state.byAttemptID, removed.AttemptID)
+	state.PendingAttempts = append(state.PendingAttempts[:idx], state.PendingAttempts[idx+1:]...)
+	for i := idx; i < len(state.PendingAttempts); i++ {
+		a := state.PendingAttempts[i]
+		state.byAttemptID[a.AttemptID] = i
+	}
+}
+
 func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 	defer recomputeReservedNanoUSD(state)
 	state.LastSeq = rec.Seq
 	state.ChargedNanoUSD += rec.ChargedNanoUSD
-	state.TotalPayloadBytes += rec.PayloadBytes
+	if rec.Event != EventSettle {
+		state.TotalPayloadBytes += rec.PayloadBytes
+	}
 
 	if rec.Event == EventMeta {
 		if rec.StartedAtUnix > 0 {
@@ -1354,9 +1607,69 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		if rec.Kind == KindQueueMessage && rec.Reason == "queue_send" {
 			state.MessagesSent++
 		}
-		if rec.ChargedNanoUSD > 0 && rec.Kind != "" && rec.Name != "" {
+		// Settle by explicit AttemptID only; unrelated ownership/read EventCost
+		// records for the same resource must NEVER clear a pending create reservation.
+		if rec.AttemptID != "" {
+			if aIdx, ok := state.byAttemptID[rec.AttemptID]; ok {
+				removeAttemptAt(state, aIdx)
+			}
 			if idx, ok := state.byKey[resourceKey(rec.Kind, rec.Parent, rec.Name)]; ok {
-				state.Entries[idx].ReservedNanoUSD = 0
+				if state.Entries[idx].CreateToken == rec.AttemptID {
+					state.Entries[idx].ReservedNanoUSD = 0
+				}
+			}
+		}
+		return nil
+	}
+	if rec.Event == EventReserve {
+		if state.byAttemptID == nil {
+			state.byAttemptID = make(map[string]int)
+		}
+		if rec.Kind == KindQueueMessage && rec.Reason == "queue_send" {
+			state.MessagesSent++
+		}
+		if aIdx, ok := state.byAttemptID[rec.AttemptID]; ok {
+			cur := state.PendingAttempts[aIdx]
+			if rec.ReservedNanoUSD > cur.ReservedNanoUSD {
+				cur.ReservedNanoUSD = rec.ReservedNanoUSD
+			}
+			cur.PayloadBytes += rec.PayloadBytes
+			cur.Seq = rec.Seq
+			state.PendingAttempts[aIdx] = cur
+			return nil
+		}
+		att := AttemptLedgerEntry{
+			AttemptID:       rec.AttemptID,
+			Kind:            rec.Kind,
+			Parent:          rec.Parent,
+			Name:            rec.Name,
+			Reason:          rec.Reason,
+			ReservedNanoUSD: rec.ReservedNanoUSD,
+			PayloadBytes:    rec.PayloadBytes,
+			Seq:             rec.Seq,
+		}
+		state.byAttemptID[rec.AttemptID] = len(state.PendingAttempts)
+		state.PendingAttempts = append(state.PendingAttempts, att)
+		return nil
+	}
+	if rec.Event == EventSettle {
+		if rec.PayloadBytes > 0 {
+			state.TotalPayloadBytes -= rec.PayloadBytes
+			if state.TotalPayloadBytes < 0 {
+				state.TotalPayloadBytes = 0
+			}
+		}
+		if aIdx, ok := state.byAttemptID[rec.AttemptID]; ok {
+			removeAttemptAt(state, aIdx)
+		}
+		if rec.Kind != "" && rec.Name != "" {
+			if idx, ok := state.byKey[resourceKey(rec.Kind, rec.Parent, rec.Name)]; ok {
+				if state.Entries[idx].CreateToken == rec.AttemptID {
+					state.Entries[idx].ReservedNanoUSD = 0
+					if rec.PayloadBytes > 0 && state.Entries[idx].PayloadBytes >= rec.PayloadBytes {
+						state.Entries[idx].PayloadBytes -= rec.PayloadBytes
+					}
+				}
 			}
 		}
 		return nil
@@ -1411,6 +1724,11 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		return nil
 
 	case EventConfirmed:
+		if rec.AttemptID != "" {
+			if aIdx, ok := state.byAttemptID[rec.AttemptID]; ok {
+				removeAttemptAt(state, aIdx)
+			}
+		}
 		if exists {
 			cur := state.Entries[idx]
 			if cur.OwnerNonce != "" && cur.OwnerNonce != rec.OwnerNonce {
@@ -1554,7 +1872,9 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			if rec.Reason != "" {
 				cur.Reason = rec.Reason
 			}
-			if rec.ReservedNanoUSD > 0 {
+			if rec.ChargedNanoUSD > 0 {
+				cur.ReservedNanoUSD = 0
+			} else if rec.ReservedNanoUSD > 0 {
 				cur.ReservedNanoUSD = rec.ReservedNanoUSD
 			}
 			cur.Seq = rec.Seq
@@ -1587,6 +1907,10 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 	case EventDeleted:
 		if !exists {
 			return nil
+		}
+		cur := state.Entries[idx]
+		if cur.State != StateConfirmed && cur.ReservedNanoUSD > 0 && rec.ChargedNanoUSD == 0 {
+			state.ChargedNanoUSD += cur.ReservedNanoUSD
 		}
 		removeEntryAt(state, idx)
 		return nil
