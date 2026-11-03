@@ -85,4 +85,4 @@ end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "11 host execution failed");
-assert(r.result.fails == r.result.want, "all 18 invalid inputs must fail pre-flight with INVALID_ARGUMENT and http_status()==0");
+assert(r.result.fails == r.result.want, "all 19 invalid inputs must fail pre-flight with INVALID_ARGUMENT and http_status()==0");

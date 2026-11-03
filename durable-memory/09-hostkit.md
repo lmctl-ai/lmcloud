@@ -312,11 +312,14 @@ type Tables interface {
 
 - `Item` = hostkit value type: `map[string]Attr` with `Attr{S *string, I *int64, N *float64, B *bool}`,
   plus `PK/SK/Version` strings and `Exists bool`. Validation (name/attr regexes with `pk`/`sk`/`__lm*`
-  reserved, key charset incl. `.`/`..`/`__..__` exclusions, key 255 bytes, UTF-16 unit cap 32768 per
-  string, NaN/Inf/out-of-range float rejection with portable range `0 or 1e-130..1e126`,
-  240-attr and 262144-byte canonical budget with the 8-byte-per-attr rule) lives in hostkit pre-flight,
-  identical across providers — adapters receive only valid values; int64 values travel as decimal text,
-  never through float conversion.
+  reserved plus reserved table names `lmcloudmeta`/`tables`, key charset incl. `.`/`..`/`__..__`
+  exclusions, key 255 bytes, UTF-16 unit cap 32768 per string (BMP=1, astral=2), NaN/Inf/out-of-range
+  float rejection with portable range `0 or 1e-130..<1e126`, **240 user attributes and 262144 user
+  bytes** — the 8-byte-per-user-attr canonical measure excludes reserved metadata; the adapter's
+  internal overhead (DynamoDB `__lmcloud_v` + `__lmt` Map tags, keys, framing) is bounded separately
+  (≤ ~20 KiB) and the full wire size is re-checked against the native ceiling before dispatch) lives in
+  hostkit pre-flight, identical across providers — adapters receive only valid values; int64 values
+  travel as decimal text, never through float conversion.
 - **Write modes & version allocation:** mode is explicit (`PutMode`); the schema's 2-arg put maps to
   `PutUnconditional`, `expect==""` to `PutIfAbsent`, else `PutIfVersion`. Each logical call generates
   **one** fresh 128-bit token reused across byte-identical retries (unconditional mode only); conditional

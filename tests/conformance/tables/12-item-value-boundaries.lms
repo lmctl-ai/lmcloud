@@ -40,9 +40,9 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let e_str = cloud.last_error();
   let str_over_invalid = e_str.code() == ErrorCode.INVALID_ARGUMENT && e_str.http_status() == 0;
 
-  # UTF-16 unit counting with multi-byte characters: 10922*3byte-char = 32766 units (fits),
-  # 10923* = 32769 units (fails) — proves the cap counts units, not bytes
-  let uni = str_repeat("雪", 10922);
+  # UTF-16 unit counting, BMP: "雪" (U+96EA) is ONE UTF-16 unit (3 UTF-8 bytes).
+  # 32768 copies = 32768 units (fits the cap); 32769 copies = 32769 units (fails pre-flight).
+  let uni = str_repeat("雪", 32768);
   cloud.set_abort_on_error(true);
   cloud.item_put(t, cloud.item_new("unifit").set_string("v", uni));
   let unifit_ok = str_len(cloud.item_get(t, "unifit").get_string("v")) == str_len(uni);
@@ -50,6 +50,17 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.item_put(t, cloud.item_new("uniover").set_string("v", uni + "雪"));
   let e_uni = cloud.last_error();
   let uni_over_invalid = e_uni.code() == ErrorCode.INVALID_ARGUMENT && e_uni.http_status() == 0;
+
+  # UTF-16 unit counting, surrogate pairs: "🚀" (U+1F680) is TWO UTF-16 units (4 UTF-8 bytes).
+  # 16384 copies = 32768 units (fits); 16385 copies = 32770 units (fails pre-flight).
+  cloud.set_abort_on_error(true);
+  let ast = str_repeat("🚀", 16384);
+  cloud.item_put(t, cloud.item_new("astfit").set_string("v", ast));
+  let astfit_ok = str_len(cloud.item_get(t, "astfit").get_string("v")) == str_len(ast);
+  cloud.set_abort_on_error(false);
+  cloud.item_put(t, cloud.item_new("astover").set_string("v", ast + "🚀"));
+  let e_ast = cloud.last_error();
+  let ast_over_invalid = e_ast.code() == ErrorCode.INVALID_ARGUMENT && e_ast.http_status() == 0;
   cloud.set_abort_on_error(true);
 
   # canonical item budget distributed across legal properties:
@@ -95,11 +106,31 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let attr_invalid = attr_err.code() == ErrorCode.INVALID_ARGUMENT && attr_err.http_status() == 0;
   cloud.set_abort_on_error(true);
 
-  # float round-trip + bool (float asserted in-program via assert_close builtin)
-  cloud.item_put(t, cloud.item_new("vals").set_number("pi", 3.141592653589793).set_bool("ok", true));
+  # float round-trip + bool + portable float range extremes (design 12 §4.2: x==0 or
+  # 1e-130 <= |x| < 1e126; DynamoDB N tops out at ~9.999e125). Values built via math_pow
+  # (embedded lmcode floats require decimal notation, no exponent literals).
+  let flow = math_pow(10.0, -130.0);
+  let fhigh = 9.999 * math_pow(10.0, 125.0);
+  cloud.item_put(t, cloud.item_new("vals")
+    .set_number("pi", 3.141592653589793)
+    .set_number("flow", flow)
+    .set_number("fhigh", fhigh)
+    .set_bool("ok", true));
   let vals = cloud.item_get(t, "vals");
   assert_close(vals.get_number("pi"), 3.141592653589793, 0.000000001);
+  assert_close(vals.get_number("flow"), flow, flow / 2.0);
+  assert_close(vals.get_number("fhigh"), fhigh, fhigh / 2.0);
   let bool_ok = vals.get_bool("ok");
+
+  # out-of-range floats rejected pre-flight: 1e126 (>= upper bound) and 1e-131 (tiny nonzero)
+  cloud.set_abort_on_error(false);
+  cloud.item_new("k1").set_number("x", math_pow(10.0, 126.0));
+  let e_ohi = cloud.last_error();
+  cloud.item_new("k1").set_number("x", math_pow(10.0, -131.0));
+  let e_olo = cloud.last_error();
+  let orange_invalid = e_ohi.code() == ErrorCode.INVALID_ARGUMENT && e_ohi.http_status() == 0
+    && e_olo.code() == ErrorCode.INVALID_ARGUMENT && e_olo.http_status() == 0;
+  cloud.set_abort_on_error(true);
 
   cloud.table_delete(t);
 
@@ -109,6 +140,9 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   lmcode_return_put("str_over_invalid", str_over_invalid);
   lmcode_return_put("unifit_ok", unifit_ok);
   lmcode_return_put("uni_over_invalid", uni_over_invalid);
+  lmcode_return_put("astfit_ok", astfit_ok);
+  lmcode_return_put("ast_over_invalid", ast_over_invalid);
+  lmcode_return_put("orange_invalid", orange_invalid);
   lmcode_return_put("big_ok", big_ok);
   lmcode_return_put("big_rt", big_rt);
   lmcode_return_put("over_invalid", over_invalid);
@@ -122,7 +156,9 @@ assert(r.ok, "12 host execution failed");
 assert(r.result.key_ok, "255-byte key must be accepted");
 assert(r.result.ints_ok, "int64 min/max round-trip");
 assert(r.result.strfit_ok && r.result.str_over_invalid, "32768 UTF-16 units OK, 32769 units pre-flight INVALID_ARGUMENT");
-assert(r.result.unifit_ok && r.result.uni_over_invalid, "UTF-16 unit cap counts units not bytes (32766 units fit, 32769 fail)");
+assert(r.result.unifit_ok && r.result.uni_over_invalid, "BMP unit cap: 32768 one-unit chars fit, 32769 fail");
+assert(r.result.astfit_ok && r.result.ast_over_invalid, "astral (surrogate-pair) unit cap: 16384 two-unit chars fit, 16385 fail");
+assert(r.result.orange_invalid, "out-of-range floats (>=1e126, tiny 1e-131) fail pre-flight INVALID_ARGUMENT");
 assert(r.result.big_ok && r.result.big_rt, "distributed 262144-byte item stores and round-trips");
 assert(r.result.over_invalid, "+1 byte over budget fails pre-flight INVALID_ARGUMENT");
 assert(r.result.wide_ok && r.result.attr_invalid, "240 attributes accepted; 241st rejected pre-flight");
