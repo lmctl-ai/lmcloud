@@ -85,6 +85,7 @@ validate_slice() {
 
 collect_scenarios() {
   local slice="$1"
+  local filter="${LMCLOUD_SCENARIO_FILTER:-}"
   local raw=()
   case "$slice" in
     object-storage|queue)
@@ -104,6 +105,16 @@ collect_scenarios() {
   for f in "${raw[@]}"; do
     if [[ "$LIVE_PROFILE" == "1" ]] && is_live_excluded_scenario "$f"; then
       continue
+    fi
+    if [[ -n "$filter" ]]; then
+      local base base_no_ext rel rel_no_ext
+      base="$(basename "$f")"
+      base_no_ext="$(basename "$f" .lms)"
+      rel="$(basename "$(dirname "$f")")/$base"
+      rel_no_ext="$(basename "$(dirname "$f")")/$base_no_ext"
+      if [[ "$filter" != "$base" && "$filter" != "$base_no_ext" && "$filter" != "$rel" && "$filter" != "$rel_no_ext" ]]; then
+        continue
+      fi
     fi
     printf '%s\n' "$f"
   done
