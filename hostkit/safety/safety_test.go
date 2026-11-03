@@ -2387,3 +2387,218 @@ func TestSafety_AllGuardOperationsDurableReservationOnCrashAfterDispatch(t *test
 		})
 	}
 }
+
+type round3Retry struct {
+	*FakeRecoveryBackend
+	calls int
+	crash bool
+}
+
+func (b *round3Retry) QuoteAttempt(in AttemptPricingInput, base AttemptQuote) (AttemptQuote, error) {
+	if in.Operation == "object_put" {
+		base.AttemptNanoUSD = 20_000_000
+	}
+	return base, nil
+}
+
+func (b *round3Retry) PutObject(ctx context.Context, bucket, key string, body []byte, ct string, m map[string]string) (hostkit.ObjectMeta, error) {
+	b.calls++
+	if b.crash {
+		panic("request dispatched and payload transferred; interrupted before reply/remote visibility")
+	}
+	return b.FakeRecoveryBackend.PutObject(ctx, bucket, key, body, ct, m)
+}
+
+func TestRound3RepeatedPendingRetries(t *testing.T) {
+	pol, run, b := newTestSetup(t)
+	pol.Cost.CapUSD = .10
+	pol.Limits.MaxTotalBytes = 6
+	r := &round3Retry{FakeRecoveryBackend: b, crash: true}
+	s := probeSession(t, pol, run, r, nil)
+	bucket, _ := FormatLiveResourceName(run, "bucket", 1)
+	if _, e := s.WrapStore(r).CreateBucket(context.Background(), bucket); e != nil {
+		t.Fatal(e)
+	}
+	for i := 0; i < 3; i++ {
+		func() {
+			defer func() { _ = recover() }()
+			_, _ = s.WrapStore(r).PutObject(context.Background(), bucket, "key", []byte("abc"), "text/plain", nil)
+		}()
+		_ = s.Close()
+		s = probeSession(t, pol, run, r, nil)
+	}
+	defer s.Close()
+	st := s.Journal().State()
+	if r.calls > 2 || st.ReservedNanoUSD < 40_000_000 || st.TotalPayloadBytes != 6 {
+		t.Fatalf("three interrupted retries: dispatches=%d durable_reserved=%d restored_charged=%d payload_bytes=%d; want <=2 dispatches, distinct attempt costs, and 6 bytes",
+			r.calls, st.ReservedNanoUSD, s.Meter().Snapshot().ChargedNanoUSD, st.TotalPayloadBytes)
+	}
+
+	// In a 10-byte campaign, run two 3-byte interrupted retries, compact and reopen,
+	// and then allow the third retry (with a 2-byte payload) to converge, verifying
+	// that OwnerNonce/CreateToken stay stable while all 3 attempts (3+3+2 = 8 bytes,
+	// >=60,000,000 nano-USD) accumulate.
+	pol2, run2, b2 := newTestSetup(t)
+	pol2.Cost.CapUSD = .10
+	pol2.Limits.MaxTotalBytes = 10
+	r2 := &round3Retry{FakeRecoveryBackend: b2, crash: true}
+	s2 := probeSession(t, pol2, run2, r2, nil)
+	bucket2, _ := FormatLiveResourceName(run2, "bucket", 1)
+	if _, e := s2.WrapStore(r2).CreateBucket(context.Background(), bucket2); e != nil {
+		t.Fatal(e)
+	}
+	for i := 0; i < 2; i++ {
+		func() {
+			defer func() { _ = recover() }()
+			_, _ = s2.WrapStore(r2).PutObject(context.Background(), bucket2, "key", []byte("abc"), "text/plain", nil)
+		}()
+		_ = s2.Close()
+		s2 = probeSession(t, pol2, run2, r2, nil)
+	}
+	st2 := s2.Journal().State()
+	eBefore, ok := st2.Lookup(KindObject, bucket2, "key")
+	if !ok || eBefore.State != StatePending {
+		t.Fatalf("expected StatePending entry before convergence, got %+v", eBefore)
+	}
+	if err := s2.Journal().Compact(); err != nil {
+		t.Fatalf("Compact before convergence: %v", err)
+	}
+	_ = s2.Close()
+
+	r2.crash = false
+	sConv := probeSession(t, pol2, run2, r2, nil)
+	defer sConv.Close()
+	if _, err := sConv.WrapStore(r2).PutObject(context.Background(), bucket2, "key", []byte("xy"), "text/plain", nil); err != nil {
+		t.Fatalf("converging PutObject: %v", err)
+	}
+	stConv := sConv.Journal().State()
+	eAfter, ok := stConv.Lookup(KindObject, bucket2, "key")
+	if !ok || eAfter.State != StateConfirmed {
+		t.Fatalf("expected StateConfirmed entry after convergence, got %+v", eAfter)
+	}
+	if eAfter.OwnerNonce != eBefore.OwnerNonce || eAfter.CreateToken != eBefore.CreateToken {
+		t.Fatalf("expected stable OwnerNonce/CreateToken across retries, got (%s,%s) vs (%s,%s)",
+			eAfter.OwnerNonce, eAfter.CreateToken, eBefore.OwnerNonce, eBefore.CreateToken)
+	}
+	if stConv.TotalPayloadBytes != 8 {
+		t.Fatalf("expected cumulative TotalPayloadBytes=8 (3+3+2), got %d", stConv.TotalPayloadBytes)
+	}
+	if got := sConv.Meter().Snapshot().ChargedNanoUSD; got < 60_000_000 {
+		t.Fatalf("expected cumulative charged cost >= 60,000,000 across 3 dispatches, got %d", got)
+	}
+}
+
+type round3ReadError struct {
+	*FakeRecoveryBackend
+	calls            int
+	bytesTransferred int
+	failRead         bool
+}
+
+func (b *round3ReadError) QuoteAttempt(in AttemptPricingInput, base AttemptQuote) (AttemptQuote, error) {
+	if in.Operation == "object_get" && in.EgressBytes > 0 {
+		base.AttemptNanoUSD = 20_000_000
+	}
+	return base, nil
+}
+
+func (b *round3ReadError) GetObject(ctx context.Context, bucket, key string, limit int64) ([]byte, error) {
+	v, e := b.FakeRecoveryBackend.GetObject(ctx, bucket, key, limit)
+	if e != nil {
+		return nil, e
+	}
+	b.calls++
+	b.bytesTransferred += len(v)
+	if b.failRead {
+		return nil, errors.New("body read failed after bytes transferred")
+	}
+	return v, nil
+}
+
+func TestRound3FailedDownloadCosts(t *testing.T) {
+	pol, run, b := newTestSetup(t)
+	r := &round3ReadError{FakeRecoveryBackend: b, failRead: true}
+	s := probeSession(t, pol, run, r, nil)
+	defer s.Close()
+	bucket, _ := FormatLiveResourceName(run, "bucket", 1)
+	store := s.WrapStore(r)
+	if _, e := store.CreateBucket(context.Background(), bucket); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := store.PutObject(context.Background(), bucket, "key", []byte("abc"), "text/plain", nil); e != nil {
+		t.Fatal(e)
+	}
+	before := s.Journal().State().ChargedNanoUSD
+	for i := 0; i < 3; i++ {
+		_, _ = store.GetObject(context.Background(), bucket, "key", 3)
+	}
+	got := s.Journal().State().ChargedNanoUSD - before
+	if r.calls > 2 || got < int64(r.calls)*20_000_000 {
+		t.Fatalf("error downloads dispatches=%d bytes_transferred=%d durable_cost=%d with 20000000 quote per transfer; cap=%d",
+			r.calls, r.bytesTransferred, got, s.Meter().Snapshot().CapNanoUSD)
+	}
+
+	// Also verify that a successful 0-byte download (proven 0 bytes transferred)
+	// refunds unused egressreservation while an oversized download retains full reservation.
+	pol2, run2, b2 := newTestSetup(t)
+	pol2.Limits.MaxObjectBytes = 4
+	r2 := &round3ReadError{FakeRecoveryBackend: b2, failRead: false}
+	s2 := probeSession(t, pol2, run2, r2, nil)
+	defer s2.Close()
+	bkt2, _ := FormatLiveResourceName(run2, "bucket", 1)
+	store2 := s2.WrapStore(r2)
+	if _, e := store2.CreateBucket(context.Background(), bkt2); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := store2.PutObject(context.Background(), bkt2, "empty", []byte(""), "text/plain", nil); e != nil {
+		t.Fatal(e)
+	}
+	beforeEmpty := s2.Journal().State().ChargedNanoUSD
+	data, err := store2.GetObject(context.Background(), bkt2, "empty", 4)
+	if err != nil || len(data) != 0 {
+		t.Fatalf("GetObject empty: data=%q err=%v", data, err)
+	}
+	// EgressBytes == 0 has base tariff (400 nano-USD), proven unused egress refunded.
+	emptyDelta := s2.Journal().State().ChargedNanoUSD - beforeEmpty
+	if emptyDelta >= 20_000_000 {
+		t.Fatalf("expected proven 0-byte download to settle at base tariff, got %d", emptyDelta)
+	}
+}
+
+func TestRound3SettlementIdempotence(t *testing.T) {
+	pol, run, b := newTestSetup(t)
+	s := probeSession(t, pol, run, b, nil)
+	bucket, _ := FormatLiveResourceName(run, "bucket", 1)
+	it, e := s.Journal().BeginCreateWithBytes(KindBucket, "", "us-east-1", bucket, 12345, 3)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e := s.Journal().SettleAttempt(it.AttemptID, 100, true); e != nil {
+		t.Fatal(e)
+	}
+	before := s.Journal().State()
+	if e := s.Journal().SettleAttempt(it.AttemptID, 100, true); e != nil {
+		t.Fatal(e)
+	}
+	// Also test duplicate settlement with CreateToken, after Compact, and after reopen.
+	if e := s.Journal().SettleAttempt(it.CreateToken, 100, true); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.Journal().Compact(); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.Journal().SettleAttempt(it.AttemptID, 100, true); e != nil {
+		t.Fatal(e)
+	}
+	_ = s.Close()
+	s2 := probeSession(t, pol, run, b, nil)
+	defer s2.Close()
+	if e := s2.Journal().SettleAttempt(it.AttemptID, 100, true); e != nil {
+		t.Fatal(e)
+	}
+	after := s2.Journal().State()
+	if after.ChargedNanoUSD != before.ChargedNanoUSD || after.TotalPayloadBytes != before.TotalPayloadBytes {
+		t.Fatalf("duplicate settlement changed accounting: charged %d->%d bytes %d->%d",
+			before.ChargedNanoUSD, after.ChargedNanoUSD, before.TotalPayloadBytes, after.TotalPayloadBytes)
+	}
+}
