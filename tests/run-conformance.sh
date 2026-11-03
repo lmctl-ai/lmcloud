@@ -12,10 +12,11 @@ if [[ -z "${LMSCRIPT_BIN:-}" ]]; then
   fi
 fi
 CONF_DIR="$ROOT/tests/conformance"
+SCHEMA_FILE="$ROOT/schema/lmcloud.dsl.json"
 
 usage() {
-  echo "Usage: $0 [--live] [--name-prefix <prefix>] <host-binary> [endpoint] [object-storage|queue|tables|all] [run-id]" >&2
-  echo "       $0 [--live] --check [object-storage|queue|tables|all]" >&2
+  echo "Usage: $0 [--live] [--name-prefix <prefix>] <host-binary> [endpoint] [object-storage|queue|cost-perf|tables|all] [run-id]" >&2
+  echo "       $0 [--live] --check [object-storage|queue|cost-perf|tables|all]" >&2
   exit 2
 }
 
@@ -58,17 +59,15 @@ if [[ ! -x "$LMSCRIPT_BIN" ]]; then
 fi
 
 is_live_excluded_scenario() {
-  local base
-  base="$(basename "$(dirname "$1")")/$(basename "$1")"
+  local base slice_dir
+  base="$(basename "$1")"
+  slice_dir="$(basename "$(dirname "$1")")"
+  case "$slice_dir" in
+    cost-perf|tables)
+      return 0
+      ;;
+  esac
   case "$base" in
-    tables/*.lms)
-      # Slice 5 (tables) is excluded from the --live profile until naming/ownership
-      # policy for table names (Azure-alnum intersection) is designed for live runs.
-      return 0
-      ;;
-    */12-auth-enforced-denial.lms|*/13-queue-auth-enforced-denial.lms)
-      return 0
-      ;;
     12-auth-enforced-denial.lms|13-queue-auth-enforced-denial.lms)
       return 0
       ;;
@@ -81,11 +80,11 @@ is_live_excluded_scenario() {
 validate_slice() {
   local slice="$1"
   case "$slice" in
-    object-storage|queue|tables|all|"")
+    object-storage|queue|cost-perf|tables|all|"")
       return 0
       ;;
     *)
-      echo "error: unknown slice '$slice' (expected: object-storage | queue | tables | all)" >&2
+      echo "error: unknown slice '$slice' (expected: object-storage | queue | cost-perf | tables | all)" >&2
       exit 2
       ;;
   esac
@@ -96,18 +95,19 @@ collect_scenarios() {
   local filter="${LMCLOUD_SCENARIO_FILTER:-}"
   local raw=()
   case "$slice" in
-    object-storage|queue|tables)
+    object-storage|queue|cost-perf|tables)
       mapfile -t raw < <(find "$CONF_DIR/$slice" -maxdepth 1 -name '*.lms' | sort)
       ;;
     all|"")
       mapfile -t raw < <(
         find "$CONF_DIR/object-storage" -maxdepth 1 -name '*.lms' | sort
         find "$CONF_DIR/queue" -maxdepth 1 -name '*.lms' | sort
+        find "$CONF_DIR/cost-perf" -maxdepth 1 -name '*.lms' | sort
         find "$CONF_DIR/tables" -maxdepth 1 -name '*.lms' | sort
       )
       ;;
     *)
-      echo "error: unknown slice '$slice' (expected: object-storage | queue | tables | all)" >&2
+      echo "error: unknown slice '$slice' (expected: object-storage | queue | cost-perf | tables | all)" >&2
       exit 2
       ;;
   esac
@@ -148,12 +148,91 @@ capability_skip_reason() {
 }
 # ---------------------------------------------------------------------------------------------
 
+# --- Embedded _lmcode_ compile gate (11-cost-perf-conformance.md §1) ------------------
+# check_scenario verifies both the outer .lms syntax/splices AND compiles
+# every embedded _lmcode_ block against schema/lmcloud.dsl.json by replacing
+# outer ${...} splices with literal "probe" strings at the exact source line
+# numbers (since outer splices otherwise defer inner lmcode bytecode compilation
+# until runtime construction).
+check_scenario() {
+  local f="$1"
+  if ! "$LMSCRIPT_BIN" --check "$f"; then
+    return 1
+  fi
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/lmcloud-embed-check.XXXXXX.lms")"
+  python3 - "$f" "$SCHEMA_FILE" "$tmp" <<'PY'
+import re, sys
+
+src_path, schema_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(src_path, "r", encoding="utf-8") as fh:
+    lines = fh.readlines()
+
+out = []
+in_block = False
+block_idx = 0
+header_re = re.compile(r'^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*|.*\brun_lmcode\s*\(\s*)_lmcode_\b.*;\s*(?:#.*)?$')
+splice_re = re.compile(r'\$\{[^}]+\}')
+
+for line in lines:
+    stripped = line.strip()
+    if not in_block:
+        if "_lmcode_" in line and not stripped.startswith("#"):
+            m = header_re.match(line.rstrip("\r\n"))
+            if m:
+                in_block = True
+                block_idx += 1
+                out.append(f'_blk_{block_idx} = _lmcode_ schema="{schema_path}";\n')
+                continue
+        out.append("# " + line if line.endswith("\n") else "# " + line + "\n")
+    else:
+        if stripped == "end _lmcode_":
+            in_block = False
+            out.append("end _lmcode_\n")
+        else:
+            out.append(splice_re.sub('"probe"', line))
+
+with open(out_path, "w", encoding="utf-8") as fh:
+    fh.writelines(out)
+PY
+  local rc=0
+  if ! "$LMSCRIPT_BIN" --check "$tmp"; then
+    rc=1
+  fi
+  rm -f "$tmp"
+  return $rc
+}
+
+# Negative control: prove check_scenario rejects a spliced _lmcode_ block
+# containing invalid inner lmcode syntax (which plain `lmscript --check` defers).
+verify_embedded_gate_negative_control() {
+  local neg
+  neg="$(mktemp "${TMPDIR:-/tmp}/lmcloud-neg-ctrl.XXXXXX.lms")"
+  cat >"$neg" <<EOF
+endpoint = "http://127.0.0.1:4566";
+p = _lmcode_ schema="$SCHEMA_FILE";
+  let ep = \${endpoint};
+  let bad = 1e-9;
+  cloud.nonexistent_method(ep, bad);
+end _lmcode_
+EOF
+  if check_scenario "$neg" >/dev/null 2>&1; then
+    rm -f "$neg"
+    echo "error: embedded _lmcode_ negative control unexpectedly passed!" >&2
+    return 1
+  fi
+  rm -f "$neg"
+  return 0
+}
+# -------------------------------------------------------------------------------------
+
 pass=0
 fail=0
 skip=0
 idx=0
 
 if [[ "${1:-}" == "--check" ]]; then
+  verify_embedded_gate_negative_control
   SLICE="${2:-all}"
   validate_slice "$SLICE"
   mapfile -t SCENARIOS < <(collect_scenarios "$SLICE")
@@ -162,17 +241,21 @@ if [[ "${1:-}" == "--check" ]]; then
     echo "error: no conformance scenarios found for slice '$SLICE'" >&2
     exit 2
   fi
+  check_label="(--check + embedded _lmcode_ compile)"
+  if [[ "$LIVE_PROFILE" == "1" ]]; then
+    check_label="(--check)"
+  fi
   echo "1..$total"
   for f in "${SCENARIOS[@]}"; do
     idx=$((idx + 1))
     slice_name="$(basename "$(dirname "$f")")"
     name="$slice_name/$(basename "$f" .lms)"
-    if "$LMSCRIPT_BIN" --check "$f" >/dev/null 2>&1; then
-      echo "ok $idx - $name (--check)"
+    if err_out="$(check_scenario "$f" 2>&1)"; then
+      echo "ok $idx - $name $check_label"
       pass=$((pass + 1))
     else
-      echo "not ok $idx - $name (--check)"
-      "$LMSCRIPT_BIN" --check "$f" >&2 || true
+      echo "not ok $idx - $name $check_label"
+      printf '%s\n' "$err_out" >&2
       fail=$((fail + 1))
     fi
   done
@@ -183,7 +266,7 @@ else
   if [[ "$LIVE_PROFILE" == "1" ]]; then
     DEFAULT_RUN_ID="run-$(date -u +%s)-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
   fi
-  if [[ "$ARG2" == "object-storage" || "$ARG2" == "queue" || "$ARG2" == "tables" || "$ARG2" == "all" ]]; then
+  if [[ "$ARG2" == "object-storage" || "$ARG2" == "queue" || "$ARG2" == "cost-perf" || "$ARG2" == "tables" || "$ARG2" == "all" ]]; then
     ENDPOINT=""
     SLICE="$ARG2"
     RUN_ID="${3:-${LMCLOUD_RUN_ID:-${LMAWS_RUN_ID:-$DEFAULT_RUN_ID}}}"

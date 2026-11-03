@@ -1,0 +1,73 @@
+# Scenario 10: Error, retry, and throttle counters in metrics(), physical attempt vs pre-flight error billing, and preservation of last_error() across inspection calls.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bkt = "lmcloud-cp10-" + run_id + "-bkt";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("all", ep);
+  }
+  let b = ${bkt};
+
+  cloud.bucket_create(b);
+  cloud.metrics_reset();
+  cloud.set_abort_on_error(false);
+
+  # 1. Pre-flight validation failure (invalid bucket name): increments metrics errors, does NOT charge cost_report()
+  let cost_before_preflight = cloud.estimated_cost();
+  let reqs_before_preflight = cloud.cost_report().total_requests();
+  cloud.bucket_create("Invalid_Bucket_Name");
+  let err_preflight = cloud.last_error();
+  let cost_after_preflight = cloud.estimated_cost();
+  let reqs_after_preflight = cloud.cost_report().total_requests();
+
+  # 2. Provider NOT_FOUND error (missing key in existing bucket on object_get): charges physical attempt AND increments metrics errors
+  cloud.object_get(b, "missing-key.txt");
+  let err_before_inspect = cloud.last_error();
+  let reqs_after_notfound = cloud.cost_report().total_requests();
+
+  # Calling metrics(), cost_report(), estimated_cost(), and cost_cap_usd() must NOT overwrite last_error()!
+  let m = cloud.metrics();
+  let rep = cloud.cost_report();
+  let est = cloud.estimated_cost();
+  let cap = cloud.cost_cap_usd();
+  let err_after_inspect = cloud.last_error();
+
+  let bcreate_m = m.op("bucket_create");
+  let oget_m = m.op("object_get");
+  let oget_item = rep.item("object_get");
+
+  # 3. Pre-flight COST_CAP_EXCEEDED refusal also increments metrics errors and cap_exceeded_count without charging physical requests
+  cloud.set_cost_cap_usd(cloud.estimated_cost());
+  cloud.object_put(b, "cap-refused.txt", "blocked");
+  let err_cap = cloud.last_error();
+  let m2 = cloud.metrics();
+  let rep2 = cloud.cost_report();
+
+  # Clean up using reserved cleanup budget
+  cloud.bucket_delete(b);
+
+  assert_close(cost_after_preflight, cost_before_preflight, 0.000000000001);
+
+  # Physical attempt invariant: for object_get, physical requests charged == calls() + retries()
+  let physical_attempts_match = oget_item.requests() == (oget_m.calls() + oget_m.retries());
+
+  lmcode_return_put("preflight_not_billed", err_preflight.code() == ErrorCode.INVALID_ARGUMENT && reqs_after_preflight == reqs_before_preflight);
+  lmcode_return_put("notfound_billed", reqs_after_notfound == (reqs_after_preflight + 1 + oget_m.retries()) && physical_attempts_match);
+  lmcode_return_put("last_error_preserved", err_before_inspect.code() == ErrorCode.NOT_FOUND && err_after_inspect.code() == ErrorCode.NOT_FOUND && !err_after_inspect.ok());
+  lmcode_return_put("error_counts_ok", m.total_calls() == 2 && m.total_errors() == 2 && bcreate_m.calls() == 1 && bcreate_m.errors() == 1 && oget_m.calls() == 1 && oget_m.errors() == 1);
+  lmcode_return_put("cap_error_counted", err_cap.code() == ErrorCode.COST_CAP_EXCEEDED && m2.total_calls() == 3 && m2.total_errors() == 3 && rep2.cap_exceeded_count() == 1 && rep2.total_requests() == reqs_after_notfound);
+  lmcode_return_put("retry_throttle_nonneg", m.total_retries() >= 0 && m.total_throttles() >= 0 && oget_m.retries() >= 0 && oget_m.throttles() >= 0);
+  lmcode_return_put("inspect_values_ok", rep.total_requests() >= 1 && est > 0.0 && cap > 0.0);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "10-metrics-error-and-retry-counters failed");
+assert(r.result.preflight_not_billed, "pre-flight INVALID_ARGUMENT must not increment cost_report().total_requests() or estimated_cost()");
+assert(r.result.notfound_billed, "provider NOT_FOUND attempt must charge physical attempts (calls + retries)");
+assert(r.result.last_error_preserved, "metrics(), cost_report(), estimated_cost(), and cost_cap_usd() must not overwrite cloud.last_error()");
+assert(r.result.error_counts_ok, "metrics() must count both pre-flight and provider errors in total_errors() and OpMetrics.errors()");
+assert(r.result.cap_error_counted, "COST_CAP_EXCEEDED must increment total_errors() and cap_exceeded_count() without charging physical requests");
+assert(r.result.retry_throttle_nonneg, "retries() and throttles() counters must be non-negative");
+assert(r.result.inspect_values_ok, "cost_report(), estimated_cost(), and cost_cap_usd() must return valid values");

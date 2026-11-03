@@ -260,6 +260,9 @@ func restoreMeterFromState(meter *CostMeter, pt *PriceTable, st LedgerState) {
 		}
 	}
 	meter.RestoreCharged(chargedNano, activeCleanupNano)
+	if st.WorkCapNanoUSD > 0 {
+		meter.RestoreWorkCap(st.WorkCapNanoUSD)
+	}
 }
 
 // Supervisor coordinates a multi-invocation live campaign sharing a single

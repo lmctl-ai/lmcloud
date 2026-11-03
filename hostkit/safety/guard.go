@@ -221,6 +221,28 @@ func (g *LiveGuard) requireMutationsAllowed(op string) *hostkit.CloudError {
 	return nil
 }
 
+// SetWorkCapUSD narrows the script-level non-cleanup work sub-cap on the active
+// CostMeter and durably persists the narrowed sub-cap to the campaign journal.
+func (g *LiveGuard) SetWorkCapUSD(workCapUSD float64) *hostkit.CloudError {
+	if cerr := g.checkWallClock(); cerr != nil {
+		return cerr
+	}
+	if err := g.meter.SetWorkCapUSD(workCapUSD); err != nil {
+		code := hostkit.InvalidArgument
+		pcode := "InvalidCostCap"
+		if errors.Is(err, ErrCostCapExceeded) {
+			code = hostkit.PermissionDenied
+			pcode = "LiveCostCapExceeded"
+		}
+		return hostkit.ProviderError(code, 0, pcode, err.Error())
+	}
+	snap := g.meter.Snapshot()
+	if err := g.journal.RecordWorkCap(snap.ScriptWorkCapNanoUSD); err != nil {
+		return journalWriteErr(err)
+	}
+	return nil
+}
+
 func (g *LiveGuard) reserveOp(in AttemptPricingInput) (*AttemptReservation, *hostkit.CloudError) {
 	if cerr := g.checkWallClock(); cerr != nil {
 		return nil, cerr

@@ -1,0 +1,51 @@
+# Scenario 01: Default cost cap ($0.05), hard ceiling ($0.25), zero initial cost, and read-only config/inspection calls accrue $0.00.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("all", ep);
+  }
+
+  let p = cloud.provider();
+  let ep_s = cloud.endpoint("storage");
+  let ab = cloud.abort_on_error();
+  let le = cloud.last_error();
+
+  let cap = cloud.cost_cap_usd();
+  let est = cloud.estimated_cost();
+  let rep = cloud.cost_report();
+  let met = cloud.metrics();
+
+  assert_close(cap, 0.05, 0.000000001);
+  assert_close(rep.cap_usd(), 0.05, 0.000000001);
+  assert_close(rep.ceiling_usd(), 0.25, 0.000000001);
+  assert_close(est, 0.0, 0.000000000001);
+  assert_close(rep.estimated_usd(), 0.0, 0.000000000001);
+
+  lmcode_return_put("provider_ok", str_len(p) > 0);
+  lmcode_return_put("ep_ok", str_len(ep) == 0 || str_len(ep_s) > 0);
+  lmcode_return_put("abort_default", ab);
+  lmcode_return_put("last_ok", le.ok() && le.code() == ErrorCode.OK);
+  lmcode_return_put("rep_provider_matches", rep.provider() == p);
+  lmcode_return_put("ver_nonempty", str_len(rep.price_table_version()) > 0);
+  lmcode_return_put("zero_reqs", rep.total_requests() == 0 && rep.total_units() == 0 && rep.total_bytes() == 0);
+  lmcode_return_put("zero_items", rep.len() == 0 && rep.cap_exceeded_count() == 0);
+  lmcode_return_put("uncalled_item_zero", rep.item("object_put").requests() == 0 && rep.item("object_put").unit_price_usd() > 0.0);
+  lmcode_return_put("summary_nonempty", str_len(rep.summary()) > 0 && str_contains(rep.summary(), "$0.00"));
+  lmcode_return_put("met_zero_calls", met.total_calls() == 0 && met.total_errors() == 0 && met.len() == 0);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "01-default-cap-and-readonly-zero-cost failed");
+assert(r.result.provider_ok, "provider() should be non-empty");
+assert(r.result.ep_ok, "endpoint(storage) should reflect active endpoint");
+assert(r.result.abort_default, "abort_on_error() should default to true");
+assert(r.result.last_ok, "last_error() should remain OK after inspection calls");
+assert(r.result.rep_provider_matches, "cost_report().provider() must match cloud.provider()");
+assert(r.result.ver_nonempty, "cost_report().price_table_version() must be non-empty");
+assert(r.result.zero_reqs, "config/inspection calls must record 0 requests, units, and bytes");
+assert(r.result.zero_items, "initial cost_report() must have len() == 0 and cap_exceeded_count() == 0");
+assert(r.result.uncalled_item_zero, "cost_report().item('object_put') must have 0 requests and a positive unit price");
+assert(r.result.summary_nonempty, "cost_report().summary() must include $0.00 when no operations ran");
+assert(r.result.met_zero_calls, "metrics() must report 0 total_calls before any domain operations");

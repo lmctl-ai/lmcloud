@@ -40,6 +40,7 @@ const (
 	EventCost      = "cost"
 	EventReserve   = "reserve"
 	EventSettle    = "settle"
+	EventWorkCap   = "work_cap"
 
 	// Resource lifecycle states after journal replay.
 	StatePending   = "pending"
@@ -193,6 +194,7 @@ type JournalRecord struct {
 	AttemptID           string `json:"attempt_id,omitempty"`
 	ReservedNanoUSD     int64  `json:"reserved_nano_usd,omitempty"`
 	ChargedNanoUSD      int64  `json:"charged_nano_usd,omitempty"`
+	WorkCapNanoUSD      int64  `json:"work_cap_nano_usd,omitempty"`
 	PayloadBytes        int64  `json:"payload_bytes,omitempty"`
 	BucketsCreated      int    `json:"buckets_created,omitempty"`
 	QueuesCreated       int    `json:"queues_created,omitempty"`
@@ -264,6 +266,7 @@ type LedgerState struct {
 	PendingAttempts   []AttemptLedgerEntry
 	ReservedNanoUSD   int64
 	ChargedNanoUSD    int64
+	WorkCapNanoUSD    int64
 	BucketsCreated    int
 	QueuesCreated     int
 	ObjectsCreated    int
@@ -987,6 +990,26 @@ func (j *Journal) RecordCostWithBytes(kind, parent, name, reason string, charged
 	})
 }
 
+// RecordWorkCap durably records a narrowed script work sub-cap (in nano-USD)
+// in the campaign journal so subsequent invocations inherit the narrowed cap.
+func (j *Journal) RecordWorkCap(workCapNanoUSD int64) error {
+	if workCapNanoUSD <= 0 {
+		return fmt.Errorf("work_cap_nano_usd must be > 0, got %d", workCapNanoUSD)
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	if j.state.WorkCapNanoUSD > 0 && workCapNanoUSD > j.state.WorkCapNanoUSD {
+		return fmt.Errorf("work_cap_nano_usd must be monotone non-increasing (got %d > %d)", workCapNanoUSD, j.state.WorkCapNanoUSD)
+	}
+	return j.appendLocked(JournalRecord{
+		Event:          EventWorkCap,
+		WorkCapNanoUSD: workCapNanoUSD,
+	})
+}
+
 func (j *Journal) rollbackAndPoisonLocked(prevOffset int64, cause error) {
 	if j.f != nil {
 		_ = j.f.Truncate(prevOffset)
@@ -1132,6 +1155,7 @@ func (j *Journal) Compact() error {
 		Endpoint:       j.meta.Endpoint,
 		StartedAtUnix:  j.state.StartedAtUnix,
 		ChargedNanoUSD: j.state.ChargedNanoUSD,
+		WorkCapNanoUSD: j.state.WorkCapNanoUSD,
 		PayloadBytes:   BasePayloadBytes,
 		BucketsCreated: baseBuckets,
 		QueuesCreated:  baseQueues,
@@ -1430,7 +1454,7 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 			return errors.New("record endpoint contains unredacted userinfo, query, or fragment")
 		}
 	}
-	if rec.ReservedNanoUSD < 0 || rec.ChargedNanoUSD < 0 || rec.PayloadBytes < 0 ||
+	if rec.ReservedNanoUSD < 0 || rec.ChargedNanoUSD < 0 || rec.WorkCapNanoUSD < 0 || rec.PayloadBytes < 0 ||
 		rec.BucketsCreated < 0 || rec.QueuesCreated < 0 || rec.ObjectsCreated < 0 || rec.MessagesSent < 0 {
 		return errors.New("negative cost or counter amount in journal record")
 	}
@@ -1442,6 +1466,11 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 		}
 		return nil
 	case EventCost:
+		return nil
+	case EventWorkCap:
+		if rec.WorkCapNanoUSD <= 0 {
+			return errors.New("work_cap record requires work_cap_nano_usd > 0")
+		}
 		return nil
 	case EventReserve, EventSettle:
 		if err := ValidateToken128(rec.AttemptID); err != nil {
@@ -1602,6 +1631,15 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		state.QueuesCreated += rec.QueuesCreated
 		state.ObjectsCreated += rec.ObjectsCreated
 		state.MessagesSent += rec.MessagesSent
+		if rec.WorkCapNanoUSD > 0 && (state.WorkCapNanoUSD == 0 || rec.WorkCapNanoUSD < state.WorkCapNanoUSD) {
+			state.WorkCapNanoUSD = rec.WorkCapNanoUSD
+		}
+		return nil
+	}
+	if rec.Event == EventWorkCap {
+		if rec.WorkCapNanoUSD > 0 && (state.WorkCapNanoUSD == 0 || rec.WorkCapNanoUSD < state.WorkCapNanoUSD) {
+			state.WorkCapNanoUSD = rec.WorkCapNanoUSD
+		}
 		return nil
 	}
 	if rec.Event == EventCost {

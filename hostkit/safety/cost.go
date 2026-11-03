@@ -228,11 +228,15 @@ func (pt *PriceTable) Quote(in AttemptPricingInput) (AttemptQuote, error) {
 // CostSnapshot reports the current state of a CostMeter.
 type CostSnapshot struct {
 	CapNanoUSD             int64
+	ActiveCapNanoUSD       int64
+	ScriptWorkCapNanoUSD   int64
+	HasScriptWorkCap       bool
 	CeilingNanoUSD         int64
 	CleanupReserveNanoUSD  int64
 	WorkCeilingNanoUSD     int64
 	ChargedNanoUSD         int64
 	InFlightNanoUSD        int64
+	InFlightWorkNanoUSD    int64
 	ResourceCleanupNanoUSD int64
 }
 
@@ -241,18 +245,23 @@ func (s CostSnapshot) TotalCommittedNanoUSD() int64 {
 	return s.ChargedNanoUSD + s.InFlightNanoUSD + s.ResourceCleanupNanoUSD
 }
 
-// CostMeter enforces per-run cost caps, pre-attempt reservations, and the
-// dedicated teardown/cleanup reserve pool.
+// CostMeter enforces per-run cost caps, optional script-narrowed work sub-caps,
+// pre-attempt reservations, and the dedicated teardown/cleanup reserve pool
+// held inside the total approved ceiling.
 type CostMeter struct {
-	mu                     sync.Mutex
-	table                  *PriceTable
-	quoter                 AttemptQuoter
-	capNanoUSD             int64
-	ceilingNanoUSD         int64
-	cleanupReserveNanoUSD  int64
-	chargedNanoUSD         int64
-	inFlightNanoUSD        int64
-	resourceCleanupNanoUSD int64
+	mu                            sync.Mutex
+	table                         *PriceTable
+	quoter                        AttemptQuoter
+	capNanoUSD                    int64
+	scriptWorkCapNanoUSD          int64
+	hasScriptWorkCap              bool
+	ceilingNanoUSD                int64
+	cleanupReserveNanoUSD         int64
+	chargedNanoUSD                int64
+	inFlightNanoUSD               int64
+	inFlightWorkNanoUSD           int64
+	inFlightCleanupReserveNanoUSD int64
+	resourceCleanupNanoUSD        int64
 }
 
 // NewCostMeter constructs a CostMeter for policy and regional PriceTable.
@@ -294,8 +303,25 @@ func (m *CostMeter) RestoreCharged(chargedNanoUSD, resourceCleanupNanoUSD int64)
 	}
 }
 
-// SetCapUSD updates the active run cost cap (rejected if > ceiling or <= cleanup reserve
-// or below already committed spend).
+// RestoreWorkCap sets or narrows the script work sub-cap replayed from an existing journal.
+func (m *CostMeter) RestoreWorkCap(workCapNanoUSD int64) {
+	if m == nil || workCapNanoUSD <= 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	maxWork := m.capNanoUSD - m.cleanupReserveNanoUSD
+	if workCapNanoUSD > maxWork {
+		workCapNanoUSD = maxWork
+	}
+	if !m.hasScriptWorkCap || workCapNanoUSD < m.scriptWorkCapNanoUSD {
+		m.scriptWorkCapNanoUSD = workCapNanoUSD
+		m.hasScriptWorkCap = true
+	}
+}
+
+// SetCapUSD updates the operator total run cost cap (rejected if > ceiling or
+// > current operator cap or <= cleanup reserve or below already committed spend).
 func (m *CostMeter) SetCapUSD(capUSD float64) error {
 	if math.IsNaN(capUSD) || math.IsInf(capUSD, 0) || capUSD <= 0 {
 		return fmt.Errorf("invalid cost cap %v", capUSD)
@@ -307,6 +333,10 @@ func (m *CostMeter) SetCapUSD(capUSD float64) error {
 		return fmt.Errorf("%w: requested cap $%.4f exceeds hard ceiling $%.4f",
 			ErrCostCapExceeded, capUSD, NanoToUSD(m.ceilingNanoUSD))
 	}
+	if newCap > m.capNanoUSD {
+		return fmt.Errorf("%w: requested cap $%.4f exceeds active total cap $%.4f",
+			ErrCostCapExceeded, capUSD, NanoToUSD(m.capNanoUSD))
+	}
 	if newCap <= m.cleanupReserveNanoUSD {
 		return fmt.Errorf("requested cap $%.4f must exceed cleanup reserve $%.4f",
 			capUSD, NanoToUSD(m.cleanupReserveNanoUSD))
@@ -317,6 +347,63 @@ func (m *CostMeter) SetCapUSD(capUSD float64) error {
 			ErrCostCapExceeded, capUSD, NanoToUSD(committed))
 	}
 	m.capNanoUSD = newCap
+	if m.hasScriptWorkCap {
+		maxWork := m.capNanoUSD - m.cleanupReserveNanoUSD
+		if m.scriptWorkCapNanoUSD > maxWork {
+			m.scriptWorkCapNanoUSD = maxWork
+		}
+	}
+	return nil
+}
+
+// SetWorkCapUSD narrows the script-level non-cleanup work sub-cap within the
+// durable operator total ceiling (`CapNanoUSD <= CeilingNanoUSD`).
+//
+// Invariants enforced:
+//  1. Finite and > 0.
+//  2. Monotone non-increasing (`newWorkCap <= ActiveCapNanoUSD`).
+//  3. Preserves mandatory cleanup reserve (`CleanupReserveNanoUSD`) and locked /
+//     in-flight per-resource cleanup commitments inside `CapNanoUSD`:
+//     `newWorkCap + ResourceCleanupNanoUSD + InFlightCleanupReserveNanoUSD + CleanupReserveNanoUSD <= CapNanoUSD`.
+//  4. Covers all settled and in-flight work charges:
+//     `newWorkCap >= ChargedNanoUSD + InFlightWorkNanoUSD`.
+func (m *CostMeter) SetWorkCapUSD(workCapUSD float64) error {
+	if math.IsNaN(workCapUSD) || math.IsInf(workCapUSD, 0) || workCapUSD <= 0 {
+		return fmt.Errorf("invalid cost cap %v", workCapUSD)
+	}
+	newWorkCap := USDToNano(workCapUSD)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	activeCap := m.capNanoUSD
+	if m.hasScriptWorkCap && m.scriptWorkCapNanoUSD < activeCap {
+		activeCap = m.scriptWorkCapNanoUSD
+	}
+	if newWorkCap > activeCap {
+		return fmt.Errorf("%w: requested work cap $%.6f exceeds active cap $%.6f",
+			ErrCostCapExceeded, workCapUSD, NanoToUSD(activeCap))
+	}
+
+	maxWorkCap := m.capNanoUSD - m.cleanupReserveNanoUSD - m.resourceCleanupNanoUSD - m.inFlightCleanupReserveNanoUSD
+	if newWorkCap > maxWorkCap {
+		return fmt.Errorf("%w: requested work cap $%.6f leaves insufficient cleanup headroom within total cap $%.6f (cleanup reserve $%.6f, locked resource cleanup $%.6f, max work cap $%.6f)",
+			ErrCostCapExceeded,
+			workCapUSD,
+			NanoToUSD(m.capNanoUSD),
+			NanoToUSD(m.cleanupReserveNanoUSD),
+			NanoToUSD(m.resourceCleanupNanoUSD+m.inFlightCleanupReserveNanoUSD),
+			NanoToUSD(maxWorkCap),
+		)
+	}
+
+	committedWork := m.chargedNanoUSD + m.inFlightWorkNanoUSD
+	if newWorkCap < committedWork {
+		return fmt.Errorf("%w: requested work cap $%.6f is below already committed work spend $%.6f",
+			ErrCostCapExceeded, workCapUSD, NanoToUSD(committedWork))
+	}
+
+	m.scriptWorkCapNanoUSD = newWorkCap
+	m.hasScriptWorkCap = true
 	return nil
 }
 
@@ -324,13 +411,25 @@ func (m *CostMeter) SetCapUSD(capUSD float64) error {
 func (m *CostMeter) Snapshot() CostSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	workCeil := m.capNanoUSD - m.cleanupReserveNanoUSD
+	activeCap := m.capNanoUSD
+	if m.hasScriptWorkCap {
+		activeCap = m.scriptWorkCapNanoUSD
+		if m.scriptWorkCapNanoUSD < workCeil {
+			workCeil = m.scriptWorkCapNanoUSD
+		}
+	}
 	return CostSnapshot{
 		CapNanoUSD:             m.capNanoUSD,
+		ActiveCapNanoUSD:       activeCap,
+		ScriptWorkCapNanoUSD:   m.scriptWorkCapNanoUSD,
+		HasScriptWorkCap:       m.hasScriptWorkCap,
 		CeilingNanoUSD:         m.ceilingNanoUSD,
 		CleanupReserveNanoUSD:  m.cleanupReserveNanoUSD,
-		WorkCeilingNanoUSD:     m.capNanoUSD - m.cleanupReserveNanoUSD,
+		WorkCeilingNanoUSD:     workCeil,
 		ChargedNanoUSD:         m.chargedNanoUSD,
 		InFlightNanoUSD:        m.inFlightNanoUSD,
+		InFlightWorkNanoUSD:    m.inFlightWorkNanoUSD,
 		ResourceCleanupNanoUSD: m.resourceCleanupNanoUSD,
 	}
 }
@@ -380,9 +479,11 @@ func (r *AttemptReservation) Quote() AttemptQuote {
 
 // ReserveAttempt prices and reserves budget for a single HTTP attempt before dispatch.
 //
-// Ordinary work (`!in.IsCleanup`) must fit within `CapNanoUSD - CleanupReserveNanoUSD`
-// (default $0.04 out of $0.05), preserving the $0.01 cleanup reserve exclusively
-// for teardown/janitor operations (`in.IsCleanup == true`).
+// Ordinary work (`!in.IsCleanup`) must fit within both the optional narrowed
+// `ScriptWorkCapNanoUSD` (for work charges) AND `CapNanoUSD - CleanupReserveNanoUSD`
+// (default $0.04 out of $0.05), preserving the $0.01 cleanup reserve and locked
+// per-resource cleanup commitments inside `CapNanoUSD` (`<= CeilingNanoUSD`)
+// exclusively for teardown/janitor operations (`in.IsCleanup == true`).
 func (m *CostMeter) ReserveAttempt(in AttemptPricingInput) (*AttemptReservation, error) {
 	quote, err := m.QuoteAttempt(in)
 	if err != nil {
@@ -391,6 +492,14 @@ func (m *CostMeter) ReserveAttempt(in AttemptPricingInput) (*AttemptReservation,
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if !in.IsCleanup && m.hasScriptWorkCap {
+		projectedWork := m.chargedNanoUSD + m.inFlightWorkNanoUSD + quote.AttemptNanoUSD
+		if projectedWork > m.scriptWorkCapNanoUSD {
+			return nil, fmt.Errorf("%w: operation %s requires %d nano-USD work charge (projected %d > script work cap %d nano-USD / $%.6f)",
+				ErrCostCapExceeded, in.Operation, quote.AttemptNanoUSD, projectedWork, m.scriptWorkCapNanoUSD, NanoToUSD(m.scriptWorkCapNanoUSD))
+		}
+	}
 
 	needed := quote.AttemptNanoUSD + quote.CleanupReserveNanoUSD
 	projected := m.chargedNanoUSD + m.inFlightNanoUSD + m.resourceCleanupNanoUSD + needed
@@ -408,6 +517,10 @@ func (m *CostMeter) ReserveAttempt(in AttemptPricingInput) (*AttemptReservation,
 	}
 
 	m.inFlightNanoUSD += needed
+	if !in.IsCleanup {
+		m.inFlightWorkNanoUSD += quote.AttemptNanoUSD
+		m.inFlightCleanupReserveNanoUSD += quote.CleanupReserveNanoUSD
+	}
 	return &AttemptReservation{
 		meter: m,
 		quote: quote,
@@ -433,6 +546,16 @@ func (r *AttemptReservation) Commit(actualAttemptNanoUSD int64, lockCleanupReser
 	r.meter.inFlightNanoUSD -= reservedTotal
 	if r.meter.inFlightNanoUSD < 0 {
 		r.meter.inFlightNanoUSD = 0
+	}
+	if !r.quote.IsCleanup {
+		r.meter.inFlightWorkNanoUSD -= r.quote.AttemptNanoUSD
+		if r.meter.inFlightWorkNanoUSD < 0 {
+			r.meter.inFlightWorkNanoUSD = 0
+		}
+		r.meter.inFlightCleanupReserveNanoUSD -= r.quote.CleanupReserveNanoUSD
+		if r.meter.inFlightCleanupReserveNanoUSD < 0 {
+			r.meter.inFlightCleanupReserveNanoUSD = 0
+		}
 	}
 
 	charge := actualAttemptNanoUSD

@@ -10,6 +10,7 @@
       "PRECONDITION_FAILED",
       "UNAUTHENTICATED",
       "PERMISSION_DENIED",
+      "COST_CAP_EXCEEDED",
       "INTERNAL"
     ]
   },
@@ -184,6 +185,292 @@
           {
             "params": ["int"],
             "returns": "QueueMessage"
+          }
+        ]
+      }
+    },
+    "CostLineItem": {
+      "methods": {
+        "operation": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "service": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "requests": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "billing_units": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "bytes": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "unit_price_usd": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "byte_price_usd_per_gib": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "estimated_usd": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ]
+      }
+    },
+    "CostReport": {
+      "methods": {
+        "provider": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "price_table_version": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "cap_usd": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "ceiling_usd": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "estimated_usd": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "total_requests": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "total_units": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "total_bytes": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "cap_exceeded_count": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "len": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "at": [
+          {
+            "params": ["int"],
+            "returns": "CostLineItem"
+          }
+        ],
+        "item": [
+          {
+            "params": ["string"],
+            "returns": "CostLineItem"
+          }
+        ],
+        "summary": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ]
+      }
+    },
+    "OpMetrics": {
+      "methods": {
+        "operation": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "calls": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "errors": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "retries": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "throttles": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "bytes_in": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "bytes_out": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "min_ms": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "p50_ms": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "p95_ms": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "max_ms": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "mean_ms": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "total_ms": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ]
+      }
+    },
+    "MetricsReport": {
+      "methods": {
+        "elapsed_ms": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "total_calls": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "total_errors": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "total_retries": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "total_throttles": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "total_bytes_in": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "total_bytes_out": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "len": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "at": [
+          {
+            "params": ["int"],
+            "returns": "OpMetrics"
+          }
+        ],
+        "op": [
+          {
+            "params": ["string"],
+            "returns": "OpMetrics"
+          }
+        ],
+        "summary": [
+          {
+            "params": [],
+            "returns": "string"
           }
         ]
       }
@@ -478,6 +765,42 @@
           {
             "params": ["string", "string", "int"],
             "returns": "string"
+          }
+        ],
+        "cost_cap_usd": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "set_cost_cap_usd": [
+          {
+            "params": ["float"],
+            "returns": "self"
+          }
+        ],
+        "estimated_cost": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "cost_report": [
+          {
+            "params": [],
+            "returns": "CostReport"
+          }
+        ],
+        "metrics_reset": [
+          {
+            "params": [],
+            "returns": "self"
+          }
+        ],
+        "metrics": [
+          {
+            "params": [],
+            "returns": "MetricsReport"
           }
         ],
         "item_new": [

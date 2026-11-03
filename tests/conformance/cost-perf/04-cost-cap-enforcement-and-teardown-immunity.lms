@@ -1,0 +1,83 @@
+# Scenario 04: Cost cap enforcement (ErrorCode.COST_CAP_EXCEEDED) and reserved cleanup budget for resource delete operations inside the durable total ceiling.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bkt = "lmcloud-cp04-" + run_id + "-bkt";
+qname = "lmcloud-cp04-" + run_id + "-q";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("all", ep);
+  }
+  let b = ${bkt};
+  let q = ${qname};
+
+  # Create a bucket, put one object, and create a queue + send/receive/ack one message while under the default $0.05 operator total ceiling ($0.04 work + $0.01 cleanup reserve inside).
+  cloud.bucket_create(b);
+  cloud.object_put(b, "keep.txt", "seed");
+  cloud.queue_create(q);
+  cloud.queue_send(q, "msg-to-ack");
+
+  let rcpt = "";
+  let poll = 0;
+  while (str_len(rcpt) == 0 && poll < 10) {
+    let msgs = cloud.queue_receive(q, 1, 1, 30);
+    if (msgs.len() > 0) {
+      rcpt = msgs.at(0).receipt();
+    }
+    poll = poll + 1;
+  }
+  if (str_len(rcpt) > 0) {
+    cloud.queue_ack(q, rcpt);
+  }
+
+  # Narrow the script work sub-cap to the current settled work cost so any further non-cleanup operation is refused pre-flight, while the $0.01 cleanup reserve remains inside the durable $0.05 operator total ceiling (<= $0.25 hard ceiling).
+  let current_cost = cloud.estimated_cost();
+  cloud.set_cost_cap_usd(current_cost);
+  assert_close(cloud.cost_cap_usd(), current_cost, 0.000000001);
+
+  cloud.set_abort_on_error(false);
+
+  # Billable non-cleanup operations must be rejected pre-flight with ErrorCode.COST_CAP_EXCEEDED.
+  let put_blocked = cloud.object_put(b, "blocked.txt", "nope");
+  let err_put = cloud.last_error();
+
+  let get_blocked = cloud.object_get(b, "keep.txt");
+  let err_get = cloud.last_error();
+
+  let qsend_blocked = cloud.queue_send(q, "blocked-msg");
+  let err_qsend = cloud.last_error();
+
+  let cost_after_refusals = cloud.estimated_cost();
+  let rep_mid = cloud.cost_report();
+  assert_close(rep_mid.cap_usd(), current_cost, 0.000000001);
+  assert_close(rep_mid.ceiling_usd(), 0.25, 0.000000001);
+
+  # Resource deletion cleanup operations (object_delete, bucket_delete, queue_delete) draw from the reserved cleanup headroom inside the durable operator total ceiling ($0.05 <= $0.25) and succeed.
+  cloud.object_delete(b, "keep.txt");
+  let err_odel = cloud.last_error();
+
+  let bdel_ok = cloud.bucket_delete(b);
+  let err_bdel = cloud.last_error();
+
+  let qdel_ok = cloud.queue_delete(q);
+  let err_qdel = cloud.last_error();
+
+  let rep_after = cloud.cost_report();
+  assert_close(cost_after_refusals, current_cost, 0.000000001);
+  assert_close(cloud.cost_cap_usd(), current_cost, 0.000000001);
+
+  lmcode_return_put("put_refused", !put_blocked.exists() && err_put.code() == ErrorCode.COST_CAP_EXCEEDED && err_put.http_status() == 0 && err_put.provider_code() == "CostCapExceeded");
+  lmcode_return_put("get_refused", str_len(get_blocked) == 0 && err_get.code() == ErrorCode.COST_CAP_EXCEEDED && err_get.http_status() == 0);
+  lmcode_return_put("qsend_refused", str_len(qsend_blocked) == 0 && err_qsend.code() == ErrorCode.COST_CAP_EXCEEDED && err_qsend.http_status() == 0);
+  lmcode_return_put("cap_exceeded_count_ok", rep_mid.cap_exceeded_count() == 3);
+  lmcode_return_put("teardown_immune_ok", str_len(rcpt) > 0 && err_odel.ok() && bdel_ok && err_bdel.ok() && qdel_ok && err_qdel.ok() && rep_after.estimated_usd() <= 0.05 && rep_after.estimated_usd() <= rep_after.ceiling_usd());
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "04-cost-cap-enforcement-and-teardown-immunity failed");
+assert(r.result.put_refused, "object_put above cap must fail pre-flight with COST_CAP_EXCEEDED and provider_code CostCapExceeded");
+assert(r.result.get_refused, "object_get above cap must fail pre-flight with COST_CAP_EXCEEDED");
+assert(r.result.qsend_refused, "queue_send above cap must fail pre-flight with COST_CAP_EXCEEDED");
+assert(r.result.cap_exceeded_count_ok, "cost_report().cap_exceeded_count() must equal 3 after 3 refused operations");
+assert(r.result.teardown_immune_ok, "object_delete, bucket_delete, and queue_delete must succeed using reserved cleanup headroom within the durable total ceiling");

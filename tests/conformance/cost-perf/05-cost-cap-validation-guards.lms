@@ -1,0 +1,75 @@
+# Scenario 05: Pre-flight validation guards on set_cost_cap_usd (<= 0, > operator cap / $0.25 ceiling, raising after narrowing, or below accrued spend).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bkt = "lmcloud-cp05-" + run_id + "-bkt";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("all", ep);
+  }
+  let b = ${bkt};
+
+  cloud.set_abort_on_error(false);
+
+  # 1. Zero and negative caps must fail with INVALID_ARGUMENT
+  cloud.set_cost_cap_usd(0.0);
+  let e_zero = cloud.last_error();
+
+  cloud.set_cost_cap_usd(-0.05);
+  let e_neg = cloud.last_error();
+
+  # 2. Caps above the operator's initial cap ($0.05) or above the $0.25 hard ceiling must fail with INVALID_ARGUMENT
+  # (scripts can only LOWER or keep equal the active cap, never raise it).
+  cloud.set_cost_cap_usd(0.06);
+  let e_raise_above_op = cloud.last_error();
+
+  cloud.set_cost_cap_usd(0.250001);
+  let e_over = cloud.last_error();
+
+  cloud.set_cost_cap_usd(1.00);
+  let e_one = cloud.last_error();
+
+  # Active cap must still be the initial 0.05
+  let cap_unchanged = cloud.cost_cap_usd();
+
+  # 3. Narrowing the cap from 0.05 to 0.04 must succeed, and attempting to raise it back to 0.05 must fail
+  cloud.set_cost_cap_usd(0.04);
+  let e_narrow_ok = cloud.last_error();
+  let cap_narrowed = cloud.cost_cap_usd();
+
+  cloud.set_cost_cap_usd(0.05);
+  let e_raise_after_narrow = cloud.last_error();
+
+  # 4. Accrue non-zero cost, then verify lowering cap below accrued spend fails with INVALID_ARGUMENT
+  cloud.bucket_create(b);
+  cloud.object_put(b, "k.txt", "value");
+  let spent = cloud.estimated_cost();
+
+  cloud.set_cost_cap_usd(spent * 0.5);
+  let e_below_spent = cloud.last_error();
+  let cap_after_below = cloud.cost_cap_usd();
+
+  # Clean up
+  cloud.object_delete(b, "k.txt");
+  cloud.bucket_delete(b);
+
+  assert_close(cap_unchanged, 0.05, 0.000000001);
+  assert_close(cap_narrowed, 0.04, 0.000000001);
+  assert_close(cap_after_below, 0.04, 0.000000001);
+
+  lmcode_return_put("zero_rejected", e_zero.code() == ErrorCode.INVALID_ARGUMENT && e_zero.http_status() == 0);
+  lmcode_return_put("neg_rejected", e_neg.code() == ErrorCode.INVALID_ARGUMENT && e_neg.http_status() == 0);
+  lmcode_return_put("over_rejected", e_raise_above_op.code() == ErrorCode.INVALID_ARGUMENT && e_over.code() == ErrorCode.INVALID_ARGUMENT && e_over.http_status() == 0);
+  lmcode_return_put("one_rejected", e_one.code() == ErrorCode.INVALID_ARGUMENT && e_one.http_status() == 0);
+  lmcode_return_put("narrow_accepted_raise_rejected", e_narrow_ok.ok() && e_narrow_ok.code() == ErrorCode.OK && e_raise_after_narrow.code() == ErrorCode.INVALID_ARGUMENT);
+  lmcode_return_put("below_spent_rejected", spent > 0.0 && e_below_spent.code() == ErrorCode.INVALID_ARGUMENT && e_below_spent.http_status() == 0);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "05-cost-cap-validation-guards failed");
+assert(r.result.zero_rejected, "set_cost_cap_usd(0.0) must fail with INVALID_ARGUMENT");
+assert(r.result.neg_rejected, "set_cost_cap_usd(-0.05) must fail with INVALID_ARGUMENT");
+assert(r.result.over_rejected && r.result.one_rejected, "set_cost_cap_usd above operator cap or ceiling must fail with INVALID_ARGUMENT");
+assert(r.result.narrow_accepted_raise_rejected, "narrowing set_cost_cap_usd(0.04) must succeed and raising it back must fail");
+assert(r.result.below_spent_rejected, "set_cost_cap_usd below already-accrued estimated_cost() must fail with INVALID_ARGUMENT");

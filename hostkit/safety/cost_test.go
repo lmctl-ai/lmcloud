@@ -4,6 +4,7 @@ package safety
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -134,5 +135,130 @@ func TestCostMeter_ReservationsAndCleanupReserve(t *testing.T) {
 	}
 	if zq.AttemptNanoUSD != 5000 || zq.CleanupReserveNanoUSD != 10000 {
 		t.Fatalf("expected zeroQuoter to be clamped to base (5000, 10000), got %+v", zq)
+	}
+}
+
+func TestCostMeter_ScriptWorkSubCapAndCleanupHeadroom(t *testing.T) {
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	pt, err := LoadEmbeddedPriceTable("aws", "us-east-1", now)
+	if err != nil {
+		t.Fatalf("LoadEmbeddedPriceTable: %v", err)
+	}
+
+	// 1. Even if the operator sets TotalCapUSD to the $0.25 hard ceiling, the $0.01
+	// cleanup reserve is held INSIDE $0.25, so a script work sub-cap of $0.25
+	// ($0.25 work + $0.01 cleanup = $0.26 > $0.25) is rejected with ErrCostCapExceeded.
+	maxMeter, err := NewCostMeter(CostPolicy{
+		CapUSD:            HardCostCeilingUSD,
+		CeilingUSD:        HardCostCeilingUSD,
+		CleanupReserveUSD: DefaultCleanupReserveUSD,
+	}, pt, nil)
+	if err != nil {
+		t.Fatalf("NewCostMeter max: %v", err)
+	}
+	if err := maxMeter.SetWorkCapUSD(0.25); !errors.Is(err, ErrCostCapExceeded) {
+		t.Fatalf("expected SetWorkCapUSD(0.25) under $0.25 total cap to fail with ErrCostCapExceeded, got %v", err)
+	}
+	if err := maxMeter.SetWorkCapUSD(0.24); err != nil {
+		t.Fatalf("expected SetWorkCapUSD(0.24) under $0.25 total cap to succeed, got %v", err)
+	}
+
+	// 2. Default $0.05 total cap ($0.01 cleanup reserve inside):
+	// Create a bucket (5,000 ns work + 10,000 ns locked resource cleanup reserve),
+	// then narrow the script work sub-cap down to exact settled work spend ($0.000005).
+	meter, err := NewCostMeter(CostPolicy{
+		CapUSD:            DefaultCostCapUSD,
+		CeilingUSD:        HardCostCeilingUSD,
+		CleanupReserveUSD: DefaultCleanupReserveUSD,
+	}, pt, nil)
+	if err != nil {
+		t.Fatalf("NewCostMeter default: %v", err)
+	}
+	res, err := meter.ReserveAttempt(AttemptPricingInput{Operation: "bucket_create"})
+	if err != nil {
+		t.Fatalf("ReserveAttempt bucket_create: %v", err)
+	}
+	res.Commit(-1, true)
+
+	// Narrowing work cap to > $0.04 minus locked resource cleanup fails.
+	if err := meter.SetWorkCapUSD(0.04); !errors.Is(err, ErrCostCapExceeded) {
+		t.Fatalf("expected SetWorkCapUSD(0.04) with locked resource cleanup to fail, got %v", err)
+	}
+	// Narrowing work cap below settled work spend (5,000 ns = $0.000005) fails.
+	if err := meter.SetWorkCapUSD(0.000004); !errors.Is(err, ErrCostCapExceeded) {
+		t.Fatalf("expected SetWorkCapUSD(0.000004) below settled work spend to fail, got %v", err)
+	}
+	// Narrowing work cap to exact settled work spend (5,000 ns = $0.000005) succeeds
+	// even though ResourceCleanupNanoUSD (10,000 ns) is locked!
+	if err := meter.SetWorkCapUSD(0.000005); err != nil {
+		t.Fatalf("SetWorkCapUSD(0.000005) failed: %v", err)
+	}
+	snap := meter.Snapshot()
+	if !snap.HasScriptWorkCap || snap.ActiveCapNanoUSD != 5000 || snap.WorkCeilingNanoUSD != 5000 || snap.CapNanoUSD != 50_000_000 {
+		t.Fatalf("unexpected snapshot after SetWorkCapUSD: %+v", snap)
+	}
+
+	// Monotone non-increasing: attempting to raise work cap back to $0.01 fails.
+	if err := meter.SetWorkCapUSD(0.01); !errors.Is(err, ErrCostCapExceeded) {
+		t.Fatalf("expected non-monotone SetWorkCapUSD(0.01) to fail, got %v", err)
+	}
+
+	// Ordinary non-cleanup work (including queue_ack or bucket_exists) is now refused.
+	if _, err := meter.ReserveAttempt(AttemptPricingInput{Operation: "bucket_exists", IsCleanup: false}); !errors.Is(err, ErrCostCapExceeded) {
+		t.Fatalf("expected bucket_exists to fail after work cap narrowed to settled spend, got %v", err)
+	}
+	if _, err := meter.ReserveAttempt(AttemptPricingInput{Operation: "queue_ack", IsCleanup: false}); !errors.Is(err, ErrCostCapExceeded) {
+		t.Fatalf("expected queue_ack (ordinary work) to fail after work cap narrowed, got %v", err)
+	}
+
+	// Cleanup operation (IsCleanup: true) succeeds using reserved cleanup headroom inside the $0.05 total cap!
+	delRes, err := meter.ReserveAttempt(AttemptPricingInput{Operation: "bucket_delete", IsCleanup: true})
+	if err != nil {
+		t.Fatalf("expected bucket_delete (IsCleanup: true) to succeed under narrowed work cap, got %v", err)
+	}
+	delRes.Commit(-1, false)
+	meter.ReleaseResourceCleanup(10_000)
+
+	// 3. Journal persistence across compaction and reopen.
+	dir := filepath.Join(t.TempDir(), "journals")
+	pol := DefaultAWSLivePolicy(dir, true)
+	runID := "run-1710000000-0123456789ab"
+	j, err := OpenJournal(dir, JournalMeta{
+		RunID:      runID,
+		PolicyHash: pol.Hash(),
+		Provider:   "aws",
+		Account:    "123456789012",
+		Scope:      "123456789012",
+		Region:     "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+	if err := j.RecordCost(KindBucket, "", "lmcloud-conf-0123456789ab-b1", "bucket_create", 5000); err != nil {
+		t.Fatalf("RecordCost: %v", err)
+	}
+	if err := j.RecordWorkCap(5000); err != nil {
+		t.Fatalf("RecordWorkCap: %v", err)
+	}
+	if err := j.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	st := j.State()
+	_ = j.Close()
+	if st.WorkCapNanoUSD != 5000 {
+		t.Fatalf("expected WorkCapNanoUSD=5000 after Compact, got %d", st.WorkCapNanoUSD)
+	}
+
+	childMeter, err := NewCostMeter(pol.Cost, pt, nil)
+	if err != nil {
+		t.Fatalf("NewCostMeter child: %v", err)
+	}
+	RestoreMeterFromState(childMeter, pt, st)
+	childSnap := childMeter.Snapshot()
+	if !childSnap.HasScriptWorkCap || childSnap.ActiveCapNanoUSD != 5000 || childSnap.ChargedNanoUSD != 5000 {
+		t.Fatalf("unexpected child meter snapshot after RestoreMeterFromState: %+v", childSnap)
+	}
+	if _, err := childMeter.ReserveAttempt(AttemptPricingInput{Operation: "bucket_exists", IsCleanup: false}); !errors.Is(err, ErrCostCapExceeded) {
+		t.Fatalf("expected child invocation ordinary work to fail under inherited narrowed work cap, got %v", err)
 	}
 }

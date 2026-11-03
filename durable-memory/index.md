@@ -18,6 +18,10 @@
 - [12-tables-design.md](12-tables-design.md): Slice 5 key/value tables — flat `table_*`/`item_*` on `cloud`, key-only vs sorted tables, `TableItem` typed attribute model (string/int/float/bool, ≤240 attrs, ≤256 KiB canonical), conditional puts (only-if-absent / only-if-version), partition query with sort-key range + pagination, bounded unordered scan, per-provider mapping (DynamoDB / Azure Table / Firestore gRPC / OCI NoSQL-pending), error model, exclusions, decisions. Live sim evidence captured 2026-11-02.
 - [13-tables-conformance.md](13-tables-conformance.md): 14 cross-provider tables conformance scenarios (`tests/conformance/tables/01..14-*.lms`), runner support for slice `tables` plus the explicit capability-skip mechanism (`tests/capabilities.conf`; OCI tables = `pending(oci-nosql-epic)`), and evidence-backed simulator enhancements A1/A2/G1/G2/O1.
 
+### Slice 3 — Cost & Performance
+- [10-cost-perf-design.md](10-cost-perf-design.md): Slice 3 cross-cutting Cost & Performance design (`cost_cap_usd`, monotone-decreasing `set_cost_cap_usd`, `estimated_cost`, `cost_report`, `metrics_reset`, `metrics`; types `CostReport`, `CostLineItem`, `MetricsReport`, `OpMetrics`; `ErrorCode.COST_CAP_EXCEEDED`, physical pre-attempt/page/probe reservations, shared campaign budget authority, reserved cleanup headroom, regional vs synthetic simulator price tables, and streaming all-call metrics + bounded 10,000-sample quantile ring buffer).
+- [11-cost-perf-conformance.md](11-cost-perf-conformance.md): 10 cross-provider cost & performance conformance scenarios (`tests/conformance/cost-perf/01..10-*.lms`) and `tests/run-conformance.sh` `--check` embedded `_lmcode_` compilation gate across all slices (`35/35` passing).
+
 ## Status (integration branch)
 
 - Four Go hosts implement the shared schema on `hostkit` and pass the 25 conformance programs against their simulators: `lmoci` (ocisim), `lmazure` (azuresim), `lmaws` (awssim), `lmgcp` (gcpsim, `lmgcp cloud`). Hosts are sim/fake only: live cloud support is deliberately not implemented and fails with `UNAUTHENTICATED` / `LiveCredentialsNotImplemented`.
