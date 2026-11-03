@@ -110,17 +110,49 @@ type message struct {
 	VisibleAt int64
 }
 
+type tableItem struct {
+	PK      string                  `json:"pk"`
+	SK      string                  `json:"sk,omitempty"`
+	Version string                  `json:"version"`
+	Attrs   map[string]hostkit.Attr `json:"attrs,omitempty"`
+}
+
+func (ti *tableItem) toHostkit() hostkit.Item {
+	attrs := make(map[string]hostkit.Attr, len(ti.Attrs))
+	for k, v := range ti.Attrs {
+		attrs[k] = v.Clone()
+	}
+	return hostkit.Item{
+		PK:      ti.PK,
+		SK:      ti.SK,
+		Version: ti.Version,
+		Exists:  true,
+		Attrs:   attrs,
+	}
+}
+
+type tableState struct {
+	Sorted bool                  `json:"sorted"`
+	Items  map[string]*tableItem `json:"items"`
+}
+
 type state struct {
 	Seq     int64
 	Buckets map[string]map[string]*object
 	Queues  map[string][]*message
+	Tables  map[string]*tableState `json:",omitempty"`
 	// Create tokens stored atomically with each create (hostkit.CreateToken).
 	BucketTokens map[string]string `json:",omitempty"`
 	QueueTokens  map[string]string `json:",omitempty"`
+	TableTokens  map[string]string `json:",omitempty"`
 }
 
 func newState() *state {
-	return &state{Buckets: map[string]map[string]*object{}, Queues: map[string][]*message{}}
+	return &state{
+		Buckets: map[string]map[string]*object{},
+		Queues:  map[string][]*message{},
+		Tables:  map[string]*tableState{},
+	}
 }
 
 // New returns a fake adapter.
@@ -135,7 +167,11 @@ func New(opts Options) *Fake {
 }
 
 // Mutators are the adapter methods that change state; a dry run must call none of them.
-var Mutators = []string{"CreateBucket", "DeleteBucket", "PutObject", "DeleteObject", "CreateQueue", "DeleteQueue", "Send", "Receive", "Ack", "Nack"}
+var Mutators = []string{
+	"CreateBucket", "DeleteBucket", "PutObject", "DeleteObject",
+	"CreateQueue", "DeleteQueue", "Send", "Receive", "Ack", "Nack",
+	"CreateTable", "DeleteTable", "PutItem", "DeleteItem", "UpdateItem",
+}
 
 // Calls returns a copy of the per-method call counters.
 func (f *Fake) Calls() map[string]int {
@@ -184,6 +220,9 @@ func (f *Fake) do(name string, fn func(s *state) error) error {
 		}
 		if s.Queues == nil {
 			s.Queues = map[string][]*message{}
+		}
+		if s.Tables == nil {
+			s.Tables = map[string]*tableState{}
 		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state read: "+err.Error())
@@ -622,4 +661,287 @@ func (f *Fake) Nack(_ context.Context, q, receipt string, visibility int) (strin
 		return f.notFound(hostkit.AbsentMessage, "MessageNotFound", "no in-flight message for receipt")
 	})
 	return next, err
+}
+
+// ---- Tables ----
+
+func tableItemKey(pk, sk string) string {
+	if sk == "" {
+		return pk
+	}
+	return pk + "\x00" + sk
+}
+
+func checkTableLayout(tbl *tableState, name, sk string) *hostkit.CloudError {
+	if tbl.Sorted && sk == "" {
+		return hostkit.Preflightf("table %q has a composite key and requires a sort key (sk)", name)
+	}
+	if !tbl.Sorted && sk != "" {
+		return hostkit.Preflightf("table %q is partition-key-only and does not accept a sort key (sk)", name)
+	}
+	return nil
+}
+
+func nextItemVersion(s *state, table, pk, sk string) string {
+	s.Seq++
+	sum := sha256.Sum256([]byte(table + "\x00" + pk + "\x00" + sk + "\x00" + strconv.FormatInt(s.Seq, 10)))
+	return hex.EncodeToString(sum[:16])
+}
+
+// TableCreateToken returns the create token stored with the table.
+func (f *Fake) TableCreateToken(_ context.Context, name string) (string, error) {
+	var tok string
+	err := f.do("TableCreateToken", func(s *state) error {
+		if _, ok := s.Tables[name]; !ok {
+			return f.notFound(hostkit.AbsentTable, "ResourceNotFoundException", "table not found")
+		}
+		tok = s.TableTokens[name]
+		return nil
+	})
+	return tok, err
+}
+
+func (f *Fake) CreateTable(ctx context.Context, name string, sorted bool) (bool, error) {
+	if f.opts.EchoCreateToken {
+		f.mu.Lock()
+		f.calls["CreateTable"]++
+		f.mu.Unlock()
+		return false, f.echoToken(ctx, "table")
+	}
+	created := false
+	err := f.do("CreateTable", func(s *state) error {
+		if existing, ok := s.Tables[name]; ok {
+			if existing.Sorted != sorted {
+				return hostkit.ProviderError(hostkit.Conflict, 409, "ResourceInUseException", "table already exists with a different key layout")
+			}
+			if tok := hostkit.CreateToken(ctx); tok != "" && s.TableTokens[name] == tok {
+				created = true
+			}
+			return nil
+		}
+		s.Tables[name] = &tableState{Sorted: sorted, Items: map[string]*tableItem{}}
+		setToken(&s.TableTokens, name, hostkit.CreateToken(ctx))
+		created = true
+		return nil
+	})
+	return created, err
+}
+
+func (f *Fake) DeleteTable(_ context.Context, name string) error {
+	return f.do("DeleteTable", func(s *state) error {
+		if _, ok := s.Tables[name]; !ok {
+			return f.notFound(hostkit.AbsentTable, "ResourceNotFoundException", "table not found")
+		}
+		delete(s.Tables, name)
+		delete(s.TableTokens, name)
+		return nil
+	})
+}
+
+func (f *Fake) HeadTable(_ context.Context, name string) error {
+	return f.do("HeadTable", func(s *state) error {
+		if _, ok := s.Tables[name]; !ok {
+			return f.notFound(hostkit.AbsentTable, "ResourceNotFoundException", "table not found")
+		}
+		return nil
+	})
+}
+
+func (f *Fake) ListTables(_ context.Context, token string) ([]string, string, error) {
+	var names []string
+	var next string
+	err := f.do("ListTables", func(s *state) error {
+		all := make([]string, 0, len(s.Tables))
+		for t := range s.Tables {
+			if t == "lmcloudmeta" {
+				continue
+			}
+			all = append(all, t)
+		}
+		var err error
+		names, next, err = page(all, token, f.opts.PageSize)
+		return err
+	})
+	return names, next, err
+}
+
+func (f *Fake) PutItem(_ context.Context, table string, item hostkit.Item, mode hostkit.PutMode, expectVersion string) (hostkit.Item, error) {
+	var out hostkit.Item
+	err := f.do("PutItem", func(s *state) error {
+		tbl, ok := s.Tables[table]
+		if !ok {
+			return f.notFound(hostkit.AbsentTable, "ResourceNotFoundException", "table not found")
+		}
+		if e := checkTableLayout(tbl, table, item.SK); e != nil {
+			return e
+		}
+		if tbl.Items == nil {
+			tbl.Items = map[string]*tableItem{}
+		}
+		ik := tableItemKey(item.PK, item.SK)
+		existing, exists := tbl.Items[ik]
+		switch mode {
+		case hostkit.PutUnconditional:
+		case hostkit.PutIfAbsent:
+			if exists {
+				return hostkit.ProviderError(hostkit.Conflict, 409, "ConditionalCheckFailedException", "item already exists")
+			}
+		case hostkit.PutIfVersion:
+			if !exists {
+				return f.notFound(hostkit.AbsentItem, "ConditionalCheckFailedException", "item not found")
+			}
+			if existing.Version != expectVersion {
+				return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "ConditionalCheckFailedException", "item version mismatch")
+			}
+		default:
+			return hostkit.ProviderError(hostkit.Internal, 0, "", "unknown PutMode")
+		}
+		attrs := make(map[string]hostkit.Attr, len(item.Attrs))
+		for k, v := range item.Attrs {
+			attrs[k] = v.Clone()
+		}
+		stored := &tableItem{
+			PK:      item.PK,
+			SK:      item.SK,
+			Version: nextItemVersion(s, table, item.PK, item.SK),
+			Attrs:   attrs,
+		}
+		tbl.Items[ik] = stored
+		out = stored.toHostkit()
+		return nil
+	})
+	return out, err
+}
+
+func (f *Fake) GetItem(_ context.Context, table, pk, sk string) (hostkit.Item, error) {
+	var out hostkit.Item
+	err := f.do("GetItem", func(s *state) error {
+		tbl, ok := s.Tables[table]
+		if !ok {
+			return f.notFound(hostkit.AbsentTable, "ResourceNotFoundException", "table not found")
+		}
+		if e := checkTableLayout(tbl, table, sk); e != nil {
+			return e
+		}
+		it, ok := tbl.Items[tableItemKey(pk, sk)]
+		if !ok {
+			return f.notFound(hostkit.AbsentItem, "ItemNotFound", "item not found")
+		}
+		out = it.toHostkit()
+		return nil
+	})
+	return out, err
+}
+
+func (f *Fake) DeleteItem(_ context.Context, table, pk, sk string) error {
+	return f.do("DeleteItem", func(s *state) error {
+		tbl, ok := s.Tables[table]
+		if !ok {
+			return f.notFound(hostkit.AbsentTable, "ResourceNotFoundException", "table not found")
+		}
+		if e := checkTableLayout(tbl, table, sk); e != nil {
+			return e
+		}
+		ik := tableItemKey(pk, sk)
+		if _, ok := tbl.Items[ik]; !ok {
+			return f.notFound(hostkit.AbsentItem, "ItemNotFound", "item not found")
+		}
+		delete(tbl.Items, ik)
+		return nil
+	})
+}
+
+func (f *Fake) UpdateItem(_ context.Context, table, pk, sk string, changes hostkit.Item) (hostkit.Item, error) {
+	var out hostkit.Item
+	err := f.do("UpdateItem", func(s *state) error {
+		tbl, ok := s.Tables[table]
+		if !ok {
+			return f.notFound(hostkit.AbsentTable, "ResourceNotFoundException", "table not found")
+		}
+		if e := checkTableLayout(tbl, table, sk); e != nil {
+			return e
+		}
+		ik := tableItemKey(pk, sk)
+		existing, ok := tbl.Items[ik]
+		if !ok {
+			return f.notFound(hostkit.AbsentItem, "ResourceNotFoundException", "item not found")
+		}
+		merged := make(map[string]hostkit.Attr, len(existing.Attrs)+len(changes.Attrs))
+		for k, v := range existing.Attrs {
+			merged[k] = v.Clone()
+		}
+		for k, v := range changes.Attrs {
+			merged[k] = v.Clone()
+		}
+		if _, cerr := hostkit.CanonicalItemBytes(merged); cerr != nil {
+			return cerr
+		}
+		existing.Attrs = merged
+		existing.Version = nextItemVersion(s, table, pk, sk)
+		out = existing.toHostkit()
+		return nil
+	})
+	return out, err
+}
+
+func (f *Fake) Query(_ context.Context, table, pk, skFrom, skTo string, max int, token string) (hostkit.TablePage, error) {
+	var out hostkit.TablePage
+	err := f.do("Query", func(s *state) error {
+		tbl, ok := s.Tables[table]
+		if !ok {
+			return f.notFound(hostkit.AbsentTable, "ResourceNotFoundException", "table not found")
+		}
+		if !tbl.Sorted && (skFrom != "" || skTo != "") {
+			return hostkit.Preflightf("sort key range [sk_from, sk_to) is not valid on partition-key-only table %q", table)
+		}
+		var keys []string
+		for k, it := range tbl.Items {
+			if it.PK != pk {
+				continue
+			}
+			if tbl.Sorted {
+				if skFrom != "" && it.SK < skFrom {
+					continue
+				}
+				if skTo != "" && it.SK >= skTo {
+					continue
+				}
+			}
+			keys = append(keys, k)
+		}
+		names, next, err := page(keys, token, min(max, f.opts.PageSize))
+		if err != nil {
+			return err
+		}
+		for _, k := range names {
+			out.Items = append(out.Items, tbl.Items[k].toHostkit())
+		}
+		out.NextToken = next
+		return nil
+	})
+	return out, err
+}
+
+func (f *Fake) Scan(_ context.Context, table string, max int, token string) (hostkit.TablePage, error) {
+	var out hostkit.TablePage
+	err := f.do("Scan", func(s *state) error {
+		tbl, ok := s.Tables[table]
+		if !ok {
+			return f.notFound(hostkit.AbsentTable, "ResourceNotFoundException", "table not found")
+		}
+		keys := make([]string, 0, len(tbl.Items))
+		for k := range tbl.Items {
+			keys = append(keys, k)
+		}
+		names, next, err := page(keys, token, min(max, f.opts.PageSize))
+		if err != nil {
+			return err
+		}
+		for _, k := range names {
+			out.Items = append(out.Items, tbl.Items[k].toHostkit())
+		}
+		out.NextToken = next
+		return nil
+	})
+	return out, err
 }

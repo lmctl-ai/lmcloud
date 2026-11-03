@@ -52,6 +52,8 @@ const (
 	AbsentObject  Absence = "object"
 	AbsentQueue   Absence = "queue"
 	AbsentMessage Absence = "message"
+	AbsentTable   Absence = "table"
+	AbsentItem    Absence = "item"
 )
 
 // CloudError is the structured last_error value.

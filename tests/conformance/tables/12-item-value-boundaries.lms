@@ -152,7 +152,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
-assert(r.ok, "12 host execution failed");
+assert(r.ok, "12 host execution failed: " + r.get("message", ""));
 assert(r.result.key_ok, "255-byte key must be accepted");
 assert(r.result.ints_ok, "int64 min/max round-trip");
 assert(r.result.strfit_ok && r.result.str_over_invalid, "32768 UTF-16 units OK, 32769 units pre-flight INVALID_ARGUMENT");

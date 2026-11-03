@@ -220,6 +220,8 @@ type replayedCampaignState struct {
 	activeBuckets          map[string]int64
 	activeObjects          map[string]int64
 	activeQueues           map[string]int64
+	activeTables           map[string]int64
+	activeItems            map[string]int64
 	pending                map[string]campaignJournalRecord
 }
 
@@ -254,7 +256,7 @@ type liveGuardProvider interface {
 	LiveGuard() *safety.LiveGuard
 }
 
-func extractLiveGuard(store hostkit.ObjectStore, queue hostkit.Queue) *safety.LiveGuard {
+func extractLiveGuard(store hostkit.ObjectStore, queue hostkit.Queue, tables hostkit.Tables) *safety.LiveGuard {
 	if gs, ok := store.(guardStore); ok {
 		store = gs.s
 	}
@@ -265,6 +267,12 @@ func extractLiveGuard(store hostkit.ObjectStore, queue hostkit.Queue) *safety.Li
 		queue = gq.q
 	}
 	if lp, ok := queue.(liveGuardProvider); ok && lp.LiveGuard() != nil {
+		return lp.LiveGuard()
+	}
+	if gt, ok := tables.(guardTables); ok {
+		tables = gt.t
+	}
+	if lp, ok := tables.(liveGuardProvider); ok && lp.LiveGuard() != nil {
 		return lp.LiveGuard()
 	}
 	return nil
@@ -287,6 +295,8 @@ type costTracker struct {
 	activeBuckets        map[string]int64
 	activeObjects        map[string]int64
 	activeQueues         map[string]int64
+	activeTables         map[string]int64
+	activeItems          map[string]int64
 	inFlightAttempts     map[string]bool
 }
 
@@ -337,7 +347,7 @@ func newCostTracker(cfg Config) *costTracker {
 		provider = "ref"
 	}
 
-	lg := extractLiveGuard(cfg.Store, cfg.Queue)
+	lg := extractLiveGuard(cfg.Store, cfg.Queue, cfg.Tables)
 	liveMode := isLiveModeEnv() || lg != nil
 
 	ct := &costTracker{
@@ -351,6 +361,8 @@ func newCostTracker(cfg Config) *costTracker {
 		activeBuckets:    map[string]int64{},
 		activeObjects:    map[string]int64{},
 		activeQueues:     map[string]int64{},
+		activeTables:     map[string]int64{},
+		activeItems:      map[string]int64{},
 		inFlightAttempts: map[string]bool{},
 	}
 
@@ -600,6 +612,8 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 		activeBuckets: map[string]int64{},
 		activeObjects: map[string]int64{},
 		activeQueues:  map[string]int64{},
+		activeTables:  map[string]int64{},
+		activeItems:   map[string]int64{},
 		pending:       map[string]campaignJournalRecord{},
 	}
 	if len(raw) == 0 {
@@ -724,6 +738,14 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 					if _, exists := st.activeQueues[p.ResKey]; !exists {
 						st.activeQueues[p.ResKey] = p.CleanupReserveNanoUSD
 					}
+				case safety.KindTable:
+					if _, exists := st.activeTables[p.ResKey]; !exists {
+						st.activeTables[p.ResKey] = p.CleanupReserveNanoUSD
+					}
+				case safety.KindTableItem:
+					if _, exists := st.activeItems[p.ResKey]; !exists {
+						st.activeItems[p.ResKey] = p.CleanupReserveNanoUSD
+					}
 				}
 			}
 			if rec.ReleaseCleanup && p.ResKey != "" {
@@ -734,6 +756,10 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 					delete(st.activeObjects, p.ResKey)
 				case safety.KindQueue:
 					delete(st.activeQueues, p.ResKey)
+				case safety.KindTable:
+					delete(st.activeTables, p.ResKey)
+				case safety.KindTableItem:
+					delete(st.activeItems, p.ResKey)
 				}
 			}
 		default:
@@ -748,6 +774,12 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 		st.resourceCleanupNanoUSD += v
 	}
 	for _, v := range st.activeQueues {
+		st.resourceCleanupNanoUSD += v
+	}
+	for _, v := range st.activeTables {
+		st.resourceCleanupNanoUSD += v
+	}
+	for _, v := range st.activeItems {
 		st.resourceCleanupNanoUSD += v
 	}
 	return st, nil
@@ -770,6 +802,14 @@ func (ct *costTracker) applyReplayedStateLocked(st *replayedCampaignState) {
 	ct.activeQueues = make(map[string]int64, len(st.activeQueues))
 	for k, v := range st.activeQueues {
 		ct.activeQueues[k] = v
+	}
+	ct.activeTables = make(map[string]int64, len(st.activeTables))
+	for k, v := range st.activeTables {
+		ct.activeTables[k] = v
+	}
+	ct.activeItems = make(map[string]int64, len(st.activeItems))
+	for k, v := range st.activeItems {
+		ct.activeItems[k] = v
 	}
 
 	charged := st.chargedNanoUSD
@@ -925,6 +965,10 @@ func (ct *costTracker) syncFromSafetyJournalLocked() {
 				activeCleanup += pt.Operations["object_put"].CleanupReserveNanoUSD
 			case safety.KindQueue:
 				activeCleanup += pt.Operations["queue_create"].CleanupReserveNanoUSD
+			case safety.KindTable:
+				activeCleanup += pt.Operations["table_create"].CleanupReserveNanoUSD
+			case safety.KindTableItem:
+				activeCleanup += pt.Operations["item_put"].CleanupReserveNanoUSD
 			}
 		}
 	}
@@ -1163,12 +1207,12 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 		var cleanupNano int64
 		if opSucceeded {
 			switch op {
-			case "bucket_create", "object_put", "queue_create":
+			case "bucket_create", "object_put", "queue_create", "table_create", "item_put":
 				if !inEntries && !inActiveCleanup && res.Quote().CleanupReserveNanoUSD > 0 {
 					lockCleanup = true
 					cleanupNano = res.Quote().CleanupReserveNanoUSD
 				}
-			case "bucket_delete", "object_delete", "queue_delete":
+			case "bucket_delete", "object_delete", "queue_delete", "table_delete", "item_delete":
 				if inActiveCleanup {
 					releaseCleanup = true
 				}
@@ -1206,6 +1250,14 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 					if _, exists := st.activeQueues[resKey]; !exists {
 						lockCleanup = true
 					}
+				case "table_create":
+					if _, exists := st.activeTables[resKey]; !exists {
+						lockCleanup = true
+					}
+				case "item_put":
+					if _, exists := st.activeItems[resKey]; !exists {
+						lockCleanup = true
+					}
 				case "bucket_delete":
 					if _, exists := st.activeBuckets[resKey]; exists {
 						releaseCleanup = true
@@ -1216,6 +1268,14 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 					}
 				case "queue_delete":
 					if _, exists := st.activeQueues[resKey]; exists {
+						releaseCleanup = true
+					}
+				case "table_delete":
+					if _, exists := st.activeTables[resKey]; exists {
+						releaseCleanup = true
+					}
+				case "item_delete":
+					if _, exists := st.activeItems[resKey]; exists {
 						releaseCleanup = true
 					}
 				}
@@ -1250,6 +1310,10 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 					st.activeObjects[resKey] = res.Quote().CleanupReserveNanoUSD
 				case safety.KindQueue:
 					st.activeQueues[resKey] = res.Quote().CleanupReserveNanoUSD
+				case safety.KindTable:
+					st.activeTables[resKey] = res.Quote().CleanupReserveNanoUSD
+				case safety.KindTableItem:
+					st.activeItems[resKey] = res.Quote().CleanupReserveNanoUSD
 				}
 				st.resourceCleanupNanoUSD += res.Quote().CleanupReserveNanoUSD
 			}
@@ -1268,6 +1332,16 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 				case safety.KindQueue:
 					if v, ok := st.activeQueues[resKey]; ok {
 						delete(st.activeQueues, resKey)
+						st.resourceCleanupNanoUSD -= v
+					}
+				case safety.KindTable:
+					if v, ok := st.activeTables[resKey]; ok {
+						delete(st.activeTables, resKey)
+						st.resourceCleanupNanoUSD -= v
+					}
+				case safety.KindTableItem:
+					if v, ok := st.activeItems[resKey]; ok {
+						delete(st.activeItems, resKey)
 						st.resourceCleanupNanoUSD -= v
 					}
 				}
@@ -1305,6 +1379,16 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 				ct.activeQueues[resKey] = res.Quote().CleanupReserveNanoUSD
 				lockCleanup = true
 			}
+		case "table_create":
+			if _, exists := ct.activeTables[resKey]; !exists && res.Quote().CleanupReserveNanoUSD > 0 {
+				ct.activeTables[resKey] = res.Quote().CleanupReserveNanoUSD
+				lockCleanup = true
+			}
+		case "item_put":
+			if _, exists := ct.activeItems[resKey]; !exists && res.Quote().CleanupReserveNanoUSD > 0 {
+				ct.activeItems[resKey] = res.Quote().CleanupReserveNanoUSD
+				lockCleanup = true
+			}
 		}
 	}
 
@@ -1325,6 +1409,16 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 		case "queue_delete":
 			if v, exists := ct.activeQueues[resKey]; exists {
 				delete(ct.activeQueues, resKey)
+				ct.meter.ReleaseResourceCleanup(v)
+			}
+		case "table_delete":
+			if v, exists := ct.activeTables[resKey]; exists {
+				delete(ct.activeTables, resKey)
+				ct.meter.ReleaseResourceCleanup(v)
+			}
+		case "item_delete":
+			if v, exists := ct.activeItems[resKey]; exists {
+				delete(ct.activeItems, resKey)
 				ct.meter.ReleaseResourceCleanup(v)
 			}
 		}
@@ -1379,6 +1473,10 @@ func (ct *costTracker) lockResourceCleanupIfNeeded(op, resKind, resKey string) {
 				if _, ok := st.activeQueues[resKey]; ok {
 					return nil
 				}
+			case safety.KindTable:
+				if _, ok := st.activeTables[resKey]; ok {
+					return nil
+				}
 			default:
 				return nil
 			}
@@ -1411,6 +1509,11 @@ func (ct *costTracker) lockResourceCleanupIfNeeded(op, resKind, resKey string) {
 	case safety.KindQueue:
 		if _, exists := ct.activeQueues[resKey]; !exists {
 			ct.activeQueues[resKey] = resNano
+			ct.meter.RestoreCharged(0, ct.meter.Snapshot().ResourceCleanupNanoUSD+resNano)
+		}
+	case safety.KindTable:
+		if _, exists := ct.activeTables[resKey]; !exists {
+			ct.activeTables[resKey] = resNano
 			ct.meter.RestoreCharged(0, ct.meter.Snapshot().ResourceCleanupNanoUSD+resNano)
 		}
 	}

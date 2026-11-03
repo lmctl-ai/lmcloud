@@ -117,4 +117,51 @@ func (g guardQueue) QueueCreateToken(ctx context.Context, q string) (string, err
 	return "", errNoToken
 }
 
+type guardTables struct{ t hostkit.Tables }
+
+func (g guardTables) CreateTable(ctx context.Context, name string, sorted bool) (bool, error) {
+	v, err := g.t.CreateTable(ctx, name, sorted)
+	return v, hostkit.NilIfTyped(err)
+}
+func (g guardTables) DeleteTable(ctx context.Context, name string) error {
+	return hostkit.NilIfTyped(g.t.DeleteTable(ctx, name))
+}
+func (g guardTables) HeadTable(ctx context.Context, name string) error {
+	return hostkit.NilIfTyped(g.t.HeadTable(ctx, name))
+}
+func (g guardTables) ListTables(ctx context.Context, token string) ([]string, string, error) {
+	v, next, err := g.t.ListTables(ctx, token)
+	return v, next, hostkit.NilIfTyped(err)
+}
+func (g guardTables) PutItem(ctx context.Context, table string, item hostkit.Item, mode hostkit.PutMode, expectVersion string) (hostkit.Item, error) {
+	v, err := g.t.PutItem(ctx, table, item, mode, expectVersion)
+	return v, hostkit.NilIfTyped(err)
+}
+func (g guardTables) GetItem(ctx context.Context, table, pk, sk string) (hostkit.Item, error) {
+	v, err := g.t.GetItem(ctx, table, pk, sk)
+	return v, hostkit.NilIfTyped(err)
+}
+func (g guardTables) DeleteItem(ctx context.Context, table, pk, sk string) error {
+	return hostkit.NilIfTyped(g.t.DeleteItem(ctx, table, pk, sk))
+}
+func (g guardTables) UpdateItem(ctx context.Context, table, pk, sk string, changes hostkit.Item) (hostkit.Item, error) {
+	v, err := g.t.UpdateItem(ctx, table, pk, sk, changes)
+	return v, hostkit.NilIfTyped(err)
+}
+func (g guardTables) Query(ctx context.Context, table, pk, skFrom, skTo string, max int, token string) (hostkit.TablePage, error) {
+	v, err := g.t.Query(ctx, table, pk, skFrom, skTo, max, token)
+	return v, hostkit.NilIfTyped(err)
+}
+func (g guardTables) Scan(ctx context.Context, table string, max int, token string) (hostkit.TablePage, error) {
+	v, err := g.t.Scan(ctx, table, max, token)
+	return v, hostkit.NilIfTyped(err)
+}
+func (g guardTables) TableCreateToken(ctx context.Context, table string) (string, error) {
+	if r, ok := g.t.(hostkit.TableCreateTokenReader); ok {
+		v, err := r.TableCreateToken(ctx, table)
+		return v, hostkit.NilIfTyped(err)
+	}
+	return "", errNoToken
+}
+
 var errNoToken = hostkit.ProviderError(hostkit.Internal, 0, "", "adapter does not store create tokens")

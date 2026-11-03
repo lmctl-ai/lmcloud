@@ -29,6 +29,8 @@ const (
 	KindObject       = "object"
 	KindQueue        = "queue"
 	KindQueueMessage = "queue_message"
+	KindTable        = "table"
+	KindTableItem    = "table_item"
 
 	// Journal event types.
 	EventMeta      = "meta"
@@ -1587,7 +1589,7 @@ func validateResourceIdentity(runID, kind, parent, name string) error {
 		return errors.New("resource parent/name contains control characters")
 	}
 	switch kind {
-	case KindBucket, KindQueue:
+	case KindBucket, KindQueue, KindTable:
 		if parent != "" {
 			return fmt.Errorf("%s record must have empty parent (got %q)", kind, parent)
 		}
@@ -1595,7 +1597,7 @@ func validateResourceIdentity(runID, kind, parent, name string) error {
 			return fmt.Errorf("forged or unprefixed %s name in journal: %w", kind, err)
 		}
 		return nil
-	case KindObject, KindQueueMessage:
+	case KindObject, KindQueueMessage, KindTableItem:
 		if err := ValidateLiveResourceName(runID, parent); err != nil {
 			return fmt.Errorf("forged or unprefixed parent %q for %s in journal: %w", parent, kind, err)
 		}
@@ -1747,9 +1749,34 @@ func inferJournalOp(rec JournalRecord, att AttemptLedgerEntry) string {
 		return "queue_ack"
 	case "queue_nack":
 		return "queue_nack"
+	case "table_create", "table_overwrite":
+		return "table_create"
+	case "table_delete":
+		return "table_delete"
+	case "table_exists":
+		return "table_exists"
+	case "table_list":
+		return "table_list"
+	case "table_read_ownership", "table_create_token":
+		return "table_read_ownership"
+	case "item_put", "item_overwrite":
+		return "item_put"
+	case "item_get":
+		return "item_get"
+	case "item_delete":
+		return "item_delete"
+	case "item_update":
+		return "item_update"
+	case "item_query":
+		return "item_query"
+	case "item_scan":
+		return "item_scan"
 	case "verify_parent_ownership":
 		if rec.Kind == KindQueue || att.Kind == KindQueue {
 			return "queue_read_ownership"
+		}
+		if rec.Kind == KindTable || att.Kind == KindTable {
+			return "table_read_ownership"
 		}
 		return "bucket_read_ownership"
 	}
@@ -1762,6 +1789,10 @@ func inferJournalOp(rec JournalRecord, att AttemptLedgerEntry) string {
 			return "queue_create"
 		case KindObject:
 			return "object_put"
+		case KindTable:
+			return "table_create"
+		case KindTableItem:
+			return "item_put"
 		}
 	}
 	return ""
@@ -1776,8 +1807,19 @@ func recordOpStat(state *LedgerState, op string, units, bytes, chargedNano int64
 	}
 	if units <= 0 {
 		units = 1
-		if (op == "queue_send" || op == "queue_receive") && bytes > 65536 {
-			units = (bytes + 65535) / 65536
+		switch op {
+		case "queue_send", "queue_receive":
+			if bytes > 65536 {
+				units = (bytes + 65535) / 65536
+			}
+		case "item_put", "item_update":
+			if bytes > 1024 {
+				units = (bytes + 1023) / 1024
+			}
+		case "item_get", "item_query", "item_scan":
+			if bytes > 4096 {
+				units = (bytes + 4095) / 4096
+			}
 		}
 	}
 	if bytes < 0 {

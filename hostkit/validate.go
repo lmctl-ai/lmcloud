@@ -4,13 +4,15 @@ package hostkit
 
 import (
 	"io"
+	"math"
 	"net/http"
 	"regexp"
 	"strings"
+	"unicode/utf16"
 	"unicode/utf8"
 )
 
-// Portable limits (design 02 §4/§7, 07 §4).
+// Portable limits (design 02 §4/§7, 07 §4, 12 §4).
 const (
 	MaxObjectBytes               = 16 << 20 // 16,777,216
 	MaxQueueBodyBytes            = 49152
@@ -21,26 +23,38 @@ const (
 	MaxGCPQueueMessageBytes      = 10 << 20 // 10 MiB (GCP Pub/Sub documented 10 MB message data / unary Pull response maximum)
 	MaxRefQueueMessageBytes      = 1 << 20  // 1 MiB (reference simulator conservative ceiling)
 	MaxKeyBytes                  = 1024
-	MaxContentTypeBytes   = 255
-	MaxMetadataEntries    = 32
-	MaxMetadataBytes      = 2048
-	DefaultListMax        = 1000
-	MaxListMax            = 1000
-	MaxReceiveMessages    = 10
-	MaxWaitSeconds        = 20
-	MaxVisibilitySeconds  = 600
-	DefaultReceiveMax     = 1
-	DefaultReceiveWait    = 0
-	DefaultReceiveVisible = 30
+	MaxContentTypeBytes          = 255
+	MaxMetadataEntries           = 32
+	MaxMetadataBytes             = 2048
+	DefaultListMax               = 1000
+	MaxListMax                   = 1000
+	MaxReceiveMessages           = 10
+	MaxWaitSeconds               = 20
+	MaxVisibilitySeconds         = 600
+	DefaultReceiveMax            = 1
+	DefaultReceiveWait           = 0
+	DefaultReceiveVisible        = 30
+
+	MaxTableKeyBytes        = 255
+	MaxAttrStringUTF16Units = 32768
+	MaxItemAttrs            = 240
+	MaxItemCanonicalBytes   = 262144
+	DefaultTablePageMax     = 100
+	MaxTablePageMax         = 500
+	MinPortableFloatAbs     = 1e-130
+	MaxPortableFloatAbs     = 1e126
 )
 
 var (
 	bucketPattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
 	queuePattern    = regexp.MustCompile(`^[a-z][a-z0-9-]{1,61}[a-z0-9]$`)
+	tablePattern    = regexp.MustCompile(`^[a-z][a-z0-9]{2,31}$`)
+	tableKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._~-]{1,255}$`)
 	metaKeyPattern  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
 	bucketBadPrefix = []string{"xn--", "sthree-", "amzn-s3-demo-", "goog"}
 	bucketBadSuffix = []string{"-s3alias", "--ol-s3"}
 	reservedInfix   = []string{"google", "g00gle"}
+	reservedTables  = map[string]bool{"lmcloudmeta": true, "tables": true}
 )
 
 // Rule is a pluggable name rule; it returns a rejection reason or "".
@@ -50,9 +64,11 @@ type Rule func(name string) string
 // example names a specific provider additionally reserves). Extra rules can
 // only narrow the portable set, never widen it.
 type Validator struct {
-	BucketRules []Rule
-	QueueRules  []Rule
-	KeyRules    []Rule
+	BucketRules   []Rule
+	QueueRules    []Rule
+	KeyRules      []Rule
+	TableRules    []Rule
+	TableKeyRules []Rule
 }
 
 func applyRules(kind, name string, rules []Rule) *CloudError {
@@ -245,6 +261,158 @@ func Visibility(v int64) *CloudError {
 func Receipt(r string) *CloudError {
 	if r == "" {
 		return Preflightf("receipt must not be empty")
+	}
+	return nil
+}
+
+// Table validates a table name (design 12 §4.1: ^[a-z][a-z0-9]{2,31}$, reserved names rejected).
+func (v *Validator) Table(name string) *CloudError {
+	if !tablePattern.MatchString(name) {
+		return Preflightf("invalid table name %q: must be 3-32 chars of [a-z0-9], starting with [a-z]", name)
+	}
+	if reservedTables[name] {
+		return Preflightf("invalid table name %q: reserved table name", name)
+	}
+	if v != nil {
+		return applyRules("table", name, v.TableRules)
+	}
+	return nil
+}
+
+// TableKey validates a partition key (pk) or sort key (sk) value (design 12 §4.1).
+func (v *Validator) TableKey(k string) *CloudError {
+	if !tableKeyPattern.MatchString(k) {
+		return Preflightf("invalid table key %q: must be 1..%d chars of [A-Za-z0-9._~-]", k, MaxTableKeyBytes)
+	}
+	if k == "." || k == ".." {
+		return Preflightf("invalid table key %q: '.' and '..' are reserved", k)
+	}
+	if len(k) >= 4 && strings.HasPrefix(k, "__") && strings.HasSuffix(k, "__") {
+		return Preflightf("invalid table key %q: double-underscore wrapped keys are reserved", k)
+	}
+	if v != nil {
+		return applyRules("table key", k, v.TableKeyRules)
+	}
+	return nil
+}
+
+// AttrName validates an item attribute name (design 12 §4.2: ^[a-z][a-z0-9_]{0,62}$,
+// excluding reserved "pk", "sk", and prefix "__lm").
+func AttrName(name string) *CloudError {
+	if !metaKeyPattern.MatchString(name) {
+		return Preflightf("invalid attribute name %q: must match ^[a-z][a-z0-9_]{0,62}$", name)
+	}
+	if name == "pk" || name == "sk" || strings.HasPrefix(name, "__lm") {
+		return Preflightf("invalid attribute name %q: reserved attribute name", name)
+	}
+	return nil
+}
+
+// UTF16Units counts the UTF-16 code units of s (1 per BMP rune, 2 per supplementary rune > U+FFFF).
+// Invalid UTF-8 fails pre-flight.
+func UTF16Units(s string) (int, *CloudError) {
+	if !utf8.ValidString(s) {
+		return 0, Preflightf("string attribute value must be valid UTF-8")
+	}
+	units := 0
+	for _, r := range s {
+		n := utf16.RuneLen(r)
+		if n < 0 {
+			return 0, Preflightf("string attribute value contains invalid rune")
+		}
+		units += n
+	}
+	return units, nil
+}
+
+// AttrStringValue validates a string attribute value against the 32,768 UTF-16 code-unit cap.
+func AttrStringValue(s string) *CloudError {
+	units, err := UTF16Units(s)
+	if err != nil {
+		return err
+	}
+	if units > MaxAttrStringUTF16Units {
+		return Preflightf("string attribute value is %d UTF-16 code units; at most %d allowed", units, MaxAttrStringUTF16Units)
+	}
+	return nil
+}
+
+// AttrNumberValue validates a float64 attribute value: finite and either 0.0 or 1e-130 <= |x| < 1e126.
+// A 1e-12 relative tolerance around the 1e-130 / 1e126 decimal boundaries absorbs IEEE-754
+// math_pow(10.0, -130.0) / math_pow(10.0, 126.0) ULP rounding across libm implementations.
+func AttrNumberValue(x float64) *CloudError {
+	if math.IsNaN(x) || math.IsInf(x, 0) {
+		return Preflightf("number attribute value must be finite (NaN and Inf are not allowed)")
+	}
+	if x != 0.0 {
+		abs := math.Abs(x)
+		if abs < MinPortableFloatAbs*(1-1e-12) || abs >= MaxPortableFloatAbs*(1-1e-12) {
+			return Preflightf("number attribute value %g is outside portable range [1e-130, 1e126)", x)
+		}
+	}
+	return nil
+}
+
+// CanonicalItemBytes validates all attributes in attrs and returns the canonical
+// user byte size: sum(len(name) + valBytes) + 8 * len(attrs) <= 262,144 and len(attrs) <= 240.
+func CanonicalItemBytes(attrs map[string]Attr) (int, *CloudError) {
+	if len(attrs) > MaxItemAttrs {
+		return 0, Preflightf("item has %d user attributes; at most %d allowed", len(attrs), MaxItemAttrs)
+	}
+	total := 8 * len(attrs)
+	for name, a := range attrs {
+		if err := AttrName(name); err != nil {
+			return 0, err
+		}
+		switch {
+		case a.S != nil:
+			if err := AttrStringValue(*a.S); err != nil {
+				return 0, err
+			}
+		case a.I != nil:
+			// All int64 values are valid.
+		case a.N != nil:
+			if err := AttrNumberValue(*a.N); err != nil {
+				return 0, err
+			}
+		case a.B != nil:
+			// All bool values are valid.
+		default:
+			return 0, Preflightf("attribute %q has no typed value", name)
+		}
+		total += len(name) + a.CanonicalValueBytes()
+	}
+	if total > MaxItemCanonicalBytes {
+		return 0, Preflightf("item canonical size is %d bytes; at most %d allowed", total, MaxItemCanonicalBytes)
+	}
+	return total, nil
+}
+
+// TablePageMax normalizes max_items on item_query / item_scan: 0 -> 100, 1..500 allowed.
+func TablePageMax(maxItems int64) (int, *CloudError) {
+	if maxItems == 0 {
+		return DefaultTablePageMax, nil
+	}
+	if maxItems < 0 || maxItems > MaxTablePageMax {
+		return 0, Preflightf("max_items must be 0..%d", MaxTablePageMax)
+	}
+	return int(maxItems), nil
+}
+
+// QueryRange validates optional [skFrom, skTo) bounds on item_query.
+func (v *Validator) QueryRange(skFrom, skTo string) *CloudError {
+	if skFrom != "" {
+		if err := v.TableKey(skFrom); err != nil {
+			return err
+		}
+	}
+	if skTo != "" {
+		if err := v.TableKey(skTo); err != nil {
+			return err
+		}
+	}
+	if skFrom != "" && skTo != "" && skFrom >= skTo {
+		return Preflightf("invalid query range: sk_from %q must be strictly less than sk_to %q", skFrom, skTo)
 	}
 	return nil
 }

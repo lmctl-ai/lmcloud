@@ -19,7 +19,7 @@ end _lmcode_
 
 r_abort = run_lmcode(abort_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(!r_abort.ok, "table_create with conflicting layout must abort in default mode");
-assert(contains(r_abort.error, "[CONFLICT]"), "abort message must carry [CONFLICT]");
+assert(contains(r_abort.message, "[CONFLICT]"), "abort message must carry [CONFLICT]");
 
 # 2. Inspection: idempotency booleans + both-direction conflict codes + cleanup
 inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";

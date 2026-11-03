@@ -64,6 +64,7 @@ func main() {
 				Provider:  "ref",
 				Store:     fake,
 				Queue:     fake,
+				Tables:    fake,
 				Endpoints: &hostkit.EndpointResolver{Prefix: "LMCLOUD_REF"},
 			}, nil
 		},

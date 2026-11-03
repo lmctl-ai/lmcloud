@@ -186,3 +186,74 @@ func TestReadBoundedRejectsOversize(t *testing.T) {
 		t.Fatal("limit+1 accepted")
 	}
 }
+
+func TestTableAndKeyAndAttrValidation(t *testing.T) {
+	v := &Validator{}
+	goodTables := []string{"abc", "lmt01r0a", "a" + strings.Repeat("9", 31)}
+	badTables := []string{"", "ab", strings.Repeat("a", 33), "1abc", "Bad", "a-b", "a_b", "lmcloudmeta", "tables"}
+	for _, n := range goodTables {
+		if err := v.Table(n); err != nil {
+			t.Errorf("Table(%q) rejected: %v", n, err)
+		}
+	}
+	for _, n := range badTables {
+		if err := v.Table(n); err == nil || err.Code != InvalidArgument {
+			t.Errorf("Table(%q) accepted or wrong code: %+v", n, err)
+		}
+	}
+
+	goodKeys := []string{"a", "A-Z_0.9~", strings.Repeat("k", 255), "__a", "a__", "_a_"}
+	badKeys := []string{"", strings.Repeat("k", 256), ".", "..", "__x__", "____", "a/b", "a b", "é"}
+	for _, k := range goodKeys {
+		if err := v.TableKey(k); err != nil {
+			t.Errorf("TableKey(%q) rejected: %v", k, err)
+		}
+	}
+	for _, k := range badKeys {
+		if err := v.TableKey(k); err == nil || err.Code != InvalidArgument {
+			t.Errorf("TableKey(%q) accepted or wrong code: %+v", k, err)
+		}
+	}
+
+	goodAttrs := []string{"a", "attr_1", "pk2", "sk_x", "a" + strings.Repeat("b", 62)}
+	badAttrs := []string{"", "pk", "sk", "__lm_meta", "1a", "Bad", "a-b", "a" + strings.Repeat("b", 63)}
+	for _, a := range goodAttrs {
+		if err := AttrName(a); err != nil {
+			t.Errorf("AttrName(%q) rejected: %v", a, err)
+		}
+	}
+	for _, a := range badAttrs {
+		if err := AttrName(a); err == nil || err.Code != InvalidArgument {
+			t.Errorf("AttrName(%q) accepted or wrong code: %+v", a, err)
+		}
+	}
+
+	// UTF-16 code units: supplementary rune U+1F680 counts as 2 UTF-16 code units.
+	bmpMax := strings.Repeat("a", MaxAttrStringUTF16Units)
+	if err := AttrStringValue(bmpMax); err != nil {
+		t.Fatalf("32768 BMP chars rejected: %v", err)
+	}
+	if err := AttrStringValue(bmpMax + "a"); err == nil {
+		t.Fatal("32769 BMP chars accepted")
+	}
+	rocketMax := strings.Repeat("🚀", MaxAttrStringUTF16Units/2)
+	if err := AttrStringValue(rocketMax); err != nil {
+		t.Fatalf("16384 supplementary runes (32768 UTF-16 units) rejected: %v", err)
+	}
+	if err := AttrStringValue(rocketMax + "a"); err == nil {
+		t.Fatal("32769 UTF-16 units with supplementary runes accepted")
+	}
+
+	// CanonicalItemBytes: 240 attr limit and 262,144-byte cap.
+	attrs240 := make(map[string]Attr, 240)
+	for i := 0; i < 240; i++ {
+		attrs240[fmt.Sprintf("a%03d", i)] = IntAttr(int64(i))
+	}
+	if _, err := CanonicalItemBytes(attrs240); err != nil {
+		t.Fatalf("240 attrs rejected: %v", err)
+	}
+	attrs240["a240"] = IntAttr(240)
+	if _, err := CanonicalItemBytes(attrs240); err == nil {
+		t.Fatal("241 attrs accepted")
+	}
+}

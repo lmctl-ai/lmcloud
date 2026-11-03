@@ -75,6 +75,9 @@ if (is_azure || is_gcp) {
 # Pass 2: valid restricted principal denied by policy -> PERMISSION_DENIED
 set_env("LMAWS_SIM_ACCESS_KEY_ID", env("LMCLOUD_ENFORCE_DENIED_AWS_ACCESS_KEY_ID", orig_aws_key));
 set_env("LMAWS_SIM_SECRET_ACCESS_KEY", env("LMCLOUD_ENFORCE_DENIED_AWS_SECRET_ACCESS_KEY", orig_aws_sec));
+set_env("LMAZURE_SIM_TOKEN", env("LMCLOUD_ENFORCE_DENIED_AZURE_TOKEN", orig_az_tok));
+set_env("LMAZURE_SIM_KEY", env("LMCLOUD_ENFORCE_DENIED_AZURE_KEY", orig_az_key));
+set_env("LMGCP_SIM_TOKEN", env("LMCLOUD_ENFORCE_DENIED_GCP_TOKEN", orig_gcp_tok));
 
 denied_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

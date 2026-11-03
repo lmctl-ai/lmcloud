@@ -54,8 +54,22 @@ func TestConformanceOpenMode(t *testing.T) {
 	bin := lmscript(t)
 	ref := buildRef(t)
 	out := runConformance(t, ref, []string{"LMSCRIPT_BIN=" + bin, "LMCLOUD_REF_STATE=" + filepath.Join(t.TempDir(), "s.json")})
-	if !strings.Contains(out, "# pass 35 / 49, skip 16, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 2, fail 0") {
+	if !strings.Contains(out, "# pass 49 / 49, skip 3, fail 0") && !strings.Contains(out, "# pass 35 / 49, skip 16, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 2, fail 0") {
 		t.Fatalf("unexpected summary:\n%s", out)
+	}
+}
+
+func TestConformanceTablesSlice(t *testing.T) {
+	bin := lmscript(t)
+	ref := buildRef(t)
+	cmd := exec.Command(filepath.Join(repoRoot(t), "tests", "run-conformance.sh"), ref, "", "tables")
+	cmd.Env = append(os.Environ(), "LMSCRIPT_BIN="+bin, "LMCLOUD_REF_STATE="+filepath.Join(t.TempDir(), "s.json"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("tables conformance failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "# pass 14 / 14, skip 1, fail 0") {
+		t.Fatalf("unexpected tables summary:\n%s", out)
 	}
 }
 
@@ -101,7 +115,7 @@ func TestConformanceEnforcedMode(t *testing.T) {
 		"LMGCP_SIM_TOKEN=allow-token",
 		"LMCLOUD_ENFORCE_DENIED_GCP_TOKEN=deny-token",
 	})
-	if !strings.Contains(out, "# pass 35 / 49, skip 14, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 0, fail 0") {
+	if !strings.Contains(out, "# pass 49 / 49, skip 0, fail 0") && !strings.Contains(out, "# pass 35 / 49, skip 14, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 0, fail 0") {
 		t.Fatalf("unexpected summary:\n%s", out)
 	}
 }
@@ -119,6 +133,9 @@ func TestDryRunThroughCompilerMakesNoMutations(t *testing.T) {
 		"queue/01-queue-lifecycle.lms",
 		"queue/03-message-send-receive-ack.lms",
 		"queue/06-visibility-timeout-and-nack.lms",
+		"tables/01-table-lifecycle.lms",
+		"tables/03-item-put-get-delete.lms",
+		"tables/05-item-update-partial.lms",
 	}
 	calls := regexp.MustCompile(`mutator_calls=(\d+)`)
 	for _, s := range scenarios {
@@ -141,7 +158,7 @@ func TestDryRunThroughCompilerMakesNoMutations(t *testing.T) {
 		}
 	}
 	raw, _ := os.ReadFile(state)
-	if strings.Contains(string(raw), "lmcloud-") {
+	if strings.Contains(string(raw), "lmcloud-") || strings.Contains(string(raw), "lmt") {
 		t.Fatalf("dry runs changed fake state: %s", raw)
 	}
 }

@@ -162,3 +162,173 @@ type BucketCreateTokenReader interface {
 type QueueCreateTokenReader interface {
 	QueueCreateToken(ctx context.Context, queue string) (string, error)
 }
+
+// TableCreateTokenReader is the tables counterpart of BucketCreateTokenReader.
+type TableCreateTokenReader interface {
+	TableCreateToken(ctx context.Context, table string) (string, error)
+}
+
+// PutMode selects the write precondition for Tables.PutItem.
+type PutMode int
+
+const (
+	PutUnconditional PutMode = iota // item_put(table, item)
+	PutIfAbsent                     // item_put_if_absent(table, item)
+	PutIfVersion                    // item_put_if_version(table, item, expectVersion)
+)
+
+// Attribute type tag constants returned by TableItem.attr_type / Attr.Kind.
+const (
+	AttrString = "string"
+	AttrInt    = "int"
+	AttrNumber = "number"
+	AttrBool   = "bool"
+)
+
+// Attr is one typed attribute value. Exactly one pointer is non-nil.
+type Attr struct {
+	S *string  `json:"s,omitempty"`
+	I *int64   `json:"i,omitempty"`
+	N *float64 `json:"n,omitempty"`
+	B *bool    `json:"b,omitempty"`
+}
+
+// StringAttr constructs a string Attr.
+func StringAttr(v string) Attr { return Attr{S: &v} }
+
+// IntAttr constructs an int64 Attr.
+func IntAttr(v int64) Attr { return Attr{I: &v} }
+
+// NumberAttr constructs a float64 Attr.
+func NumberAttr(v float64) Attr { return Attr{N: &v} }
+
+// BoolAttr constructs a bool Attr.
+func BoolAttr(v bool) Attr { return Attr{B: &v} }
+
+// Kind returns the schema type tag ("string", "int", "number", "bool") or "" if unset.
+func (a Attr) Kind() string {
+	switch {
+	case a.S != nil:
+		return AttrString
+	case a.I != nil:
+		return AttrInt
+	case a.N != nil:
+		return AttrNumber
+	case a.B != nil:
+		return AttrBool
+	default:
+		return ""
+	}
+}
+
+// CanonicalValueBytes returns the canonical value byte cost for item budget calculation.
+func (a Attr) CanonicalValueBytes() int {
+	switch {
+	case a.S != nil:
+		return len(*a.S)
+	case a.I != nil:
+		return 8
+	case a.N != nil:
+		return 8
+	case a.B != nil:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// Clone returns an independent copy of a.
+func (a Attr) Clone() Attr {
+	switch {
+	case a.S != nil:
+		v := *a.S
+		return Attr{S: &v}
+	case a.I != nil:
+		v := *a.I
+		return Attr{I: &v}
+	case a.N != nil:
+		v := *a.N
+		return Attr{N: &v}
+	case a.B != nil:
+		v := *a.B
+		return Attr{B: &v}
+	default:
+		return Attr{}
+	}
+}
+
+// Item is the normalized table item value passed between host and adapter.
+type Item struct {
+	PK      string          `json:"pk"`
+	SK      string          `json:"sk,omitempty"`
+	Version string          `json:"version,omitempty"`
+	Exists  bool            `json:"exists"`
+	Attrs   map[string]Attr `json:"attrs,omitempty"`
+}
+
+// Clone returns a deep copy of it.
+func (it Item) Clone() Item {
+	out := Item{
+		PK:      it.PK,
+		SK:      it.SK,
+		Version: it.Version,
+		Exists:  it.Exists,
+	}
+	if it.Attrs != nil {
+		out.Attrs = make(map[string]Attr, len(it.Attrs))
+		for k, v := range it.Attrs {
+			out.Attrs[k] = v.Clone()
+		}
+	}
+	return out
+}
+
+// TablePage is one query or scan page. NextToken is "" on the last page.
+type TablePage struct {
+	Items     []Item
+	NextToken string
+}
+
+// Tables is the provider adapter for the tables (structured KV/document) slice.
+// The host has already validated every argument (table name, key charset/length,
+// attribute names/types/sizes, canonical item budget, page bounds, query range)
+// and attached the resolved endpoint to ctx (EndpointFrom).
+type Tables interface {
+	// CreateTable creates a key-only (sorted=false) or composite-key (sorted=true)
+	// table and blocks until it is ACTIVE. Returns created=true for a new table,
+	// (false, nil) if it already exists with the SAME key layout, or CONFLICT if
+	// it already exists with the OTHER key layout.
+	CreateTable(ctx context.Context, name string, sorted bool) (created bool, err error)
+	// DeleteTable deletes the table and blocks until deletion completes; NOT_FOUND when absent.
+	DeleteTable(ctx context.Context, name string) error
+	// HeadTable returns nil when the table exists and is accessible; NOT_FOUND when absent.
+	HeadTable(ctx context.Context, name string) error
+	// ListTables returns one provider page of logical table names (excluding any
+	// internal metadata table such as lmcloudmeta).
+	ListTables(ctx context.Context, token string) (names []string, next string, err error)
+
+	// PutItem writes item under mode and returns the stored item with its new
+	// non-empty Version and Exists=true.
+	//   - PutUnconditional: creates or replaces the item, rotating Version.
+	//   - PutIfAbsent: CONFLICT when the item already exists.
+	//   - PutIfVersion: NOT_FOUND (Absent=item) when the item is absent;
+	//     PRECONDITION_FAILED when the stored version != expectVersion.
+	// NOT_FOUND (Absent=table) when the table does not exist.
+	// INVALID_ARGUMENT (Preflight) when item.SK == "" on a sorted table or
+	// item.SK != "" on a key-only table.
+	PutItem(ctx context.Context, table string, item Item, mode PutMode, expectVersion string) (Item, error)
+	// GetItem reads one item; NOT_FOUND with Absent=table or Absent=item.
+	GetItem(ctx context.Context, table, pk, sk string) (Item, error)
+	// DeleteItem deletes one item; NOT_FOUND with Absent=table or Absent=item.
+	DeleteItem(ctx context.Context, table, pk, sk string) error
+	// UpdateItem merges changes.Attrs onto an EXISTING item, rotates Version and
+	// returns the full updated item; NOT_FOUND (Absent=table or Absent=item) when
+	// the table or item does not exist.
+	UpdateItem(ctx context.Context, table, pk, sk string, changes Item) (Item, error)
+	// Query returns one page of items in partition pk (and within [skFrom, skTo)
+	// in ascending UTF-8 byte order on a sorted table). INVALID_ARGUMENT when
+	// skFrom != "" or skTo != "" on a key-only table.
+	Query(ctx context.Context, table, pk, skFrom, skTo string, max int, token string) (TablePage, error)
+	// Scan returns one page of items across all partitions.
+	Scan(ctx context.Context, table string, max int, token string) (TablePage, error)
+}

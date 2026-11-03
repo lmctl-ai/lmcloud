@@ -28,6 +28,7 @@ type Config struct {
 	Provider  string
 	Store     hostkit.ObjectStore
 	Queue     hostkit.Queue
+	Tables    hostkit.Tables
 	Endpoints *hostkit.EndpointResolver
 	Validator *hostkit.Validator
 	// OpTimeout bounds one operation (default 2m); ListTimeout bounds exhaustive lists (default 10m).
@@ -87,6 +88,9 @@ func New(cfg Config) *Host {
 	}
 	if cfg.Queue != nil {
 		cfg.Queue = guardQueue{cfg.Queue}
+	}
+	if cfg.Tables != nil {
+		cfg.Tables = guardTables{cfg.Tables}
 	}
 	return &Host{
 		cfg:     cfg,
@@ -1910,6 +1914,17 @@ type dryObject struct {
 	meta *hostkit.ObjectMeta // nil = deleted in this dry run
 }
 
+type dryTable struct {
+	exists     bool
+	sorted     bool
+	hasSorted  bool
+	createdNow bool
+}
+
+type dryTableItem struct {
+	item *hostkit.Item // nil = deleted in this dry run
+}
+
 // overlay records what a dry run would have changed, so later reads in the
 // same dry run see the previewed state instead of aborting. It never reaches
 // the provider.
@@ -1919,10 +1934,20 @@ type overlay struct {
 	created map[string]bool // bucket did not exist before this dry run
 	objects map[string]map[string]dryObject
 	queues  map[string]bool
+	tables  map[string]dryTable
+	items   map[string]map[string]dryTableItem
+	drySeq  int64
 }
 
 func newOverlay() *overlay {
-	return &overlay{buckets: map[string]bool{}, created: map[string]bool{}, objects: map[string]map[string]dryObject{}, queues: map[string]bool{}}
+	return &overlay{
+		buckets: map[string]bool{},
+		created: map[string]bool{},
+		objects: map[string]map[string]dryObject{},
+		queues:  map[string]bool{},
+		tables:  map[string]dryTable{},
+		items:   map[string]map[string]dryTableItem{},
+	}
 }
 
 func (o *overlay) bucket(b string) (bool, bool) {
@@ -2062,6 +2087,86 @@ func (o *overlay) mergeQueues(names []string) []string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return mergeSet(names, o.queues)
+}
+
+func (o *overlay) table(t string) (dryTable, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	v, ok := o.tables[t]
+	return v, ok
+}
+
+func (o *overlay) setTable(t string, exists, sorted, hasSorted, createdNow bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.tables[t] = dryTable{exists: exists, sorted: sorted, hasSorted: hasSorted, createdNow: createdNow}
+	if !exists {
+		o.items[t] = map[string]dryTableItem{}
+	}
+}
+
+func (o *overlay) mergeTables(names []string) []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	set := map[string]bool{}
+	for _, n := range names {
+		set[n] = true
+	}
+	for n, dt := range o.tables {
+		set[n] = dt.exists
+	}
+	var out []string
+	for n, live := range set {
+		if live {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func (o *overlay) nextDryVersion(table, pk, sk string) string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.drySeq++
+	sum := sha256.Sum256([]byte(table + "\x00" + pk + "\x00" + sk + "\x00" + hostkit.EscapeSegment(string(rune(o.drySeq)))))
+	return "dry-" + hex.EncodeToString(sum[:8])
+}
+
+func (o *overlay) putTableItem(t, key string, it hostkit.Item) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.items[t] == nil {
+		o.items[t] = map[string]dryTableItem{}
+	}
+	cp := it.Clone()
+	o.items[t][key] = dryTableItem{item: &cp}
+}
+
+func (o *overlay) deleteTableItem(t, key string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.items[t] == nil {
+		o.items[t] = map[string]dryTableItem{}
+	}
+	o.items[t][key] = dryTableItem{item: nil}
+}
+
+func (o *overlay) tableItem(t, key string) (dryState, hostkit.Item) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if dt, ok := o.tables[t]; ok && !dt.exists {
+		return dryBucketGone, hostkit.Item{}
+	}
+	if di, ok := o.items[t][key]; ok {
+		if di.item == nil {
+			return dryObjectGone, hostkit.Item{}
+		}
+		return dryPresent, di.item.Clone()
+	}
+	if dt, ok := o.tables[t]; ok && dt.createdNow {
+		return dryObjectGone, hostkit.Item{}
+	}
+	return dryUnknown, hostkit.Item{}
 }
 
 // errIndex is returned by list accessors for out-of-range indices.

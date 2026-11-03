@@ -262,6 +262,46 @@ func SyntheticSimPriceTable(provider string) *PriceTable {
 			"queue_nack": {
 				RequestNanoUSD: qnack,
 			},
+			"table_create": {
+				RequestNanoUSD:        5000,
+				CleanupReserveNanoUSD: 10_000,
+			},
+			"table_delete": {
+				RequestNanoUSD: bdelNano,
+			},
+			"table_exists": {
+				RequestNanoUSD: 400,
+			},
+			"table_list": {
+				RequestNanoUSD: 5000,
+			},
+			"table_read_ownership": {
+				RequestNanoUSD: 400,
+			},
+			"item_put": {
+				RequestNanoUSD:        1250,
+				ChunkBytes:            1024,
+				CleanupReserveNanoUSD: 1250,
+			},
+			"item_get": {
+				RequestNanoUSD: 250,
+				ChunkBytes:     4096,
+			},
+			"item_delete": {
+				RequestNanoUSD: 1250,
+			},
+			"item_update": {
+				RequestNanoUSD: 1250,
+				ChunkBytes:     1024,
+			},
+			"item_query": {
+				RequestNanoUSD: 250,
+				ChunkBytes:     4096,
+			},
+			"item_scan": {
+				RequestNanoUSD: 250,
+				ChunkBytes:     4096,
+			},
 		},
 	}
 }

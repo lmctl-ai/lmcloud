@@ -287,6 +287,110 @@ func (r Router) QueueCreateToken(ctx context.Context, q string) (string, error) 
 	return "", errNoToken
 }
 
+func (r Router) TableCreateToken(ctx context.Context, table string) (string, error) {
+	be, err := r.pick(ctx)
+	if err != nil {
+		return "", err
+	}
+	if t, ok := be.(TableCreateTokenReader); ok {
+		return t.TableCreateToken(ctx, table)
+	}
+	return "", errNoToken
+}
+
+var errNoTables = ProviderError(Internal, 0, "", "backend does not support tables")
+
+func (r Router) pickTables(ctx context.Context) (Tables, error) {
+	be, err := r.pick(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if t, ok := be.(Tables); ok {
+		return t, nil
+	}
+	return nil, errNoTables
+}
+
+func (r Router) CreateTable(ctx context.Context, name string, sorted bool) (bool, error) {
+	t, err := r.pickTables(ctx)
+	if err != nil {
+		return false, err
+	}
+	return t.CreateTable(ctx, name, sorted)
+}
+
+func (r Router) DeleteTable(ctx context.Context, name string) error {
+	t, err := r.pickTables(ctx)
+	if err != nil {
+		return err
+	}
+	return t.DeleteTable(ctx, name)
+}
+
+func (r Router) HeadTable(ctx context.Context, name string) error {
+	t, err := r.pickTables(ctx)
+	if err != nil {
+		return err
+	}
+	return t.HeadTable(ctx, name)
+}
+
+func (r Router) ListTables(ctx context.Context, token string) ([]string, string, error) {
+	t, err := r.pickTables(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	return t.ListTables(ctx, token)
+}
+
+func (r Router) PutItem(ctx context.Context, table string, item Item, mode PutMode, expectVersion string) (Item, error) {
+	t, err := r.pickTables(ctx)
+	if err != nil {
+		return Item{}, err
+	}
+	return t.PutItem(ctx, table, item, mode, expectVersion)
+}
+
+func (r Router) GetItem(ctx context.Context, table, pk, sk string) (Item, error) {
+	t, err := r.pickTables(ctx)
+	if err != nil {
+		return Item{}, err
+	}
+	return t.GetItem(ctx, table, pk, sk)
+}
+
+func (r Router) DeleteItem(ctx context.Context, table, pk, sk string) error {
+	t, err := r.pickTables(ctx)
+	if err != nil {
+		return err
+	}
+	return t.DeleteItem(ctx, table, pk, sk)
+}
+
+func (r Router) UpdateItem(ctx context.Context, table, pk, sk string, changes Item) (Item, error) {
+	t, err := r.pickTables(ctx)
+	if err != nil {
+		return Item{}, err
+	}
+	return t.UpdateItem(ctx, table, pk, sk, changes)
+}
+
+func (r Router) Query(ctx context.Context, table, pk, skFrom, skTo string, max int, token string) (TablePage, error) {
+	t, err := r.pickTables(ctx)
+	if err != nil {
+		return TablePage{}, err
+	}
+	return t.Query(ctx, table, pk, skFrom, skTo, max, token)
+}
+
+func (r Router) Scan(ctx context.Context, table string, max int, token string) (TablePage, error) {
+	t, err := r.pickTables(ctx)
+	if err != nil {
+		return TablePage{}, err
+	}
+	return t.Scan(ctx, table, max, token)
+}
+
 // isNilPointer catches a typed-nil backend (e.g. a nil *Client stored in a
 // Backend), which would otherwise panic on the first method call.
 func isNilPointer(v any) bool {

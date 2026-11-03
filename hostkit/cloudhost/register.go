@@ -26,6 +26,7 @@ type (
 	costReportSnapshot    struct{ r CostReport }
 	opMetricsSnapshot     struct{ m OpMetrics }
 	metricsReportSnapshot struct{ r MetricsReport }
+	tablePageSnapshot     struct{ p TablePage }
 )
 
 type method = func(self any, args []lmcode.Value) (lmcode.Value, error)
@@ -282,6 +283,115 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 		return lmcode.String(v), hostErr(err)
 	})
 
+	// Tables & Items.
+	tableItemVal := func(it *TableItem, err error) (lmcode.Value, error) {
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return lmcode.Object("TableItem", it), nil
+	}
+	tableItemArg := func(v lmcode.Value) (*TableItem, error) {
+		if v.Obj == nil {
+			return nil, lmcode.NewHostError("expected TableItem, got nil")
+		}
+		it, ok := v.Obj.(*TableItem)
+		if !ok {
+			return nil, lmcode.NewHostError(fmt.Sprintf("expected TableItem, got %T", v.Obj))
+		}
+		return it, nil
+	}
+	r.pure("Cloud", "item_new", []string{"string"}, "TableItem", func(self any, a []lmcode.Value) (lmcode.Value, error) {
+		return tableItemVal(self.(*Host).ItemNew(a[0].Str, "", false))
+	})
+	r.pure("Cloud", "item_new", []string{"string", "string"}, "TableItem", func(self any, a []lmcode.Value) (lmcode.Value, error) {
+		return tableItemVal(self.(*Host).ItemNew(a[0].Str, a[1].Str, true))
+	})
+	r.op("table_create", []string{"string"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.TableCreate(dry, a[0].Str, false)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("table_create", []string{"string", "bool"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.TableCreate(dry, a[0].Str, a[1].Bool)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("table_delete", []string{"string"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.TableDelete(dry, a[0].Str)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("table_exists", []string{"string"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.TableExists(dry, a[0].Str)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("table_list", nil, "StrList", func(h *Host, dry bool, _ []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.TableList(dry)
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return r.strList(v)
+	})
+	r.op("item_put", []string{"string", "TableItem"}, "TableItem", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		it, err := tableItemArg(a[1])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		return tableItemVal(h.ItemPut(dry, a[0].Str, it, hostkit.PutUnconditional, ""))
+	})
+	r.op("item_put", []string{"string", "TableItem", "string"}, "TableItem", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		it, err := tableItemArg(a[1])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		mode := hostkit.PutIfVersion
+		if a[2].Str == "" {
+			mode = hostkit.PutIfAbsent
+		}
+		return tableItemVal(h.ItemPut(dry, a[0].Str, it, mode, a[2].Str))
+	})
+	r.op("item_get", []string{"string", "string"}, "TableItem", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return tableItemVal(h.ItemGet(dry, a[0].Str, a[1].Str, "", false))
+	})
+	r.op("item_get", []string{"string", "string", "string"}, "TableItem", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return tableItemVal(h.ItemGet(dry, a[0].Str, a[1].Str, a[2].Str, true))
+	})
+	r.op("item_delete", []string{"string", "string"}, "void", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.None(), hostErr(h.ItemDelete(dry, a[0].Str, a[1].Str, "", false))
+	})
+	r.op("item_delete", []string{"string", "string", "string"}, "void", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.None(), hostErr(h.ItemDelete(dry, a[0].Str, a[1].Str, a[2].Str, true))
+	})
+	r.op("item_update", []string{"string", "string", "TableItem"}, "TableItem", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		it, err := tableItemArg(a[2])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		return tableItemVal(h.ItemUpdate(dry, a[0].Str, a[1].Str, "", false, it))
+	})
+	r.op("item_update", []string{"string", "string", "string", "TableItem"}, "TableItem", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		it, err := tableItemArg(a[3])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		return tableItemVal(h.ItemUpdate(dry, a[0].Str, a[1].Str, a[2].Str, true, it))
+	})
+	tablePageVal := func(p *TablePage, err error) (lmcode.Value, error) {
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return lmcode.Object("TablePage", &tablePageSnapshot{p: *p}), nil
+	}
+	r.op("item_query", []string{"string", "string"}, "TablePage", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return tablePageVal(h.ItemQuery(dry, a[0].Str, a[1].Str, "", "", 0, ""))
+	})
+	r.op("item_query", []string{"string", "string", "string", "string", "int", "string"}, "TablePage", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return tablePageVal(h.ItemQuery(dry, a[0].Str, a[1].Str, a[2].Str, a[3].Str, a[4].Int, a[5].Str))
+	})
+	r.op("item_scan", []string{"string"}, "TablePage", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return tablePageVal(h.ItemScan(dry, a[0].Str, 0, ""))
+	})
+	r.op("item_scan", []string{"string", "int", "string"}, "TablePage", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return tablePageVal(h.ItemScan(dry, a[0].Str, a[1].Int, a[2].Str))
+	})
+
 	// Cost & Performance.
 	r.pure("Cloud", "cost_cap_usd", nil, "float", func(self any, _ []lmcode.Value) (lmcode.Value, error) {
 		return lmcode.Float(self.(*Host).CostCapUSD()), nil
@@ -429,6 +539,81 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 		return lmcode.Object("OpMetrics", &opMetricsSnapshot{m: mr(s).Op(a[0].Str)}), nil
 	})
 	r.pure("MetricsReport", "summary", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.String(mr(s).Summary()), nil })
+
+	ti := func(self any) *TableItem { return self.(*TableItem) }
+	r.pure("TableItem", "set_string", []string{"string", "string"}, "TableItem", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return tableItemVal(ti(s).SetString(a[0].Str, a[1].Str))
+	})
+	r.pure("TableItem", "set_int", []string{"string", "int"}, "TableItem", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return tableItemVal(ti(s).SetInt(a[0].Str, a[1].Int))
+	})
+	r.pure("TableItem", "set_number", []string{"string", "float"}, "TableItem", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return tableItemVal(ti(s).SetNumber(a[0].Str, a[1].Float))
+	})
+	r.pure("TableItem", "set_bool", []string{"string", "bool"}, "TableItem", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return tableItemVal(ti(s).SetBool(a[0].Str, a[1].Bool))
+	})
+	r.pure("TableItem", "remove", []string{"string"}, "TableItem", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return tableItemVal(ti(s).Remove(a[0].Str))
+	})
+	r.pure("TableItem", "has", []string{"string"}, "bool", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Bool(ti(s).Has(a[0].Str)), nil
+	})
+	r.pure("TableItem", "type_of", []string{"string"}, "string", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(ti(s).TypeOf(a[0].Str)), nil
+	})
+	r.pure("TableItem", "get_string", []string{"string"}, "string", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := ti(s).GetString(a[0].Str)
+		return lmcode.String(v), hostErr(err)
+	})
+	r.pure("TableItem", "get_int", []string{"string"}, "int", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := ti(s).GetInt(a[0].Str)
+		return lmcode.Int(v), hostErr(err)
+	})
+	r.pure("TableItem", "get_number", []string{"string"}, "float", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := ti(s).GetNumber(a[0].Str)
+		return lmcode.Float(v), hostErr(err)
+	})
+	r.pure("TableItem", "get_bool", []string{"string"}, "bool", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := ti(s).GetBool(a[0].Str)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.pure("TableItem", "names", nil, "StrList", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return r.strList(ti(s).Names())
+	})
+	r.pure("TableItem", "len", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(ti(s).Len()), nil
+	})
+	r.pure("TableItem", "pk", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(ti(s).PK()), nil
+	})
+	r.pure("TableItem", "sk", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(ti(s).SK()), nil
+	})
+	r.pure("TableItem", "version", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(ti(s).Version()), nil
+	})
+	r.pure("TableItem", "exists", nil, "bool", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Bool(ti(s).Exists()), nil
+	})
+
+	tp := func(self any) TablePage { return self.(*tablePageSnapshot).p }
+	r.pure("TablePage", "len", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(int64(len(tp(s).Items))), nil
+	})
+	r.pure("TablePage", "at", []string{"int"}, "TableItem", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		p := tp(s)
+		if a[0].Int < 0 || a[0].Int >= int64(len(p.Items)) {
+			return lmcode.None(), lmcode.NewHostError(fmt.Sprintf("TablePage.at(%d): %v (len %d)", a[0].Int, errIndex, len(p.Items)))
+		}
+		return lmcode.Object("TableItem", p.Items[a[0].Int]), nil
+	})
+	r.pure("TablePage", "has_more", nil, "bool", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Bool(tp(s).NextToken != ""), nil
+	})
+	r.pure("TablePage", "next_token", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(tp(s).NextToken), nil
+	})
 	return r.first
 }
 

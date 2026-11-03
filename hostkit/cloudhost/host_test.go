@@ -17,7 +17,7 @@ import (
 func newTestHost(t *testing.T, opts fakeadapter.Options) (*Host, *fakeadapter.Fake) {
 	t.Helper()
 	f := fakeadapter.New(opts)
-	h := New(Config{Provider: "ref", Store: f, Queue: f, Endpoints: &hostkit.EndpointResolver{Getenv: func(string) string { return "" }}, PollInterval: time.Millisecond})
+	h := New(Config{Provider: "ref", Store: f, Queue: f, Tables: f, Endpoints: &hostkit.EndpointResolver{Getenv: func(string) string { return "" }}, PollInterval: time.Millisecond})
 	h.SetAbortOnError(false)
 	return h, f
 }
@@ -88,6 +88,19 @@ func TestDryRunMakesZeroMutatorCalls(t *testing.T) {
 	}
 	if names, _ := h.QueueList(true); strings.Join(names, ",") != "dry-q" {
 		t.Fatalf("dry queue_list = %v", names)
+	}
+	mustB(t)(h.TableCreate(true, "dryt", true))
+	dryIt, _ := h.ItemNew("p1", "s1", true)
+	_, _ = dryIt.SetString("msg", "hello")
+	putRes, _ := h.ItemPut(true, "dryt", dryIt, hostkit.PutUnconditional, "")
+	if !putRes.Exists() || putRes.Version() == "" {
+		t.Fatal("dry item_put preview")
+	}
+	if gotIt, _ := h.ItemGet(true, "dryt", "p1", "s1", true); !gotIt.Exists() {
+		t.Fatal("dry item_get of previewed item")
+	}
+	if tnames, _ := h.TableList(true); strings.Join(tnames, ",") != "dryt" {
+		t.Fatalf("dry table_list = %v", tnames)
 	}
 	if got := f.MutatorCalls(); got != before {
 		t.Fatalf("dry run made %d provider mutator calls: %v", got-before, f.Calls())
@@ -376,4 +389,81 @@ func TestHostIsSafeForConcurrentUse(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+type tableStub struct {
+	*fakeadapter.Fake
+	getItem    func() (hostkit.Item, error)
+	queryItems func(token string) (hostkit.TablePage, error)
+}
+
+func (s *tableStub) GetItem(ctx context.Context, table, pk, sk string) (hostkit.Item, error) {
+	if s.getItem != nil {
+		return s.getItem()
+	}
+	return s.Fake.GetItem(ctx, table, pk, sk)
+}
+
+func (s *tableStub) Query(ctx context.Context, table, pk, skFrom, skTo string, maxItems int, token string) (hostkit.TablePage, error) {
+	if s.queryItems != nil {
+		return s.queryItems(token)
+	}
+	return s.Fake.Query(ctx, table, pk, skFrom, skTo, maxItems, token)
+}
+
+func TestTablesTokenBindingAndOversizedProviderItem(t *testing.T) {
+	s := &tableStub{Fake: fakeadapter.New(fakeadapter.Options{})}
+	h := New(Config{Provider: "ref", Store: s.Fake, Queue: s.Fake, Tables: s, Endpoints: &hostkit.EndpointResolver{Getenv: func(string) string { return "" }}})
+	h.SetAbortOnError(false)
+
+	mustB(t)(h.TableCreate(false, "tba", true))
+	mustB(t)(h.TableCreate(false, "tbb", true))
+	for _, sk := range []string{"s1", "s2", "s3"} {
+		it, _ := h.ItemNew("p1", sk, true)
+		_, _ = it.SetString("v", sk)
+		_, _ = h.ItemPut(false, "tba", it, hostkit.PutUnconditional, "")
+	}
+
+	p1, _ := h.ItemQuery(false, "tba", "p1", "s1", "s9", 1, "")
+	if p1.NextToken == "" || code(h) != hostkit.OK {
+		t.Fatalf("expected page 1 token, got %+v err=%+v", p1, h.LastError())
+	}
+	tok := p1.NextToken
+
+	// Replay query token against different table, pk, range, or item_scan must fail pre-flight INVALID_ARGUMENT.
+	if _, _ = h.ItemQuery(false, "tbb", "p1", "s1", "s9", 1, tok); code(h) != hostkit.InvalidArgument || h.LastError().HTTPStatus != 0 {
+		t.Fatalf("cross-table query token replay must fail preflight: %+v", h.LastError())
+	}
+	if _, _ = h.ItemQuery(false, "tba", "p2", "s1", "s9", 1, tok); code(h) != hostkit.InvalidArgument {
+		t.Fatalf("cross-pk query token replay must fail preflight: %+v", h.LastError())
+	}
+	if _, _ = h.ItemQuery(false, "tba", "p1", "s2", "s9", 1, tok); code(h) != hostkit.InvalidArgument {
+		t.Fatalf("changed sk_from query token replay must fail preflight: %+v", h.LastError())
+	}
+	if _, _ = h.ItemScan(false, "tba", 1, tok); code(h) != hostkit.InvalidArgument {
+		t.Fatalf("query token replayed on item_scan must fail preflight: %+v", h.LastError())
+	}
+
+	// Stalled provider token fails closed with INTERNAL.
+	s.queryItems = func(token string) (hostkit.TablePage, error) {
+		return hostkit.TablePage{Items: []hostkit.Item{{PK: "p1", SK: "s1", Version: "e1", Attrs: map[string]hostkit.Attr{}}}, NextToken: token}, nil
+	}
+	if _, _ = h.ItemQuery(false, "tba", "p1", "s1", "s9", 1, tok); code(h) != hostkit.Internal {
+		t.Fatalf("stalled query token must fail INTERNAL: %+v", h.LastError())
+	}
+	s.queryItems = nil
+
+	// Oversized item returned by a buggy provider fails closed with INTERNAL (OversizedTableItem).
+	s.getItem = func() (hostkit.Item, error) {
+		big := strings.Repeat("x", hostkit.MaxAttrStringUTF16Units+1)
+		return hostkit.Item{
+			PK:      "p1",
+			SK:      "s1",
+			Version: "e1",
+			Attrs:   map[string]hostkit.Attr{"big": hostkit.StringAttr(big)},
+		}, nil
+	}
+	if got, _ := h.ItemGet(false, "tba", "p1", "s1", true); got.Exists() || code(h) != hostkit.Internal || h.LastError().ProviderCode != "OversizedTableItem" {
+		t.Fatalf("oversized provider item must fail closed INTERNAL/OversizedTableItem: exists=%v err=%+v", got.Exists(), h.LastError())
+	}
 }
