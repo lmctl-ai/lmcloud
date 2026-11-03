@@ -1,7 +1,8 @@
 # Scenario 03: Object CRUD with UTF-8 text, quotes, newlines, Unicode, and special-character keys (space, +, %, ?, #, Unicode).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-bucket = "lmcloud-c03-" + run_id + "-utf8";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+bucket = len(name_prefix) > 0 ? (name_prefix + "c03-utf8") : ("lmcloud-c03-" + run_id + "-utf8");
 key = "docs/2026/greeting.json";
 special_key = "docs/2026/a b+c%d?e#f-雪.json";
 payload = "{\"msg\": \"hello \\\"lmcloud\\\"\\n雪 / 🚀\"}";

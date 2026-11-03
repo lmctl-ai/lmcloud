@@ -1,7 +1,8 @@
 # Scenario 04: Empty (""), sentinel-escape ("__lmcloud_empty__"), UTF-8, XML/JSON-special, and binary byte-preserving message bodies (H2).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-qname = "lmcloud-q04-" + run_id + "-enc";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+qname = len(name_prefix) > 0 ? (name_prefix + "q04-enc") : ("lmcloud-q04-" + run_id + "-enc");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

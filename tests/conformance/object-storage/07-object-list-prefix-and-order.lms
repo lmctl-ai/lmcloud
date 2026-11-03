@@ -3,7 +3,8 @@
 # follows next_token until !has_more() instead of assuming one page holds all keys.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-bucket = "lmcloud-c07-" + run_id + "-prefix";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+bucket = len(name_prefix) > 0 ? (name_prefix + "c07-prefix") : ("lmcloud-c07-" + run_id + "-prefix");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

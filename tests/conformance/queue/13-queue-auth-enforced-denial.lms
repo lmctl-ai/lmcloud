@@ -5,7 +5,8 @@
 #     fail with ErrorCode.PERMISSION_DENIED (never exists == false with ErrorCode.OK).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-denied_q = "lmcloud-q13-" + run_id + "-denied";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+denied_q = len(name_prefix) > 0 ? (name_prefix + "q13-denied") : ("lmcloud-q13-" + run_id + "-denied");
 
 orig_aws_key = env("LMAWS_SIM_ACCESS_KEY_ID", "");
 orig_aws_sec = env("LMAWS_SIM_SECRET_ACCESS_KEY", "");

@@ -1,7 +1,8 @@
 # Scenario 04: Zero-byte empty object and raw binary payload (via str_hex_decode: NUL + non-UTF-8 bytes) round-trip.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-bucket = "lmcloud-c04-" + run_id + "-binary";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+bucket = len(name_prefix) > 0 ? (name_prefix + "c04-binary") : ("lmcloud-c04-" + run_id + "-binary");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

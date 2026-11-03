@@ -3,8 +3,9 @@
 # and polls for post-delete disappearance before testing second delete (M3).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-q_active = "lmcloud-q02-" + run_id + "-active";
-q_never = "lmcloud-q02-" + run_id + "-never";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+q_active = len(name_prefix) > 0 ? (name_prefix + "q02-active") : ("lmcloud-q02-" + run_id + "-active");
+q_never = len(name_prefix) > 0 ? (name_prefix + "q02-never") : ("lmcloud-q02-" + run_id + "-never");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

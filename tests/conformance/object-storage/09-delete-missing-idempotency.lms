@@ -1,7 +1,8 @@
 # Scenario 09: Idempotent object_delete (void) on missing keys in an existing bucket.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-bucket = "lmcloud-c09-" + run_id + "-delidem";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+bucket = len(name_prefix) > 0 ? (name_prefix + "c09-delidem") : ("lmcloud-c09-" + run_id + "-delidem");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

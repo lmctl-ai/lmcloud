@@ -2,7 +2,8 @@
 # and bounded-poll redelivery after queue_nack(q, receipt, 0) (M1, L2).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-qname = "lmcloud-q06-" + run_id + "-vis";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+qname = len(name_prefix) > 0 ? (name_prefix + "q06-vis") : ("lmcloud-q06-" + run_id + "-vis");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
