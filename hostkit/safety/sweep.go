@@ -29,6 +29,9 @@ type SweepOptions struct {
 	// Apply must be true to perform deletions and mutate the journal; false (the
 	// zero value) runs in dry-run mode.
 	Apply bool
+	// Compact optionally compacts the journal after a successful Apply sweep;
+	// false (the default) preserves the append-only EventReserve/EventSettle/EventDeleted records.
+	Compact bool
 	// ScanPrefix also queries Recovery.FindOwned for any remaining resources
 	// with this run's prefix and reports unowned siblings without deleting them.
 	ScanPrefix bool
@@ -678,7 +681,7 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 		}
 	}
 
-	if opts.Apply && j != nil {
+	if opts.Apply && opts.Compact && j != nil {
 		if err := j.Compact(); err != nil {
 			return report, fmt.Errorf("compact journal after sweep: %w", err)
 		}
