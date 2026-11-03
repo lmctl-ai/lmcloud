@@ -84,10 +84,10 @@ func RedactEndpoint(raw string) (string, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid journal endpoint %q: %w", raw, err)
+		return "", errors.New("invalid journal endpoint URL")
 	}
 	if u.Scheme == "" || u.Host == "" {
-		return "", fmt.Errorf("invalid journal endpoint %q: scheme and host are required", raw)
+		return "", errors.New("invalid journal endpoint URL: scheme and host are required")
 	}
 	u.User = nil
 	u.RawQuery = ""
@@ -144,7 +144,7 @@ func (m JournalMeta) Validate() error {
 			return err
 		}
 		if cleanEP != m.Endpoint {
-			return fmt.Errorf("journal endpoint %q contains unredacted userinfo, query, or fragment", m.Endpoint)
+			return errors.New("journal endpoint contains unredacted userinfo, query, or fragment")
 		}
 	}
 	return nil
@@ -229,6 +229,7 @@ type LedgerEntry struct {
 	ConfirmedAtUnix     int64
 	ServerCreatedAtUnix int64
 	ReservedNanoUSD     int64
+	PayloadBytes        int64
 	State               string // StatePending, StateConfirmed, StateRetained
 	Retain              bool
 	Reason              string
@@ -354,6 +355,23 @@ type Journal struct {
 	meta       JournalMeta
 	state      *LedgerState
 	now        func() time.Time
+}
+
+// CheckHealth verifies that the journal is open, writable, and not poisoned by
+// an earlier write, short-write, or fsync error.
+func (j *Journal) CheckHealth() error {
+	if j == nil {
+		return errors.New("journal is nil")
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.f == nil {
+		return errors.New("journal is closed")
+	}
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	return nil
 }
 
 // SetClock configures the clock used for timestamps on subsequent journal writes.
@@ -574,6 +592,12 @@ func (j *Journal) Lookup(kind, parent, name string) (LedgerEntry, bool) {
 //   - Otherwise, BeginCreate generates fresh 128-bit OwnerNonce and CreateToken
 //     values, appends an `intent` record, and fsyncs the journal before returning.
 func (j *Journal) BeginCreate(kind, parent, location, name string, reservedNanoUSD int64) (CreateIntent, error) {
+	return j.BeginCreateWithBytes(kind, parent, location, name, reservedNanoUSD, 0)
+}
+
+// BeginCreateWithBytes is like BeginCreate and also records payloadBytes on the
+// durable intent record before provider dispatch.
+func (j *Journal) BeginCreateWithBytes(kind, parent, location, name string, reservedNanoUSD, payloadBytes int64) (CreateIntent, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.poisoned != nil {
@@ -594,15 +618,40 @@ func (j *Journal) BeginCreate(kind, parent, location, name string, reservedNanoU
 			}, nil
 		}
 		if existing.State == StatePending {
-			return CreateIntent{
+			nowUnix := j.nowTime().UTC().Unix()
+			resNano := existing.ReservedNanoUSD
+			if reservedNanoUSD > resNano {
+				resNano = reservedNanoUSD
+			}
+			extraBytes := int64(0)
+			if payloadBytes > existing.PayloadBytes {
+				extraBytes = payloadBytes - existing.PayloadBytes
+			}
+			intent := CreateIntent{
 				Kind:         existing.Kind,
 				Parent:       existing.Parent,
 				Location:     existing.Location,
 				Name:         existing.Name,
 				OwnerNonce:   existing.OwnerNonce,
 				CreateToken:  existing.CreateToken,
-				IntentAtUnix: existing.IntentAtUnix,
-			}, nil
+				IntentAtUnix: nowUnix,
+			}
+			rec := JournalRecord{
+				Event:           EventIntent,
+				Kind:            intent.Kind,
+				Parent:          intent.Parent,
+				Location:        intent.Location,
+				Name:            intent.Name,
+				OwnerNonce:      intent.OwnerNonce,
+				CreateToken:     intent.CreateToken,
+				IntentAtUnix:    intent.IntentAtUnix,
+				ReservedNanoUSD: resNano,
+				PayloadBytes:    extraBytes,
+			}
+			if err := j.appendLocked(rec); err != nil {
+				return CreateIntent{}, err
+			}
+			return intent, nil
 		}
 	}
 
@@ -626,6 +675,7 @@ func (j *Journal) BeginCreate(kind, parent, location, name string, reservedNanoU
 		CreateToken:     intent.CreateToken,
 		IntentAtUnix:    intent.IntentAtUnix,
 		ReservedNanoUSD: reservedNanoUSD,
+		PayloadBytes:    payloadBytes,
 	}
 	if err := j.appendLocked(rec); err != nil {
 		return CreateIntent{}, err
@@ -739,6 +789,7 @@ func (j *Journal) Retain(kind, parent, name, reason string) error {
 		rec.IntentAtUnix = existing.IntentAtUnix
 		rec.ConfirmedAtUnix = existing.ConfirmedAtUnix
 		rec.ServerCreatedAtUnix = existing.ServerCreatedAtUnix
+		rec.ReservedNanoUSD = existing.ReservedNanoUSD
 	}
 	return j.appendLocked(rec)
 }
@@ -873,7 +924,7 @@ func (j *Journal) Compact() error {
 		activeObjects int
 	)
 	for _, e := range j.state.Entries {
-		if e.State == StateConfirmed && !e.Retain {
+		if (e.State == StateConfirmed || e.State == StatePending) && !e.Retain {
 			switch e.Kind {
 			case KindBucket:
 				activeBuckets++
@@ -902,27 +953,26 @@ func (j *Journal) Compact() error {
 	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 
 	compacted = append(compacted, JournalRecord{
-		Version:         JournalVersion,
-		Seq:             seq,
-		Time:            nowStr,
-		Event:           EventMeta,
-		RunID:           j.meta.RunID,
-		SessionID:       j.meta.SessionID,
-		PolicyHash:      j.meta.PolicyHash,
-		Provider:        j.meta.Provider,
-		Account:         j.meta.Account,
-		Tenant:          j.meta.Tenant,
-		Scope:           j.meta.Scope,
-		Region:          j.meta.Region,
-		Endpoint:        j.meta.Endpoint,
-		StartedAtUnix:   j.state.StartedAtUnix,
-		ReservedNanoUSD: j.state.ReservedNanoUSD,
-		ChargedNanoUSD:  j.state.ChargedNanoUSD,
-		PayloadBytes:    j.state.TotalPayloadBytes,
-		BucketsCreated:  baseBuckets,
-		QueuesCreated:   baseQueues,
-		ObjectsCreated:  baseObjects,
-		MessagesSent:    j.state.MessagesSent,
+		Version:        JournalVersion,
+		Seq:            seq,
+		Time:           nowStr,
+		Event:          EventMeta,
+		RunID:          j.meta.RunID,
+		SessionID:      j.meta.SessionID,
+		PolicyHash:     j.meta.PolicyHash,
+		Provider:       j.meta.Provider,
+		Account:        j.meta.Account,
+		Tenant:         j.meta.Tenant,
+		Scope:          j.meta.Scope,
+		Region:         j.meta.Region,
+		Endpoint:       j.meta.Endpoint,
+		StartedAtUnix:  j.state.StartedAtUnix,
+		ChargedNanoUSD: j.state.ChargedNanoUSD,
+		PayloadBytes:   j.state.TotalPayloadBytes,
+		BucketsCreated: baseBuckets,
+		QueuesCreated:  baseQueues,
+		ObjectsCreated: baseObjects,
+		MessagesSent:   j.state.MessagesSent,
 	})
 
 	for _, e := range j.state.Entries {
@@ -966,6 +1016,7 @@ func (j *Journal) Compact() error {
 			IntentAtUnix:        e.IntentAtUnix,
 			ConfirmedAtUnix:     e.ConfirmedAtUnix,
 			ServerCreatedAtUnix: e.ServerCreatedAtUnix,
+			ReservedNanoUSD:     e.ReservedNanoUSD,
 			Reason:              e.Reason,
 			Retain:              retainFlag,
 		})
@@ -974,13 +1025,6 @@ func (j *Journal) Compact() error {
 	newState, err := ReplayJournal(compacted)
 	if err != nil {
 		return fmt.Errorf("validate compacted journal: %w", err)
-	}
-	// Preserve per-entry pending reservations in memory.
-	for i := range newState.Entries {
-		ne := &newState.Entries[i]
-		if old, ok := j.state.Lookup(ne.Kind, ne.Parent, ne.Name); ok {
-			ne.ReservedNanoUSD = old.ReservedNanoUSD
-		}
 	}
 
 	tmpPath := j.path + ".tmp"
@@ -1188,7 +1232,7 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 			return err
 		}
 		if cleanEP != rec.Endpoint {
-			return fmt.Errorf("record endpoint %q contains unredacted userinfo, query, or fragment", rec.Endpoint)
+			return errors.New("record endpoint contains unredacted userinfo, query, or fragment")
 		}
 	}
 	if rec.ReservedNanoUSD < 0 || rec.ChargedNanoUSD < 0 || rec.PayloadBytes < 0 ||
@@ -1259,9 +1303,36 @@ func incrementKindCreated(state *LedgerState, kind string) {
 	}
 }
 
+func decrementKindCreated(state *LedgerState, kind string) {
+	switch kind {
+	case KindBucket:
+		if state.BucketsCreated > 0 {
+			state.BucketsCreated--
+		}
+	case KindQueue:
+		if state.QueuesCreated > 0 {
+			state.QueuesCreated--
+		}
+	case KindObject:
+		if state.ObjectsCreated > 0 {
+			state.ObjectsCreated--
+		}
+	}
+}
+
+func recomputeReservedNanoUSD(state *LedgerState) {
+	var total int64
+	for _, e := range state.Entries {
+		if e.ReservedNanoUSD > 0 {
+			total += e.ReservedNanoUSD
+		}
+	}
+	state.ReservedNanoUSD = total
+}
+
 func applyRecordToState(state *LedgerState, rec JournalRecord) error {
+	defer recomputeReservedNanoUSD(state)
 	state.LastSeq = rec.Seq
-	state.ReservedNanoUSD += rec.ReservedNanoUSD
 	state.ChargedNanoUSD += rec.ChargedNanoUSD
 	state.TotalPayloadBytes += rec.PayloadBytes
 
@@ -1283,6 +1354,11 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		if rec.Kind == KindQueueMessage && rec.Reason == "queue_send" {
 			state.MessagesSent++
 		}
+		if rec.ChargedNanoUSD > 0 && rec.Kind != "" && rec.Name != "" {
+			if idx, ok := state.byKey[resourceKey(rec.Kind, rec.Parent, rec.Name)]; ok {
+				state.Entries[idx].ReservedNanoUSD = 0
+			}
+		}
 		return nil
 	}
 
@@ -1303,12 +1379,19 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 				return fmt.Errorf("conflicting owner_nonce on pending %s %s/%s", rec.Kind, rec.Parent, rec.Name)
 			}
 			cur.CreateToken = rec.CreateToken
-			if rec.ReservedNanoUSD > 0 {
-				cur.ReservedNanoUSD += rec.ReservedNanoUSD
+			if rec.IntentAtUnix != 0 {
+				cur.IntentAtUnix = rec.IntentAtUnix
 			}
+			if rec.ReservedNanoUSD > cur.ReservedNanoUSD {
+				cur.ReservedNanoUSD = rec.ReservedNanoUSD
+			}
+			cur.PayloadBytes += rec.PayloadBytes
 			cur.Seq = rec.Seq
 			state.Entries[idx] = cur
 			return nil
+		}
+		if !rec.Retain {
+			incrementKindCreated(state, rec.Kind)
 		}
 		entry := LedgerEntry{
 			Kind:            rec.Kind,
@@ -1319,6 +1402,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			CreateToken:     rec.CreateToken,
 			IntentAtUnix:    rec.IntentAtUnix,
 			ReservedNanoUSD: rec.ReservedNanoUSD,
+			PayloadBytes:    rec.PayloadBytes,
 			State:           StatePending,
 			Seq:             rec.Seq,
 		}
@@ -1332,20 +1416,24 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			if cur.OwnerNonce != "" && cur.OwnerNonce != rec.OwnerNonce {
 				return fmt.Errorf("confirmed owner_nonce mismatch for %s %s/%s", rec.Kind, rec.Parent, rec.Name)
 			}
-			wasConfirmed := cur.State == StateConfirmed
+			wasCounted := (cur.State == StateConfirmed || cur.State == StatePending) && !cur.Retain
 			if cur.Retain || cur.State == StateRetained || rec.Retain {
 				cur.State = StateRetained
 				cur.Retain = true
 				if rec.Reason != "" {
 					cur.Reason = rec.Reason
 				}
+				if wasCounted {
+					decrementKindCreated(state, rec.Kind)
+				}
 			} else {
 				cur.State = StateConfirmed
-				if !wasConfirmed {
+				if !wasCounted {
 					incrementKindCreated(state, rec.Kind)
 				}
 			}
 			cur.ReservedNanoUSD = 0
+			cur.PayloadBytes += rec.PayloadBytes
 			if rec.Location != "" {
 				cur.Location = rec.Location
 			}
@@ -1410,12 +1498,30 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		if cur.State == StateConfirmed || cur.State == StateRetained || cur.Retain {
 			return nil
 		}
+		if cur.State == StatePending {
+			decrementKindCreated(state, cur.Kind)
+			if cur.PayloadBytes > 0 {
+				state.TotalPayloadBytes -= cur.PayloadBytes
+				if state.TotalPayloadBytes < 0 {
+					state.TotalPayloadBytes = 0
+				}
+			}
+		}
 		removeEntryAt(state, idx)
 		return nil
 
 	case EventRetained:
 		if exists {
 			cur := state.Entries[idx]
+			if cur.State == StatePending && !cur.Retain {
+				decrementKindCreated(state, cur.Kind)
+				if cur.PayloadBytes > 0 {
+					state.TotalPayloadBytes -= cur.PayloadBytes
+					if state.TotalPayloadBytes < 0 {
+						state.TotalPayloadBytes = 0
+					}
+				}
+			}
 			cur.State = StateRetained
 			cur.Retain = true
 			if rec.Location != "" {
@@ -1448,6 +1554,9 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			if rec.Reason != "" {
 				cur.Reason = rec.Reason
 			}
+			if rec.ReservedNanoUSD > 0 {
+				cur.ReservedNanoUSD = rec.ReservedNanoUSD
+			}
 			cur.Seq = rec.Seq
 			state.Entries[idx] = cur
 			return nil
@@ -1465,6 +1574,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			IntentAtUnix:        rec.IntentAtUnix,
 			ConfirmedAtUnix:     rec.ConfirmedAtUnix,
 			ServerCreatedAtUnix: rec.ServerCreatedAtUnix,
+			ReservedNanoUSD:     rec.ReservedNanoUSD,
 			State:               StateRetained,
 			Retain:              true,
 			Reason:              rec.Reason,

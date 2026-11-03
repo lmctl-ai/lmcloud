@@ -48,8 +48,9 @@ const (
 	DefaultMaxObjectBytes    = 16 * 1024 * 1024 // 16 MiB
 	DefaultMaxMessageBytes   = 48 * 1024        // 48 KiB
 	DefaultMaxTotalBytes     = 64 * 1024 * 1024 // 64 MiB
-	DefaultMaxRunSeconds     = 20 * 60          // 20 minutes
-	DefaultMaxCleanupSeconds = 5 * 60           // 5 minutes
+	DefaultMaxRunSeconds            = 20 * 60          // 20 minutes
+	DefaultMaxCleanupSeconds        = 5 * 60           // 5 minutes
+	DefaultMaxRequestTimeoutSeconds = 10               // 10 seconds per physical cloud request attempt
 
 	// ReservedLivePrefix is the mandatory prefix for any resource created in live mode.
 	ReservedLivePrefix = "lmcloud-conf-"
@@ -402,7 +403,7 @@ func (p *Policy) Validate() error {
 		}
 		for _, orig := range origins {
 			if err := ValidateLiveOrigin(orig); err != nil {
-				return fmt.Errorf("policy allowed_endpoints[%q] (%q): %w", svc, orig, err)
+				return fmt.Errorf("policy allowed_endpoints[%q]: %w", svc, err)
 			}
 		}
 	}
@@ -429,7 +430,7 @@ func ValidateLiveOrigin(raw string) error {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("malformed URL: %w", err)
+		return errors.New("malformed live origin URL")
 	}
 	if !strings.EqualFold(u.Scheme, "https") {
 		return fmt.Errorf("live origin must use https:// (got %q)", u.Scheme)
@@ -488,7 +489,7 @@ func (p Policy) CheckEndpoint(service, endpointURL string) error {
 	}
 	u, err := url.Parse(strings.TrimSpace(endpointURL))
 	if err != nil {
-		return err
+		return errors.New("malformed endpoint URL")
 	}
 	candOrigin := strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
 	for _, a := range allowed {
@@ -501,7 +502,7 @@ func (p Policy) CheckEndpoint(service, endpointURL string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("endpoint %q is not in policy allowed_endpoints[%q]", endpointURL, service)
+	return fmt.Errorf("endpoint origin %q is not in policy allowed_endpoints[%q]", candOrigin, service)
 }
 
 // GateConfig describes the environment and endpoint inputs to the live mode gate.
