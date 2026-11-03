@@ -216,27 +216,22 @@ func (p RetryPolicy) Do(ctx context.Context, idempotent bool, fn func(ctx contex
 	hooks := RetryHooksFrom(ctx)
 	var last Attempt
 	n := 0
-	reservedNext := false
 	for i := 0; i < p.Attempts; i++ {
 		if ctx.Err() != nil && n > 0 {
-			if reservedNext && hooks.AfterAttempt != nil {
-				hooks.AfterAttempt(ctx, i, Attempt{Err: ctx.Err(), NotSent: true})
-			}
 			break
 		}
-		if !reservedNext && hooks.BeforeAttempt != nil {
+		if hooks.BeforeAttempt != nil {
 			if err := hooks.BeforeAttempt(ctx, i); err != nil {
 				last = Attempt{Err: err, NotSent: true}
 				break
 			}
 		}
-		reservedNext = false
 		last = fn(ctx, i)
 		n++
 		if hooks.AfterAttempt != nil {
 			hooks.AfterAttempt(ctx, i, last)
 		}
-		retry := retryable(last, idempotent) && (last.Err == nil || ctx.Err() == nil)
+		retry := retryable(last, idempotent) && (last.Err == nil || (ctx.Err() == nil && !errors.Is(last.Err, context.Canceled) && !errors.Is(last.Err, context.DeadlineExceeded)))
 		if !retry || i == p.Attempts-1 {
 			break
 		}
@@ -244,17 +239,7 @@ func (p RetryPolicy) Do(ctx context.Context, idempotent bool, fn func(ctx contex
 		if dl, ok := ctx.Deadline(); ok && p.Now().Add(d).After(dl) {
 			break
 		}
-		if hooks.BeforeAttempt != nil {
-			if err := hooks.BeforeAttempt(ctx, i+1); err != nil {
-				last = Attempt{Err: err, NotSent: true}
-				break
-			}
-			reservedNext = true
-		}
 		if err := p.Sleep(ctx, d); err != nil {
-			if reservedNext && hooks.AfterAttempt != nil {
-				hooks.AfterAttempt(ctx, i+1, Attempt{Err: err, NotSent: true})
-			}
 			break
 		}
 	}

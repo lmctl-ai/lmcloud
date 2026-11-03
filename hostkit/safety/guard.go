@@ -91,6 +91,22 @@ func NewLiveGuard(cfg GuardConfig) (*LiveGuard, error) {
 	return g, nil
 }
 
+// Meter returns the CostMeter governing this LiveGuard.
+func (g *LiveGuard) Meter() *CostMeter {
+	if g == nil {
+		return nil
+	}
+	return g.meter
+}
+
+// Journal returns the durable Journal governing this LiveGuard.
+func (g *LiveGuard) Journal() *Journal {
+	if g == nil {
+		return nil
+	}
+	return g.journal
+}
+
 func journalWriteErr(err error) *hostkit.CloudError {
 	if err == nil {
 		return nil
@@ -151,12 +167,16 @@ func (g *LiveGuard) beginDurableAttempt(in AttemptPricingInput, kind, parent, na
 }
 
 func (da *durableAttempt) settle(actualAttemptNanoUSD int64, lockCleanupReserve, refundBytes bool) (int64, *hostkit.CloudError) {
+	return da.settleWithDetails(actualAttemptNanoUSD, 0, 0, lockCleanupReserve, refundBytes)
+}
+
+func (da *durableAttempt) settleWithDetails(actualAttemptNanoUSD, settledBytes, billingUnits int64, lockCleanupReserve, refundBytes bool) (int64, *hostkit.CloudError) {
 	if da == nil || da.settled {
 		return 0, nil
 	}
 	da.settled = true
 	charged := da.res.Commit(actualAttemptNanoUSD, lockCleanupReserve)
-	if err := da.guard.journal.SettleAttempt(da.attemptID, charged, refundBytes); err != nil {
+	if err := da.guard.journal.SettleAttemptWithDetails(da.attemptID, charged, settledBytes, billingUnits, refundBytes); err != nil {
 		return charged, journalWriteErr(err)
 	}
 	return charged, nil
@@ -245,7 +265,11 @@ func (g *LiveGuard) reserveOp(in AttemptPricingInput) (*AttemptReservation, *hos
 	if err != nil {
 		code := hostkit.PermissionDenied
 		pcode := "LiveCostCapExceeded"
-		if !errors.Is(err, ErrCostCapExceeded) {
+		if errors.Is(err, ErrCostCapExceeded) {
+			if g.journal != nil {
+				_ = g.journal.RecordCapExceeded(in.Operation)
+			}
+		} else {
 			code = hostkit.Internal
 			pcode = "LivePricingFailure"
 		}
@@ -360,6 +384,14 @@ func (g *LiveGuard) WrapQueue(queue hostkit.Queue) *GuardQueue {
 type GuardStore struct {
 	guard *LiveGuard
 	store hostkit.ObjectStore
+}
+
+// LiveGuard returns the underlying LiveGuard.
+func (s *GuardStore) LiveGuard() *LiveGuard {
+	if s == nil {
+		return nil
+	}
+	return s.guard
 }
 
 func (s *GuardStore) CreateBucket(ctx context.Context, bucket string) (bool, error) {
@@ -895,16 +927,18 @@ func (s *GuardStore) GetObject(ctx context.Context, bucket, key string, limit in
 		body = nil
 	}
 	actualNano := int64(-1)
+	settledBytes := clampedLimit
 	if err == nil {
+		settledBytes = int64(len(body))
 		actualQuote, qerr := s.guard.meter.QuoteAttempt(AttemptPricingInput{
 			Operation:   "object_get",
-			EgressBytes: int64(len(body)),
+			EgressBytes: settledBytes,
 		})
 		if qerr == nil {
 			actualNano = actualQuote.AttemptNanoUSD
 		}
 	}
-	if _, scerr := da.settle(actualNano, false, false); scerr != nil && err == nil {
+	if _, scerr := da.settleWithDetails(actualNano, settledBytes, 1, false, false); scerr != nil && err == nil {
 		return nil, scerr
 	}
 	return body, err
@@ -1048,6 +1082,14 @@ func (s *GuardStore) BucketCreateToken(ctx context.Context, bucket string) (stri
 type GuardQueue struct {
 	guard *LiveGuard
 	queue hostkit.Queue
+}
+
+// LiveGuard returns the underlying LiveGuard.
+func (q *GuardQueue) LiveGuard() *LiveGuard {
+	if q == nil {
+		return nil
+	}
+	return q.guard
 }
 
 func (q *GuardQueue) QueueCaps() hostkit.QueueCaps {
@@ -1464,7 +1506,19 @@ func (q *GuardQueue) Receive(ctx context.Context, queue string, max, waitSeconds
 	if _, cerr := g.verifyOwnedParent(ctx, KindQueue, queue, hostkit.AbsentQueue, false); cerr != nil {
 		return nil, cerr
 	}
-	da, cerr := g.beginDurableAttempt(AttemptPricingInput{Operation: "queue_receive"}, KindQueue, "", queue, "queue_receive", 0)
+	boundMax := max
+	if boundMax <= 0 {
+		boundMax = 1
+	}
+	if boundMax > hostkit.MaxReceiveMessages {
+		boundMax = hostkit.MaxReceiveMessages
+	}
+	caps := hostkit.CapsFor(ctx, q.queue, queue)
+	maxWireBytes := int64(boundMax) * 65536
+	if caps.TextOnlyWire {
+		maxWireBytes = int64(boundMax) * 2 * 65536
+	}
+	da, cerr := g.beginDurableAttempt(AttemptPricingInput{Operation: "queue_receive", PayloadSize: maxWireBytes}, KindQueue, "", queue, "queue_receive", 0)
 	if cerr != nil {
 		return nil, cerr
 	}
@@ -1472,7 +1526,24 @@ func (q *GuardQueue) Receive(ctx context.Context, queue string, max, waitSeconds
 	msgs, err := q.queue.Receive(reqCtx, queue, max, waitSeconds, visibility)
 	cancel()
 	err = hostkit.NilIfTyped(err)
-	if _, scerr := da.settle(-1, false, false); scerr != nil && err == nil {
+	actualNano := int64(-1)
+	settledBytes := maxWireBytes
+	units := (maxWireBytes + 65535) / 65536
+	if err == nil && len(msgs) <= boundMax {
+		var wireBytes int64
+		for _, m := range msgs {
+			wireBytes += int64(len(m.Wire))
+		}
+		settledBytes = wireBytes
+		units = 1
+		if wireBytes > 65536 {
+			units = (wireBytes + 65535) / 65536
+		}
+		if qQuote, qerr := g.meter.QuoteAttempt(AttemptPricingInput{Operation: "queue_receive", PayloadSize: wireBytes}); qerr == nil {
+			actualNano = qQuote.AttemptNanoUSD
+		}
+	}
+	if _, scerr := da.settleWithDetails(actualNano, settledBytes, units, false, false); scerr != nil && err == nil {
 		return nil, scerr
 	}
 	return msgs, err

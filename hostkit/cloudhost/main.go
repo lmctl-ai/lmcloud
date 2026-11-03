@@ -134,8 +134,12 @@ func (p Program) Main(args []string) int {
 	if err != nil {
 		return invoke.Failure("app", lmcode.NewError(lmcode.APP_FAIL, err.Error()))
 	}
-	if !inv.Dry && cfg.CampaignStatePath == "" && cfg.Meter == nil {
-		cfg.CampaignStatePath = defaultCampaignStatePath()
+	if !inv.Dry && cfg.CampaignStatePath == "" && cfg.Meter == nil && cfg.Journal == nil && !isLiveModeEnv() {
+		statePath, err := defaultCampaignStatePath(cfg.Provider)
+		if err != nil {
+			return invoke.Failure("app", lmcode.NewError(lmcode.APP_FAIL, err.Error()))
+		}
+		cfg.CampaignStatePath = statePath
 	}
 	reg, err := NewRegistry(out)
 	if err != nil {

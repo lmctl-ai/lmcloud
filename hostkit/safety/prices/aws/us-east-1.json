@@ -43,6 +43,9 @@
     "object_list": {
       "request_nano_usd": 5000
     },
+    "object_list_all": {
+      "request_nano_usd": 5000
+    },
     "object_copy": {
       "request_nano_usd": 5000,
       "storage_gib_month_nano_usd": 23000000,

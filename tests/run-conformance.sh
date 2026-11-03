@@ -275,8 +275,14 @@ else
     SLICE="${3:-all}"
     RUN_ID="${4:-${LMCLOUD_RUN_ID:-${LMAWS_RUN_ID:-$DEFAULT_RUN_ID}}}"
   fi
+  export LMCLOUD_RUN_ID="$RUN_ID"
+  if [[ -z "${LMCLOUD_STATE_DIR:-}" ]]; then
+    RUNNER_STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lmcloud-state.XXXXXX")"
+    chmod 0700 "$RUNNER_STATE_DIR"
+    export LMCLOUD_STATE_DIR="$RUNNER_STATE_DIR"
+    trap 'rm -rf "$RUNNER_STATE_DIR"' EXIT
+  fi
   if [[ "$LIVE_PROFILE" == "1" ]]; then
-    export LMCLOUD_RUN_ID="$RUN_ID"
     export LMAWS_RUN_ID="${LMAWS_RUN_ID:-$RUN_ID}"
     if [[ -z "${LMCLOUD_NAME_PREFIX:-}" ]]; then
       RAND_SUFFIX="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
@@ -305,6 +311,11 @@ else
     idx=$((idx + 1))
     slice_name="$(basename "$(dirname "$f")")"
     name="$slice_name/$(basename "$f" .lms)"
+    if [[ "$LIVE_PROFILE" == "1" ]]; then
+      export LMCLOUD_CAMPAIGN_ID="$RUN_ID"
+    else
+      export LMCLOUD_CAMPAIGN_ID="${RUN_ID}-${slice_name}-$(basename "$f" .lms)"
+    fi
     reason="$(capability_skip_reason "$HOST_BIN" "$f")"
     if [[ -n "$reason" ]]; then
       echo "ok $idx - $name # SKIP $reason"

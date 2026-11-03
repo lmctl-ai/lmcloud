@@ -41,6 +41,7 @@ type Config struct {
 	// Optional cost metering configuration (defaults to SyntheticSimPriceTable and DefaultCostCapUSD).
 	Meter             *safety.CostMeter
 	PriceTable        *safety.PriceTable
+	Journal           *safety.Journal
 	CampaignStatePath string
 	OnSetWorkCap      func(workCapNanoUSD int64) error
 }
@@ -99,6 +100,9 @@ func New(cfg Config) *Host {
 // ---- small helpers ----
 
 func (h *Host) fail(op, target string, e *hostkit.CloudError) error {
+	if e != nil && e.ProviderCode == "LiveCostCapExceeded" {
+		e = hostkit.ProviderError(hostkit.CostCapExceeded, 0, "CostCapExceeded", e.Message)
+	}
 	return h.errs.Fail(op, target, e)
 }
 
@@ -189,6 +193,37 @@ func (h *Host) SetEndpoint(service, raw string) error {
 
 // ---- probes shared by real and dry paths (read-only) ----
 
+func isDefinitiveNonStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ce *hostkit.CloudError
+	if !errors.As(err, &ce) || ce == nil {
+		return false
+	}
+	if ce.HTTPStatus >= 400 {
+		return true
+	}
+	switch ce.Code {
+	case hostkit.NotFound, hostkit.Conflict, hostkit.PreconditionFailed, hostkit.PermissionDenied, hostkit.InvalidArgument, hostkit.CostCapExceeded:
+		return true
+	}
+	return false
+}
+
+func maxQueueReceiveWireBytes(max int, textOnlyWire bool) int64 {
+	if max <= 0 {
+		max = 1
+	}
+	if max > hostkit.MaxReceiveMessages {
+		max = hostkit.MaxReceiveMessages
+	}
+	if textOnlyWire {
+		return int64(max) * 2 * 65536
+	}
+	return int64(max) * 65536
+}
+
 func (h *Host) realBucketExists(ctx context.Context, b string) (bool, *hostkit.CloudError) {
 	if h.cfg.Store == nil {
 		return false, missingStore()
@@ -202,6 +237,53 @@ func (h *Host) realBucketExists(ctx context.Context, b string) (bool, *hostkit.C
 	default:
 		return false, e
 	}
+}
+
+func (h *Host) meteredBucketExists(ctx context.Context, b string, isCleanup bool) (bool, *hostkit.CloudError) {
+	if h.cfg.Store == nil {
+		return false, missingStore()
+	}
+	mctx, scope, cerr := h.beginAttemptScope(ctx, "bucket_exists", safety.AttemptPricingInput{Operation: "bucket_exists", IsCleanup: isCleanup}, safety.KindBucket, b)
+	if cerr != nil {
+		return false, cerr
+	}
+	exists, e := h.realBucketExists(mctx, b)
+	_, _, aerr := scope.finish(0, 0, true, e == nil)
+	if aerr != nil {
+		e = aerr
+	}
+	return exists, e
+}
+
+func (h *Host) meteredBucketCreateToken(ctx context.Context, b, token string) (bool, *hostkit.CloudError) {
+	if token == "" || h.cfg.Store == nil {
+		return false, nil
+	}
+	rawStore := h.cfg.Store
+	if gs, ok := rawStore.(guardStore); ok {
+		rawStore = gs.s
+	}
+	r, ok := rawStore.(hostkit.BucketCreateTokenReader)
+	if !ok {
+		return false, nil
+	}
+	mctx, scope, cerr := h.beginAttemptScope(ctx, "bucket_read_ownership", safety.AttemptPricingInput{Operation: "bucket_read_ownership"}, safety.KindBucket, b)
+	if cerr != nil {
+		return false, cerr
+	}
+	got, err := r.BucketCreateToken(mctx, b)
+	err = hostkit.NilIfTyped(err)
+	_, _, aerr := scope.finish(0, 0, true, err == nil)
+	if aerr != nil {
+		return false, aerr
+	}
+	if err != nil {
+		if ce := hostkit.AsCloudError(err); ce != nil && ce.Code == hostkit.CostCapExceeded {
+			return false, ce
+		}
+		return false, nil
+	}
+	return got == token, nil
 }
 
 func (h *Host) bucketExists(ctx context.Context, dry bool, b string) (bool, *hostkit.CloudError) {
@@ -226,6 +308,53 @@ func (h *Host) realQueueExists(ctx context.Context, q string) (bool, *hostkit.Cl
 	default:
 		return false, e
 	}
+}
+
+func (h *Host) meteredQueueExists(ctx context.Context, q string) (bool, *hostkit.CloudError) {
+	if h.cfg.Queue == nil {
+		return false, missingQueue()
+	}
+	mctx, scope, cerr := h.beginAttemptScope(ctx, "queue_exists", safety.AttemptPricingInput{Operation: "queue_exists"}, safety.KindQueue, q)
+	if cerr != nil {
+		return false, cerr
+	}
+	exists, e := h.realQueueExists(mctx, q)
+	_, _, aerr := scope.finish(0, 0, true, e == nil)
+	if aerr != nil {
+		e = aerr
+	}
+	return exists, e
+}
+
+func (h *Host) meteredQueueCreateToken(ctx context.Context, q, token string) (bool, *hostkit.CloudError) {
+	if token == "" || h.cfg.Queue == nil {
+		return false, nil
+	}
+	rawQueue := h.cfg.Queue
+	if gq, ok := rawQueue.(guardQueue); ok {
+		rawQueue = gq.q
+	}
+	r, ok := rawQueue.(hostkit.QueueCreateTokenReader)
+	if !ok {
+		return false, nil
+	}
+	mctx, scope, cerr := h.beginAttemptScope(ctx, "queue_read_ownership", safety.AttemptPricingInput{Operation: "queue_read_ownership"}, safety.KindQueue, q)
+	if cerr != nil {
+		return false, cerr
+	}
+	got, err := r.QueueCreateToken(mctx, q)
+	err = hostkit.NilIfTyped(err)
+	_, _, aerr := scope.finish(0, 0, true, err == nil)
+	if aerr != nil {
+		return false, aerr
+	}
+	if err != nil {
+		if ce := hostkit.AsCloudError(err); ce != nil && ce.Code == hostkit.CostCapExceeded {
+			return false, ce
+		}
+		return false, nil
+	}
+	return got == token, nil
 }
 
 func (h *Host) queueExists(ctx context.Context, dry bool, q string) (bool, *hostkit.CloudError) {
@@ -283,23 +412,46 @@ func (h *Host) BucketCreate(dry bool, b string) (bool, error) {
 	h.errs.AddRedaction(token) // v4: never echoed into last_error/aborts
 	mctx = hostkit.WithCreateToken(mctx, token)
 	created, err := h.cfg.Store.CreateBucket(mctx, b)
+	var abortErr *hostkit.CloudError
 	if err == nil {
-		retries, throttles = scope.finish(0, true)
+		retries, throttles, abortErr = scope.finish(0, 0, true, true)
+		if abortErr != nil {
+			failed = true
+			return false, h.fail(op, b, abortErr)
+		}
 		h.ok()
 		return created, nil
 	}
 	ce := hostkit.AsCloudError(err)
 	if ce.Code == hostkit.Conflict {
-		// Design 02 §6.1: 409 is idempotent success only if the bucket is accessible in our scope.
-		if exists, perr := h.realBucketExists(ctx, b); perr == nil && exists {
-			retries, throttles = scope.finish(0, true)
-			h.ok()
-			return provenByToken(h.cfg.Store, token, func(r hostkit.BucketCreateTokenReader) (string, error) {
-				return r.BucketCreateToken(ctx, b)
-			}), nil
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		if abortErr != nil {
+			failed = true
+			return false, h.fail(op, b, abortErr)
 		}
+		// Design 02 §6.1: 409 is idempotent success only if the bucket is accessible in our scope.
+		exists, perr := h.meteredBucketExists(ctx, b, false)
+		if perr == nil && exists {
+			h.cost.lockResourceCleanupIfNeeded(op, safety.KindBucket, b)
+			proven, terr := h.meteredBucketCreateToken(ctx, b, token)
+			if terr != nil {
+				failed = true
+				return false, h.fail(op, b, terr)
+			}
+			h.ok()
+			return proven, nil
+		}
+		if perr != nil && perr.Code == hostkit.CostCapExceeded {
+			failed = true
+			return false, h.fail(op, b, perr)
+		}
+		failed = true
+		return false, h.fail(op, b, ce)
 	}
-	retries, throttles = scope.finish(0, false)
+	retries, throttles, abortErr = scope.finish(0, 0, true, false)
+	if abortErr != nil {
+		ce = abortErr
+	}
 	failed = true
 	return false, h.fail(op, b, ce)
 }
@@ -358,17 +510,29 @@ func (h *Host) BucketDelete(dry bool, b string) (bool, error) {
 		return false, h.fail(op, b, cerr)
 	}
 	ce := hostkit.AsCloudError(h.cfg.Store.DeleteBucket(mctx, b))
+	var abortErr *hostkit.CloudError
 	switch {
 	case ce == nil:
-		retries, throttles = scope.finish(0, true)
+		retries, throttles, abortErr = scope.finish(0, 0, true, true)
+		if abortErr != nil {
+			failed = true
+			return false, h.fail(op, b, abortErr)
+		}
 		h.ok()
 		return true, nil
 	case isNotFound(ce) && ce.Absent != hostkit.AbsentObject:
-		retries, throttles = scope.finish(0, true)
+		retries, throttles, abortErr = scope.finish(0, 0, true, true)
+		if abortErr != nil {
+			failed = true
+			return false, h.fail(op, b, abortErr)
+		}
 		h.ok()
 		return false, nil
 	default:
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
 		return false, h.fail(op, b, ce)
 	}
@@ -414,7 +578,11 @@ func (h *Host) BucketExists(dry bool, b string) (bool, error) {
 		return false, h.fail(op, b, cerr)
 	}
 	exists, e := h.realBucketExists(mctx, b)
-	retries, throttles = scope.finish(0, e == nil)
+	var abortErr *hostkit.CloudError
+	retries, throttles, abortErr = scope.finish(0, 0, true, e == nil)
+	if abortErr != nil {
+		e = abortErr
+	}
 	if e != nil {
 		failed = true
 		return false, h.fail(op, b, e)
@@ -453,9 +621,12 @@ func (h *Host) BucketList(dry bool) ([]string, error) {
 			return nil, "", cerr
 		}
 		items, next, err := h.cfg.Store.ListBuckets(mctx, token)
-		r, t := scope.finish(0, err == nil)
+		r, t, abortErr := scope.finish(0, 0, true, err == nil)
 		retries += r
 		throttles += t
+		if abortErr != nil {
+			return nil, "", abortErr
+		}
 		return items, next, err
 	})
 	if e != nil {
@@ -521,13 +692,22 @@ func (h *Host) ObjectPut(dry bool, b, k, body, ct string, meta map[string]string
 		return none, h.fail(op, target(b, k), cerr)
 	}
 	m, err := h.cfg.Store.PutObject(mctx, b, k, []byte(body), ct, copyMap(meta))
+	var abortErr *hostkit.CloudError
 	if err != nil {
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(sz, sz, false, false)
+		ce := hostkit.AsCloudError(err)
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
-		return none, h.fail(op, target(b, k), hostkit.AsCloudError(err))
+		return none, h.fail(op, target(b, k), ce)
+	}
+	retries, throttles, abortErr = scope.finish(sz, sz, true, true)
+	if abortErr != nil {
+		failed = true
+		return none, h.fail(op, target(b, k), abortErr)
 	}
 	bytesOut = sz
-	retries, throttles = scope.finish(sz, true)
 	m.Exists, m.Bucket, m.Key, m.Size = true, b, k, sz
 	m.ETag = NormalizeETag(m.ETag)
 	if m.ContentType == "" {
@@ -588,18 +768,36 @@ func (h *Host) ObjectGet(dry bool, b, k string) (string, error) {
 		}
 	}
 	data, err := h.cfg.Store.GetObject(mctx, b, k, hostkit.MaxObjectBytes)
+	var abortErr *hostkit.CloudError
 	if err != nil {
-		retries, throttles = scope.finish(0, false)
+		if len(data) == 0 && isDefinitiveNonStreamError(err) {
+			retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		} else {
+			retries, throttles, abortErr = scope.finish(hostkit.MaxObjectBytes, hostkit.MaxObjectBytes, false, false)
+		}
+		ce := hostkit.AsCloudError(err)
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
-		return "", h.fail(op, target(b, k), hostkit.AsCloudError(err))
+		return "", h.fail(op, target(b, k), ce)
 	}
 	if len(data) > hostkit.MaxObjectBytes {
-		retries, throttles = scope.finish(hostkit.MaxObjectBytes, false)
+		retries, throttles, abortErr = scope.finish(hostkit.MaxObjectBytes, hostkit.MaxObjectBytes, false, false)
+		ce := hostkit.ProviderError(hostkit.Internal, 0, "", "object body exceeds the 16 MiB limit; refusing to truncate")
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
-		return "", h.fail(op, target(b, k), hostkit.ProviderError(hostkit.Internal, 0, "", "object body exceeds the 16 MiB limit; refusing to truncate"))
+		return "", h.fail(op, target(b, k), ce)
 	}
-	bytesIn = int64(len(data))
-	retries, throttles = scope.finish(bytesIn, true)
+	actualBytes := int64(len(data))
+	retries, throttles, abortErr = scope.finish(actualBytes, actualBytes, true, true)
+	if abortErr != nil {
+		failed = true
+		return "", h.fail(op, target(b, k), abortErr)
+	}
+	bytesIn = actualBytes
 	h.ok()
 	return string(data), nil
 }
@@ -667,8 +865,13 @@ func (h *Host) ObjectHead(dry bool, b, k string) (*hostkit.ObjectMeta, error) {
 		}
 	}
 	m, err := h.cfg.Store.HeadObject(mctx, b, k)
+	var abortErr *hostkit.CloudError
 	if err == nil {
-		retries, throttles = scope.finish(0, true)
+		retries, throttles, abortErr = scope.finish(0, 0, true, true)
+		if abortErr != nil {
+			failed = true
+			return absent, h.fail(op, target(b, k), abortErr)
+		}
 		m.Exists, m.Bucket, m.Key = true, b, k
 		m.ETag = NormalizeETag(m.ETag)
 		if m.ContentType == "" {
@@ -682,32 +885,50 @@ func (h *Host) ObjectHead(dry bool, b, k string) (*hostkit.ObjectMeta, error) {
 	}
 	ce := hostkit.AsCloudError(err)
 	if !isNotFound(ce) {
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
 		return absent, h.fail(op, target(b, k), ce)
 	}
 	switch ce.Absent {
 	case hostkit.AbsentObject:
-		retries, throttles = scope.finish(0, true)
+		retries, throttles, abortErr = scope.finish(0, 0, true, true)
+		if abortErr != nil {
+			failed = true
+			return absent, h.fail(op, target(b, k), abortErr)
+		}
 		h.ok()
 		return absent, nil
 	case hostkit.AbsentBucket:
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
 		return absent, h.fail(op, target(b, k), ce)
 	}
-	exists, perr := h.realBucketExists(ctx, b)
+	retries, throttles, abortErr = scope.finish(0, 0, true, true)
+	if abortErr != nil {
+		failed = true
+		return absent, h.fail(op, target(b, k), abortErr)
+	}
+	var exists bool
+	var perr *hostkit.CloudError
+	if dry {
+		exists, perr = h.realBucketExists(ctx, b)
+	} else {
+		exists, perr = h.meteredBucketExists(ctx, b, false)
+	}
 	if perr != nil {
-		retries, throttles = scope.finish(0, false)
 		failed = true
 		return absent, h.fail(op, target(b, k), perr)
 	}
 	if !exists {
-		retries, throttles = scope.finish(0, false)
 		failed = true
 		return absent, h.fail(op, target(b, k), ce.WithAbsent(hostkit.AbsentBucket))
 	}
-	retries, throttles = scope.finish(0, true)
 	h.ok()
 	return absent, nil
 }
@@ -759,38 +980,55 @@ func (h *Host) ObjectDelete(dry bool, b, k string) error {
 		return h.fail(op, target(b, k), cerr)
 	}
 	ce := hostkit.AsCloudError(h.cfg.Store.DeleteObject(mctx, b, k))
+	var abortErr *hostkit.CloudError
 	if ce == nil {
-		retries, throttles = scope.finish(0, true)
+		retries, throttles, abortErr = scope.finish(0, 0, true, true)
+		if abortErr != nil {
+			failed = true
+			return h.fail(op, target(b, k), abortErr)
+		}
 		h.ok()
 		return nil
 	}
 	if !isNotFound(ce) {
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
 		return h.fail(op, target(b, k), ce)
 	}
 	switch ce.Absent {
 	case hostkit.AbsentObject:
-		retries, throttles = scope.finish(0, true)
+		retries, throttles, abortErr = scope.finish(0, 0, true, true)
+		if abortErr != nil {
+			failed = true
+			return h.fail(op, target(b, k), abortErr)
+		}
 		h.ok()
 		return nil
 	case hostkit.AbsentBucket:
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
 		return h.fail(op, target(b, k), ce)
 	}
-	exists, perr := h.realBucketExists(ctx, b)
+	retries, throttles, abortErr = scope.finish(0, 0, true, true)
+	if abortErr != nil {
+		failed = true
+		return h.fail(op, target(b, k), abortErr)
+	}
+	exists, perr := h.meteredBucketExists(ctx, b, true)
 	if perr != nil {
-		retries, throttles = scope.finish(0, false)
 		failed = true
 		return h.fail(op, target(b, k), perr)
 	}
 	if !exists {
-		retries, throttles = scope.finish(0, false)
 		failed = true
 		return h.fail(op, target(b, k), ce.WithAbsent(hostkit.AbsentBucket))
 	}
-	retries, throttles = scope.finish(0, true)
 	h.ok()
 	return nil
 }
@@ -868,22 +1106,39 @@ func (h *Host) ObjectList(dry bool, b, prefix string, maxKeys int64, token strin
 		}
 	}
 	page, err := h.cfg.Store.ListObjects(mctx, b, prefix, max, token)
+	var abortErr *hostkit.CloudError
 	if err != nil {
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		ce := hostkit.AsCloudError(err)
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
-		return empty, h.fail(op, b, hostkit.AsCloudError(err))
+		return empty, h.fail(op, b, ce)
 	}
 	if len(page.Items) > max {
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		ce := hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned more items than max_keys")
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
-		return empty, h.fail(op, b, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned more items than max_keys"))
+		return empty, h.fail(op, b, ce)
 	}
 	if token != "" && page.NextToken == token {
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		ce := hostkit.ProviderError(hostkit.Internal, 0, "", "pagination stalled: continuation token repeated")
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
-		return empty, h.fail(op, b, hostkit.ProviderError(hostkit.Internal, 0, "", "pagination stalled: continuation token repeated"))
+		return empty, h.fail(op, b, ce)
 	}
-	retries, throttles = scope.finish(0, true)
+	retries, throttles, abortErr = scope.finish(0, 0, true, true)
+	if abortErr != nil {
+		failed = true
+		return empty, h.fail(op, b, abortErr)
+	}
 	items := append([]hostkit.ObjectSummary(nil), page.Items...)
 	sort.SliceStable(items, func(i, j int) bool { return items[i].Key < items[j].Key })
 	for i := range items {
@@ -962,9 +1217,12 @@ func (h *Host) ObjectListAll(dry bool, b, prefix string) ([]string, error) {
 				return nil, "", cerr
 			}
 			page, err := h.cfg.Store.ListObjects(mctx, b, prefix, hostkit.MaxListMax, token)
-			r, t := scope.finish(0, err == nil)
+			r, t, abortErr := scope.finish(0, 0, true, err == nil)
 			retries += r
 			throttles += t
+			if abortErr != nil {
+				return nil, "", abortErr
+			}
 			if err != nil {
 				return nil, "", err
 			}
@@ -1029,22 +1287,45 @@ func (h *Host) QueueCreate(dry bool, q string) (bool, error) {
 	h.errs.AddRedaction(token) // v4: never echoed into last_error/aborts
 	mctx = hostkit.WithCreateToken(mctx, token)
 	created, err := h.cfg.Queue.CreateQueue(mctx, q)
+	var abortErr *hostkit.CloudError
 	if err != nil {
 		ce := hostkit.AsCloudError(err)
 		if ce.Code == hostkit.Conflict {
-			if exists, perr := h.realQueueExists(ctx, q); perr == nil && exists {
-				retries, throttles = scope.finish(0, true)
-				h.ok()
-				return provenByToken(h.cfg.Queue, token, func(r hostkit.QueueCreateTokenReader) (string, error) {
-					return r.QueueCreateToken(ctx, q)
-				}), nil
+			retries, throttles, abortErr = scope.finish(0, 0, true, false)
+			if abortErr != nil {
+				failed = true
+				return false, h.fail(op, q, abortErr)
 			}
+			exists, perr := h.meteredQueueExists(ctx, q)
+			if perr == nil && exists {
+				h.cost.lockResourceCleanupIfNeeded(op, safety.KindQueue, q)
+				proven, terr := h.meteredQueueCreateToken(ctx, q, token)
+				if terr != nil {
+					failed = true
+					return false, h.fail(op, q, terr)
+				}
+				h.ok()
+				return proven, nil
+			}
+			if perr != nil && perr.Code == hostkit.CostCapExceeded {
+				failed = true
+				return false, h.fail(op, q, perr)
+			}
+			failed = true
+			return false, h.fail(op, q, ce)
 		}
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
 		return false, h.fail(op, q, ce)
 	}
-	retries, throttles = scope.finish(0, true)
+	retries, throttles, abortErr = scope.finish(0, 0, true, true)
+	if abortErr != nil {
+		failed = true
+		return false, h.fail(op, q, abortErr)
+	}
 	h.ok()
 	return created, nil
 }
@@ -1090,17 +1371,29 @@ func (h *Host) QueueDelete(dry bool, q string) (bool, error) {
 		return false, h.fail(op, q, cerr)
 	}
 	ce := hostkit.AsCloudError(h.cfg.Queue.DeleteQueue(mctx, q))
+	var abortErr *hostkit.CloudError
 	switch {
 	case ce == nil:
-		retries, throttles = scope.finish(0, true)
+		retries, throttles, abortErr = scope.finish(0, 0, true, true)
+		if abortErr != nil {
+			failed = true
+			return false, h.fail(op, q, abortErr)
+		}
 		h.ok()
 		return true, nil
 	case isNotFound(ce):
-		retries, throttles = scope.finish(0, true)
+		retries, throttles, abortErr = scope.finish(0, 0, true, true)
+		if abortErr != nil {
+			failed = true
+			return false, h.fail(op, q, abortErr)
+		}
 		h.ok()
 		return false, nil
 	default:
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
 		return false, h.fail(op, q, ce)
 	}
@@ -1146,7 +1439,11 @@ func (h *Host) QueueExists(dry bool, q string) (bool, error) {
 		return false, h.fail(op, q, cerr)
 	}
 	exists, e := h.realQueueExists(mctx, q)
-	retries, throttles = scope.finish(0, e == nil)
+	var abortErr *hostkit.CloudError
+	retries, throttles, abortErr = scope.finish(0, 0, true, e == nil)
+	if abortErr != nil {
+		e = abortErr
+	}
 	if e != nil {
 		failed = true
 		return false, h.fail(op, q, e)
@@ -1185,9 +1482,12 @@ func (h *Host) QueueList(dry bool) ([]string, error) {
 			return nil, "", cerr
 		}
 		items, next, err := h.cfg.Queue.ListQueues(mctx, token)
-		r, t := scope.finish(0, err == nil)
+		r, t, abortErr := scope.finish(0, 0, true, err == nil)
 		retries += r
 		throttles += t
+		if abortErr != nil {
+			return nil, "", abortErr
+		}
 		return items, next, err
 	})
 	if e != nil {
@@ -1248,25 +1548,42 @@ func (h *Host) QueueSend(dry bool, q, body string) (string, error) {
 		return "", h.fail(op, q, missingQueue())
 	}
 	sz := int64(len(body))
-	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: sz}, safety.KindQueue, q)
+	wire := hostkit.EncodeQueueBody(body, hostkit.CapsFor(ctx, h.cfg.Queue, q).TextOnlyWire)
+	chargeBytes := sz
+	if int64(len(wire)) > chargeBytes {
+		chargeBytes = int64(len(wire))
+	}
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: chargeBytes}, safety.KindQueue, q)
 	if cerr != nil {
 		failed = true
 		return "", h.fail(op, q, cerr)
 	}
-	wire := hostkit.EncodeQueueBody(body, hostkit.CapsFor(ctx, h.cfg.Queue, q).TextOnlyWire)
 	id, err := h.cfg.Queue.Send(mctx, q, wire)
+	var abortErr *hostkit.CloudError
 	if err != nil {
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(chargeBytes, sz, false, false)
+		ce := hostkit.AsCloudError(err)
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
-		return "", h.fail(op, q, hostkit.AsCloudError(err))
+		return "", h.fail(op, q, ce)
 	}
 	if id == "" {
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(chargeBytes, sz, false, false)
+		ce := hostkit.ProviderError(hostkit.Internal, 0, "", "provider accepted the message but returned no message id")
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
-		return "", h.fail(op, q, hostkit.ProviderError(hostkit.Internal, 0, "", "provider accepted the message but returned no message id"))
+		return "", h.fail(op, q, ce)
+	}
+	retries, throttles, abortErr = scope.finish(chargeBytes, sz, true, true)
+	if abortErr != nil {
+		failed = true
+		return "", h.fail(op, q, abortErr)
 	}
 	bytesOut = sz
-	retries, throttles = scope.finish(sz, true)
 	h.ok()
 	return id, nil
 }
@@ -1312,50 +1629,122 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 		failed = true
 		return nil, h.fail(op, q, missingQueue())
 	}
-	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindQueue, q)
-	if cerr != nil {
-		failed = true
-		return nil, h.fail(op, q, cerr)
-	}
 	caps := hostkit.CapsFor(ctx, h.cfg.Queue, q)
-	var raw []hostkit.RawMessage
-	var rerr error
-	if caps.LongPoll {
-		raw, rerr = h.cfg.Queue.Receive(mctx, q, int(max), int(wait), int(vis))
-	} else {
-		rerr = hostkit.WaitLoop(mctx, time.Duration(wait)*time.Second, h.cfg.PollInterval, h.cfg.Now, h.cfg.Sleep, func(ctx context.Context) (int, error) {
-			msgs, err := h.cfg.Queue.Receive(ctx, q, int(max), 0, int(vis))
-			raw = msgs
-			return len(msgs), err
-		})
+	maxWire := maxQueueReceiveWireBytes(int(max), caps.TextOnlyWire)
+	pricingIn := safety.AttemptPricingInput{Operation: op, PayloadSize: maxWire}
+
+	parseRawMessages := func(raw []hostkit.RawMessage) ([]Message, int64, int64, *hostkit.CloudError) {
+		if len(raw) > int(max) {
+			return nil, maxWire, maxWire, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned more messages than max_messages")
+		}
+		out := make([]Message, 0, len(raw))
+		var totalDecoded, totalCharge int64
+		for _, m := range raw {
+			if m.ID == "" || m.Receipt == "" {
+				return nil, maxWire, maxWire, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned a message without id or receipt")
+			}
+			body, e := hostkit.DecodeQueueBody(m.Wire)
+			if e != nil {
+				return nil, maxWire, maxWire, e
+			}
+			decSz := int64(len(body))
+			wireSz := int64(len(m.Wire))
+			if decSz > wireSz {
+				wireSz = decSz
+			}
+			totalDecoded += decSz
+			totalCharge += wireSz
+			out = append(out, Message{ID: m.ID, Body: body, Receipt: m.Receipt})
+		}
+		return out, totalCharge, totalDecoded, nil
 	}
+
+	if caps.LongPoll {
+		mctx, scope, cerr := h.beginAttemptScope(ctx, op, pricingIn, safety.KindQueue, q)
+		if cerr != nil {
+			failed = true
+			return nil, h.fail(op, q, cerr)
+		}
+		raw, rerr := h.cfg.Queue.Receive(mctx, q, int(max), int(wait), int(vis))
+		var abortErr *hostkit.CloudError
+		if rerr != nil {
+			if len(raw) == 0 && isDefinitiveNonStreamError(rerr) {
+				retries, throttles, abortErr = scope.finish(0, 0, true, false)
+			} else {
+				retries, throttles, abortErr = scope.finish(maxWire, maxWire, false, false)
+			}
+			ce := hostkit.AsCloudError(rerr)
+			if abortErr != nil {
+				ce = abortErr
+			}
+			failed = true
+			return nil, h.fail(op, q, ce)
+		}
+		out, totalCharge, totalDecoded, perr := parseRawMessages(raw)
+		if perr != nil {
+			retries, throttles, abortErr = scope.finish(maxWire, maxWire, false, false)
+			if abortErr != nil {
+				perr = abortErr
+			}
+			failed = true
+			return nil, h.fail(op, q, perr)
+		}
+		retries, throttles, abortErr = scope.finish(totalCharge, totalDecoded, true, true)
+		if abortErr != nil {
+			failed = true
+			return nil, h.fail(op, q, abortErr)
+		}
+		bytesIn = totalDecoded
+		h.ok()
+		return out, nil
+	}
+
+	var out []Message
+	rerr := hostkit.WaitLoop(ctx, time.Duration(wait)*time.Second, h.cfg.PollInterval, h.cfg.Now, h.cfg.Sleep, func(pollCtx context.Context) (int, error) {
+		mctx, scope, cerr := h.beginAttemptScope(pollCtx, op, pricingIn, safety.KindQueue, q)
+		if cerr != nil {
+			return 0, cerr
+		}
+		raw, err := h.cfg.Queue.Receive(mctx, q, int(max), 0, int(vis))
+		if err != nil {
+			var r, t int64
+			var abortErr *hostkit.CloudError
+			if len(raw) == 0 && isDefinitiveNonStreamError(err) {
+				r, t, abortErr = scope.finish(0, 0, true, false)
+			} else {
+				r, t, abortErr = scope.finish(maxWire, maxWire, false, false)
+			}
+			retries += r
+			throttles += t
+			if abortErr != nil {
+				return 0, abortErr
+			}
+			return 0, err
+		}
+		parsed, totalCharge, totalDecoded, perr := parseRawMessages(raw)
+		if perr != nil {
+			r, t, abortErr := scope.finish(maxWire, maxWire, false, false)
+			retries += r
+			throttles += t
+			if abortErr != nil {
+				return 0, abortErr
+			}
+			return 0, perr
+		}
+		r, t, abortErr := scope.finish(totalCharge, totalDecoded, true, true)
+		retries += r
+		throttles += t
+		if abortErr != nil {
+			return 0, abortErr
+		}
+		out = parsed
+		bytesIn += totalDecoded
+		return len(parsed), nil
+	})
 	if rerr != nil {
-		retries, throttles = scope.finish(0, false)
 		failed = true
 		return nil, h.fail(op, q, hostkit.AsCloudError(rerr))
 	}
-	if len(raw) > int(max) {
-		retries, throttles = scope.finish(0, false)
-		failed = true
-		return nil, h.fail(op, q, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned more messages than max_messages"))
-	}
-	out := make([]Message, 0, len(raw))
-	for _, m := range raw {
-		if m.ID == "" || m.Receipt == "" {
-			retries, throttles = scope.finish(0, false)
-			failed = true
-			return nil, h.fail(op, q, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned a message without id or receipt"))
-		}
-		body, e := hostkit.DecodeQueueBody(m.Wire)
-		if e != nil {
-			retries, throttles = scope.finish(0, false)
-			failed = true
-			return nil, h.fail(op, q, e)
-		}
-		bytesIn += int64(len(body))
-		out = append(out, Message{ID: m.ID, Body: body, Receipt: m.Receipt})
-	}
-	retries, throttles = scope.finish(bytesIn, true)
 	h.ok()
 	return out, nil
 }
@@ -1401,8 +1790,13 @@ func (h *Host) QueueAck(dry bool, q, receipt string) error {
 		return h.fail(op, q, cerr)
 	}
 	ce := hostkit.AsCloudError(h.cfg.Queue.Ack(mctx, q, receipt))
-	ce = hostkit.ReceiptPrecedence(ce, true, func() (bool, *hostkit.CloudError) { return h.realQueueExists(ctx, q) })
-	retries, throttles = scope.finish(0, ce == nil)
+	var abortErr *hostkit.CloudError
+	retries, throttles, abortErr = scope.finish(0, 0, true, ce == nil)
+	if abortErr != nil {
+		failed = true
+		return h.fail(op, q, abortErr)
+	}
+	ce = hostkit.ReceiptPrecedence(ce, true, func() (bool, *hostkit.CloudError) { return h.meteredQueueExists(ctx, q) })
 	if ce != nil {
 		failed = true
 		return h.fail(op, q, ce)
@@ -1452,21 +1846,34 @@ func (h *Host) QueueNack(dry bool, q, receipt string, vis int64) (string, error)
 		return "", h.fail(op, q, cerr)
 	}
 	nr, err := h.cfg.Queue.Nack(mctx, q, receipt, int(vis))
+	var abortErr *hostkit.CloudError
 	if err != nil {
-		ce := hostkit.ReceiptPrecedence(hostkit.AsCloudError(err), false, func() (bool, *hostkit.CloudError) { return h.realQueueExists(ctx, q) })
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		if abortErr != nil {
+			failed = true
+			return "", h.fail(op, q, abortErr)
+		}
+		ce := hostkit.ReceiptPrecedence(hostkit.AsCloudError(err), false, func() (bool, *hostkit.CloudError) { return h.meteredQueueExists(ctx, q) })
 		if ce == nil {
 			ce = hostkit.ProviderError(hostkit.Internal, 0, "", "nack failed")
 		}
-		retries, throttles = scope.finish(0, false)
 		failed = true
 		return "", h.fail(op, q, ce)
 	}
 	if nr == "" {
-		retries, throttles = scope.finish(0, false)
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		ce := hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned no receipt after visibility change")
+		if abortErr != nil {
+			ce = abortErr
+		}
 		failed = true
-		return "", h.fail(op, q, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned no receipt after visibility change"))
+		return "", h.fail(op, q, ce)
 	}
-	retries, throttles = scope.finish(0, true)
+	retries, throttles, abortErr = scope.finish(0, 0, true, true)
+	if abortErr != nil {
+		failed = true
+		return "", h.fail(op, q, abortErr)
+	}
 	h.ok()
 	return nr, nil
 }

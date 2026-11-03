@@ -38,9 +38,10 @@ const (
 	EventRetained  = "retained"
 	EventDeleted   = "deleted"
 	EventCost      = "cost"
-	EventReserve   = "reserve"
-	EventSettle    = "settle"
-	EventWorkCap   = "work_cap"
+	EventReserve     = "reserve"
+	EventSettle      = "settle"
+	EventWorkCap     = "work_cap"
+	EventCapExceeded = "cap_exceeded"
 
 	// Resource lifecycle states after journal replay.
 	StatePending   = "pending"
@@ -194,9 +195,14 @@ type JournalRecord struct {
 	AttemptID           string `json:"attempt_id,omitempty"`
 	ReservedNanoUSD     int64  `json:"reserved_nano_usd,omitempty"`
 	ChargedNanoUSD      int64  `json:"charged_nano_usd,omitempty"`
-	WorkCapNanoUSD      int64  `json:"work_cap_nano_usd,omitempty"`
-	PayloadBytes        int64  `json:"payload_bytes,omitempty"`
-	BucketsCreated      int    `json:"buckets_created,omitempty"`
+	WorkCapNanoUSD      int64                   `json:"work_cap_nano_usd,omitempty"`
+	PayloadBytes        int64                   `json:"payload_bytes,omitempty"`
+	Operation           string                  `json:"operation,omitempty"`
+	BillingUnits        int64                   `json:"billing_units,omitempty"`
+	SettledBytes        int64                   `json:"settled_bytes,omitempty"`
+	CapExceededCount    int64                   `json:"cap_exceeded_count,omitempty"`
+	OpStats             map[string]OpLedgerStat `json:"op_stats,omitempty"`
+	BucketsCreated      int                     `json:"buckets_created,omitempty"`
 	QueuesCreated       int    `json:"queues_created,omitempty"`
 	ObjectsCreated      int    `json:"objects_created,omitempty"`
 	MessagesSent        int    `json:"messages_sent,omitempty"`
@@ -244,6 +250,7 @@ type LedgerEntry struct {
 // AttemptLedgerEntry is an unresolved durable per-attempt cost/byte reservation.
 type AttemptLedgerEntry struct {
 	AttemptID       string
+	Operation       string
 	Kind            string
 	Parent          string
 	Name            string
@@ -251,6 +258,14 @@ type AttemptLedgerEntry struct {
 	ReservedNanoUSD int64
 	PayloadBytes    int64
 	Seq             uint64
+}
+
+// OpLedgerStat records cumulative per-operation cost and request counters in LedgerState.
+type OpLedgerStat struct {
+	Requests       int64 `json:"requests"`
+	BillingUnits   int64 `json:"billing_units"`
+	Bytes          int64 `json:"bytes"`
+	ChargedNanoUSD int64 `json:"charged_nano_usd"`
 }
 
 func resourceKey(kind, parent, name string) string {
@@ -267,6 +282,8 @@ type LedgerState struct {
 	ReservedNanoUSD   int64
 	ChargedNanoUSD    int64
 	WorkCapNanoUSD    int64
+	CapExceededCount  int64
+	OpStats           map[string]OpLedgerStat
 	BucketsCreated    int
 	QueuesCreated     int
 	ObjectsCreated    int
@@ -503,6 +520,7 @@ func OpenJournal(dir string, meta JournalMeta) (*Journal, error) {
 		j.state = &LedgerState{
 			Meta:          j.meta,
 			StartedAtUnix: startedUnix,
+			OpStats:       make(map[string]OpLedgerStat),
 			byKey:         make(map[string]int),
 			byAttemptID:   make(map[string]int),
 		}
@@ -601,6 +619,10 @@ func (j *Journal) State() LedgerState {
 	cp := *j.state
 	cp.Entries = append([]LedgerEntry(nil), j.state.Entries...)
 	cp.PendingAttempts = append([]AttemptLedgerEntry(nil), j.state.PendingAttempts...)
+	cp.OpStats = make(map[string]OpLedgerStat, len(j.state.OpStats))
+	for k, v := range j.state.OpStats {
+		cp.OpStats[k] = v
+	}
 	cp.byKey = make(map[string]int, len(j.state.byKey))
 	for k, v := range j.state.byKey {
 		cp.byKey[k] = v
@@ -658,6 +680,12 @@ func (j *Journal) BeginAttempt(kind, parent, name, reason string, reservedNanoUS
 // TotalPayloadBytes. Settling an already-settled or unknown attemptID is an
 // idempotent no-op.
 func (j *Journal) SettleAttempt(attemptID string, chargedNanoUSD int64, refundBytes bool) error {
+	return j.SettleAttemptWithDetails(attemptID, chargedNanoUSD, 0, 0, refundBytes)
+}
+
+// SettleAttemptWithDetails durably settles an unresolved attempt by attemptID,
+// recording actual chargedNanoUSD, settledBytes, and billingUnits.
+func (j *Journal) SettleAttemptWithDetails(attemptID string, chargedNanoUSD, settledBytes, billingUnits int64, refundBytes bool) error {
 	if strings.TrimSpace(attemptID) == "" {
 		return nil
 	}
@@ -676,12 +704,15 @@ func (j *Journal) SettleAttempt(attemptID string, chargedNanoUSD int64, refundBy
 	}
 	return j.appendLocked(JournalRecord{
 		Event:          EventSettle,
+		Operation:      att.Operation,
 		Kind:           att.Kind,
 		Parent:         att.Parent,
 		Name:           att.Name,
 		AttemptID:      attemptID,
 		ChargedNanoUSD: chargedNanoUSD,
 		PayloadBytes:   refund,
+		SettledBytes:   settledBytes,
+		BillingUnits:   billingUnits,
 		Reason:         att.Reason,
 	})
 }
@@ -1010,6 +1041,20 @@ func (j *Journal) RecordWorkCap(workCapNanoUSD int64) error {
 	})
 }
 
+// RecordCapExceeded durably records a pre-attempt cost-cap refusal in the journal.
+func (j *Journal) RecordCapExceeded(operation string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	return j.appendLocked(JournalRecord{
+		Event:            EventCapExceeded,
+		Operation:        operation,
+		CapExceededCount: 1,
+	})
+}
+
 func (j *Journal) rollbackAndPoisonLocked(prevOffset int64, cause error) {
 	if j.f != nil {
 		_ = j.f.Truncate(prevOffset)
@@ -1139,28 +1184,35 @@ func (j *Journal) Compact() error {
 		BasePayloadBytes = 0
 	}
 
+	baseOpStats := make(map[string]OpLedgerStat, len(j.state.OpStats))
+	for k, v := range j.state.OpStats {
+		baseOpStats[k] = v
+	}
+
 	compacted = append(compacted, JournalRecord{
-		Version:        JournalVersion,
-		Seq:            seq,
-		Time:           nowStr,
-		Event:          EventMeta,
-		RunID:          j.meta.RunID,
-		SessionID:      j.meta.SessionID,
-		PolicyHash:     j.meta.PolicyHash,
-		Provider:       j.meta.Provider,
-		Account:        j.meta.Account,
-		Tenant:         j.meta.Tenant,
-		Scope:          j.meta.Scope,
-		Region:         j.meta.Region,
-		Endpoint:       j.meta.Endpoint,
-		StartedAtUnix:  j.state.StartedAtUnix,
-		ChargedNanoUSD: j.state.ChargedNanoUSD,
-		WorkCapNanoUSD: j.state.WorkCapNanoUSD,
-		PayloadBytes:   BasePayloadBytes,
-		BucketsCreated: baseBuckets,
-		QueuesCreated:  baseQueues,
-		ObjectsCreated: baseObjects,
-		MessagesSent:   j.state.MessagesSent,
+		Version:          JournalVersion,
+		Seq:              seq,
+		Time:             nowStr,
+		Event:            EventMeta,
+		RunID:            j.meta.RunID,
+		SessionID:        j.meta.SessionID,
+		PolicyHash:       j.meta.PolicyHash,
+		Provider:         j.meta.Provider,
+		Account:          j.meta.Account,
+		Tenant:           j.meta.Tenant,
+		Scope:            j.meta.Scope,
+		Region:           j.meta.Region,
+		Endpoint:         j.meta.Endpoint,
+		StartedAtUnix:    j.state.StartedAtUnix,
+		ChargedNanoUSD:   j.state.ChargedNanoUSD,
+		WorkCapNanoUSD:   j.state.WorkCapNanoUSD,
+		CapExceededCount: j.state.CapExceededCount,
+		OpStats:          baseOpStats,
+		PayloadBytes:     BasePayloadBytes,
+		BucketsCreated:   baseBuckets,
+		QueuesCreated:    baseQueues,
+		ObjectsCreated:   baseObjects,
+		MessagesSent:     j.state.MessagesSent,
 	})
 
 	for _, e := range j.state.Entries {
@@ -1419,6 +1471,7 @@ func ReplayJournal(records []JournalRecord) (*LedgerState, error) {
 	state := &LedgerState{
 		Meta:          meta,
 		StartedAtUnix: meta.StartedAtUnix,
+		OpStats:       make(map[string]OpLedgerStat),
 		byKey:         make(map[string]int),
 		byAttemptID:   make(map[string]int),
 	}
@@ -1455,6 +1508,7 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 		}
 	}
 	if rec.ReservedNanoUSD < 0 || rec.ChargedNanoUSD < 0 || rec.WorkCapNanoUSD < 0 || rec.PayloadBytes < 0 ||
+		rec.BillingUnits < 0 || rec.SettledBytes < 0 || rec.CapExceededCount < 0 ||
 		rec.BucketsCreated < 0 || rec.QueuesCreated < 0 || rec.ObjectsCreated < 0 || rec.MessagesSent < 0 {
 		return errors.New("negative cost or counter amount in journal record")
 	}
@@ -1465,7 +1519,7 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 			return errors.New("duplicate meta record after seq 1")
 		}
 		return nil
-	case EventCost:
+	case EventCost, EventCapExceeded:
 		return nil
 	case EventWorkCap:
 		if rec.WorkCapNanoUSD <= 0 {
@@ -1611,8 +1665,107 @@ func removeAttemptAt(state *LedgerState, idx int) {
 	}
 }
 
+func inferJournalOp(rec JournalRecord, att AttemptLedgerEntry) string {
+	if rec.Operation != "" {
+		return rec.Operation
+	}
+	if att.Operation != "" {
+		return att.Operation
+	}
+	reason := rec.Reason
+	if reason == "" {
+		reason = att.Reason
+	}
+	switch reason {
+	case "bucket_create", "bucket_overwrite":
+		return "bucket_create"
+	case "bucket_delete":
+		return "bucket_delete"
+	case "bucket_exists":
+		return "bucket_exists"
+	case "bucket_list":
+		return "bucket_list"
+	case "bucket_read_ownership", "pre_create_bucket_check", "post_create_bucket_check", "duplicate_bucket_create_check", "pre_delete_bucket_check", "bucket_create_token":
+		return "bucket_read_ownership"
+	case "object_put", "object_overwrite":
+		return "object_put"
+	case "object_get":
+		return "object_get"
+	case "object_head", "post_failed_object_put_check", "pre_delete_object_check":
+		return "object_head"
+	case "object_delete":
+		return "object_delete"
+	case "object_list", "pre_delete_bucket_list_children":
+		return "object_list"
+	case "object_list_all":
+		return "object_list_all"
+	case "queue_create", "queue_overwrite":
+		return "queue_create"
+	case "queue_delete":
+		return "queue_delete"
+	case "queue_exists":
+		return "queue_exists"
+	case "queue_list":
+		return "queue_list"
+	case "queue_read_ownership", "pre_create_queue_check", "post_create_queue_check", "duplicate_queue_create_check", "pre_delete_queue_check", "queue_create_token":
+		return "queue_read_ownership"
+	case "queue_send", "queue_send_compacted":
+		return "queue_send"
+	case "queue_receive":
+		return "queue_receive"
+	case "queue_ack":
+		return "queue_ack"
+	case "queue_nack":
+		return "queue_nack"
+	case "verify_parent_ownership":
+		if rec.Kind == KindQueue || att.Kind == KindQueue {
+			return "queue_read_ownership"
+		}
+		return "bucket_read_ownership"
+	}
+	switch rec.Event {
+	case EventConfirmed, EventFailed, EventRetained:
+		switch rec.Kind {
+		case KindBucket:
+			return "bucket_create"
+		case KindQueue:
+			return "queue_create"
+		case KindObject:
+			return "object_put"
+		}
+	}
+	return ""
+}
+
+func recordOpStat(state *LedgerState, op string, units, bytes, chargedNano int64) {
+	if op == "" {
+		return
+	}
+	if state.OpStats == nil {
+		state.OpStats = make(map[string]OpLedgerStat)
+	}
+	if units <= 0 {
+		units = 1
+		if (op == "queue_send" || op == "queue_receive") && bytes > 65536 {
+			units = (bytes + 65535) / 65536
+		}
+	}
+	if bytes < 0 {
+		bytes = 0
+	}
+	cur := state.OpStats[op]
+	cur.Requests++
+	cur.BillingUnits += units
+	cur.Bytes += bytes
+	cur.ChargedNanoUSD += chargedNano
+	state.OpStats[op] = cur
+}
+
 func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 	defer recomputeReservedNanoUSD(state)
+	if state.OpStats == nil {
+		state.OpStats = make(map[string]OpLedgerStat)
+	}
 	state.LastSeq = rec.Seq
 	if rec.Event != EventSettle {
 		state.ChargedNanoUSD += rec.ChargedNanoUSD
@@ -1631,9 +1784,26 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		state.QueuesCreated += rec.QueuesCreated
 		state.ObjectsCreated += rec.ObjectsCreated
 		state.MessagesSent += rec.MessagesSent
+		state.CapExceededCount += rec.CapExceededCount
+		for k, v := range rec.OpStats {
+			cur := state.OpStats[k]
+			cur.Requests += v.Requests
+			cur.BillingUnits += v.BillingUnits
+			cur.Bytes += v.Bytes
+			cur.ChargedNanoUSD += v.ChargedNanoUSD
+			state.OpStats[k] = cur
+		}
 		if rec.WorkCapNanoUSD > 0 && (state.WorkCapNanoUSD == 0 || rec.WorkCapNanoUSD < state.WorkCapNanoUSD) {
 			state.WorkCapNanoUSD = rec.WorkCapNanoUSD
 		}
+		return nil
+	}
+	if rec.Event == EventCapExceeded {
+		n := rec.CapExceededCount
+		if n <= 0 {
+			n = 1
+		}
+		state.CapExceededCount += n
 		return nil
 	}
 	if rec.Event == EventWorkCap {
@@ -1646,13 +1816,23 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		if rec.Kind == KindQueueMessage && rec.Reason == "queue_send" {
 			state.MessagesSent++
 		}
+		var att AttemptLedgerEntry
 		// Settle by explicit AttemptID only; unrelated ownership/read EventCost
 		// records for the same resource must NEVER clear a pending create reservation.
 		if rec.AttemptID != "" {
 			if aIdx, ok := state.byAttemptID[rec.AttemptID]; ok {
+				att = state.PendingAttempts[aIdx]
 				removeAttemptAt(state, aIdx)
 			}
 		}
+		b := rec.SettledBytes
+		if b == 0 {
+			b = rec.PayloadBytes
+		}
+		if b == 0 {
+			b = att.PayloadBytes
+		}
+		recordOpStat(state, inferJournalOp(rec, att), rec.BillingUnits, b, rec.ChargedNanoUSD)
 		return nil
 	}
 	if rec.Event == EventReserve {
@@ -1661,6 +1841,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		}
 		upsertPendingAttempt(state, AttemptLedgerEntry{
 			AttemptID:       rec.AttemptID,
+			Operation:       rec.Operation,
 			Kind:            rec.Kind,
 			Parent:          rec.Parent,
 			Name:            rec.Name,
@@ -1677,6 +1858,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			// Already settled: idempotent no-op on replay.
 			return nil
 		}
+		att := state.PendingAttempts[aIdx]
 		state.ChargedNanoUSD += rec.ChargedNanoUSD
 		if rec.PayloadBytes > 0 {
 			state.TotalPayloadBytes -= rec.PayloadBytes
@@ -1684,6 +1866,11 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 				state.TotalPayloadBytes = 0
 			}
 		}
+		settledBytes := rec.SettledBytes
+		if settledBytes == 0 && att.PayloadBytes > 0 && rec.PayloadBytes < att.PayloadBytes {
+			settledBytes = att.PayloadBytes - rec.PayloadBytes
+		}
+		recordOpStat(state, inferJournalOp(rec, att), rec.BillingUnits, settledBytes, rec.ChargedNanoUSD)
 		removeAttemptAt(state, aIdx)
 		return nil
 	}
@@ -1747,14 +1934,25 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		return nil
 
 	case EventConfirmed:
+		var settledAtt AttemptLedgerEntry
+		var hadSettledAtt bool
 		attID := rec.AttemptID
 		if attID == "" && rec.ChargedNanoUSD > 0 {
 			attID = latestAttemptIDFor(state, rec.Kind, rec.Parent, rec.Name)
 		}
 		if attID != "" {
 			if aIdx, ok := state.byAttemptID[attID]; ok {
+				settledAtt = state.PendingAttempts[aIdx]
+				hadSettledAtt = true
 				removeAttemptAt(state, aIdx)
 			}
+		}
+		if hadSettledAtt || rec.ChargedNanoUSD > 0 {
+			b := rec.SettledBytes
+			if b == 0 {
+				b = settledAtt.PayloadBytes
+			}
+			recordOpStat(state, inferJournalOp(rec, settledAtt), rec.BillingUnits, b, rec.ChargedNanoUSD)
 		}
 		if exists {
 			cur := state.Entries[idx]
@@ -1833,14 +2031,25 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		return nil
 
 	case EventFailed:
+		var settledAtt AttemptLedgerEntry
+		var hadSettledAtt bool
 		attID := rec.AttemptID
 		if attID == "" {
 			attID = latestAttemptIDFor(state, rec.Kind, rec.Parent, rec.Name)
 		}
 		if attID != "" {
 			if aIdx, ok := state.byAttemptID[attID]; ok {
+				settledAtt = state.PendingAttempts[aIdx]
+				hadSettledAtt = true
 				removeAttemptAt(state, aIdx)
 			}
+		}
+		if hadSettledAtt || rec.ChargedNanoUSD > 0 {
+			b := rec.SettledBytes
+			if b == 0 {
+				b = settledAtt.PayloadBytes
+			}
+			recordOpStat(state, inferJournalOp(rec, settledAtt), rec.BillingUnits, b, rec.ChargedNanoUSD)
 		}
 		if !exists {
 			return nil
@@ -1858,15 +2067,22 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 
 	case EventRetained:
 		if rec.ChargedNanoUSD > 0 {
+			var settledAtt AttemptLedgerEntry
 			attID := rec.AttemptID
 			if attID == "" {
 				attID = latestAttemptIDFor(state, rec.Kind, rec.Parent, rec.Name)
 			}
 			if attID != "" {
 				if aIdx, ok := state.byAttemptID[attID]; ok {
+					settledAtt = state.PendingAttempts[aIdx]
 					removeAttemptAt(state, aIdx)
 				}
 			}
+			b := rec.SettledBytes
+			if b == 0 {
+				b = settledAtt.PayloadBytes
+			}
+			recordOpStat(state, inferJournalOp(rec, settledAtt), rec.BillingUnits, b, rec.ChargedNanoUSD)
 		} else if rec.ReservedNanoUSD > 0 && latestAttemptIDFor(state, rec.Kind, rec.Parent, rec.Name) == "" {
 			attID := rec.AttemptID
 			if attID == "" {

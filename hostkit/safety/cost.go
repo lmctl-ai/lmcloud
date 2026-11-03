@@ -114,6 +114,15 @@ func (pt *PriceTable) VersionID() string {
 	return fmt.Sprintf("%s-%s-%s-v%d", eff, pt.Provider, pt.Region, pt.SchemaVersion)
 }
 
+// IsSynthetic reports whether pt is a synthetic simulator tariff table that must
+// never be used in live cloud mode.
+func (pt *PriceTable) IsSynthetic() bool {
+	if pt == nil {
+		return false
+	}
+	return pt.Version == SyntheticSimPriceTableVersion || strings.EqualFold(strings.TrimSpace(pt.Region), "sim")
+}
+
 // SyntheticSimPriceTable returns the deterministic synthetic simulator reference
 // tariff table ("2026-11-sim-v1") for offline and loopback simulator hosts.
 // It must never be used in live mode (LMCLOUD_LIVE=1).
@@ -309,6 +318,9 @@ func (pt *PriceTable) Validate(expectedProvider, expectedRegion string, now time
 	if expectedRegion != "" && pt.Region != expectedRegion {
 		return fmt.Errorf("price table region %q does not match expected %q", pt.Region, expectedRegion)
 	}
+	if pt.IsSynthetic() && expectedRegion != "" && !strings.EqualFold(expectedRegion, "sim") {
+		return fmt.Errorf("synthetic price table %q cannot be used for live region %q", pt.VersionID(), expectedRegion)
+	}
 	if pt.Currency != "USD" {
 		return fmt.Errorf("unsupported price table currency %q (want USD)", pt.Currency)
 	}
@@ -373,7 +385,13 @@ func (pt *PriceTable) Quote(in AttemptPricingInput) (AttemptQuote, error) {
 	if pt == nil {
 		return AttemptQuote{}, errors.New("nil price table (fail closed)")
 	}
+	if in.PayloadSize < 0 || in.EgressBytes < 0 {
+		return AttemptQuote{}, errors.New("negative payload or egress size (fail closed)")
+	}
 	tariff, ok := pt.Operations[in.Operation]
+	if !ok && in.Operation == "object_list_all" {
+		tariff, ok = pt.Operations["object_list"]
+	}
 	if !ok {
 		return AttemptQuote{}, fmt.Errorf("unknown operation %q in price table %s/%s (fail closed)", in.Operation, pt.Provider, pt.Region)
 	}
@@ -505,6 +523,33 @@ func (m *CostMeter) RestoreWorkCap(workCapNanoUSD int64) {
 	if !m.hasScriptWorkCap || workCapNanoUSD < m.scriptWorkCapNanoUSD {
 		m.scriptWorkCapNanoUSD = workCapNanoUSD
 		m.hasScriptWorkCap = true
+	}
+}
+
+// SyncLedgerState synchronizes the meter's settled charges, locked resource
+// cleanup reserve, and narrowed script work sub-cap from an authoritative
+// replayed journal state.
+func (m *CostMeter) SyncLedgerState(chargedNanoUSD, resourceCleanupNanoUSD, workCapNanoUSD int64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if chargedNanoUSD >= 0 {
+		m.chargedNanoUSD = chargedNanoUSD
+	}
+	if resourceCleanupNanoUSD >= 0 {
+		m.resourceCleanupNanoUSD = resourceCleanupNanoUSD
+	}
+	if workCapNanoUSD > 0 {
+		maxWork := m.capNanoUSD - m.cleanupReserveNanoUSD
+		if workCapNanoUSD > maxWork {
+			workCapNanoUSD = maxWork
+		}
+		if !m.hasScriptWorkCap || workCapNanoUSD < m.scriptWorkCapNanoUSD {
+			m.scriptWorkCapNanoUSD = workCapNanoUSD
+			m.hasScriptWorkCap = true
+		}
 	}
 }
 
@@ -755,7 +800,7 @@ func (r *AttemptReservation) Commit(actualAttemptNanoUSD int64, lockCleanupReser
 	}
 
 	charge := actualAttemptNanoUSD
-	if charge < 0 {
+	if charge < 0 || charge > r.quote.AttemptNanoUSD {
 		charge = r.quote.AttemptNanoUSD
 	}
 	r.meter.chargedNanoUSD += charge
@@ -763,6 +808,15 @@ func (r *AttemptReservation) Commit(actualAttemptNanoUSD int64, lockCleanupReser
 		r.meter.resourceCleanupNanoUSD += r.quote.CleanupReserveNanoUSD
 	}
 	return charge
+}
+
+// Release aborts an AttemptReservation that was never dispatched on the wire,
+// releasing its in-flight reservation without adding to ChargedNanoUSD.
+func (r *AttemptReservation) Release() {
+	if r == nil {
+		return
+	}
+	r.Commit(0, false)
 }
 
 // ReleaseResourceCleanup releases the per-resource cleanup reservation once a
