@@ -77,6 +77,12 @@ type QueueCaps struct {
 	// then applies the __lmcloud_b64__ envelope to unsafe bytes). False when the
 	// adapter base64-encodes the whole message itself.
 	TextOnlyWire bool
+	// MaxMessageWireBytes, when > 0, is the adapter-attested maximum wire bytes
+	// a single received message can occupy on the provider transport.
+	MaxMessageWireBytes int64
+	// MaxBatchWireBytes, when > 0, is the adapter-attested maximum wire bytes
+	// a single Receive response batch can occupy on the provider transport.
+	MaxBatchWireBytes int64
 }
 
 // Queue is the provider adapter for the queue slice.

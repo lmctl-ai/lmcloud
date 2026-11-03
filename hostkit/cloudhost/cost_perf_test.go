@@ -401,7 +401,7 @@ func TestSolQueueBatchOverspendsTotal(t *testing.T) {
 		}
 	}
 
-	// Also verify AttemptReservation.Commit clamps direct ActualCostNanoUSD overrides above reservation.
+	// Also verify AttemptReservation.Commit never clamp-hides actual spend above reservation.
 	tbl := safety.SyntheticSimPriceTable("ref")
 	meter2, err := safety.NewCostMeter(safety.CostPolicy{
 		CapUSD:            0.25,
@@ -415,10 +415,10 @@ func TestSolQueueBatchOverspendsTotal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	committed := res.Commit(1_000_000_000, false) // attempt to settle $1.00 on a 400-ns reservation
+	committed := res.Commit(1_000_000_000, false) // actual spend above reservation must be recorded truthfully
 	snap2 := meter2.Snapshot()
-	if committed != res.Quote().AttemptNanoUSD || snap2.ChargedNanoUSD > res.Quote().AttemptNanoUSD {
-		t.Fatalf("Commit failed to clamp to admitted reservation: committed=%d total=%d quote=%d", committed, snap2.ChargedNanoUSD, res.Quote().AttemptNanoUSD)
+	if committed != 1_000_000_000 || snap2.ChargedNanoUSD != 1_000_000_000 {
+		t.Fatalf("Commit clamp-hid excess spend: committed=%d total=%d", committed, snap2.ChargedNanoUSD)
 	}
 }
 
@@ -1591,6 +1591,123 @@ func TestOwnR3CampaignMetaAndPrivateDirectory(t *testing.T) {
 		})
 	}
 }
+
+// ---- SolReviewer Round 4 Regression Probes (TestR4*) ----
+
+type r4GcpLarge struct {
+	*fakeadapter.Fake
+	consumed int
+	size     int
+}
+
+func (a *r4GcpLarge) Receive(ctx context.Context, _ string, _, _, _ int) ([]hostkit.RawMessage, error) {
+	sz := a.size
+	if sz <= 0 {
+		sz = 2 << 20
+	}
+	var out []hostkit.RawMessage
+	last, _ := hostkit.DefaultRetryPolicy().Do(ctx, false, func(context.Context, int) hostkit.Attempt {
+		wire := strings.Repeat("x", sz)
+		a.consumed += len(wire)
+		out = []hostkit.RawMessage{{ID: "m", Receipt: "r", Wire: wire}}
+		return hostkit.Attempt{Status: 200}
+	})
+	return out, last.Err
+}
+
+func TestR4GcpProviderMaximumStillUnderAdmits(t *testing.T) {
+	// 1. Sol's probe: under a 1 MiB narrowed cap (38,400 nanos) or amplified $0.01/unit tariff
+	// ($1.60 for 10 MiB > $0.25 ceiling), GCP QueueReceive reserves the 10 MiB Pub/Sub maximum
+	// (160 units) BEFORE dispatch and refuses with COST_CAP_EXCEEDED (0 bytes consumed).
+	for _, amplified := range []bool{false, true} {
+		t.Run(fmt.Sprintf("amplified=%v", amplified), func(t *testing.T) {
+			a := &r4GcpLarge{Fake: fakeadapter.New(fakeadapter.Options{LongPoll: true, BinaryWire: true})}
+			pt := safety.SyntheticSimPriceTable("gcp")
+			totalCap := 0.05
+			if amplified {
+				x := pt.Operations["queue_receive"]
+				x.RequestNanoUSD = 10_000_000
+				pt.Operations["queue_receive"] = x
+				totalCap = 0.25
+			}
+			m, e := safety.NewCostMeter(safety.CostPolicy{CapUSD: totalCap, CeilingUSD: 0.25, CleanupReserveUSD: 0.01}, pt, nil)
+			if e != nil {
+				t.Fatal(e)
+			}
+			bound1MiB, e := m.QuoteAttempt(safety.AttemptPricingInput{Operation: "queue_receive", PayloadSize: hostkit.MaxProviderQueueMessageBytes})
+			if e != nil {
+				t.Fatal(e)
+			}
+			h := New(Config{Provider: "gcp", Queue: a, Meter: m})
+			h.SetAbortOnError(false)
+			if e := h.SetCostCapUSD(safety.NanoToUSD(bound1MiB.AttemptNanoUSD)); e != nil {
+				t.Fatal(e)
+			}
+			msgs, _ := h.QueueReceive(false, "probe-queue", 1, 0, 30)
+			report := h.CostReport().Item("queue_receive")
+			if a.consumed != 0 || len(msgs) != 0 || h.LastError().Code != hostkit.CostCapExceeded {
+				t.Fatalf("expected pre-dispatch COST_CAP_EXCEEDED refusal for GCP receive under 1 MiB cap, got consumed=%d msgs=%d last=%+v", a.consumed, len(msgs), h.LastError())
+			}
+			if report.Requests != 0 || report.BillingUnits != 0 || report.EstimatedUSD != 0 {
+				t.Fatalf("expected 0 requests/units/cost when refused before dispatch, got %+v", report)
+			}
+		})
+	}
+
+	// 2. When funded for the 10 MiB (160-unit = 384,000-nano) GCP reservation, dispatch proceeds,
+	// the 2 MiB message is rejected as OversizedQueueMessage, and the exact 32 units (76,800 nanos)
+	// consumed on the wire are settled (refunding the unused 128 units).
+	aFunded := &r4GcpLarge{Fake: fakeadapter.New(fakeadapter.Options{LongPoll: true, BinaryWire: true})}
+	ptGcp := safety.SyntheticSimPriceTable("gcp")
+	mFunded, e := safety.NewCostMeter(safety.CostPolicy{CapUSD: 0.05, CeilingUSD: 0.25, CleanupReserveUSD: 0.01}, ptGcp, nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	hFunded := New(Config{Provider: "gcp", Queue: aFunded, Meter: mFunded})
+	hFunded.SetAbortOnError(false)
+	msgsFunded, _ := hFunded.QueueReceive(false, "probe-queue", 1, 0, 30)
+	repFunded := hFunded.CostReport().Item("queue_receive")
+	actual2MiB, e := mFunded.QuoteAttempt(safety.AttemptPricingInput{Operation: "queue_receive", PayloadSize: 2 << 20})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if aFunded.consumed != 2<<20 || len(msgsFunded) != 0 || hFunded.LastError().ProviderCode != "OversizedQueueMessage" {
+		t.Fatalf("expected post-dispatch OversizedQueueMessage for 2 MiB GCP message, got consumed=%d msgs=%d last=%+v", aFunded.consumed, len(msgsFunded), hFunded.LastError())
+	}
+	if repFunded.BillingUnits != 32 || repFunded.Bytes != 2<<20 || repFunded.EstimatedUSD != safety.NanoToUSD(actual2MiB.AttemptNanoUSD) {
+		t.Fatalf("expected 32 billing units (76,800 nanos) settled for 2 MiB GCP message, got %+v", repFunded)
+	}
+
+	// 3. Unknown provider without attested MaxMessageWireBytes fails closed before dispatch.
+	aUnknown := &r4GcpLarge{Fake: fakeadapter.New(fakeadapter.Options{LongPoll: true, BinaryWire: true})}
+	hUnknown := New(Config{Provider: "unknown-cloud", Queue: aUnknown})
+	hUnknown.SetAbortOnError(false)
+	msgsUnknown, _ := hUnknown.QueueReceive(false, "probe-queue", 1, 0, 30)
+	if aUnknown.consumed != 0 || len(msgsUnknown) != 0 || hUnknown.LastError().Code != hostkit.InvalidArgument {
+		t.Fatalf("expected unknown provider to fail closed with INVALID_ARGUMENT before dispatch, got consumed=%d last=%+v", aUnknown.consumed, hUnknown.LastError())
+	}
+
+	// 4. If a broken adapter ever returns more bytes than the reserved provider ceiling (e.g. 2 MiB on AWS),
+	// settlement records the full unclamped 32 units / 2 MiB spend AND poisons the tracker (ReservationExceeded).
+	aExcess := &r4GcpLarge{Fake: fakeadapter.New(fakeadapter.Options{LongPoll: true, BinaryWire: true}), size: 2 << 20}
+	hExcess := New(Config{Provider: "aws", Queue: aExcess})
+	hExcess.SetAbortOnError(false)
+	_, _ = hExcess.QueueReceive(false, "probe-queue", 1, 0, 30)
+	repExcess := hExcess.CostReport().Item("queue_receive")
+	if repExcess.BillingUnits != 32 || repExcess.Bytes != 2<<20 {
+		t.Fatalf("expected unclamped 32 units / 2 MiB recorded when adapter exceeds reservation, got %+v", repExcess)
+	}
+	if hExcess.LastError().Code != hostkit.Internal || hExcess.LastError().ProviderCode != "ReservationExceeded" {
+		t.Fatalf("expected ReservationExceeded error when adapter exceeds reservation, got %+v", hExcess.LastError())
+	}
+	// Subsequent calls on the poisoned tracker must fail closed before dispatch.
+	aExcess.consumed = 0
+	_, _ = hExcess.QueueReceive(false, "probe-queue", 1, 0, 30)
+	if aExcess.consumed != 0 || hExcess.LastError().ProviderCode != "ReservationExceeded" {
+		t.Fatalf("expected poisoned tracker to refuse subsequent dispatch, got consumed=%d last=%+v", aExcess.consumed, hExcess.LastError())
+	}
+}
+
 
 
 

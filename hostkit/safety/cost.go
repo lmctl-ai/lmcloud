@@ -800,7 +800,7 @@ func (r *AttemptReservation) Commit(actualAttemptNanoUSD int64, lockCleanupReser
 	}
 
 	charge := actualAttemptNanoUSD
-	if charge < 0 || charge > r.quote.AttemptNanoUSD {
+	if charge < 0 {
 		charge = r.quote.AttemptNanoUSD
 	}
 	r.meter.chargedNanoUSD += charge

@@ -1719,7 +1719,14 @@ func (q *GuardQueue) Receive(ctx context.Context, queue string, max, waitSeconds
 		perMsgWireLimit = 2 * 65536
 	}
 	maxBatchWireLimit := int64(boundMax) * perMsgWireLimit
-	maxWireBytes := int64(boundMax) * hostkit.MaxProviderQueueMessageBytes
+	provider := g.journal.Meta().Provider
+	if provider == "" && g.meter != nil && g.meter.Table() != nil {
+		provider = g.meter.Table().Provider
+	}
+	maxWireBytes, cerr := hostkit.ProviderMaxQueueReceiveWireBytes(provider, boundMax, caps)
+	if cerr != nil {
+		return nil, cerr
+	}
 	da, cerr := g.beginDurableAttempt(AttemptPricingInput{Operation: "queue_receive", PayloadSize: maxWireBytes}, KindQueue, "", queue, "queue_receive", 0)
 	if cerr != nil {
 		return nil, cerr
@@ -1735,9 +1742,6 @@ func (q *GuardQueue) Receive(ctx context.Context, queue string, max, waitSeconds
 		var rawWireTotal int64
 		for _, m := range msgs {
 			rawWireTotal += int64(len(m.Wire))
-		}
-		if rawWireTotal > maxWireBytes {
-			rawWireTotal = maxWireBytes
 		}
 		if len(msgs) > boundMax {
 			err = hostkit.ProviderError(

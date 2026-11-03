@@ -211,16 +211,6 @@ func isDefinitiveNonStreamError(err error) bool {
 	return false
 }
 
-func maxQueueReceiveWireBytes(max int, _ bool) int64 {
-	if max <= 0 {
-		max = 1
-	}
-	if max > hostkit.MaxReceiveMessages {
-		max = hostkit.MaxReceiveMessages
-	}
-	return int64(max) * hostkit.MaxProviderQueueMessageBytes
-}
-
 func (h *Host) realBucketExists(ctx context.Context, b string) (bool, *hostkit.CloudError) {
 	if h.cfg.Store == nil {
 		return false, missingStore()
@@ -1628,7 +1618,11 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 		return nil, h.fail(op, q, missingQueue())
 	}
 	caps := hostkit.CapsFor(ctx, h.cfg.Queue, q)
-	maxWire := maxQueueReceiveWireBytes(int(max), caps.TextOnlyWire)
+	maxWire, cerr := hostkit.ProviderMaxQueueReceiveWireBytes(h.cost.provider, int(max), caps)
+	if cerr != nil {
+		failed = true
+		return nil, h.fail(op, q, cerr)
+	}
 	perMsgWireLimit := int64(65_536)
 	if caps.TextOnlyWire {
 		perMsgWireLimit = 2 * 65_536
@@ -1641,29 +1635,30 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 		for _, m := range raw {
 			rawWireTotal += int64(len(m.Wire))
 		}
-		if rawWireTotal <= 0 || rawWireTotal > maxWire {
-			rawWireTotal = maxWire
+		errWire := rawWireTotal
+		if errWire <= 0 {
+			errWire = maxWire
 		}
 		if len(raw) > int(max) {
-			return nil, rawWireTotal, rawWireTotal, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned more messages than max_messages")
+			return nil, errWire, errWire, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned more messages than max_messages")
 		}
 		out := make([]Message, 0, len(raw))
 		var totalDecoded, totalCharge int64
 		for _, m := range raw {
 			if m.ID == "" || m.Receipt == "" {
-				return nil, rawWireTotal, rawWireTotal, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned a message without id or receipt")
+				return nil, errWire, errWire, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned a message without id or receipt")
 			}
 			wireSz := int64(len(m.Wire))
 			if wireSz > perMsgWireLimit {
-				return nil, rawWireTotal, rawWireTotal, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a message exceeding the per-message wire bound")
+				return nil, errWire, errWire, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a message exceeding the per-message wire bound")
 			}
 			body, e := hostkit.DecodeQueueBody(m.Wire)
 			if e != nil {
-				return nil, rawWireTotal, rawWireTotal, e
+				return nil, errWire, errWire, e
 			}
 			decSz := int64(len(body))
 			if decSz > hostkit.MaxQueueBodyBytes {
-				return nil, rawWireTotal, rawWireTotal, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a message body exceeding the 48 KiB limit")
+				return nil, errWire, errWire, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a message body exceeding the 48 KiB limit")
 			}
 			if decSz > wireSz {
 				wireSz = decSz
@@ -1671,7 +1666,7 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 			totalDecoded += decSz
 			totalCharge += wireSz
 			if totalCharge > maxBatchWireLimit {
-				return nil, rawWireTotal, rawWireTotal, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a batch exceeding the quoted wire bound")
+				return nil, errWire, errWire, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a batch exceeding the quoted wire bound")
 			}
 			out = append(out, Message{ID: m.ID, Body: body, Receipt: m.Receipt})
 		}
@@ -1702,7 +1697,7 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 		}
 		out, totalCharge, totalDecoded, perr := parseRawMessages(raw)
 		if perr != nil {
-			retries, throttles, abortErr = scope.finish(totalCharge, totalDecoded, totalCharge < maxWire, false)
+			retries, throttles, abortErr = scope.finish(totalCharge, totalDecoded, true, false)
 			if abortErr != nil {
 				perr = abortErr
 			}
@@ -1744,7 +1739,7 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 		}
 		parsed, totalCharge, totalDecoded, perr := parseRawMessages(raw)
 		if perr != nil {
-			r, t, abortErr := scope.finish(totalCharge, totalDecoded, totalCharge < maxWire, false)
+			r, t, abortErr := scope.finish(totalCharge, totalDecoded, true, false)
 			retries += r
 			throttles += t
 			if abortErr != nil {

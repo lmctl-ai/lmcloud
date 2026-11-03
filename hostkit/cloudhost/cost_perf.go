@@ -702,9 +702,6 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 				continue
 			}
 			charge := rec.ChargedNanoUSD
-			if charge > p.AttemptNanoUSD {
-				charge = p.AttemptNanoUSD
-			}
 			st.chargedNanoUSD += charge
 			cur := st.ops[p.Operation]
 			cur.Requests++
@@ -1123,15 +1120,7 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 	pt := ct.meter.Table()
 	var actualNano int64 = -1
 	var units int64 = 1
-	if !cleanSuccess {
-		// Ambiguous or interrupted transfer: preserve the full reserved quote.
-		actualNano = res.Quote().AttemptNanoUSD
-		if pt != nil {
-			if t, ok := pt.Operations[op]; ok && t.ChunkBytes > 0 && chargeBytes > t.ChunkBytes {
-				units = (chargeBytes + t.ChunkBytes - 1) / t.ChunkBytes
-			}
-		}
-	} else if pt != nil {
+	if pt != nil {
 		t, ok := pt.Operations[op]
 		if !ok && op == "object_list_all" {
 			t, ok = pt.Operations["object_list"]
@@ -1153,6 +1142,15 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 				actualNano = q.AttemptNanoUSD
 			}
 		}
+	}
+	if !cleanSuccess && actualNano < res.Quote().AttemptNanoUSD {
+		// Ambiguous or interrupted transfer: preserve the full reserved quote.
+		actualNano = res.Quote().AttemptNanoUSD
+	}
+	var excessErr *hostkit.CloudError
+	if actualNano > res.Quote().AttemptNanoUSD {
+		excessErr = hostkit.ProviderError(hostkit.Internal, 0, "ReservationExceeded",
+			fmt.Sprintf("%s settled cost %d nano-USD exceeds admitted reservation %d nano-USD", op, actualNano, res.Quote().AttemptNanoUSD))
 	}
 
 	if ct.journal != nil {
@@ -1183,6 +1181,10 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 			return ct.poisoned
 		}
 		ct.syncFromSafetyJournalLocked()
+		if excessErr != nil {
+			ct.poisoned = excessErr
+			return excessErr
+		}
 		return nil
 	}
 
@@ -1276,6 +1278,10 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
 			return ct.poisoned
 		}
+		if excessErr != nil {
+			ct.poisoned = excessErr
+			return excessErr
+		}
 		return nil
 	}
 
@@ -1330,6 +1336,10 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 	cur.Bytes += reportedBytes
 	cur.ChargedNanoUSD += charged
 	ct.ops[op] = cur
+	if excessErr != nil {
+		ct.poisoned = excessErr
+		return excessErr
+	}
 	return nil
 }
 

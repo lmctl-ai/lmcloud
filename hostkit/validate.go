@@ -14,7 +14,12 @@ import (
 const (
 	MaxObjectBytes               = 16 << 20 // 16,777,216
 	MaxQueueBodyBytes            = 49152
-	MaxProviderQueueMessageBytes = 1 << 20 // 1,048,576 (conservative provider per-message wire ceiling, e.g. AWS SQS 1 MiB = 16 x 64 KiB chunks)
+	MaxProviderQueueMessageBytes = 1 << 20  // 1,048,576 (AWS SQS / Azure Service Bus / OCI Queue / ref conservative per-message wire ceiling)
+	MaxAWSQueueMessageBytes      = 1 << 20  // 1 MiB (AWS SQS documented maximum message size)
+	MaxAzureQueueMessageBytes    = 1 << 20  // 1 MiB (covers Azure Queue Storage 64 KiB XML and Azure Service Bus Standard 256 KiB / Premium 1 MiB)
+	MaxOCIQueueMessageBytes      = 1 << 20  // 1 MiB (covers OCI Queue 256 KiB message / 512 KiB batch limit)
+	MaxGCPQueueMessageBytes      = 10 << 20 // 10 MiB (GCP Pub/Sub documented 10 MB message data / unary Pull response maximum)
+	MaxRefQueueMessageBytes      = 1 << 20  // 1 MiB (reference simulator conservative ceiling)
 	MaxKeyBytes                  = 1024
 	MaxContentTypeBytes   = 255
 	MaxMetadataEntries    = 32
@@ -273,6 +278,51 @@ func EscapeKeyPath(key string) string {
 
 // EscapeKeyWhole encodes the whole key as one segment ('/' becomes %2F).
 func EscapeKeyWhole(key string) string { return EscapeSegment(key) }
+
+// ProviderMaxQueueReceiveWireBytes returns the conservative pre-dispatch wire
+// byte reservation for a queue_receive call of up to maxMessages on provider
+// with transport capabilities caps. If provider is not a recognized provider
+// ("aws", "azure", "gcp", "oci", "ref") and caps does not supply an explicit
+// MaxMessageWireBytes > 0, it fails closed with INVALID_ARGUMENT.
+func ProviderMaxQueueReceiveWireBytes(provider string, maxMessages int, caps QueueCaps) (int64, *CloudError) {
+	if maxMessages <= 0 {
+		maxMessages = 1
+	}
+	if maxMessages > MaxReceiveMessages {
+		maxMessages = MaxReceiveMessages
+	}
+	p := strings.ToLower(strings.TrimSpace(provider))
+	var providerPerMsg int64
+	switch p {
+	case "", "ref":
+		providerPerMsg = MaxRefQueueMessageBytes
+	case "aws":
+		providerPerMsg = MaxAWSQueueMessageBytes
+	case "azure":
+		providerPerMsg = MaxAzureQueueMessageBytes
+	case "oci":
+		providerPerMsg = MaxOCIQueueMessageBytes
+	case "gcp":
+		providerPerMsg = MaxGCPQueueMessageBytes
+		if caps.TextOnlyWire {
+			// Cover 4/3 base64 expansion over a 10 MiB binary message on JSON/text wire.
+			providerPerMsg = 14 << 20
+		}
+	default:
+		if caps.MaxMessageWireBytes <= 0 {
+			return 0, Preflightf("queue_receive: unsupported provider %q without attested MaxMessageWireBytes", provider)
+		}
+	}
+	perMsg := providerPerMsg
+	if caps.MaxMessageWireBytes > perMsg {
+		perMsg = caps.MaxMessageWireBytes
+	}
+	total := int64(maxMessages) * perMsg
+	if caps.MaxBatchWireBytes > total {
+		total = caps.MaxBatchWireBytes
+	}
+	return total, nil
+}
 
 // ReadBounded reads at most limit bytes and fails (never truncates) when the
 // stream holds more. The returned error is INTERNAL with the observed bound.
