@@ -649,10 +649,11 @@ func (j *Journal) BeginAttempt(kind, parent, name, reason string, reservedNanoUS
 	return attemptID, nil
 }
 
-// SettleAttempt durably settles an `EventReserve` (or pending create) attempt
-// by attemptID, clearing its pending reservation and recording actual
-// chargedNanoUSD. If refundBytes is true, any payloadBytes reserved by this
-// attempt are refunded from TotalPayloadBytes.
+// SettleAttempt durably settles an unresolved attempt by attemptID, clearing
+// its pending reservation and recording actual chargedNanoUSD. If refundBytes
+// is true, any payloadBytes reserved by this attempt are refunded from
+// TotalPayloadBytes. Settling an already-settled or unknown attemptID is an
+// idempotent no-op.
 func (j *Journal) SettleAttempt(attemptID string, chargedNanoUSD int64, refundBytes bool) error {
 	if strings.TrimSpace(attemptID) == "" {
 		return nil
@@ -662,41 +663,24 @@ func (j *Journal) SettleAttempt(attemptID string, chargedNanoUSD int64, refundBy
 	if j.poisoned != nil {
 		return j.poisoned
 	}
-	if att, ok := j.state.LookupAttempt(attemptID); ok {
-		var refund int64
-		if refundBytes && att.PayloadBytes > 0 {
-			refund = att.PayloadBytes
-		}
-		return j.appendLocked(JournalRecord{
-			Event:          EventSettle,
-			Kind:           att.Kind,
-			Parent:         att.Parent,
-			Name:           att.Name,
-			AttemptID:      attemptID,
-			ChargedNanoUSD: chargedNanoUSD,
-			PayloadBytes:   refund,
-			Reason:         att.Reason,
-		})
+	att, ok := j.state.LookupAttempt(attemptID)
+	if !ok {
+		return nil
 	}
-	for _, e := range j.state.Entries {
-		if e.CreateToken == attemptID {
-			var refund int64
-			if refundBytes && e.PayloadBytes > 0 {
-				refund = e.PayloadBytes
-			}
-			return j.appendLocked(JournalRecord{
-				Event:          EventSettle,
-				Kind:           e.Kind,
-				Parent:         e.Parent,
-				Name:           e.Name,
-				AttemptID:      attemptID,
-				ChargedNanoUSD: chargedNanoUSD,
-				PayloadBytes:   refund,
-				Reason:         e.Kind + "_attempt_settled",
-			})
-		}
+	var refund int64
+	if refundBytes && att.PayloadBytes > 0 {
+		refund = att.PayloadBytes
 	}
-	return nil
+	return j.appendLocked(JournalRecord{
+		Event:          EventSettle,
+		Kind:           att.Kind,
+		Parent:         att.Parent,
+		Name:           att.Name,
+		AttemptID:      attemptID,
+		ChargedNanoUSD: chargedNanoUSD,
+		PayloadBytes:   refund,
+		Reason:         att.Reason,
+	})
 }
 
 // BeginCreate durably records an `intent` entry (with fsync) BEFORE a cloud
@@ -708,9 +692,12 @@ func (j *Journal) SettleAttempt(attemptID string, chargedNanoUSD int64, refundBy
 //     does NOT overwrite the resource's OwnerNonce or CreateToken.
 //   - If the resource is currently `pending` (e.g. a retry after an ambiguous
 //     transport failure), BeginCreate reuses the persisted OwnerNonce and
-//     CreateToken so the provider can deduplicate the retry.
-//   - Otherwise, BeginCreate generates fresh 128-bit OwnerNonce and CreateToken
-//     values, appends an `intent` record, and fsyncs the journal before returning.
+//     CreateToken so the provider can deduplicate the retry, while allocating
+//     a fresh accounting AttemptID and independent reservation for the new
+//     physical dispatch.
+//   - Otherwise, BeginCreate generates fresh 128-bit OwnerNonce, CreateToken,
+//     and AttemptID values, appends an `intent` record, and fsyncs the journal
+//     before returning.
 func (j *Journal) BeginCreate(kind, parent, location, name string, reservedNanoUSD int64) (CreateIntent, error) {
 	return j.BeginCreateWithBytes(kind, parent, location, name, reservedNanoUSD, 0)
 }
@@ -769,14 +756,7 @@ func (j *Journal) BeginCreateWithBytes(kind, parent, location, name string, rese
 		}
 		if existing.State == StatePending {
 			nowUnix := j.nowTime().UTC().Unix()
-			resNano := existing.ReservedNanoUSD
-			if reservedNanoUSD > resNano {
-				resNano = reservedNanoUSD
-			}
-			extraBytes := int64(0)
-			if payloadBytes > existing.PayloadBytes {
-				extraBytes = payloadBytes - existing.PayloadBytes
-			}
+			attemptID := NewToken128()
 			intent := CreateIntent{
 				Kind:         existing.Kind,
 				Parent:       existing.Parent,
@@ -784,7 +764,7 @@ func (j *Journal) BeginCreateWithBytes(kind, parent, location, name string, rese
 				Name:         existing.Name,
 				OwnerNonce:   existing.OwnerNonce,
 				CreateToken:  existing.CreateToken,
-				AttemptID:    existing.CreateToken,
+				AttemptID:    attemptID,
 				IntentAtUnix: nowUnix,
 			}
 			rec := JournalRecord{
@@ -797,8 +777,8 @@ func (j *Journal) BeginCreateWithBytes(kind, parent, location, name string, rese
 				CreateToken:     intent.CreateToken,
 				AttemptID:       intent.AttemptID,
 				IntentAtUnix:    intent.IntentAtUnix,
-				ReservedNanoUSD: resNano,
-				PayloadBytes:    extraBytes,
+				ReservedNanoUSD: reservedNanoUSD,
+				PayloadBytes:    payloadBytes,
 			}
 			if err := j.appendLocked(rec); err != nil {
 				return CreateIntent{}, err
@@ -808,15 +788,14 @@ func (j *Journal) BeginCreateWithBytes(kind, parent, location, name string, rese
 	}
 
 	nowUnix := j.nowTime().UTC().Unix()
-	createToken := NewToken128()
 	intent := CreateIntent{
 		Kind:         kind,
 		Parent:       parent,
 		Location:     location,
 		Name:         name,
 		OwnerNonce:   NewToken128(),
-		CreateToken:  createToken,
-		AttemptID:    createToken,
+		CreateToken:  NewToken128(),
+		AttemptID:    NewToken128(),
 		IntentAtUnix: nowUnix,
 	}
 	rec := JournalRecord{
@@ -859,6 +838,10 @@ func (j *Journal) Confirm(kind, parent, name string, details ConfirmDetails) err
 	if confAt == 0 {
 		confAt = j.nowTime().UTC().Unix()
 	}
+	attID := details.AttemptID
+	if attID == "" {
+		attID = latestAttemptIDFor(j.state, kind, parent, name)
+	}
 	rec := JournalRecord{
 		Event:               EventConfirmed,
 		Kind:                kind,
@@ -868,7 +851,7 @@ func (j *Journal) Confirm(kind, parent, name string, details ConfirmDetails) err
 		ProviderID:          details.ProviderID,
 		OwnerNonce:          existing.OwnerNonce,
 		CreateToken:         existing.CreateToken,
-		AttemptID:           details.AttemptID,
+		AttemptID:           attID,
 		ETag:                details.ETag,
 		Generation:          details.Generation,
 		IntentAtUnix:        existing.IntentAtUnix,
@@ -896,13 +879,15 @@ func (j *Journal) Failed(kind, parent, name, reason string, chargedNanoUSD int64
 	if !ok {
 		return nil
 	}
+	attID := latestAttemptIDFor(j.state, kind, parent, name)
 	if existing.State == StateConfirmed || existing.State == StateRetained || existing.Retain {
-		if chargedNanoUSD > 0 {
+		if chargedNanoUSD > 0 || attID != "" {
 			return j.appendLocked(JournalRecord{
 				Event:          EventCost,
 				Kind:           kind,
 				Parent:         parent,
 				Name:           name,
+				AttemptID:      attID,
 				ChargedNanoUSD: chargedNanoUSD,
 				Reason:         reason,
 			})
@@ -915,6 +900,7 @@ func (j *Journal) Failed(kind, parent, name, reason string, chargedNanoUSD int64
 		Parent:         parent,
 		Location:       existing.Location,
 		Name:           name,
+		AttemptID:      attID,
 		Reason:         reason,
 		ChargedNanoUSD: chargedNanoUSD,
 	})
@@ -933,11 +919,16 @@ func (j *Journal) RetainWithCost(kind, parent, name, reason string, chargedNanoU
 	defer j.mu.Unlock()
 
 	existing, ok := j.state.Lookup(kind, parent, name)
+	var attID string
+	if chargedNanoUSD > 0 {
+		attID = latestAttemptIDFor(j.state, kind, parent, name)
+	}
 	rec := JournalRecord{
 		Event:          EventRetained,
 		Kind:           kind,
 		Parent:         parent,
 		Name:           name,
+		AttemptID:      attID,
 		Reason:         reason,
 		Retain:         true,
 		ChargedNanoUSD: chargedNanoUSD,
@@ -952,9 +943,6 @@ func (j *Journal) RetainWithCost(kind, parent, name, reason string, chargedNanoU
 		rec.IntentAtUnix = existing.IntentAtUnix
 		rec.ConfirmedAtUnix = existing.ConfirmedAtUnix
 		rec.ServerCreatedAtUnix = existing.ServerCreatedAtUnix
-		if chargedNanoUSD <= 0 {
-			rec.ReservedNanoUSD = existing.ReservedNanoUSD
-		}
 	}
 	return j.appendLocked(rec)
 }
@@ -1124,11 +1112,6 @@ func (j *Journal) Compact() error {
 			BasePayloadBytes -= a.PayloadBytes
 		}
 	}
-	for _, e := range j.state.Entries {
-		if e.State == StatePending && !e.Retain && e.PayloadBytes > 0 {
-			BasePayloadBytes -= e.PayloadBytes
-		}
-	}
 	if BasePayloadBytes < 0 {
 		BasePayloadBytes = 0
 	}
@@ -1160,18 +1143,14 @@ func (j *Journal) Compact() error {
 		seq++
 		ev := EventIntent
 		retainFlag := e.Retain
-		resNano := e.ReservedNanoUSD
-		var entryBytes int64
 		switch {
 		case e.Retain || e.State == StateRetained:
 			ev = EventRetained
 			retainFlag = true
 		case e.State == StateConfirmed:
 			ev = EventConfirmed
-			resNano = 0
 		case e.State == StatePending:
 			ev = EventIntent
-			entryBytes = e.PayloadBytes
 		default:
 			continue
 		}
@@ -1201,8 +1180,6 @@ func (j *Journal) Compact() error {
 			IntentAtUnix:        e.IntentAtUnix,
 			ConfirmedAtUnix:     e.ConfirmedAtUnix,
 			ServerCreatedAtUnix: e.ServerCreatedAtUnix,
-			ReservedNanoUSD:     resNano,
-			PayloadBytes:        entryBytes,
 			Reason:              e.Reason,
 			Retain:              retainFlag,
 		})
@@ -1548,27 +1525,51 @@ func decrementKindCreated(state *LedgerState, kind string) {
 
 func recomputeReservedNanoUSD(state *LedgerState) {
 	for i := range state.Entries {
-		if state.Entries[i].State == StateConfirmed && !state.Entries[i].Retain {
-			state.Entries[i].ReservedNanoUSD = 0
-		}
+		state.Entries[i].ReservedNanoUSD = 0
+		state.Entries[i].PayloadBytes = 0
 	}
 	var total int64
 	for _, a := range state.PendingAttempts {
 		if a.ReservedNanoUSD > 0 {
 			total += a.ReservedNanoUSD
-			if idx, ok := state.byKey[resourceKey(a.Kind, a.Parent, a.Name)]; ok {
-				if state.Entries[idx].State == StateConfirmed && !state.Entries[idx].Retain {
-					state.Entries[idx].ReservedNanoUSD += a.ReservedNanoUSD
-				}
-			}
 		}
-	}
-	for _, e := range state.Entries {
-		if (e.State != StateConfirmed || e.Retain) && e.ReservedNanoUSD > 0 {
-			total += e.ReservedNanoUSD
+		if idx, ok := state.byKey[resourceKey(a.Kind, a.Parent, a.Name)]; ok {
+			state.Entries[idx].ReservedNanoUSD += a.ReservedNanoUSD
+			state.Entries[idx].PayloadBytes += a.PayloadBytes
 		}
 	}
 	state.ReservedNanoUSD = total
+}
+
+func latestAttemptIDFor(state *LedgerState, kind, parent, name string) string {
+	if state == nil {
+		return ""
+	}
+	for i := len(state.PendingAttempts) - 1; i >= 0; i-- {
+		a := state.PendingAttempts[i]
+		if a.Kind == kind && a.Parent == parent && a.Name == name {
+			return a.AttemptID
+		}
+	}
+	return ""
+}
+
+func upsertPendingAttempt(state *LedgerState, att AttemptLedgerEntry) {
+	if state.byAttemptID == nil {
+		state.byAttemptID = make(map[string]int)
+	}
+	if aIdx, ok := state.byAttemptID[att.AttemptID]; ok {
+		cur := state.PendingAttempts[aIdx]
+		if att.ReservedNanoUSD > cur.ReservedNanoUSD {
+			cur.ReservedNanoUSD = att.ReservedNanoUSD
+		}
+		cur.PayloadBytes += att.PayloadBytes
+		cur.Seq = att.Seq
+		state.PendingAttempts[aIdx] = cur
+		return
+	}
+	state.byAttemptID[att.AttemptID] = len(state.PendingAttempts)
+	state.PendingAttempts = append(state.PendingAttempts, att)
 }
 
 func removeAttemptAt(state *LedgerState, idx int) {
@@ -1584,8 +1585,8 @@ func removeAttemptAt(state *LedgerState, idx int) {
 func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 	defer recomputeReservedNanoUSD(state)
 	state.LastSeq = rec.Seq
-	state.ChargedNanoUSD += rec.ChargedNanoUSD
 	if rec.Event != EventSettle {
+		state.ChargedNanoUSD += rec.ChargedNanoUSD
 		state.TotalPayloadBytes += rec.PayloadBytes
 	}
 
@@ -1613,32 +1614,14 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			if aIdx, ok := state.byAttemptID[rec.AttemptID]; ok {
 				removeAttemptAt(state, aIdx)
 			}
-			if idx, ok := state.byKey[resourceKey(rec.Kind, rec.Parent, rec.Name)]; ok {
-				if state.Entries[idx].CreateToken == rec.AttemptID {
-					state.Entries[idx].ReservedNanoUSD = 0
-				}
-			}
 		}
 		return nil
 	}
 	if rec.Event == EventReserve {
-		if state.byAttemptID == nil {
-			state.byAttemptID = make(map[string]int)
-		}
 		if rec.Kind == KindQueueMessage && rec.Reason == "queue_send" {
 			state.MessagesSent++
 		}
-		if aIdx, ok := state.byAttemptID[rec.AttemptID]; ok {
-			cur := state.PendingAttempts[aIdx]
-			if rec.ReservedNanoUSD > cur.ReservedNanoUSD {
-				cur.ReservedNanoUSD = rec.ReservedNanoUSD
-			}
-			cur.PayloadBytes += rec.PayloadBytes
-			cur.Seq = rec.Seq
-			state.PendingAttempts[aIdx] = cur
-			return nil
-		}
-		att := AttemptLedgerEntry{
+		upsertPendingAttempt(state, AttemptLedgerEntry{
 			AttemptID:       rec.AttemptID,
 			Kind:            rec.Kind,
 			Parent:          rec.Parent,
@@ -1647,31 +1630,23 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			ReservedNanoUSD: rec.ReservedNanoUSD,
 			PayloadBytes:    rec.PayloadBytes,
 			Seq:             rec.Seq,
-		}
-		state.byAttemptID[rec.AttemptID] = len(state.PendingAttempts)
-		state.PendingAttempts = append(state.PendingAttempts, att)
+		})
 		return nil
 	}
 	if rec.Event == EventSettle {
+		aIdx, ok := state.byAttemptID[rec.AttemptID]
+		if !ok {
+			// Already settled: idempotent no-op on replay.
+			return nil
+		}
+		state.ChargedNanoUSD += rec.ChargedNanoUSD
 		if rec.PayloadBytes > 0 {
 			state.TotalPayloadBytes -= rec.PayloadBytes
 			if state.TotalPayloadBytes < 0 {
 				state.TotalPayloadBytes = 0
 			}
 		}
-		if aIdx, ok := state.byAttemptID[rec.AttemptID]; ok {
-			removeAttemptAt(state, aIdx)
-		}
-		if rec.Kind != "" && rec.Name != "" {
-			if idx, ok := state.byKey[resourceKey(rec.Kind, rec.Parent, rec.Name)]; ok {
-				if state.Entries[idx].CreateToken == rec.AttemptID {
-					state.Entries[idx].ReservedNanoUSD = 0
-					if rec.PayloadBytes > 0 && state.Entries[idx].PayloadBytes >= rec.PayloadBytes {
-						state.Entries[idx].PayloadBytes -= rec.PayloadBytes
-					}
-				}
-			}
-		}
+		removeAttemptAt(state, aIdx)
 		return nil
 	}
 
@@ -1680,6 +1655,22 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 
 	switch rec.Event {
 	case EventIntent:
+		attID := rec.AttemptID
+		if attID == "" && (rec.ReservedNanoUSD > 0 || rec.PayloadBytes > 0) {
+			attID = rec.CreateToken
+		}
+		if attID != "" {
+			upsertPendingAttempt(state, AttemptLedgerEntry{
+				AttemptID:       attID,
+				Kind:            rec.Kind,
+				Parent:          rec.Parent,
+				Name:            rec.Name,
+				Reason:          rec.Kind + "_create",
+				ReservedNanoUSD: rec.ReservedNanoUSD,
+				PayloadBytes:    rec.PayloadBytes,
+				Seq:             rec.Seq,
+			})
+		}
 		if exists {
 			cur := state.Entries[idx]
 			// Duplicate intent on an already confirmed/retained resource never
@@ -1695,10 +1686,6 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			if rec.IntentAtUnix != 0 {
 				cur.IntentAtUnix = rec.IntentAtUnix
 			}
-			if rec.ReservedNanoUSD > cur.ReservedNanoUSD {
-				cur.ReservedNanoUSD = rec.ReservedNanoUSD
-			}
-			cur.PayloadBytes += rec.PayloadBytes
 			cur.Seq = rec.Seq
 			state.Entries[idx] = cur
 			return nil
@@ -1707,25 +1694,27 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			incrementKindCreated(state, rec.Kind)
 		}
 		entry := LedgerEntry{
-			Kind:            rec.Kind,
-			Parent:          rec.Parent,
-			Location:        rec.Location,
-			Name:            rec.Name,
-			OwnerNonce:      rec.OwnerNonce,
-			CreateToken:     rec.CreateToken,
-			IntentAtUnix:    rec.IntentAtUnix,
-			ReservedNanoUSD: rec.ReservedNanoUSD,
-			PayloadBytes:    rec.PayloadBytes,
-			State:           StatePending,
-			Seq:             rec.Seq,
+			Kind:         rec.Kind,
+			Parent:       rec.Parent,
+			Location:     rec.Location,
+			Name:         rec.Name,
+			OwnerNonce:   rec.OwnerNonce,
+			CreateToken:  rec.CreateToken,
+			IntentAtUnix: rec.IntentAtUnix,
+			State:        StatePending,
+			Seq:          rec.Seq,
 		}
 		state.byKey[key] = len(state.Entries)
 		state.Entries = append(state.Entries, entry)
 		return nil
 
 	case EventConfirmed:
-		if rec.AttemptID != "" {
-			if aIdx, ok := state.byAttemptID[rec.AttemptID]; ok {
+		attID := rec.AttemptID
+		if attID == "" && rec.ChargedNanoUSD > 0 {
+			attID = latestAttemptIDFor(state, rec.Kind, rec.Parent, rec.Name)
+		}
+		if attID != "" {
+			if aIdx, ok := state.byAttemptID[attID]; ok {
 				removeAttemptAt(state, aIdx)
 			}
 		}
@@ -1750,8 +1739,6 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 					incrementKindCreated(state, rec.Kind)
 				}
 			}
-			cur.ReservedNanoUSD = 0
-			cur.PayloadBytes += rec.PayloadBytes
 			if rec.Location != "" {
 				cur.Location = rec.Location
 			}
@@ -1808,6 +1795,15 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		return nil
 
 	case EventFailed:
+		attID := rec.AttemptID
+		if attID == "" {
+			attID = latestAttemptIDFor(state, rec.Kind, rec.Parent, rec.Name)
+		}
+		if attID != "" {
+			if aIdx, ok := state.byAttemptID[attID]; ok {
+				removeAttemptAt(state, aIdx)
+			}
+		}
 		if !exists {
 			return nil
 		}
@@ -1818,27 +1814,43 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		}
 		if cur.State == StatePending {
 			decrementKindCreated(state, cur.Kind)
-			if cur.PayloadBytes > 0 {
-				state.TotalPayloadBytes -= cur.PayloadBytes
-				if state.TotalPayloadBytes < 0 {
-					state.TotalPayloadBytes = 0
-				}
-			}
 		}
 		removeEntryAt(state, idx)
 		return nil
 
 	case EventRetained:
+		if rec.ChargedNanoUSD > 0 {
+			attID := rec.AttemptID
+			if attID == "" {
+				attID = latestAttemptIDFor(state, rec.Kind, rec.Parent, rec.Name)
+			}
+			if attID != "" {
+				if aIdx, ok := state.byAttemptID[attID]; ok {
+					removeAttemptAt(state, aIdx)
+				}
+			}
+		} else if rec.ReservedNanoUSD > 0 && latestAttemptIDFor(state, rec.Kind, rec.Parent, rec.Name) == "" {
+			attID := rec.AttemptID
+			if attID == "" {
+				attID = rec.CreateToken
+			}
+			if attID == "" {
+				attID = NewToken128()
+			}
+			upsertPendingAttempt(state, AttemptLedgerEntry{
+				AttemptID:       attID,
+				Kind:            rec.Kind,
+				Parent:          rec.Parent,
+				Name:            rec.Name,
+				Reason:          "retained_reserve",
+				ReservedNanoUSD: rec.ReservedNanoUSD,
+				Seq:             rec.Seq,
+			})
+		}
 		if exists {
 			cur := state.Entries[idx]
 			if cur.State == StatePending && !cur.Retain {
 				decrementKindCreated(state, cur.Kind)
-				if cur.PayloadBytes > 0 {
-					state.TotalPayloadBytes -= cur.PayloadBytes
-					if state.TotalPayloadBytes < 0 {
-						state.TotalPayloadBytes = 0
-					}
-				}
 			}
 			cur.State = StateRetained
 			cur.Retain = true
@@ -1872,11 +1884,6 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			if rec.Reason != "" {
 				cur.Reason = rec.Reason
 			}
-			if rec.ChargedNanoUSD > 0 {
-				cur.ReservedNanoUSD = 0
-			} else if rec.ReservedNanoUSD > 0 {
-				cur.ReservedNanoUSD = rec.ReservedNanoUSD
-			}
 			cur.Seq = rec.Seq
 			state.Entries[idx] = cur
 			return nil
@@ -1894,7 +1901,6 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			IntentAtUnix:        rec.IntentAtUnix,
 			ConfirmedAtUnix:     rec.ConfirmedAtUnix,
 			ServerCreatedAtUnix: rec.ServerCreatedAtUnix,
-			ReservedNanoUSD:     rec.ReservedNanoUSD,
 			State:               StateRetained,
 			Retain:              true,
 			Reason:              rec.Reason,
@@ -1908,9 +1914,16 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		if !exists {
 			return nil
 		}
-		cur := state.Entries[idx]
-		if cur.State != StateConfirmed && cur.ReservedNanoUSD > 0 && rec.ChargedNanoUSD == 0 {
-			state.ChargedNanoUSD += cur.ReservedNanoUSD
+		for {
+			attID := latestAttemptIDFor(state, rec.Kind, rec.Parent, rec.Name)
+			if attID == "" {
+				break
+			}
+			aIdx := state.byAttemptID[attID]
+			if rec.ChargedNanoUSD == 0 && state.PendingAttempts[aIdx].ReservedNanoUSD > 0 {
+				state.ChargedNanoUSD += state.PendingAttempts[aIdx].ReservedNanoUSD
+			}
+			removeAttemptAt(state, aIdx)
 		}
 		removeEntryAt(state, idx)
 		return nil

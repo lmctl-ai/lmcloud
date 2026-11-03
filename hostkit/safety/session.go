@@ -240,16 +240,12 @@ func restoreMeterFromState(meter *CostMeter, pt *PriceTable, st LedgerState) {
 		case StatePending:
 			// LOW 12: Account for unresolved pending intent reservations after a crash
 			// so subsequent work or recovery sweeps never undercount committed spend.
-			if e.ReservedNanoUSD > 0 {
-				chargedNano += e.ReservedNanoUSD
-			} else {
+			// Explicit reservations are in st.PendingAttempts (and summed below);
+			// fall back to base tariff only when no reservation was recorded.
+			if e.ReservedNanoUSD == 0 {
 				chargedNano += opPrice.RequestNanoUSD + opPrice.CleanupReserveNanoUSD
 			}
 			activeCleanupNano += opPrice.CleanupReserveNanoUSD
-		case StateRetained:
-			if e.ReservedNanoUSD > 0 {
-				chargedNano += e.ReservedNanoUSD
-			}
 		}
 	}
 	for _, a := range st.PendingAttempts {
