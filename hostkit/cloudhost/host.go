@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/lmctl-ai/lmcloud/hostkit"
+	"github.com/lmctl-ai/lmcloud/hostkit/safety"
 )
 
 // Config wires a provider into the shared host.
@@ -37,13 +38,20 @@ type Config struct {
 	PollInterval time.Duration
 	Now          func() time.Time
 	Sleep        func(context.Context, time.Duration) error
+	// Optional cost metering configuration (defaults to SyntheticSimPriceTable and DefaultCostCapUSD).
+	Meter             *safety.CostMeter
+	PriceTable        *safety.PriceTable
+	CampaignStatePath string
+	OnSetWorkCap      func(workCapNanoUSD int64) error
 }
 
 // Host is the state behind the `cloud` context object.
 type Host struct {
-	cfg  Config
-	errs *hostkit.ErrorState
-	dry  *dryScopes
+	cfg     Config
+	errs    *hostkit.ErrorState
+	dry     *dryScopes
+	cost    *costTracker
+	metrics *metricsTracker
 }
 
 // New returns a host for cfg. Missing optional fields get defaults.
@@ -79,7 +87,13 @@ func New(cfg Config) *Host {
 	if cfg.Queue != nil {
 		cfg.Queue = guardQueue{cfg.Queue}
 	}
-	return &Host{cfg: cfg, errs: hostkit.NewErrorState(), dry: &dryScopes{m: map[string]*overlay{}}}
+	return &Host{
+		cfg:     cfg,
+		errs:    hostkit.NewErrorState(),
+		dry:     &dryScopes{m: map[string]*overlay{}},
+		cost:    newCostTracker(cfg),
+		metrics: newMetricsTracker(cfg.Now),
+	}
 }
 
 // ---- small helpers ----
@@ -228,17 +242,28 @@ func (h *Host) queueExists(ctx context.Context, dry bool, q string) (bool, *host
 // BucketCreate implements bucket_create.
 func (h *Host) BucketCreate(dry bool, b string) (bool, error) {
 	const op = "bucket_create"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	if e := h.cfg.Validator.Bucket(b); e != nil {
+		failed = true
 		return false, h.fail(op, b, e)
 	}
 	ctx, cancel, e := h.opCtx("storage", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return false, h.fail(op, b, e)
 	}
 	defer cancel()
 	if dry {
 		exists, e := h.bucketExists(ctx, true, b)
 		if e != nil {
+			failed = true
 			return false, h.fail(op, b, e)
 		}
 		h.ov(ctx).setBucket(b, true, !exists)
@@ -246,13 +271,20 @@ func (h *Host) BucketCreate(dry bool, b string) (bool, error) {
 		return !exists, nil
 	}
 	if h.cfg.Store == nil {
+		failed = true
 		return false, h.fail(op, b, missingStore())
+	}
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindBucket, b)
+	if cerr != nil {
+		failed = true
+		return false, h.fail(op, b, cerr)
 	}
 	token := newCreateToken()
 	h.errs.AddRedaction(token) // v4: never echoed into last_error/aborts
-	ctx = hostkit.WithCreateToken(ctx, token)
-	created, err := h.cfg.Store.CreateBucket(ctx, b)
+	mctx = hostkit.WithCreateToken(mctx, token)
+	created, err := h.cfg.Store.CreateBucket(mctx, b)
 	if err == nil {
+		retries, throttles = scope.finish(0, true)
 		h.ok()
 		return created, nil
 	}
@@ -260,29 +292,43 @@ func (h *Host) BucketCreate(dry bool, b string) (bool, error) {
 	if ce.Code == hostkit.Conflict {
 		// Design 02 §6.1: 409 is idempotent success only if the bucket is accessible in our scope.
 		if exists, perr := h.realBucketExists(ctx, b); perr == nil && exists {
+			retries, throttles = scope.finish(0, true)
 			h.ok()
 			return provenByToken(h.cfg.Store, token, func(r hostkit.BucketCreateTokenReader) (string, error) {
 				return r.BucketCreateToken(ctx, b)
 			}), nil
 		}
 	}
+	retries, throttles = scope.finish(0, false)
+	failed = true
 	return false, h.fail(op, b, ce)
 }
 
 // BucketDelete implements bucket_delete.
 func (h *Host) BucketDelete(dry bool, b string) (bool, error) {
 	const op = "bucket_delete"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	if e := h.cfg.Validator.Bucket(b); e != nil {
+		failed = true
 		return false, h.fail(op, b, e)
 	}
 	ctx, cancel, e := h.opCtx("storage", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return false, h.fail(op, b, e)
 	}
 	defer cancel()
 	if dry {
 		exists, e := h.bucketExists(ctx, true, b)
 		if e != nil {
+			failed = true
 			return false, h.fail(op, b, e)
 		}
 		if !exists {
@@ -291,9 +337,11 @@ func (h *Host) BucketDelete(dry bool, b string) (bool, error) {
 		}
 		keys, e := h.dryKeys(ctx, b, "")
 		if e != nil {
+			failed = true
 			return false, h.fail(op, b, e)
 		}
 		if len(keys) > 0 {
+			failed = true
 			return false, h.fail(op, b, hostkit.ProviderError(hostkit.Conflict, 409, "BucketNotEmpty", "bucket is not empty (dry-run preview)"))
 		}
 		h.ov(ctx).setBucket(b, false, false)
@@ -301,17 +349,27 @@ func (h *Host) BucketDelete(dry bool, b string) (bool, error) {
 		return true, nil
 	}
 	if h.cfg.Store == nil {
+		failed = true
 		return false, h.fail(op, b, missingStore())
 	}
-	ce := hostkit.AsCloudError(h.cfg.Store.DeleteBucket(ctx, b))
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, IsCleanup: true}, safety.KindBucket, b)
+	if cerr != nil {
+		failed = true
+		return false, h.fail(op, b, cerr)
+	}
+	ce := hostkit.AsCloudError(h.cfg.Store.DeleteBucket(mctx, b))
 	switch {
 	case ce == nil:
+		retries, throttles = scope.finish(0, true)
 		h.ok()
 		return true, nil
 	case isNotFound(ce) && ce.Absent != hostkit.AbsentObject:
+		retries, throttles = scope.finish(0, true)
 		h.ok()
 		return false, nil
 	default:
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return false, h.fail(op, b, ce)
 	}
 }
@@ -319,16 +377,46 @@ func (h *Host) BucketDelete(dry bool, b string) (bool, error) {
 // BucketExists implements bucket_exists. Only a genuine NOT_FOUND yields false/OK.
 func (h *Host) BucketExists(dry bool, b string) (bool, error) {
 	const op = "bucket_exists"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	if e := h.cfg.Validator.Bucket(b); e != nil {
+		failed = true
 		return false, h.fail(op, b, e)
 	}
 	ctx, cancel, e := h.opCtx("storage", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return false, h.fail(op, b, e)
 	}
 	defer cancel()
-	exists, e := h.bucketExists(ctx, dry, b)
+	if dry {
+		exists, e := h.bucketExists(ctx, true, b)
+		if e != nil {
+			failed = true
+			return false, h.fail(op, b, e)
+		}
+		h.ok()
+		return exists, nil
+	}
+	if h.cfg.Store == nil {
+		failed = true
+		return false, h.fail(op, b, missingStore())
+	}
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindBucket, b)
+	if cerr != nil {
+		failed = true
+		return false, h.fail(op, b, cerr)
+	}
+	exists, e := h.realBucketExists(mctx, b)
+	retries, throttles = scope.finish(0, e == nil)
 	if e != nil {
+		failed = true
 		return false, h.fail(op, b, e)
 	}
 	h.ok()
@@ -338,16 +426,40 @@ func (h *Host) BucketExists(dry bool, b string) (bool, error) {
 // BucketList implements bucket_list: every page, sorted, de-duplicated.
 func (h *Host) BucketList(dry bool) ([]string, error) {
 	const op = "bucket_list"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	ctx, cancel, e := h.opCtx("storage", h.cfg.ListTimeout)
 	if e != nil {
+		failed = true
 		return nil, h.fail(op, "", e)
 	}
 	defer cancel()
 	if h.cfg.Store == nil {
+		failed = true
 		return nil, h.fail(op, "", missingStore())
 	}
-	names, e := hostkit.ListAll(ctx, h.cfg.MaxPages, h.cfg.Store.ListBuckets)
+	names, e := hostkit.ListAll(ctx, h.cfg.MaxPages, func(ctx context.Context, token string) ([]string, string, error) {
+		if dry {
+			return h.cfg.Store.ListBuckets(ctx, token)
+		}
+		mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindBucket, "")
+		if cerr != nil {
+			return nil, "", cerr
+		}
+		items, next, err := h.cfg.Store.ListBuckets(mctx, token)
+		r, t := scope.finish(0, err == nil)
+		retries += r
+		throttles += t
+		return items, next, err
+	})
 	if e != nil {
+		failed = true
 		return nil, h.fail(op, "", e)
 	}
 	if dry {
@@ -362,23 +474,35 @@ func (h *Host) BucketList(dry bool) ([]string, error) {
 // ObjectPut implements both object_put overloads.
 func (h *Host) ObjectPut(dry bool, b, k, body, ct string, meta map[string]string) (*hostkit.ObjectMeta, error) {
 	const op = "object_put"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles, bytesOut int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, bytesOut)
+		}
+	}()
 	none := &hostkit.ObjectMeta{Bucket: b, Key: k, Metadata: map[string]string{}}
 	for _, e := range []*hostkit.CloudError{h.cfg.Validator.Bucket(b), h.cfg.Validator.Key(k), hostkit.ObjectSize(len(body)), hostkit.ContentType(ct), hostkit.Metadata(meta)} {
 		if e != nil {
+			failed = true
 			return none, h.fail(op, target(b, k), e)
 		}
 	}
 	ctx, cancel, e := h.opCtx("storage", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return none, h.fail(op, target(b, k), e)
 	}
 	defer cancel()
 	if dry {
 		exists, e := h.bucketExists(ctx, true, b)
 		if e != nil {
+			failed = true
 			return none, h.fail(op, target(b, k), e)
 		}
 		if !exists {
+			failed = true
 			return none, h.fail(op, target(b, k), notFound(hostkit.AbsentBucket, "bucket does not exist (dry-run preview)"))
 		}
 		m := &hostkit.ObjectMeta{Exists: true, Bucket: b, Key: k, Size: int64(len(body)), ETag: dryETag(body), ContentType: ct, Metadata: copyMap(meta)}
@@ -387,13 +511,24 @@ func (h *Host) ObjectPut(dry bool, b, k, body, ct string, meta map[string]string
 		return m, nil
 	}
 	if h.cfg.Store == nil {
+		failed = true
 		return none, h.fail(op, target(b, k), missingStore())
 	}
-	m, err := h.cfg.Store.PutObject(ctx, b, k, []byte(body), ct, copyMap(meta))
+	sz := int64(len(body))
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: sz}, safety.KindObject, target(b, k))
+	if cerr != nil {
+		failed = true
+		return none, h.fail(op, target(b, k), cerr)
+	}
+	m, err := h.cfg.Store.PutObject(mctx, b, k, []byte(body), ct, copyMap(meta))
 	if err != nil {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return none, h.fail(op, target(b, k), hostkit.AsCloudError(err))
 	}
-	m.Exists, m.Bucket, m.Key, m.Size = true, b, k, int64(len(body))
+	bytesOut = sz
+	retries, throttles = scope.finish(sz, true)
+	m.Exists, m.Bucket, m.Key, m.Size = true, b, k, sz
 	m.ETag = NormalizeETag(m.ETag)
 	if m.ContentType == "" {
 		m.ContentType = ct
@@ -408,13 +543,23 @@ func (h *Host) ObjectPut(dry bool, b, k, body, ct string, meta map[string]string
 // ObjectGet implements object_get. Oversized bodies fail; they are never truncated.
 func (h *Host) ObjectGet(dry bool, b, k string) (string, error) {
 	const op = "object_get"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles, bytesIn int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, bytesIn, 0)
+		}
+	}()
 	for _, e := range []*hostkit.CloudError{h.cfg.Validator.Bucket(b), h.cfg.Validator.Key(k)} {
 		if e != nil {
+			failed = true
 			return "", h.fail(op, target(b, k), e)
 		}
 	}
 	ctx, cancel, e := h.opCtx("storage", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return "", h.fail(op, target(b, k), e)
 	}
 	defer cancel()
@@ -424,19 +569,37 @@ func (h *Host) ObjectGet(dry bool, b, k string) (string, error) {
 				h.ok()
 				return body, nil
 			}
+			failed = true
 			return "", h.fail(op, target(b, k), h.dryMissing(state))
 		}
 	}
 	if h.cfg.Store == nil {
+		failed = true
 		return "", h.fail(op, target(b, k), missingStore())
 	}
-	data, err := h.cfg.Store.GetObject(ctx, b, k, hostkit.MaxObjectBytes)
+	var scope *attemptScope
+	mctx := ctx
+	if !dry {
+		var cerr *hostkit.CloudError
+		mctx, scope, cerr = h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, EgressBytes: hostkit.MaxObjectBytes}, safety.KindObject, target(b, k))
+		if cerr != nil {
+			failed = true
+			return "", h.fail(op, target(b, k), cerr)
+		}
+	}
+	data, err := h.cfg.Store.GetObject(mctx, b, k, hostkit.MaxObjectBytes)
 	if err != nil {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return "", h.fail(op, target(b, k), hostkit.AsCloudError(err))
 	}
 	if len(data) > hostkit.MaxObjectBytes {
+		retries, throttles = scope.finish(hostkit.MaxObjectBytes, false)
+		failed = true
 		return "", h.fail(op, target(b, k), hostkit.ProviderError(hostkit.Internal, 0, "", "object body exceeds the 16 MiB limit; refusing to truncate"))
 	}
+	bytesIn = int64(len(data))
+	retries, throttles = scope.finish(bytesIn, true)
 	h.ok()
 	return string(data), nil
 }
@@ -451,14 +614,24 @@ func (h *Host) dryMissing(state dryState) *hostkit.CloudError {
 // ObjectHead implements object_head: missing key in an existing bucket is exists()==false/OK.
 func (h *Host) ObjectHead(dry bool, b, k string) (*hostkit.ObjectMeta, error) {
 	const op = "object_head"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	absent := &hostkit.ObjectMeta{Bucket: b, Key: k, Metadata: map[string]string{}}
 	for _, e := range []*hostkit.CloudError{h.cfg.Validator.Bucket(b), h.cfg.Validator.Key(k)} {
 		if e != nil {
+			failed = true
 			return absent, h.fail(op, target(b, k), e)
 		}
 	}
 	ctx, cancel, e := h.opCtx("storage", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return absent, h.fail(op, target(b, k), e)
 	}
 	defer cancel()
@@ -471,6 +644,7 @@ func (h *Host) ObjectHead(dry bool, b, k string) (*hostkit.ObjectMeta, error) {
 				c.Metadata = copyMap(m.Metadata)
 				return &c, nil
 			case dryBucketGone:
+				failed = true
 				return absent, h.fail(op, target(b, k), h.dryMissing(state))
 			default:
 				h.ok()
@@ -479,10 +653,22 @@ func (h *Host) ObjectHead(dry bool, b, k string) (*hostkit.ObjectMeta, error) {
 		}
 	}
 	if h.cfg.Store == nil {
+		failed = true
 		return absent, h.fail(op, target(b, k), missingStore())
 	}
-	m, err := h.cfg.Store.HeadObject(ctx, b, k)
+	var scope *attemptScope
+	mctx := ctx
+	if !dry {
+		var cerr *hostkit.CloudError
+		mctx, scope, cerr = h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindObject, target(b, k))
+		if cerr != nil {
+			failed = true
+			return absent, h.fail(op, target(b, k), cerr)
+		}
+	}
+	m, err := h.cfg.Store.HeadObject(mctx, b, k)
 	if err == nil {
+		retries, throttles = scope.finish(0, true)
 		m.Exists, m.Bucket, m.Key = true, b, k
 		m.ETag = NormalizeETag(m.ETag)
 		if m.ContentType == "" {
@@ -496,22 +682,32 @@ func (h *Host) ObjectHead(dry bool, b, k string) (*hostkit.ObjectMeta, error) {
 	}
 	ce := hostkit.AsCloudError(err)
 	if !isNotFound(ce) {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return absent, h.fail(op, target(b, k), ce)
 	}
 	switch ce.Absent {
 	case hostkit.AbsentObject:
+		retries, throttles = scope.finish(0, true)
 		h.ok()
 		return absent, nil
 	case hostkit.AbsentBucket:
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return absent, h.fail(op, target(b, k), ce)
 	}
 	exists, perr := h.realBucketExists(ctx, b)
 	if perr != nil {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return absent, h.fail(op, target(b, k), perr)
 	}
 	if !exists {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return absent, h.fail(op, target(b, k), ce.WithAbsent(hostkit.AbsentBucket))
 	}
+	retries, throttles = scope.finish(0, true)
 	h.ok()
 	return absent, nil
 }
@@ -519,22 +715,34 @@ func (h *Host) ObjectHead(dry bool, b, k string) (*hostkit.ObjectMeta, error) {
 // ObjectDelete implements object_delete: idempotent within an existing bucket.
 func (h *Host) ObjectDelete(dry bool, b, k string) error {
 	const op = "object_delete"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	for _, e := range []*hostkit.CloudError{h.cfg.Validator.Bucket(b), h.cfg.Validator.Key(k)} {
 		if e != nil {
+			failed = true
 			return h.fail(op, target(b, k), e)
 		}
 	}
 	ctx, cancel, e := h.opCtx("storage", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return h.fail(op, target(b, k), e)
 	}
 	defer cancel()
 	if dry {
 		exists, e := h.bucketExists(ctx, true, b)
 		if e != nil {
+			failed = true
 			return h.fail(op, target(b, k), e)
 		}
 		if !exists {
+			failed = true
 			return h.fail(op, target(b, k), notFound(hostkit.AbsentBucket, "bucket does not exist (dry-run preview)"))
 		}
 		h.ov(ctx).deleteObject(b, k)
@@ -542,30 +750,47 @@ func (h *Host) ObjectDelete(dry bool, b, k string) error {
 		return nil
 	}
 	if h.cfg.Store == nil {
+		failed = true
 		return h.fail(op, target(b, k), missingStore())
 	}
-	ce := hostkit.AsCloudError(h.cfg.Store.DeleteObject(ctx, b, k))
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, IsCleanup: true}, safety.KindObject, target(b, k))
+	if cerr != nil {
+		failed = true
+		return h.fail(op, target(b, k), cerr)
+	}
+	ce := hostkit.AsCloudError(h.cfg.Store.DeleteObject(mctx, b, k))
 	if ce == nil {
+		retries, throttles = scope.finish(0, true)
 		h.ok()
 		return nil
 	}
 	if !isNotFound(ce) {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return h.fail(op, target(b, k), ce)
 	}
 	switch ce.Absent {
 	case hostkit.AbsentObject:
+		retries, throttles = scope.finish(0, true)
 		h.ok()
 		return nil
 	case hostkit.AbsentBucket:
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return h.fail(op, target(b, k), ce)
 	}
 	exists, perr := h.realBucketExists(ctx, b)
 	if perr != nil {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return h.fail(op, target(b, k), perr)
 	}
 	if !exists {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return h.fail(op, target(b, k), ce.WithAbsent(hostkit.AbsentBucket))
 	}
+	retries, throttles = scope.finish(0, true)
 	h.ok()
 	return nil
 }
@@ -579,22 +804,34 @@ type Page struct {
 // ObjectList implements both object_list overloads.
 func (h *Host) ObjectList(dry bool, b, prefix string, maxKeys int64, token string) (*Page, error) {
 	const op = "object_list"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	empty := &Page{}
 	if e := h.cfg.Validator.Bucket(b); e != nil {
+		failed = true
 		return empty, h.fail(op, b, e)
 	}
 	max, e := hostkit.ListMax(maxKeys)
 	if e != nil {
+		failed = true
 		return empty, h.fail(op, b, e)
 	}
 	ctx, cancel, e := h.opCtx("storage", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return empty, h.fail(op, b, e)
 	}
 	defer cancel()
 	if dry && h.ov(ctx).touchesBucket(b) {
 		keys, e := h.dryKeys(ctx, b, prefix)
 		if e != nil {
+			failed = true
 			return empty, h.fail(op, b, e)
 		}
 		p := &Page{}
@@ -617,18 +854,36 @@ func (h *Host) ObjectList(dry bool, b, prefix string, maxKeys int64, token strin
 		return p, nil
 	}
 	if h.cfg.Store == nil {
+		failed = true
 		return empty, h.fail(op, b, missingStore())
 	}
-	page, err := h.cfg.Store.ListObjects(ctx, b, prefix, max, token)
+	var scope *attemptScope
+	mctx := ctx
+	if !dry {
+		var cerr *hostkit.CloudError
+		mctx, scope, cerr = h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindBucket, b)
+		if cerr != nil {
+			failed = true
+			return empty, h.fail(op, b, cerr)
+		}
+	}
+	page, err := h.cfg.Store.ListObjects(mctx, b, prefix, max, token)
 	if err != nil {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return empty, h.fail(op, b, hostkit.AsCloudError(err))
 	}
 	if len(page.Items) > max {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return empty, h.fail(op, b, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned more items than max_keys"))
 	}
 	if token != "" && page.NextToken == token {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return empty, h.fail(op, b, hostkit.ProviderError(hostkit.Internal, 0, "", "pagination stalled: continuation token repeated"))
 	}
+	retries, throttles = scope.finish(0, true)
 	items := append([]hostkit.ObjectSummary(nil), page.Items...)
 	sort.SliceStable(items, func(i, j int) bool { return items[i].Key < items[j].Key })
 	for i := range items {
@@ -671,21 +926,57 @@ func (h *Host) dryKeys(ctx context.Context, b, prefix string) ([]string, *hostki
 // ObjectListAll implements object_list_all: all pages or an error, never partial.
 func (h *Host) ObjectListAll(dry bool, b, prefix string) ([]string, error) {
 	const op = "object_list_all"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	if e := h.cfg.Validator.Bucket(b); e != nil {
+		failed = true
 		return nil, h.fail(op, b, e)
 	}
 	ctx, cancel, e := h.opCtx("storage", h.cfg.ListTimeout)
 	if e != nil {
+		failed = true
 		return nil, h.fail(op, b, e)
 	}
 	defer cancel()
 	var keys []string
-	if dry && h.ov(ctx).touchesBucket(b) {
-		keys, e = h.dryKeys(ctx, b, prefix)
+	if dry {
+		if h.ov(ctx).touchesBucket(b) {
+			keys, e = h.dryKeys(ctx, b, prefix)
+		} else {
+			keys, e = h.realKeys(ctx, b, prefix)
+		}
 	} else {
-		keys, e = h.realKeys(ctx, b, prefix)
+		if h.cfg.Store == nil {
+			failed = true
+			return nil, h.fail(op, b, missingStore())
+		}
+		keys, e = hostkit.ListAll(ctx, h.cfg.MaxPages, func(ctx context.Context, token string) ([]string, string, error) {
+			mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindBucket, b)
+			if cerr != nil {
+				return nil, "", cerr
+			}
+			page, err := h.cfg.Store.ListObjects(mctx, b, prefix, hostkit.MaxListMax, token)
+			r, t := scope.finish(0, err == nil)
+			retries += r
+			throttles += t
+			if err != nil {
+				return nil, "", err
+			}
+			out := make([]string, len(page.Items))
+			for i, it := range page.Items {
+				out[i] = it.Key
+			}
+			return out, page.NextToken, nil
+		})
 	}
 	if e != nil {
+		failed = true
 		return nil, h.fail(op, b, e)
 	}
 	h.ok()
@@ -697,17 +988,28 @@ func (h *Host) ObjectListAll(dry bool, b, prefix string) ([]string, error) {
 // QueueCreate implements queue_create.
 func (h *Host) QueueCreate(dry bool, q string) (bool, error) {
 	const op = "queue_create"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	if e := h.cfg.Validator.Queue(q); e != nil {
+		failed = true
 		return false, h.fail(op, q, e)
 	}
 	ctx, cancel, e := h.opCtx("queue", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return false, h.fail(op, q, e)
 	}
 	defer cancel()
 	if dry {
 		exists, e := h.queueExists(ctx, true, q)
 		if e != nil {
+			failed = true
 			return false, h.fail(op, q, e)
 		}
 		h.ov(ctx).setQueue(q, true)
@@ -715,24 +1017,34 @@ func (h *Host) QueueCreate(dry bool, q string) (bool, error) {
 		return !exists, nil
 	}
 	if h.cfg.Queue == nil {
+		failed = true
 		return false, h.fail(op, q, missingQueue())
+	}
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindQueue, q)
+	if cerr != nil {
+		failed = true
+		return false, h.fail(op, q, cerr)
 	}
 	token := newCreateToken()
 	h.errs.AddRedaction(token) // v4: never echoed into last_error/aborts
-	ctx = hostkit.WithCreateToken(ctx, token)
-	created, err := h.cfg.Queue.CreateQueue(ctx, q)
+	mctx = hostkit.WithCreateToken(mctx, token)
+	created, err := h.cfg.Queue.CreateQueue(mctx, q)
 	if err != nil {
 		ce := hostkit.AsCloudError(err)
 		if ce.Code == hostkit.Conflict {
 			if exists, perr := h.realQueueExists(ctx, q); perr == nil && exists {
+				retries, throttles = scope.finish(0, true)
 				h.ok()
 				return provenByToken(h.cfg.Queue, token, func(r hostkit.QueueCreateTokenReader) (string, error) {
 					return r.QueueCreateToken(ctx, q)
 				}), nil
 			}
 		}
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return false, h.fail(op, q, ce)
 	}
+	retries, throttles = scope.finish(0, true)
 	h.ok()
 	return created, nil
 }
@@ -740,17 +1052,28 @@ func (h *Host) QueueCreate(dry bool, q string) (bool, error) {
 // QueueDelete implements queue_delete.
 func (h *Host) QueueDelete(dry bool, q string) (bool, error) {
 	const op = "queue_delete"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	if e := h.cfg.Validator.Queue(q); e != nil {
+		failed = true
 		return false, h.fail(op, q, e)
 	}
 	ctx, cancel, e := h.opCtx("queue", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return false, h.fail(op, q, e)
 	}
 	defer cancel()
 	if dry {
 		exists, e := h.queueExists(ctx, true, q)
 		if e != nil {
+			failed = true
 			return false, h.fail(op, q, e)
 		}
 		h.ov(ctx).setQueue(q, false)
@@ -758,17 +1081,27 @@ func (h *Host) QueueDelete(dry bool, q string) (bool, error) {
 		return exists, nil
 	}
 	if h.cfg.Queue == nil {
+		failed = true
 		return false, h.fail(op, q, missingQueue())
 	}
-	ce := hostkit.AsCloudError(h.cfg.Queue.DeleteQueue(ctx, q))
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, IsCleanup: true}, safety.KindQueue, q)
+	if cerr != nil {
+		failed = true
+		return false, h.fail(op, q, cerr)
+	}
+	ce := hostkit.AsCloudError(h.cfg.Queue.DeleteQueue(mctx, q))
 	switch {
 	case ce == nil:
+		retries, throttles = scope.finish(0, true)
 		h.ok()
 		return true, nil
 	case isNotFound(ce):
+		retries, throttles = scope.finish(0, true)
 		h.ok()
 		return false, nil
 	default:
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return false, h.fail(op, q, ce)
 	}
 }
@@ -776,16 +1109,46 @@ func (h *Host) QueueDelete(dry bool, q string) (bool, error) {
 // QueueExists implements queue_exists.
 func (h *Host) QueueExists(dry bool, q string) (bool, error) {
 	const op = "queue_exists"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	if e := h.cfg.Validator.Queue(q); e != nil {
+		failed = true
 		return false, h.fail(op, q, e)
 	}
 	ctx, cancel, e := h.opCtx("queue", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return false, h.fail(op, q, e)
 	}
 	defer cancel()
-	exists, e := h.queueExists(ctx, dry, q)
+	if dry {
+		exists, e := h.queueExists(ctx, true, q)
+		if e != nil {
+			failed = true
+			return false, h.fail(op, q, e)
+		}
+		h.ok()
+		return exists, nil
+	}
+	if h.cfg.Queue == nil {
+		failed = true
+		return false, h.fail(op, q, missingQueue())
+	}
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindQueue, q)
+	if cerr != nil {
+		failed = true
+		return false, h.fail(op, q, cerr)
+	}
+	exists, e := h.realQueueExists(mctx, q)
+	retries, throttles = scope.finish(0, e == nil)
 	if e != nil {
+		failed = true
 		return false, h.fail(op, q, e)
 	}
 	h.ok()
@@ -795,16 +1158,40 @@ func (h *Host) QueueExists(dry bool, q string) (bool, error) {
 // QueueList implements queue_list: every page, sorted, de-duplicated.
 func (h *Host) QueueList(dry bool) ([]string, error) {
 	const op = "queue_list"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	ctx, cancel, e := h.opCtx("queue", h.cfg.ListTimeout)
 	if e != nil {
+		failed = true
 		return nil, h.fail(op, "", e)
 	}
 	defer cancel()
 	if h.cfg.Queue == nil {
+		failed = true
 		return nil, h.fail(op, "", missingQueue())
 	}
-	names, e := hostkit.ListAll(ctx, h.cfg.MaxPages, h.cfg.Queue.ListQueues)
+	names, e := hostkit.ListAll(ctx, h.cfg.MaxPages, func(ctx context.Context, token string) ([]string, string, error) {
+		if dry {
+			return h.cfg.Queue.ListQueues(ctx, token)
+		}
+		mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindQueue, "")
+		if cerr != nil {
+			return nil, "", cerr
+		}
+		items, next, err := h.cfg.Queue.ListQueues(mctx, token)
+		r, t := scope.finish(0, err == nil)
+		retries += r
+		throttles += t
+		return items, next, err
+	})
 	if e != nil {
+		failed = true
 		return nil, h.fail(op, "", e)
 	}
 	if dry {
@@ -828,34 +1215,58 @@ func (h *Host) requireQueue(ctx context.Context, dry bool, q string) *hostkit.Cl
 // QueueSend implements queue_send.
 func (h *Host) QueueSend(dry bool, q, body string) (string, error) {
 	const op = "queue_send"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles, bytesOut int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, bytesOut)
+		}
+	}()
 	for _, e := range []*hostkit.CloudError{h.cfg.Validator.Queue(q), hostkit.QueueBodySize(len(body))} {
 		if e != nil {
+			failed = true
 			return "", h.fail(op, q, e)
 		}
 	}
 	ctx, cancel, e := h.opCtx("queue", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return "", h.fail(op, q, e)
 	}
 	defer cancel()
 	if dry {
 		if e := h.requireQueue(ctx, true, q); e != nil {
+			failed = true
 			return "", h.fail(op, q, e)
 		}
 		h.ok()
 		return "dry-run-message-id", nil
 	}
 	if h.cfg.Queue == nil {
+		failed = true
 		return "", h.fail(op, q, missingQueue())
 	}
+	sz := int64(len(body))
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: sz}, safety.KindQueue, q)
+	if cerr != nil {
+		failed = true
+		return "", h.fail(op, q, cerr)
+	}
 	wire := hostkit.EncodeQueueBody(body, hostkit.CapsFor(ctx, h.cfg.Queue, q).TextOnlyWire)
-	id, err := h.cfg.Queue.Send(ctx, q, wire)
+	id, err := h.cfg.Queue.Send(mctx, q, wire)
 	if err != nil {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return "", h.fail(op, q, hostkit.AsCloudError(err))
 	}
 	if id == "" {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return "", h.fail(op, q, hostkit.ProviderError(hostkit.Internal, 0, "", "provider accepted the message but returned no message id"))
 	}
+	bytesOut = sz
+	retries, throttles = scope.finish(sz, true)
 	h.ok()
 	return id, nil
 }
@@ -868,56 +1279,83 @@ type Message struct {
 // QueueReceive implements both queue_receive overloads.
 func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message, error) {
 	const op = "queue_receive"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles, bytesIn int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, bytesIn, 0)
+		}
+	}()
 	for _, e := range []*hostkit.CloudError{h.cfg.Validator.Queue(q), hostkit.ReceiveArgs(max, wait, vis)} {
 		if e != nil {
+			failed = true
 			return nil, h.fail(op, q, e)
 		}
 	}
 	ctx, cancel, e := h.opCtx("queue", h.cfg.OpTimeout+time.Duration(wait)*time.Second)
 	if e != nil {
+		failed = true
 		return nil, h.fail(op, q, e)
 	}
 	defer cancel()
 	if dry {
 		// Receiving consumes (hides) messages: the preview never calls Receive.
 		if e := h.requireQueue(ctx, true, q); e != nil {
+			failed = true
 			return nil, h.fail(op, q, e)
 		}
 		h.ok()
 		return nil, nil
 	}
 	if h.cfg.Queue == nil {
+		failed = true
 		return nil, h.fail(op, q, missingQueue())
+	}
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindQueue, q)
+	if cerr != nil {
+		failed = true
+		return nil, h.fail(op, q, cerr)
 	}
 	caps := hostkit.CapsFor(ctx, h.cfg.Queue, q)
 	var raw []hostkit.RawMessage
 	var rerr error
 	if caps.LongPoll {
-		raw, rerr = h.cfg.Queue.Receive(ctx, q, int(max), int(wait), int(vis))
+		raw, rerr = h.cfg.Queue.Receive(mctx, q, int(max), int(wait), int(vis))
 	} else {
-		rerr = hostkit.WaitLoop(ctx, time.Duration(wait)*time.Second, h.cfg.PollInterval, h.cfg.Now, h.cfg.Sleep, func(ctx context.Context) (int, error) {
+		rerr = hostkit.WaitLoop(mctx, time.Duration(wait)*time.Second, h.cfg.PollInterval, h.cfg.Now, h.cfg.Sleep, func(ctx context.Context) (int, error) {
 			msgs, err := h.cfg.Queue.Receive(ctx, q, int(max), 0, int(vis))
 			raw = msgs
 			return len(msgs), err
 		})
 	}
 	if rerr != nil {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return nil, h.fail(op, q, hostkit.AsCloudError(rerr))
 	}
 	if len(raw) > int(max) {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return nil, h.fail(op, q, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned more messages than max_messages"))
 	}
 	out := make([]Message, 0, len(raw))
 	for _, m := range raw {
 		if m.ID == "" || m.Receipt == "" {
+			retries, throttles = scope.finish(0, false)
+			failed = true
 			return nil, h.fail(op, q, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned a message without id or receipt"))
 		}
 		body, e := hostkit.DecodeQueueBody(m.Wire)
 		if e != nil {
+			retries, throttles = scope.finish(0, false)
+			failed = true
 			return nil, h.fail(op, q, e)
 		}
+		bytesIn += int64(len(body))
 		out = append(out, Message{ID: m.ID, Body: body, Receipt: m.Receipt})
 	}
+	retries, throttles = scope.finish(bytesIn, true)
 	h.ok()
 	return out, nil
 }
@@ -925,29 +1363,48 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 // QueueAck implements queue_ack with missing-queue precedence and idempotent re-ack.
 func (h *Host) QueueAck(dry bool, q, receipt string) error {
 	const op = "queue_ack"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	for _, e := range []*hostkit.CloudError{h.cfg.Validator.Queue(q), hostkit.Receipt(receipt)} {
 		if e != nil {
+			failed = true
 			return h.fail(op, q, e)
 		}
 	}
 	ctx, cancel, e := h.opCtx("queue", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return h.fail(op, q, e)
 	}
 	defer cancel()
 	if dry {
 		if e := h.requireQueue(ctx, true, q); e != nil {
+			failed = true
 			return h.fail(op, q, e)
 		}
 		h.ok()
 		return nil
 	}
 	if h.cfg.Queue == nil {
+		failed = true
 		return h.fail(op, q, missingQueue())
 	}
-	ce := hostkit.AsCloudError(h.cfg.Queue.Ack(ctx, q, receipt))
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, IsCleanup: false}, safety.KindQueue, q)
+	if cerr != nil {
+		failed = true
+		return h.fail(op, q, cerr)
+	}
+	ce := hostkit.AsCloudError(h.cfg.Queue.Ack(mctx, q, receipt))
 	ce = hostkit.ReceiptPrecedence(ce, true, func() (bool, *hostkit.CloudError) { return h.realQueueExists(ctx, q) })
+	retries, throttles = scope.finish(0, ce == nil)
 	if ce != nil {
+		failed = true
 		return h.fail(op, q, ce)
 	}
 	h.ok()
@@ -957,37 +1414,59 @@ func (h *Host) QueueAck(dry bool, q, receipt string) error {
 // QueueNack implements queue_nack and returns the receipt valid from now on.
 func (h *Host) QueueNack(dry bool, q, receipt string, vis int64) (string, error) {
 	const op = "queue_nack"
+	start := h.cfg.Now()
+	failed := false
+	var retries, throttles int64
+	defer func() {
+		if !dry {
+			h.metrics.record(op, h.cfg.Now().Sub(start), failed, retries, throttles, 0, 0)
+		}
+	}()
 	for _, e := range []*hostkit.CloudError{h.cfg.Validator.Queue(q), hostkit.Visibility(vis), hostkit.Receipt(receipt)} {
 		if e != nil {
+			failed = true
 			return "", h.fail(op, q, e)
 		}
 	}
 	ctx, cancel, e := h.opCtx("queue", h.cfg.OpTimeout)
 	if e != nil {
+		failed = true
 		return "", h.fail(op, q, e)
 	}
 	defer cancel()
 	if dry {
 		if e := h.requireQueue(ctx, true, q); e != nil {
+			failed = true
 			return "", h.fail(op, q, e)
 		}
 		h.ok()
 		return receipt, nil
 	}
 	if h.cfg.Queue == nil {
+		failed = true
 		return "", h.fail(op, q, missingQueue())
 	}
-	nr, err := h.cfg.Queue.Nack(ctx, q, receipt, int(vis))
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindQueue, q)
+	if cerr != nil {
+		failed = true
+		return "", h.fail(op, q, cerr)
+	}
+	nr, err := h.cfg.Queue.Nack(mctx, q, receipt, int(vis))
 	if err != nil {
 		ce := hostkit.ReceiptPrecedence(hostkit.AsCloudError(err), false, func() (bool, *hostkit.CloudError) { return h.realQueueExists(ctx, q) })
 		if ce == nil {
 			ce = hostkit.ProviderError(hostkit.Internal, 0, "", "nack failed")
 		}
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return "", h.fail(op, q, ce)
 	}
 	if nr == "" {
+		retries, throttles = scope.finish(0, false)
+		failed = true
 		return "", h.fail(op, q, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned no receipt after visibility change"))
 	}
+	retries, throttles = scope.finish(0, true)
 	h.ok()
 	return nr, nil
 }

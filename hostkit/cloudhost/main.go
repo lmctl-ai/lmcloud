@@ -134,6 +134,9 @@ func (p Program) Main(args []string) int {
 	if err != nil {
 		return invoke.Failure("app", lmcode.NewError(lmcode.APP_FAIL, err.Error()))
 	}
+	if !inv.Dry && cfg.CampaignStatePath == "" && cfg.Meter == nil {
+		cfg.CampaignStatePath = defaultCampaignStatePath()
+	}
 	reg, err := NewRegistry(out)
 	if err != nil {
 		return invoke.Failure("app", lmcode.NewError(lmcode.APP_FAIL, err.Error()))

@@ -22,6 +22,9 @@ const (
 	// PriceTableSchemaVersion is the current regional price table format version.
 	PriceTableSchemaVersion = 1
 
+	// SyntheticSimPriceTableVersion is the identifier for the offline/simulator reference tariff table.
+	SyntheticSimPriceTableVersion = "2026-11-sim-v1"
+
 	secondsPerMonth = 30 * 24 * 3600
 	bytesPerGiB     = 1024 * 1024 * 1024
 )
@@ -35,10 +38,36 @@ var ErrCostCapExceeded = errors.New("live cost cap exceeded")
 // USDToNano converts a USD float64 to integer nano-USD, rounding up to avoid
 // under-estimating charges.
 func USDToNano(usd float64) int64 {
-	if usd <= 0 {
+	if math.IsNaN(usd) || math.IsInf(usd, 0) || usd <= 0 {
 		return 0
 	}
-	return int64(math.Ceil(usd * float64(NanoUSDPerUSD)))
+	scaled := math.Ceil(usd * float64(NanoUSDPerUSD))
+	if scaled > float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(scaled)
+}
+
+// parseCapUSDToNano validates a caller-supplied cost cap in USD and converts it
+// to integer nano-USD before any CostMeter state is modified. Positive values
+// smaller than 1 nano-USD ($0.000000001) or overflowing int64 are rejected.
+func parseCapUSDToNano(capUSD float64) (int64, error) {
+	if math.IsNaN(capUSD) || math.IsInf(capUSD, 0) || capUSD <= 0 {
+		return 0, fmt.Errorf("invalid cost cap %v: must be finite and > 0", capUSD)
+	}
+	scaled := capUSD * float64(NanoUSDPerUSD)
+	if scaled < 1.0-1e-6 {
+		return 0, fmt.Errorf("invalid cost cap %v: positive cap smaller than 1 nano-USD ($0.000000001)", capUSD)
+	}
+	rounded := math.Round(scaled)
+	if rounded < 1.0 || rounded > float64(math.MaxInt64) {
+		return 0, fmt.Errorf("invalid cost cap %v: out of nano-USD int64 range", capUSD)
+	}
+	nano := int64(rounded)
+	if nano <= 0 {
+		return 0, fmt.Errorf("invalid cost cap %v: rounds to <= 0 nano-USD", capUSD)
+	}
+	return nano, nil
 }
 
 // NanoToUSD converts integer nano-USD to float64 USD.
@@ -59,6 +88,7 @@ type OperationTariff struct {
 // PriceTable holds the verified tariff schedule for one (provider, region).
 type PriceTable struct {
 	SchemaVersion                    int                        `json:"schema_version"`
+	Version                          string                     `json:"version,omitempty"`
 	Provider                         string                     `json:"provider"`
 	Region                           string                     `json:"region"`
 	Currency                         string                     `json:"currency"`
@@ -67,6 +97,164 @@ type PriceTable struct {
 	MaxAgeDays                       int                        `json:"max_age_days"`
 	CleanupReservePerResourceNanoUSD int64                      `json:"cleanup_reserve_per_resource_nano_usd"`
 	Operations                       map[string]OperationTariff `json:"operations"`
+}
+
+// VersionID returns the canonical version identifier for CostReport.price_table_version().
+func (pt *PriceTable) VersionID() string {
+	if pt == nil {
+		return ""
+	}
+	if pt.Version != "" {
+		return pt.Version
+	}
+	eff := strings.TrimSpace(pt.EffectiveDate)
+	if len(eff) >= 7 {
+		eff = eff[:7]
+	}
+	return fmt.Sprintf("%s-%s-%s-v%d", eff, pt.Provider, pt.Region, pt.SchemaVersion)
+}
+
+// SyntheticSimPriceTable returns the deterministic synthetic simulator reference
+// tariff table ("2026-11-sim-v1") for offline and loopback simulator hosts.
+// It must never be used in live mode (LMCLOUD_LIVE=1).
+func SyntheticSimPriceTable(provider string) *PriceTable {
+	p := strings.ToLower(strings.TrimSpace(provider))
+	var (
+		bdelNano   int64 = 0
+		odelNano   int64 = 0
+		putGiBNano int64 = 23_000_000
+		getGiBNano int64 = 90_000_000
+		qcreate    int64 = 400
+		qdel       int64 = 400
+		qlist      int64 = 400
+		qsend      int64 = 400
+		qrecv      int64 = 400
+		qack       int64 = 400
+		qnack      int64 = 400
+	)
+	switch p {
+	case "azure":
+		bdelNano = 400
+		odelNano = 400
+		putGiBNano = 18_400_000
+		getGiBNano = 7_000_000
+		qcreate = 500
+		qdel = 400
+		qlist = 500
+		qsend = 400
+		qrecv = 400
+		qack = 400
+		qnack = 400
+	case "gcp":
+		bdelNano = 0
+		odelNano = 0
+		putGiBNano = 20_000_000
+		getGiBNano = 12_000_000
+		qcreate = 1000
+		qdel = 0
+		qlist = 400
+		qsend = 2400
+		qrecv = 2400
+		qack = 0
+		qnack = 400
+	case "oci":
+		bdelNano = 0
+		odelNano = 0
+		putGiBNano = 25_500_000
+		getGiBNano = 8_500_000
+		qcreate = 1000
+		qdel = 0
+		qlist = 1000
+		qsend = 1000
+		qrecv = 1000
+		qack = 1000
+		qnack = 1000
+	default:
+		if p == "" {
+			p = "ref"
+		}
+	}
+	return &PriceTable{
+		SchemaVersion:                    PriceTableSchemaVersion,
+		Version:                          SyntheticSimPriceTableVersion,
+		Provider:                         p,
+		Region:                           "sim",
+		Currency:                         "USD",
+		SourceURL:                        "https://lmctl.ai/lmcloud/prices/2026-11-sim-v1",
+		EffectiveDate:                    "2026-11-01",
+		MaxAgeDays:                       36500,
+		CleanupReservePerResourceNanoUSD: 10_000,
+		Operations: map[string]OperationTariff{
+			"bucket_create": {
+				RequestNanoUSD:        5000,
+				CleanupReserveNanoUSD: 10_000,
+			},
+			"bucket_delete": {
+				RequestNanoUSD: bdelNano,
+			},
+			"bucket_exists": {
+				RequestNanoUSD: 400,
+			},
+			"bucket_list": {
+				RequestNanoUSD: 5000,
+			},
+			"bucket_read_ownership": {
+				RequestNanoUSD: 400,
+			},
+			"object_put": {
+				RequestNanoUSD:         5000,
+				StorageGiBMonthNanoUSD: putGiBNano,
+				MinDurationSeconds:     secondsPerMonth,
+				CleanupReserveNanoUSD:  5000,
+			},
+			"object_get": {
+				RequestNanoUSD:   400,
+				EgressGiBNanoUSD: getGiBNano,
+			},
+			"object_head": {
+				RequestNanoUSD: 400,
+			},
+			"object_delete": {
+				RequestNanoUSD: odelNano,
+			},
+			"object_list": {
+				RequestNanoUSD: 5000,
+			},
+			"object_list_all": {
+				RequestNanoUSD: 5000,
+			},
+			"queue_create": {
+				RequestNanoUSD:        qcreate,
+				CleanupReserveNanoUSD: 10_000,
+			},
+			"queue_delete": {
+				RequestNanoUSD: qdel,
+			},
+			"queue_exists": {
+				RequestNanoUSD: 400,
+			},
+			"queue_list": {
+				RequestNanoUSD: qlist,
+			},
+			"queue_read_ownership": {
+				RequestNanoUSD: 400,
+			},
+			"queue_send": {
+				RequestNanoUSD: qsend,
+				ChunkBytes:     65536,
+			},
+			"queue_receive": {
+				RequestNanoUSD: qrecv,
+				ChunkBytes:     65536,
+			},
+			"queue_ack": {
+				RequestNanoUSD: qack,
+			},
+			"queue_nack": {
+				RequestNanoUSD: qnack,
+			},
+		},
+	}
 }
 
 // LoadEmbeddedPriceTable loads and validates the embedded price table for
@@ -320,13 +508,21 @@ func (m *CostMeter) RestoreWorkCap(workCapNanoUSD int64) {
 	}
 }
 
+// Table returns the active PriceTable configured on m.
+func (m *CostMeter) Table() *PriceTable {
+	if m == nil {
+		return nil
+	}
+	return m.table
+}
+
 // SetCapUSD updates the operator total run cost cap (rejected if > ceiling or
 // > current operator cap or <= cleanup reserve or below already committed spend).
 func (m *CostMeter) SetCapUSD(capUSD float64) error {
-	if math.IsNaN(capUSD) || math.IsInf(capUSD, 0) || capUSD <= 0 {
-		return fmt.Errorf("invalid cost cap %v", capUSD)
+	newCap, err := parseCapUSDToNano(capUSD)
+	if err != nil {
+		return err
 	}
-	newCap := USDToNano(capUSD)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if newCap > m.ceilingNanoUSD {
@@ -360,7 +556,7 @@ func (m *CostMeter) SetCapUSD(capUSD float64) error {
 // durable operator total ceiling (`CapNanoUSD <= CeilingNanoUSD`).
 //
 // Invariants enforced:
-//  1. Finite and > 0.
+//  1. Finite and >= 1 nano-USD ($0.000000001).
 //  2. Monotone non-increasing (`newWorkCap <= ActiveCapNanoUSD`).
 //  3. Preserves mandatory cleanup reserve (`CleanupReserveNanoUSD`) and locked /
 //     in-flight per-resource cleanup commitments inside `CapNanoUSD`:
@@ -368,10 +564,10 @@ func (m *CostMeter) SetCapUSD(capUSD float64) error {
 //  4. Covers all settled and in-flight work charges:
 //     `newWorkCap >= ChargedNanoUSD + InFlightWorkNanoUSD`.
 func (m *CostMeter) SetWorkCapUSD(workCapUSD float64) error {
-	if math.IsNaN(workCapUSD) || math.IsInf(workCapUSD, 0) || workCapUSD <= 0 {
-		return fmt.Errorf("invalid cost cap %v", workCapUSD)
+	newWorkCap, err := parseCapUSDToNano(workCapUSD)
+	if err != nil {
+		return err
 	}
-	newWorkCap := USDToNano(workCapUSD)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

@@ -59,6 +59,33 @@ type Attempt struct {
 	NotSent    bool
 }
 
+// RetryHooks allows callers (such as cloudhost cost and performance metering)
+// to attach pre-attempt admission and per-attempt outcome hooks to a context.
+type RetryHooks struct {
+	// BeforeAttempt runs before each attempt (attempt == 0, 1, ...).
+	// If it returns a non-nil error (e.g. COST_CAP_EXCEEDED), Do stops
+	// immediately without sleeping or dispatching that attempt.
+	BeforeAttempt func(ctx context.Context, attempt int) error
+	// AfterAttempt runs after each dispatched attempt completes.
+	AfterAttempt func(ctx context.Context, attempt int, a Attempt)
+}
+
+type retryHooksKey struct{}
+
+// WithRetryHooks attaches h to ctx for RetryPolicy.Do / DoHTTP.
+func WithRetryHooks(ctx context.Context, h RetryHooks) context.Context {
+	return context.WithValue(ctx, retryHooksKey{}, h)
+}
+
+// RetryHooksFrom returns any RetryHooks attached to ctx.
+func RetryHooksFrom(ctx context.Context) RetryHooks {
+	if ctx == nil {
+		return RetryHooks{}
+	}
+	h, _ := ctx.Value(retryHooksKey{}).(RetryHooks)
+	return h
+}
+
 // IdempotentMethod is the default retry safety by HTTP method: GET, HEAD,
 // PUT, DELETE and OPTIONS are idempotent; POST and PATCH are not. An adapter
 // may still pass idempotent=true for a POST that carries a client token
@@ -186,14 +213,29 @@ func (p RetryPolicy) Delay(i int, retryAfter string) time.Duration {
 // 5xx, which could turn a create that succeeded server-side into a 409.
 func (p RetryPolicy) Do(ctx context.Context, idempotent bool, fn func(ctx context.Context, attempt int) Attempt) (Attempt, int) {
 	p = p.normalized()
+	hooks := RetryHooksFrom(ctx)
 	var last Attempt
 	n := 0
+	reservedNext := false
 	for i := 0; i < p.Attempts; i++ {
 		if ctx.Err() != nil && n > 0 {
+			if reservedNext && hooks.AfterAttempt != nil {
+				hooks.AfterAttempt(ctx, i, Attempt{Err: ctx.Err(), NotSent: true})
+			}
 			break
 		}
+		if !reservedNext && hooks.BeforeAttempt != nil {
+			if err := hooks.BeforeAttempt(ctx, i); err != nil {
+				last = Attempt{Err: err, NotSent: true}
+				break
+			}
+		}
+		reservedNext = false
 		last = fn(ctx, i)
 		n++
+		if hooks.AfterAttempt != nil {
+			hooks.AfterAttempt(ctx, i, last)
+		}
 		retry := retryable(last, idempotent) && (last.Err == nil || ctx.Err() == nil)
 		if !retry || i == p.Attempts-1 {
 			break
@@ -202,7 +244,17 @@ func (p RetryPolicy) Do(ctx context.Context, idempotent bool, fn func(ctx contex
 		if dl, ok := ctx.Deadline(); ok && p.Now().Add(d).After(dl) {
 			break
 		}
-		if p.Sleep(ctx, d) != nil {
+		if hooks.BeforeAttempt != nil {
+			if err := hooks.BeforeAttempt(ctx, i+1); err != nil {
+				last = Attempt{Err: err, NotSent: true}
+				break
+			}
+			reservedNext = true
+		}
+		if err := p.Sleep(ctx, d); err != nil {
+			if reservedNext && hooks.AfterAttempt != nil {
+				hooks.AfterAttempt(ctx, i+1, Attempt{Err: err, NotSent: true})
+			}
 			break
 		}
 	}
@@ -219,12 +271,15 @@ func (p RetryPolicy) DoHTTP(ctx context.Context, client *http.Client, idempotent
 	client = EnforceClient(client)
 	var resp *http.Response
 	var buildErr error
-	last, n := p.Do(ctx, idempotent, func(ctx context.Context, _ int) Attempt {
+	discardResp := func() {
 		if resp != nil {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 			_ = resp.Body.Close()
 			resp = nil
 		}
+	}
+	last, n := p.Do(ctx, idempotent, func(ctx context.Context, _ int) Attempt {
+		discardResp()
 		req, err := build(ctx)
 		if err != nil {
 			buildErr = err
@@ -238,9 +293,11 @@ func (p RetryPolicy) DoHTTP(ctx context.Context, client *http.Client, idempotent
 		return Attempt{Status: r.StatusCode, RetryAfter: r.Header.Get("Retry-After")}
 	})
 	if buildErr != nil {
+		discardResp()
 		return nil, n, buildErr
 	}
 	if last.Err != nil {
+		discardResp()
 		return nil, n, last.Err
 	}
 	return resp, n, nil

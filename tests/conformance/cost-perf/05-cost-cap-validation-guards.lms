@@ -41,7 +41,12 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.set_cost_cap_usd(0.05);
   let e_raise_after_narrow = cloud.last_error();
 
-  # 4. Accrue non-zero cost, then verify lowering cap below accrued spend fails with INVALID_ARGUMENT
+  # 4. Tiny positive cap smaller than 1 nano-USD (e.g. 0.0000000001) must fail with INVALID_ARGUMENT BEFORE mutating state
+  cloud.set_cost_cap_usd(0.0000000001);
+  let e_tiny = cloud.last_error();
+  let cap_after_tiny = cloud.cost_cap_usd();
+
+  # 5. Accrue non-zero cost, then verify lowering cap below accrued spend fails with INVALID_ARGUMENT
   cloud.bucket_create(b);
   cloud.object_put(b, "k.txt", "value");
   let spent = cloud.estimated_cost();
@@ -56,6 +61,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 
   assert_close(cap_unchanged, 0.05, 0.000000001);
   assert_close(cap_narrowed, 0.04, 0.000000001);
+  assert_close(cap_after_tiny, 0.04, 0.000000001);
   assert_close(cap_after_below, 0.04, 0.000000001);
 
   lmcode_return_put("zero_rejected", e_zero.code() == ErrorCode.INVALID_ARGUMENT && e_zero.http_status() == 0);
@@ -63,6 +69,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   lmcode_return_put("over_rejected", e_raise_above_op.code() == ErrorCode.INVALID_ARGUMENT && e_over.code() == ErrorCode.INVALID_ARGUMENT && e_over.http_status() == 0);
   lmcode_return_put("one_rejected", e_one.code() == ErrorCode.INVALID_ARGUMENT && e_one.http_status() == 0);
   lmcode_return_put("narrow_accepted_raise_rejected", e_narrow_ok.ok() && e_narrow_ok.code() == ErrorCode.OK && e_raise_after_narrow.code() == ErrorCode.INVALID_ARGUMENT);
+  lmcode_return_put("tiny_rejected", e_tiny.code() == ErrorCode.INVALID_ARGUMENT && e_tiny.http_status() == 0);
   lmcode_return_put("below_spent_rejected", spent > 0.0 && e_below_spent.code() == ErrorCode.INVALID_ARGUMENT && e_below_spent.http_status() == 0);
 end _lmcode_
 
@@ -72,4 +79,5 @@ assert(r.result.zero_rejected, "set_cost_cap_usd(0.0) must fail with INVALID_ARG
 assert(r.result.neg_rejected, "set_cost_cap_usd(-0.05) must fail with INVALID_ARGUMENT");
 assert(r.result.over_rejected && r.result.one_rejected, "set_cost_cap_usd above operator cap or ceiling must fail with INVALID_ARGUMENT");
 assert(r.result.narrow_accepted_raise_rejected, "narrowing set_cost_cap_usd(0.04) must succeed and raising it back must fail");
+assert(r.result.tiny_rejected, "set_cost_cap_usd(< 1 nano-USD) must fail with INVALID_ARGUMENT before mutating state");
 assert(r.result.below_spent_rejected, "set_cost_cap_usd below already-accrued estimated_cost() must fail with INVALID_ARGUMENT");

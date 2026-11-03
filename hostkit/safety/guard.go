@@ -228,13 +228,7 @@ func (g *LiveGuard) SetWorkCapUSD(workCapUSD float64) *hostkit.CloudError {
 		return cerr
 	}
 	if err := g.meter.SetWorkCapUSD(workCapUSD); err != nil {
-		code := hostkit.InvalidArgument
-		pcode := "InvalidCostCap"
-		if errors.Is(err, ErrCostCapExceeded) {
-			code = hostkit.PermissionDenied
-			pcode = "LiveCostCapExceeded"
-		}
-		return hostkit.ProviderError(code, 0, pcode, err.Error())
+		return hostkit.ProviderError(hostkit.InvalidArgument, 0, "InvalidCostCap", err.Error())
 	}
 	snap := g.meter.Snapshot()
 	if err := g.journal.RecordWorkCap(snap.ScriptWorkCapNanoUSD); err != nil {

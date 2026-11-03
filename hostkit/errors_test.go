@@ -9,7 +9,7 @@ import (
 )
 
 func TestCodesAreExactlyTheSchemaEnum(t *testing.T) {
-	want := []string{"OK", "INVALID_ARGUMENT", "NOT_FOUND", "CONFLICT", "PRECONDITION_FAILED", "UNAUTHENTICATED", "PERMISSION_DENIED", "INTERNAL"}
+	want := []string{"OK", "INVALID_ARGUMENT", "NOT_FOUND", "CONFLICT", "PRECONDITION_FAILED", "UNAUTHENTICATED", "PERMISSION_DENIED", "COST_CAP_EXCEEDED", "INTERNAL"}
 	if len(Codes) != len(want) {
 		t.Fatalf("codes = %v", Codes)
 	}

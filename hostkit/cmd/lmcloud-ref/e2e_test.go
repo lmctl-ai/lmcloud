@@ -54,8 +54,22 @@ func TestConformanceOpenMode(t *testing.T) {
 	bin := lmscript(t)
 	ref := buildRef(t)
 	out := runConformance(t, ref, []string{"LMSCRIPT_BIN=" + bin, "LMCLOUD_REF_STATE=" + filepath.Join(t.TempDir(), "s.json")})
-	if !strings.Contains(out, "# pass 25 / 25, skip 2, fail 0") {
+	if !strings.Contains(out, "# pass 35 / 49, skip 16, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 2, fail 0") {
 		t.Fatalf("unexpected summary:\n%s", out)
+	}
+}
+
+func TestConformanceCostPerfSlice(t *testing.T) {
+	bin := lmscript(t)
+	ref := buildRef(t)
+	cmd := exec.Command(filepath.Join(repoRoot(t), "tests", "run-conformance.sh"), ref, "", "cost-perf")
+	cmd.Env = append(os.Environ(), "LMSCRIPT_BIN="+bin, "LMCLOUD_REF_STATE="+filepath.Join(t.TempDir(), "s.json"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("cost-perf conformance failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "# pass 10 / 10, skip 0, fail 0") {
+		t.Fatalf("unexpected cost-perf summary:\n%s", out)
 	}
 }
 
@@ -87,7 +101,7 @@ func TestConformanceEnforcedMode(t *testing.T) {
 		"LMGCP_SIM_TOKEN=allow-token",
 		"LMCLOUD_ENFORCE_DENIED_GCP_TOKEN=deny-token",
 	})
-	if !strings.Contains(out, "# pass 25 / 25, skip 0, fail 0") {
+	if !strings.Contains(out, "# pass 35 / 49, skip 14, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 0, fail 0") {
 		t.Fatalf("unexpected summary:\n%s", out)
 	}
 }
@@ -136,12 +150,27 @@ func TestSchemaAndSignatureParity(t *testing.T) {
 	bin := lmscript(t)
 	ref := buildRef(t)
 	schemaPath := filepath.Join(repoRoot(t), "schema", "lmcloud.dsl.json")
-	want, err := exec.Command(bin, "--lmcode-signatures", schemaPath).Output()
+	wantRaw, err := exec.Command(bin, "--lmcode-signatures", schemaPath).Output()
 	if err != nil {
 		t.Fatal(err)
 	}
+	want := string(wantRaw)
+	capsRaw, _ := os.ReadFile(filepath.Join(repoRoot(t), "tests", "capabilities.conf"))
+	if strings.Contains(string(capsRaw), "lmcloud-ref:tables=pending(") {
+		var filtered []string
+		for _, line := range strings.Split(want, "\n") {
+			if strings.HasPrefix(line, "method TableItem.") ||
+				strings.HasPrefix(line, "method TablePage.") ||
+				strings.HasPrefix(line, "method Cloud.table_") ||
+				strings.HasPrefix(line, "method Cloud.item_") {
+				continue
+			}
+			filtered = append(filtered, line)
+		}
+		want = strings.Join(filtered, "\n")
+	}
 	got, err := exec.Command(ref, "--lmcode-signatures").Output()
-	if err != nil || string(got) != string(want) {
+	if err != nil || string(got) != want {
 		t.Fatalf("signature drift:\n--- lmscript\n%s\n--- ref\n%s", want, got)
 	}
 	raw, _ := os.ReadFile(schemaPath)

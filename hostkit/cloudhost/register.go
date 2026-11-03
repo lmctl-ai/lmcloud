@@ -16,12 +16,16 @@ import (
 // Snapshot types handed to the VM. They are immutable after creation, so
 // their accessors are identical in real and dry runs.
 type (
-	errSnapshot  struct{ e hostkit.CloudError }
-	metaSnapshot struct{ m hostkit.ObjectMeta }
-	summary      struct{ s hostkit.ObjectSummary }
-	pageSnapshot struct{ p Page }
-	message      struct{ m Message }
-	messageList  struct{ items []Message }
+	errSnapshot           struct{ e hostkit.CloudError }
+	metaSnapshot          struct{ m hostkit.ObjectMeta }
+	summary               struct{ s hostkit.ObjectSummary }
+	pageSnapshot          struct{ p Page }
+	message               struct{ m Message }
+	messageList           struct{ items []Message }
+	costLineItemSnapshot  struct{ it CostLineItem }
+	costReportSnapshot    struct{ r CostReport }
+	opMetricsSnapshot     struct{ m OpMetrics }
+	metricsReportSnapshot struct{ r MetricsReport }
 )
 
 type method = func(self any, args []lmcode.Value) (lmcode.Value, error)
@@ -278,6 +282,29 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 		return lmcode.String(v), hostErr(err)
 	})
 
+	// Cost & Performance.
+	r.pure("Cloud", "cost_cap_usd", nil, "float", func(self any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Float(self.(*Host).CostCapUSD()), nil
+	})
+	r.pure("Cloud", "set_cost_cap_usd", []string{"float"}, "Cloud", func(self any, a []lmcode.Value) (lmcode.Value, error) {
+		h := self.(*Host)
+		return lmcode.Object("Cloud", h), hostErr(h.SetCostCapUSD(a[0].Float))
+	})
+	r.pure("Cloud", "estimated_cost", nil, "float", func(self any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Float(self.(*Host).EstimatedCost()), nil
+	})
+	r.pure("Cloud", "cost_report", nil, "CostReport", func(self any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Object("CostReport", &costReportSnapshot{r: self.(*Host).CostReport()}), nil
+	})
+	r.pure("Cloud", "metrics_reset", nil, "Cloud", func(self any, _ []lmcode.Value) (lmcode.Value, error) {
+		h := self.(*Host)
+		h.MetricsReset()
+		return lmcode.Object("Cloud", h), nil
+	})
+	r.pure("Cloud", "metrics", nil, "MetricsReport", func(self any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Object("MetricsReport", &metricsReportSnapshot{r: self.(*Host).Metrics()}), nil
+	})
+
 	// Snapshot accessors.
 	ce := func(self any) hostkit.CloudError { return self.(*errSnapshot).e }
 	r.pure("CloudError", "ok", nil, "bool", func(s any, _ []lmcode.Value) (lmcode.Value, error) { e := ce(s); return lmcode.Bool(e.OK()), nil })
@@ -333,6 +360,75 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 		}
 		return lmcode.Object("QueueMessage", &message{m: items[a[0].Int]}), nil
 	})
+
+	cli := func(self any) CostLineItem { return self.(*costLineItemSnapshot).it }
+	r.pure("CostLineItem", "operation", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.String(cli(s).Operation), nil })
+	r.pure("CostLineItem", "service", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.String(cli(s).Service), nil })
+	r.pure("CostLineItem", "requests", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(cli(s).Requests), nil })
+	r.pure("CostLineItem", "billing_units", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(cli(s).BillingUnits), nil })
+	r.pure("CostLineItem", "bytes", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(cli(s).Bytes), nil })
+	r.pure("CostLineItem", "unit_price_usd", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(cli(s).UnitPriceUSD), nil })
+	r.pure("CostLineItem", "byte_price_usd_per_gib", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(cli(s).BytePriceUSDPerGiB), nil })
+	r.pure("CostLineItem", "estimated_usd", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(cli(s).EstimatedUSD), nil })
+
+	cr := func(self any) CostReport { return self.(*costReportSnapshot).r }
+	r.pure("CostReport", "provider", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.String(cr(s).Provider), nil })
+	r.pure("CostReport", "price_table_version", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.String(cr(s).PriceTableVersion), nil })
+	r.pure("CostReport", "cap_usd", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(cr(s).CapUSD), nil })
+	r.pure("CostReport", "ceiling_usd", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(cr(s).CeilingUSD), nil })
+	r.pure("CostReport", "estimated_usd", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(cr(s).EstimatedUSD), nil })
+	r.pure("CostReport", "total_requests", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(cr(s).TotalRequests), nil })
+	r.pure("CostReport", "total_units", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(cr(s).TotalUnits), nil })
+	r.pure("CostReport", "total_bytes", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(cr(s).TotalBytes), nil })
+	r.pure("CostReport", "cap_exceeded_count", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(cr(s).CapExceededCount), nil })
+	r.pure("CostReport", "len", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(int64(len(cr(s).Items))), nil })
+	r.pure("CostReport", "at", []string{"int"}, "CostLineItem", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		rep := cr(s)
+		if a[0].Int < 0 || a[0].Int >= int64(len(rep.Items)) {
+			return lmcode.None(), lmcode.NewHostError(fmt.Sprintf("CostReport.at(%d): %v (len %d)", a[0].Int, errIndex, len(rep.Items)))
+		}
+		return lmcode.Object("CostLineItem", &costLineItemSnapshot{it: rep.Items[a[0].Int]}), nil
+	})
+	r.pure("CostReport", "item", []string{"string"}, "CostLineItem", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Object("CostLineItem", &costLineItemSnapshot{it: cr(s).Item(a[0].Str)}), nil
+	})
+	r.pure("CostReport", "summary", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.String(cr(s).Summary()), nil })
+
+	opm := func(self any) OpMetrics { return self.(*opMetricsSnapshot).m }
+	r.pure("OpMetrics", "operation", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.String(opm(s).Operation), nil })
+	r.pure("OpMetrics", "calls", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(opm(s).Calls), nil })
+	r.pure("OpMetrics", "errors", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(opm(s).Errors), nil })
+	r.pure("OpMetrics", "retries", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(opm(s).Retries), nil })
+	r.pure("OpMetrics", "throttles", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(opm(s).Throttles), nil })
+	r.pure("OpMetrics", "bytes_in", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(opm(s).BytesIn), nil })
+	r.pure("OpMetrics", "bytes_out", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(opm(s).BytesOut), nil })
+	r.pure("OpMetrics", "min_ms", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(opm(s).MinMS), nil })
+	r.pure("OpMetrics", "p50_ms", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(opm(s).P50MS), nil })
+	r.pure("OpMetrics", "p95_ms", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(opm(s).P95MS), nil })
+	r.pure("OpMetrics", "max_ms", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(opm(s).MaxMS), nil })
+	r.pure("OpMetrics", "mean_ms", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(opm(s).MeanMS), nil })
+	r.pure("OpMetrics", "total_ms", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(opm(s).TotalMS), nil })
+
+	mr := func(self any) MetricsReport { return self.(*metricsReportSnapshot).r }
+	r.pure("MetricsReport", "elapsed_ms", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(mr(s).ElapsedMS), nil })
+	r.pure("MetricsReport", "total_calls", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(mr(s).TotalCalls), nil })
+	r.pure("MetricsReport", "total_errors", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(mr(s).TotalErrors), nil })
+	r.pure("MetricsReport", "total_retries", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(mr(s).TotalRetries), nil })
+	r.pure("MetricsReport", "total_throttles", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(mr(s).TotalThrottles), nil })
+	r.pure("MetricsReport", "total_bytes_in", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(mr(s).TotalBytesIn), nil })
+	r.pure("MetricsReport", "total_bytes_out", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(mr(s).TotalBytesOut), nil })
+	r.pure("MetricsReport", "len", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(int64(len(mr(s).Ops))), nil })
+	r.pure("MetricsReport", "at", []string{"int"}, "OpMetrics", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		rep := mr(s)
+		if a[0].Int < 0 || a[0].Int >= int64(len(rep.Ops)) {
+			return lmcode.None(), lmcode.NewHostError(fmt.Sprintf("MetricsReport.at(%d): %v (len %d)", a[0].Int, errIndex, len(rep.Ops)))
+		}
+		return lmcode.Object("OpMetrics", &opMetricsSnapshot{m: rep.Ops[a[0].Int]}), nil
+	})
+	r.pure("MetricsReport", "op", []string{"string"}, "OpMetrics", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Object("OpMetrics", &opMetricsSnapshot{m: mr(s).Op(a[0].Str)}), nil
+	})
+	r.pure("MetricsReport", "summary", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.String(mr(s).Summary()), nil })
 	return r.first
 }
 

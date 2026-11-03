@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/lmctl-ai/lmcloud/hostkit"
 )
 
 type customQuoter struct {
@@ -262,3 +264,49 @@ func TestCostMeter_ScriptWorkSubCapAndCleanupHeadroom(t *testing.T) {
 		t.Fatalf("expected child invocation ordinary work to fail under inherited narrowed work cap, got %v", err)
 	}
 }
+
+func TestSetWorkCapUSD_TinyAndSetterErrorMapping(t *testing.T) {
+	pt := SyntheticSimPriceTable("aws")
+	m, err := NewCostMeter(CostPolicy{CapUSD: 0.25, CeilingUSD: 0.25, CleanupReserveUSD: 0.01}, pt, nil)
+	if err != nil {
+		t.Fatalf("NewCostMeter: %v", err)
+	}
+
+	// Note 5: tiny positive cap < 1 nano-USD rounds to zero and must be rejected before mutating state.
+	if err := m.SetWorkCapUSD(1e-10); err == nil {
+		t.Fatalf("expected error for 1e-10, got nil")
+	}
+	if m.Snapshot().HasScriptWorkCap {
+		t.Fatalf("expected HasScriptWorkCap to remain false after rejected tiny cap")
+	}
+
+	// Exact 1 nano-USD ($0.000000001) succeeds.
+	if err := m.SetWorkCapUSD(1e-9); err != nil {
+		t.Fatalf("expected 1e-9 to succeed, got %v", err)
+	}
+	if m.Snapshot().ActiveCapNanoUSD != 1 {
+		t.Fatalf("expected ActiveCapNanoUSD=1, got %d", m.Snapshot().ActiveCapNanoUSD)
+	}
+
+	// Note 4: LiveGuard.SetWorkCapUSD maps setter validation errors to hostkit.InvalidArgument (HTTPStatus 0).
+	jDir := filepath.Join(t.TempDir(), "journals")
+	jPol := DefaultAWSLivePolicy(jDir, true)
+	j, err := OpenJournal(jDir, JournalMeta{
+		RunID:      "run-1710000000-0123456789ab",
+		PolicyHash: jPol.Hash(),
+		Provider:   "aws",
+		Account:    "123456789012",
+		Scope:      "123456789012",
+		Region:     "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+	defer func() { _ = j.Close() }()
+	g := &LiveGuard{meter: m, journal: j, now: time.Now}
+	cerr := g.SetWorkCapUSD(0.10) // widens above 1e-9
+	if cerr == nil || cerr.Code != hostkit.InvalidArgument || cerr.HTTPStatus != 0 {
+		t.Fatalf("expected hostkit.InvalidArgument with HTTPStatus=0, got %#v", cerr)
+	}
+}
+

@@ -13,7 +13,7 @@ import (
 	"sync"
 )
 
-// Code is the shared schema enum ErrorCode. Only these eight values exist;
+// Code is the shared schema enum ErrorCode. Only these nine values exist;
 // adapters must map every provider outcome onto one of them.
 type Code string
 
@@ -25,11 +25,12 @@ const (
 	PreconditionFailed Code = "PRECONDITION_FAILED"
 	Unauthenticated    Code = "UNAUTHENTICATED"
 	PermissionDenied   Code = "PERMISSION_DENIED"
+	CostCapExceeded    Code = "COST_CAP_EXCEEDED"
 	Internal           Code = "INTERNAL"
 )
 
 // Codes lists the schema enum in declaration order.
-var Codes = []Code{OK, InvalidArgument, NotFound, Conflict, PreconditionFailed, Unauthenticated, PermissionDenied, Internal}
+var Codes = []Code{OK, InvalidArgument, NotFound, Conflict, PreconditionFailed, Unauthenticated, PermissionDenied, CostCapExceeded, Internal}
 
 // Valid reports whether c is a member of the shared enum.
 func (c Code) Valid() bool {
