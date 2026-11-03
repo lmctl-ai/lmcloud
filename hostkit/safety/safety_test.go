@@ -5,6 +5,7 @@ package safety
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1539,5 +1540,850 @@ func TestReviewerUntaggedCollisionRetained(t *testing.T) {
 	e, ok := s.Journal().Lookup(KindBucket, "", name)
 	if !ok || !e.Retain || e.State != StateRetained {
 		t.Fatalf("untagged collision not retained: %+v", e)
+	}
+}
+
+type round2Dispatch struct {
+	*FakeRecoveryBackend
+	journalPath      string
+	observedReserved int64
+	observedCharged  int64
+	crash            bool
+	createCalls      int
+}
+
+func (b *round2Dispatch) QuoteAttempt(in AttemptPricingInput, base AttemptQuote) (AttemptQuote, error) {
+	if in.Operation == "bucket_create" {
+		base.AttemptNanoUSD = 20_000_000
+	}
+	return base, nil
+}
+
+func (b *round2Dispatch) CreateBucket(ctx context.Context, name string) (bool, error) {
+	b.createCalls++
+	st, e := LoadJournal(b.journalPath)
+	if e != nil {
+		return false, e
+	}
+	entry, _ := st.Lookup(KindBucket, "", name)
+	b.observedReserved = entry.ReservedNanoUSD
+	b.observedCharged = st.ChargedNanoUSD
+	v, e := b.FakeRecoveryBackend.CreateBucket(ctx, name)
+	if b.crash {
+		panic("simulate process stopped after cloud commit")
+	}
+	return v, e
+}
+
+func TestRound2OwnershipReadClearsOutstandingCreate(t *testing.T) {
+	pol, run, b := newTestSetup(t)
+	r := &round2Dispatch{FakeRecoveryBackend: b, crash: true}
+	s := probeSession(t, pol, run, r, nil)
+	r.journalPath = filepath.Join(pol.JournalDir, run+".jsonl")
+	name, _ := FormatLiveResourceName(run, "priced", 1)
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = s.WrapStore(r).CreateBucket(context.Background(), name)
+	}()
+	_ = s.Close()
+	s2 := probeSession(t, pol, run, r, nil)
+	got := s2.Meter().Snapshot().ChargedNanoUSD
+	if got < 20_000_000 {
+		t.Fatalf("create quote=20000000, at dispatch reserved=%d charged=%d, restored charged=%d after cloud commit/crash",
+			r.observedReserved, r.observedCharged, got)
+	}
+}
+
+func TestRound2OverwriteBytesPersistAcrossReopen(t *testing.T) {
+	pol, run, b := newTestSetup(t)
+	pol.Limits.MaxTotalBytes = 6
+	s := probeSession(t, pol, run, b, nil)
+	name, _ := FormatLiveResourceName(run, "bucket", 1)
+	store := s.WrapStore(b)
+	if _, e := store.CreateBucket(context.Background(), name); e != nil {
+		t.Fatal(e)
+	}
+	for i := 0; i < 2; i++ {
+		if _, e := store.PutObject(context.Background(), name, "key", []byte("abc"), "text/plain", nil); e != nil {
+			t.Fatal(e)
+		}
+	}
+	before := s.Journal().State().TotalPayloadBytes
+	_ = s.Close()
+	s2 := probeSession(t, pol, run, b, nil)
+	_, e := s2.WrapStore(b).PutObject(context.Background(), name, "key", []byte("abc"), "text/plain", nil)
+	if e == nil {
+		t.Fatalf("6-byte campaign allowed third 3-byte write; journal bytes before reopen=%d after=%d",
+			before, s2.Journal().State().TotalPayloadBytes)
+	}
+}
+
+type round2Overwrite struct {
+	*FakeRecoveryBackend
+	path  string
+	crash bool
+}
+
+func (b *round2Overwrite) QuoteAttempt(in AttemptPricingInput, base AttemptQuote) (AttemptQuote, error) {
+	if in.Operation == "object_put" {
+		base.AttemptNanoUSD = 20_000_000
+	}
+	return base, nil
+}
+
+func (b *round2Overwrite) PutObject(ctx context.Context, bucket, key string, body []byte, ct string, m map[string]string) (hostkit.ObjectMeta, error) {
+	if b.crash {
+		st, e := LoadJournal(b.path)
+		if e != nil {
+			return hostkit.ObjectMeta{}, e
+		}
+		entry, _ := st.Lookup(KindObject, bucket, key)
+		_, _ = b.FakeRecoveryBackend.PutObject(ctx, bucket, key, body, ct, m)
+		panic(fmt.Sprintf("durable charge=%d reserve=%d", st.ChargedNanoUSD, entry.ReservedNanoUSD))
+	}
+	return b.FakeRecoveryBackend.PutObject(ctx, bucket, key, body, ct, m)
+}
+
+func TestRound2OverwriteCostDurableBeforeDispatch(t *testing.T) {
+	pol, run, b := newTestSetup(t)
+	pol.Cost.CapUSD = .10
+	r := &round2Overwrite{FakeRecoveryBackend: b}
+	s := probeSession(t, pol, run, r, nil)
+	r.path = filepath.Join(pol.JournalDir, run+".jsonl")
+	name, _ := FormatLiveResourceName(run, "bucket", 1)
+	store := s.WrapStore(r)
+	if _, e := store.CreateBucket(context.Background(), name); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := store.PutObject(context.Background(), name, "key", []byte("abc"), "text/plain", nil); e != nil {
+		t.Fatal(e)
+	}
+	r.crash = true
+	var snapshot any
+	func() {
+		defer func() { snapshot = recover() }()
+		_, _ = store.PutObject(context.Background(), name, "key", []byte("def"), "text/plain", nil)
+	}()
+	_ = s.Close()
+	s2 := probeSession(t, pol, run, r, nil)
+	if got := s2.Meter().Snapshot().ChargedNanoUSD; got < 40_000_000 {
+		t.Fatalf("second 20000000 write has no durable reservation: restored=%d dispatch snapshot=%v", got, snapshot)
+	}
+}
+
+type round2Cancel struct {
+	*FakeRecoveryBackend
+	called   bool
+	deadline time.Duration
+	diskCost int64
+	path     string
+}
+
+func (b *round2Cancel) Send(ctx context.Context, q, w string) (string, error) {
+	b.called = true
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return "", fmt.Errorf("missing deadline")
+	}
+	b.deadline = time.Until(dl)
+	st, e := LoadJournal(b.path)
+	if e != nil {
+		return "", e
+	}
+	b.diskCost = st.ChargedNanoUSD
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func TestRound2TimeoutHonorsEarlierDeadlineAndDurableSend(t *testing.T) {
+	pol, run, b := newTestSetup(t)
+	r := &round2Cancel{FakeRecoveryBackend: b}
+	s := probeSession(t, pol, run, r, nil)
+	r.path = filepath.Join(pol.JournalDir, run+".jsonl")
+	q, _ := FormatLiveResourceName(run, "queue", 1)
+	queue := s.WrapQueue(r)
+	if _, e := queue.CreateQueue(context.Background(), q); e != nil {
+		t.Fatal(e)
+	}
+	old := s.Journal().State()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, e := queue.Send(ctx, q, "abc")
+	if !r.called || e == nil || time.Since(start) > time.Second || r.deadline > time.Second {
+		t.Fatalf("timeout did not propagate: called=%v err=%v duration=%v deadline=%v",
+			r.called, e, time.Since(start), r.deadline)
+	}
+	st, err := LoadJournal(r.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.MessagesSent != 1 || st.TotalPayloadBytes != 3 || r.diskCost <= old.ChargedNanoUSD {
+		t.Fatalf("send not write-ahead: %+v", st)
+	}
+}
+
+type round2Wait struct {
+	*FakeRecoveryBackend
+	allowance time.Duration
+}
+
+func (b *round2Wait) Receive(ctx context.Context, q string, max, wait, vis int) ([]hostkit.RawMessage, error) {
+	dl, _ := ctx.Deadline()
+	b.allowance = time.Until(dl)
+	return nil, nil
+}
+
+func TestRound2TwentySecondReceiveTimeout(t *testing.T) {
+	pol, run, b := newTestSetup(t)
+	r := &round2Wait{FakeRecoveryBackend: b}
+	s := probeSession(t, pol, run, r, nil)
+	q, _ := FormatLiveResourceName(run, "queue", 1)
+	queue := s.WrapQueue(r)
+	if _, e := queue.CreateQueue(context.Background(), q); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := queue.Receive(context.Background(), q, 1, 20, 30); e != nil {
+		t.Fatal(e)
+	}
+	if r.allowance < 20*time.Second {
+		t.Fatalf("legal wait_seconds=20 receives only %v context budget", r.allowance)
+	}
+}
+
+type round2Download struct {
+	*FakeRecoveryBackend
+	crash bool
+}
+
+func (b *round2Download) QuoteAttempt(in AttemptPricingInput, base AttemptQuote) (AttemptQuote, error) {
+	if in.Operation == "object_get" && in.EgressBytes > 0 {
+		base.AttemptNanoUSD = 20_000_000
+	}
+	return base, nil
+}
+
+func (b *round2Download) GetObject(ctx context.Context, bucket, key string, limit int64) ([]byte, error) {
+	body, e := b.FakeRecoveryBackend.GetObject(ctx, bucket, key, limit)
+	if b.crash {
+		panic("download completed; process stopped before cost commit")
+	}
+	return body, e
+}
+
+func TestRound2DownloadEgressDurableBeforeDispatch(t *testing.T) {
+	pol, run, b := newTestSetup(t)
+	r := &round2Download{FakeRecoveryBackend: b}
+	s := probeSession(t, pol, run, r, nil)
+	name, _ := FormatLiveResourceName(run, "bucket", 1)
+	store := s.WrapStore(r)
+	if _, e := store.CreateBucket(context.Background(), name); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := store.PutObject(context.Background(), name, "key", []byte("abc"), "text/plain", nil); e != nil {
+		t.Fatal(e)
+	}
+	before := s.Journal().State().ChargedNanoUSD
+	r.crash = true
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = store.GetObject(context.Background(), name, "key", 3)
+	}()
+	_ = s.Close()
+	s2 := probeSession(t, pol, run, r, nil)
+	if got := s2.Meter().Snapshot().ChargedNanoUSD - before; got < 20_000_000 {
+		t.Fatalf("completed download quoted=20000000, restored incremental cost=%d", got)
+	}
+}
+
+type allOpsCrashBackend struct {
+	*FakeRecoveryBackend
+	journalPath string
+	targetOp    string
+	priceOp     string
+	crash       bool
+	dispatched  bool
+	diskState   *LedgerState
+}
+
+func (b *allOpsCrashBackend) QuoteAttempt(in AttemptPricingInput, base AttemptQuote) (AttemptQuote, error) {
+	if b.crash && in.Operation == b.priceOp {
+		base.AttemptNanoUSD = 20_000_000
+	}
+	return base, nil
+}
+
+func (b *allOpsCrashBackend) recordAndMaybeCrash(op string) {
+	if !b.crash || op != b.targetOp {
+		return
+	}
+	b.dispatched = true
+	st, err := LoadJournal(b.journalPath)
+	if err != nil {
+		panic(fmt.Sprintf("LoadJournal in %s: %v", op, err))
+	}
+	b.diskState = st
+	panic("crash after provider dispatch: " + op)
+}
+
+func (b *allOpsCrashBackend) ReadOwnership(ctx context.Context, ref ResourceRef) (RemoteOwnership, error) {
+	v, err := b.FakeRecoveryBackend.ReadOwnership(ctx, ref)
+	b.recordAndMaybeCrash("ReadOwnership")
+	return v, err
+}
+
+func (b *allOpsCrashBackend) CreateBucket(ctx context.Context, bucket string) (bool, error) {
+	v, err := b.FakeRecoveryBackend.CreateBucket(ctx, bucket)
+	b.recordAndMaybeCrash("CreateBucket")
+	return v, err
+}
+
+func (b *allOpsCrashBackend) DeleteBucket(ctx context.Context, bucket string) error {
+	err := b.FakeRecoveryBackend.DeleteBucket(ctx, bucket)
+	b.recordAndMaybeCrash("DeleteBucket")
+	return err
+}
+
+func (b *allOpsCrashBackend) HeadBucket(ctx context.Context, bucket string) error {
+	err := b.FakeRecoveryBackend.HeadBucket(ctx, bucket)
+	b.recordAndMaybeCrash("HeadBucket")
+	return err
+}
+
+func (b *allOpsCrashBackend) ListBuckets(ctx context.Context, token string) ([]string, string, error) {
+	v, next, err := b.FakeRecoveryBackend.ListBuckets(ctx, token)
+	b.recordAndMaybeCrash("ListBuckets")
+	return v, next, err
+}
+
+func (b *allOpsCrashBackend) BucketCreateToken(ctx context.Context, bucket string) (string, error) {
+	b.recordAndMaybeCrash("BucketCreateToken")
+	return "tok", nil
+}
+
+func (b *allOpsCrashBackend) PutObject(ctx context.Context, bucket, key string, body []byte, ct string, meta map[string]string) (hostkit.ObjectMeta, error) {
+	v, err := b.FakeRecoveryBackend.PutObject(ctx, bucket, key, body, ct, meta)
+	b.recordAndMaybeCrash("PutObject")
+	return v, err
+}
+
+func (b *allOpsCrashBackend) GetObject(ctx context.Context, bucket, key string, limit int64) ([]byte, error) {
+	v, err := b.FakeRecoveryBackend.GetObject(ctx, bucket, key, limit)
+	b.recordAndMaybeCrash("GetObject")
+	return v, err
+}
+
+func (b *allOpsCrashBackend) HeadObject(ctx context.Context, bucket, key string) (hostkit.ObjectMeta, error) {
+	v, err := b.FakeRecoveryBackend.HeadObject(ctx, bucket, key)
+	b.recordAndMaybeCrash("HeadObject")
+	return v, err
+}
+
+func (b *allOpsCrashBackend) DeleteObject(ctx context.Context, bucket, key string) error {
+	err := b.FakeRecoveryBackend.DeleteObject(ctx, bucket, key)
+	b.recordAndMaybeCrash("DeleteObject")
+	return err
+}
+
+func (b *allOpsCrashBackend) ListObjects(ctx context.Context, bucket, prefix string, maxKeys int, token string) (hostkit.ObjectPage, error) {
+	v, err := b.FakeRecoveryBackend.ListObjects(ctx, bucket, prefix, maxKeys, token)
+	b.recordAndMaybeCrash("ListObjects")
+	return v, err
+}
+
+func (b *allOpsCrashBackend) CreateQueue(ctx context.Context, queue string) (bool, error) {
+	v, err := b.FakeRecoveryBackend.CreateQueue(ctx, queue)
+	b.recordAndMaybeCrash("CreateQueue")
+	return v, err
+}
+
+func (b *allOpsCrashBackend) DeleteQueue(ctx context.Context, queue string) error {
+	err := b.FakeRecoveryBackend.DeleteQueue(ctx, queue)
+	b.recordAndMaybeCrash("DeleteQueue")
+	return err
+}
+
+func (b *allOpsCrashBackend) LookupQueue(ctx context.Context, queue string) error {
+	err := b.FakeRecoveryBackend.LookupQueue(ctx, queue)
+	b.recordAndMaybeCrash("LookupQueue")
+	return err
+}
+
+func (b *allOpsCrashBackend) ListQueues(ctx context.Context, token string) ([]string, string, error) {
+	v, next, err := b.FakeRecoveryBackend.ListQueues(ctx, token)
+	b.recordAndMaybeCrash("ListQueues")
+	return v, next, err
+}
+
+func (b *allOpsCrashBackend) QueueCreateToken(ctx context.Context, queue string) (string, error) {
+	b.recordAndMaybeCrash("QueueCreateToken")
+	return "tok", nil
+}
+
+func (b *allOpsCrashBackend) Send(ctx context.Context, queue, wire string) (string, error) {
+	v, err := b.FakeRecoveryBackend.Send(ctx, queue, wire)
+	b.recordAndMaybeCrash("Send")
+	return v, err
+}
+
+func (b *allOpsCrashBackend) Receive(ctx context.Context, queue string, max, wait, vis int) ([]hostkit.RawMessage, error) {
+	v, err := b.FakeRecoveryBackend.Receive(ctx, queue, max, wait, vis)
+	b.recordAndMaybeCrash("Receive")
+	return v, err
+}
+
+func (b *allOpsCrashBackend) Ack(ctx context.Context, queue, receipt string) error {
+	err := b.FakeRecoveryBackend.Ack(ctx, queue, receipt)
+	b.recordAndMaybeCrash("Ack")
+	return err
+}
+
+func (b *allOpsCrashBackend) Nack(ctx context.Context, queue, receipt string, vis int) (string, error) {
+	v, err := b.FakeRecoveryBackend.Nack(ctx, queue, receipt, vis)
+	b.recordAndMaybeCrash("Nack")
+	return v, err
+}
+
+func TestSafety_AllGuardOperationsDurableReservationOnCrashAfterDispatch(t *testing.T) {
+	cases := []struct {
+		name      string
+		targetOp  string
+		priceOp   string
+		wantBytes int64
+		wantMsgs  int
+		setup     func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (bkt, que, receipt string)
+		invoke    func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string)
+	}{
+		{
+			name:     "CreateBucket_fresh",
+			targetOp: "CreateBucket",
+			priceOp:  "bucket_create",
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				bkt, _ := FormatLiveResourceName(run, "bkt", 1)
+				return bkt, "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = store.CreateBucket(ctx, bkt)
+			},
+		},
+		{
+			name:     "CreateBucket_duplicate",
+			targetOp: "ReadOwnership",
+			priceOp:  "bucket_create",
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				bkt, _ := FormatLiveResourceName(run, "bkt", 1)
+				if _, err := store.CreateBucket(ctx, bkt); err != nil {
+					t.Fatal(err)
+				}
+				return bkt, "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = store.CreateBucket(ctx, bkt)
+			},
+		},
+		{
+			name:     "HeadBucket",
+			targetOp: "HeadBucket",
+			priceOp:  "bucket_exists",
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				bkt, _ := FormatLiveResourceName(run, "bkt", 1)
+				if _, err := store.CreateBucket(ctx, bkt); err != nil {
+					t.Fatal(err)
+				}
+				return bkt, "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_ = store.HeadBucket(ctx, bkt)
+			},
+		},
+		{
+			name:     "ListBuckets",
+			targetOp: "ListBuckets",
+			priceOp:  "bucket_list",
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				return "", "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _, _ = store.ListBuckets(ctx, "")
+			},
+		},
+		{
+			name:     "BucketCreateToken",
+			targetOp: "BucketCreateToken",
+			priceOp:  "bucket_read_ownership",
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				bkt, _ := FormatLiveResourceName(run, "bkt", 1)
+				return bkt, "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = store.(hostkit.BucketCreateTokenReader).BucketCreateToken(ctx, bkt)
+			},
+		},
+		{
+			name:      "PutObject_fresh",
+			targetOp:  "PutObject",
+			priceOp:   "object_put",
+			wantBytes: 4,
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				bkt, _ := FormatLiveResourceName(run, "bkt", 1)
+				if _, err := store.CreateBucket(ctx, bkt); err != nil {
+					t.Fatal(err)
+				}
+				return bkt, "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = store.PutObject(ctx, bkt, "k1", []byte("data"), "text/plain", nil)
+			},
+		},
+		{
+			name:      "PutObject_overwrite",
+			targetOp:  "PutObject",
+			priceOp:   "object_put",
+			wantBytes: 9,
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				bkt, _ := FormatLiveResourceName(run, "bkt", 1)
+				if _, err := store.CreateBucket(ctx, bkt); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.PutObject(ctx, bkt, "k1", []byte("abcd"), "text/plain", nil); err != nil {
+					t.Fatal(err)
+				}
+				return bkt, "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = store.PutObject(ctx, bkt, "k1", []byte("12345"), "text/plain", nil)
+			},
+		},
+		{
+			name:      "GetObject",
+			targetOp:  "GetObject",
+			priceOp:   "object_get",
+			wantBytes: 4,
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				bkt, _ := FormatLiveResourceName(run, "bkt", 1)
+				if _, err := store.CreateBucket(ctx, bkt); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.PutObject(ctx, bkt, "k1", []byte("abcd"), "text/plain", nil); err != nil {
+					t.Fatal(err)
+				}
+				return bkt, "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = store.GetObject(ctx, bkt, "k1", 4)
+			},
+		},
+		{
+			name:      "HeadObject",
+			targetOp:  "HeadObject",
+			priceOp:   "object_head",
+			wantBytes: 4,
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				bkt, _ := FormatLiveResourceName(run, "bkt", 1)
+				if _, err := store.CreateBucket(ctx, bkt); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.PutObject(ctx, bkt, "k1", []byte("abcd"), "text/plain", nil); err != nil {
+					t.Fatal(err)
+				}
+				return bkt, "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = store.HeadObject(ctx, bkt, "k1")
+			},
+		},
+		{
+			name:      "ListObjects",
+			targetOp:  "ListObjects",
+			priceOp:   "object_list",
+			wantBytes: 4,
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				bkt, _ := FormatLiveResourceName(run, "bkt", 1)
+				if _, err := store.CreateBucket(ctx, bkt); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.PutObject(ctx, bkt, "k1", []byte("abcd"), "text/plain", nil); err != nil {
+					t.Fatal(err)
+				}
+				return bkt, "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = store.ListObjects(ctx, bkt, "", 10, "")
+			},
+		},
+		{
+			name:      "DeleteObject",
+			targetOp:  "DeleteObject",
+			priceOp:   "object_delete",
+			wantBytes: 4,
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				bkt, _ := FormatLiveResourceName(run, "bkt", 1)
+				if _, err := store.CreateBucket(ctx, bkt); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.PutObject(ctx, bkt, "k1", []byte("abcd"), "text/plain", nil); err != nil {
+					t.Fatal(err)
+				}
+				return bkt, "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_ = store.DeleteObject(ctx, bkt, "k1")
+			},
+		},
+		{
+			name:     "DeleteBucket",
+			targetOp: "DeleteBucket",
+			priceOp:  "bucket_delete",
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				bkt, _ := FormatLiveResourceName(run, "bkt", 1)
+				if _, err := store.CreateBucket(ctx, bkt); err != nil {
+					t.Fatal(err)
+				}
+				return bkt, "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_ = store.DeleteBucket(ctx, bkt)
+			},
+		},
+		{
+			name:     "CreateQueue_fresh",
+			targetOp: "CreateQueue",
+			priceOp:  "queue_create",
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				que, _ := FormatLiveResourceName(run, "que", 1)
+				return "", que, ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = queue.CreateQueue(ctx, que)
+			},
+		},
+		{
+			name:     "CreateQueue_duplicate",
+			targetOp: "ReadOwnership",
+			priceOp:  "queue_create",
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				que, _ := FormatLiveResourceName(run, "que", 1)
+				if _, err := queue.CreateQueue(ctx, que); err != nil {
+					t.Fatal(err)
+				}
+				return "", que, ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = queue.CreateQueue(ctx, que)
+			},
+		},
+		{
+			name:     "LookupQueue",
+			targetOp: "LookupQueue",
+			priceOp:  "queue_exists",
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				que, _ := FormatLiveResourceName(run, "que", 1)
+				if _, err := queue.CreateQueue(ctx, que); err != nil {
+					t.Fatal(err)
+				}
+				return "", que, ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_ = queue.LookupQueue(ctx, que)
+			},
+		},
+		{
+			name:     "ListQueues",
+			targetOp: "ListQueues",
+			priceOp:  "queue_list",
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				return "", "", ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _, _ = queue.ListQueues(ctx, "")
+			},
+		},
+		{
+			name:     "QueueCreateToken",
+			targetOp: "QueueCreateToken",
+			priceOp:  "queue_read_ownership",
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				que, _ := FormatLiveResourceName(run, "que", 1)
+				return "", que, ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = queue.(hostkit.QueueCreateTokenReader).QueueCreateToken(ctx, que)
+			},
+		},
+		{
+			name:      "Send",
+			targetOp:  "Send",
+			priceOp:   "queue_send",
+			wantBytes: 5,
+			wantMsgs:  1,
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				que, _ := FormatLiveResourceName(run, "que", 1)
+				if _, err := queue.CreateQueue(ctx, que); err != nil {
+					t.Fatal(err)
+				}
+				return "", que, ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = queue.Send(ctx, que, "hello")
+			},
+		},
+		{
+			name:      "Receive",
+			targetOp:  "Receive",
+			priceOp:   "queue_receive",
+			wantBytes: 5,
+			wantMsgs:  1,
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				que, _ := FormatLiveResourceName(run, "que", 1)
+				if _, err := queue.CreateQueue(ctx, que); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := queue.Send(ctx, que, "hello"); err != nil {
+					t.Fatal(err)
+				}
+				return "", que, ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = queue.Receive(ctx, que, 1, 0, 30)
+			},
+		},
+		{
+			name:      "Ack",
+			targetOp:  "Ack",
+			priceOp:   "queue_ack",
+			wantBytes: 5,
+			wantMsgs:  1,
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				que, _ := FormatLiveResourceName(run, "que", 1)
+				if _, err := queue.CreateQueue(ctx, que); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := queue.Send(ctx, que, "hello"); err != nil {
+					t.Fatal(err)
+				}
+				msgs, err := queue.Receive(ctx, que, 1, 0, 30)
+				if err != nil || len(msgs) != 1 {
+					t.Fatalf("Receive: msgs=%v err=%v", msgs, err)
+				}
+				return "", que, msgs[0].Receipt
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_ = queue.Ack(ctx, que, receipt)
+			},
+		},
+		{
+			name:      "Nack",
+			targetOp:  "Nack",
+			priceOp:   "queue_nack",
+			wantBytes: 5,
+			wantMsgs:  1,
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				que, _ := FormatLiveResourceName(run, "que", 1)
+				if _, err := queue.CreateQueue(ctx, que); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := queue.Send(ctx, que, "hello"); err != nil {
+					t.Fatal(err)
+				}
+				msgs, err := queue.Receive(ctx, que, 1, 0, 30)
+				if err != nil || len(msgs) != 1 {
+					t.Fatalf("Receive: msgs=%v err=%v", msgs, err)
+				}
+				return "", que, msgs[0].Receipt
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_, _ = queue.Nack(ctx, que, receipt, 0)
+			},
+		},
+		{
+			name:     "DeleteQueue",
+			targetOp: "DeleteQueue",
+			priceOp:  "queue_delete",
+			setup: func(t *testing.T, ctx context.Context, run string, store hostkit.ObjectStore, queue hostkit.Queue) (string, string, string) {
+				que, _ := FormatLiveResourceName(run, "que", 1)
+				if _, err := queue.CreateQueue(ctx, que); err != nil {
+					t.Fatal(err)
+				}
+				return "", que, ""
+			},
+			invoke: func(ctx context.Context, store hostkit.ObjectStore, queue hostkit.Queue, bkt, que, receipt string) {
+				_ = queue.DeleteQueue(ctx, que)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pol, run, base := newTestSetup(t)
+			pol.Cost.CapUSD = 0.20
+			pol.Cost.CleanupReserveUSD = 0.05
+			r := &allOpsCrashBackend{
+				FakeRecoveryBackend: base,
+				journalPath:         filepath.Join(pol.JournalDir, run+".jsonl"),
+				targetOp:            tc.targetOp,
+				priceOp:             tc.priceOp,
+			}
+			s := probeSession(t, pol, run, r, nil)
+			store := s.WrapStore(r)
+			queue := s.WrapQueue(r)
+
+			bkt, que, receipt := tc.setup(t, ctx, run, store, queue)
+
+			// Verify zero dangling reservations after normal setup.
+			preState := s.Journal().State()
+			if preState.ReservedNanoUSD != 0 || len(preState.PendingAttempts) != 0 {
+				t.Fatalf("expected zero pending reservations before crash step, got reserved=%d pendingAttempts=%v",
+					preState.ReservedNanoUSD, preState.PendingAttempts)
+			}
+			beforeMeter := s.Meter().Snapshot().ChargedNanoUSD
+
+			r.crash = true
+			func() {
+				defer func() { _ = recover() }()
+				tc.invoke(ctx, store, queue, bkt, que, receipt)
+			}()
+			if !r.dispatched || r.diskState == nil {
+				t.Fatalf("expected %s to dispatch and capture on-disk state", tc.name)
+			}
+
+			// 1. At provider dispatch time, the 20,000,000 nano-USD reservation and
+			// counter increments must already be durable on disk.
+			atDispatchTotal := r.diskState.ChargedNanoUSD + r.diskState.ReservedNanoUSD
+			if atDispatchTotal-beforeMeter < 20_000_000 {
+				t.Fatalf("%s: dispatch-time durable total=%d (charged=%d reserved=%d), before=%d; want delta >= 20,000,000",
+					tc.name, atDispatchTotal, r.diskState.ChargedNanoUSD, r.diskState.ReservedNanoUSD, beforeMeter)
+			}
+			if r.diskState.TotalPayloadBytes != tc.wantBytes {
+				t.Fatalf("%s: dispatch-time TotalPayloadBytes=%d, want %d", tc.name, r.diskState.TotalPayloadBytes, tc.wantBytes)
+			}
+			if r.diskState.MessagesSent != tc.wantMsgs {
+				t.Fatalf("%s: dispatch-time MessagesSent=%d, want %d", tc.name, r.diskState.MessagesSent, tc.wantMsgs)
+			}
+
+			// 2. Compact and reopen: the unresolved reservation and counters must survive
+			// compaction and restore into the new session's CostMeter.
+			if err := s.Journal().Compact(); err != nil {
+				t.Fatalf("%s: Compact after crash: %v", tc.name, err)
+			}
+			_ = s.Close()
+
+			r.crash = false
+			s2 := probeSession(t, pol, run, r, nil)
+			defer s2.Close()
+
+			afterMeter := s2.Meter().Snapshot().ChargedNanoUSD
+			if afterMeter-beforeMeter < 20_000_000 {
+				t.Fatalf("%s: reopened meter charged=%d, before=%d; want delta >= 20,000,000",
+					tc.name, afterMeter, beforeMeter)
+			}
+			st2 := s2.Journal().State()
+			if st2.TotalPayloadBytes != tc.wantBytes {
+				t.Fatalf("%s: reopened TotalPayloadBytes=%d, want %d", tc.name, st2.TotalPayloadBytes, tc.wantBytes)
+			}
+			if st2.MessagesSent != tc.wantMsgs {
+				t.Fatalf("%s: reopened MessagesSent=%d, want %d", tc.name, st2.MessagesSent, tc.wantMsgs)
+			}
+		})
 	}
 }
