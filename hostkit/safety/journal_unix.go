@@ -12,6 +12,10 @@ import (
 	"syscall"
 )
 
+func init() {
+	ignoreSIGXFSZ()
+}
+
 func ignoreSIGXFSZ() {
 	signal.Ignore(syscall.SIGXFSZ)
 }

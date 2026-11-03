@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -280,4 +282,188 @@ func TestJournal_ForgedRecordsRejected(t *testing.T) {
 		t.Fatalf("expected confirmed resource to survive subsequent failed record, got %+v", st.Entries)
 	}
 	_ = json.Marshal
+}
+
+func TestJournal_CompactionLeaseRace(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "journals")
+	meta, bkt := sampleMeta(t, dir)
+
+	j, err := OpenJournal(dir, meta)
+	if err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+	defer j.Close()
+
+	if _, err := j.BeginCreate(KindBucket, "", "us-east-1", bkt, 5000); err != nil {
+		t.Fatalf("BeginCreate: %v", err)
+	}
+	if err := j.Confirm(KindBucket, "", bkt, ConfirmDetails{ConfirmedAtUnix: 1712880010, ChargedNanoUSD: 5000}); err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var stolenLeases int
+	var unexpectedErr error
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			j2, oerr := OpenJournal(dir, meta)
+			if oerr == nil {
+				stolenLeases++
+				_ = j2.Close()
+				return
+			}
+			if !errors.Is(oerr, ErrJournalLeaseBusy) {
+				unexpectedErr = oerr
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 350; i++ {
+		if err := j.Compact(); err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("Compact iteration %d failed: %v", i, err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+
+	if stolenLeases > 0 {
+		t.Fatalf("concurrent OpenJournal stole lease %d time(s) during Compact", stolenLeases)
+	}
+	if unexpectedErr != nil {
+		t.Fatalf("concurrent OpenJournal returned unexpected error: %v", unexpectedErr)
+	}
+
+	// Verify appends after 350 compactions land in the live journal file on disk.
+	bkt2, _ := FormatLiveResourceName(meta.RunID, "bkt", 2)
+	if _, err := j.BeginCreate(KindBucket, "", "us-east-1", bkt2, 5000); err != nil {
+		t.Fatalf("BeginCreate bkt2 after compactions: %v", err)
+	}
+	st, err := LoadJournal(j.Path())
+	if err != nil {
+		t.Fatalf("LoadJournal after compactions: %v", err)
+	}
+	if _, ok := st.Lookup(KindBucket, "", bkt2); !ok {
+		t.Fatalf("expected bkt2 in journal on disk after compactions, got %+v", st.Entries)
+	}
+}
+
+func TestJournal_WriteFailurePoisonsAndPreservesIntegrity(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "journals")
+	meta, bkt1 := sampleMeta(t, dir)
+	bkt2, _ := FormatLiveResourceName(meta.RunID, "bkt", 2)
+
+	j, err := OpenJournal(dir, meta)
+	if err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+	defer j.Close()
+
+	var origLim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &origLim); err != nil {
+		t.Fatalf("Getrlimit: %v", err)
+	}
+	defer func() {
+		_ = syscall.Setrlimit(syscall.RLIMIT_FSIZE, &origLim)
+	}()
+
+	fi, err := os.Stat(j.Path())
+	if err != nil {
+		t.Fatalf("stat journal: %v", err)
+	}
+	// Clamp RLIMIT_FSIZE to header + 32 bytes so the next append fails mid-line with EFBIG.
+	small := uint64(fi.Size() + 32)
+	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{Cur: small, Max: origLim.Max}); err != nil {
+		t.Fatalf("Setrlimit small: %v", err)
+	}
+
+	_, err1 := j.BeginCreate(KindBucket, "", "us-east-1", bkt1, 5000)
+	if err1 == nil {
+		t.Fatal("expected first BeginCreate under RLIMIT_FSIZE to fail")
+	}
+
+	// Restore RLIMIT_FSIZE and try a second append on the same Journal instance.
+	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &origLim); err != nil {
+		t.Fatalf("restore RLIMIT_FSIZE: %v", err)
+	}
+
+	if _, err2 := j.BeginCreate(KindBucket, "", "us-east-1", bkt2, 5000); err2 == nil {
+		t.Fatal("expected second BeginCreate on poisoned journal to fail")
+	}
+
+	// The on-disk journal must have rolled back the partial write and remain 100% valid JSONL.
+	st, err := LoadJournal(j.Path())
+	if err != nil {
+		t.Fatalf("LoadJournal after failed write: %v", err)
+	}
+	if len(st.Entries) != 0 {
+		t.Fatalf("expected 0 entries after failed write rollback, got %+v", st.Entries)
+	}
+
+	// Closing and reopening the journal must succeed and allow clean appends.
+	if err := j.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	j2, err := OpenJournal(dir, meta)
+	if err != nil {
+		t.Fatalf("OpenJournal reopen: %v", err)
+	}
+	defer j2.Close()
+	if _, err := j2.BeginCreate(KindBucket, "", "us-east-1", bkt2, 5000); err != nil {
+		t.Fatalf("BeginCreate on reopened journal: %v", err)
+	}
+}
+
+func TestJournal_EndpointRedactionAndValidation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "journals")
+	meta, _ := sampleMeta(t, dir)
+	meta.Endpoint = "https://akid:secretpass@s3.us-east-1.amazonaws.com/bucket?X-Amz-Signature=deadbeef#frag"
+
+	j, err := OpenJournal(dir, meta)
+	if err != nil {
+		t.Fatalf("OpenJournal with userinfo/query endpoint: %v", err)
+	}
+	defer j.Close()
+
+	if j.Meta().Endpoint != "https://s3.us-east-1.amazonaws.com/bucket" {
+		t.Fatalf("unexpected redacted endpoint: got %q", j.Meta().Endpoint)
+	}
+	raw, err := os.ReadFile(j.Path())
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	for _, secret := range []string{"akid", "secretpass", "X-Amz-Signature", "deadbeef", "frag"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("secret %q leaked into journal file: %s", secret, raw)
+		}
+	}
+
+	// Forged record with unredacted query string in Endpoint is rejected by ReplayJournal.
+	forgedHeader := JournalRecord{
+		Version:    JournalVersion,
+		Seq:        1,
+		Time:       "2026-04-12T00:00:00Z",
+		Event:      EventMeta,
+		RunID:      meta.RunID,
+		PolicyHash: meta.PolicyHash,
+		Provider:   meta.Provider,
+		Account:    meta.Account,
+		Scope:      meta.Scope,
+		Region:     meta.Region,
+		Endpoint:   "https://s3.us-east-1.amazonaws.com/?X-Amz-Security-Token=secret",
+	}
+	if _, err := ReplayJournal([]JournalRecord{forgedHeader}); err == nil {
+		t.Fatal("expected unredacted endpoint query in ReplayJournal to be rejected")
+	}
 }

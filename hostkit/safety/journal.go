@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -70,18 +71,45 @@ func ValidateToken128(tok string) error {
 	return nil
 }
 
+// RedactEndpoint strips any userinfo, query string, or fragment from an
+// endpoint URL so credentials or signed query parameters never reach the
+// on-disk journal.
+func RedactEndpoint(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if hasControlChars(raw) {
+		return "", errors.New("journal endpoint contains control characters")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid journal endpoint %q: %w", raw, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("invalid journal endpoint %q: scheme and host are required", raw)
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.String(), nil
+}
+
 // JournalMeta pins the run identity, policy hash, and attested provider scope
 // for a single journal file. Every record in the file must match this header.
 type JournalMeta struct {
-	RunID      string `json:"run_id"`
-	SessionID  string `json:"session_id,omitempty"`
-	PolicyHash string `json:"policy_hash"`
-	Provider   string `json:"provider"`
-	Account    string `json:"account"`
-	Tenant     string `json:"tenant,omitempty"`
-	Scope      string `json:"scope"`
-	Region     string `json:"region"`
-	Endpoint   string `json:"endpoint,omitempty"`
+	RunID         string `json:"run_id"`
+	SessionID     string `json:"session_id,omitempty"`
+	PolicyHash    string `json:"policy_hash"`
+	Provider      string `json:"provider"`
+	Account       string `json:"account"`
+	Tenant        string `json:"tenant,omitempty"`
+	Scope         string `json:"scope"`
+	Region        string `json:"region"`
+	Endpoint      string `json:"endpoint,omitempty"`
+	StartedAtUnix int64  `json:"started_at_unix,omitempty"`
 }
 
 // Validate checks that m contains a valid run ID, policy hash, and attested scope.
@@ -109,6 +137,15 @@ func (m JournalMeta) Validate() error {
 	}
 	if hasControlChars(m.SessionID) || hasControlChars(m.Endpoint) {
 		return errors.New("journal meta contains control characters")
+	}
+	if m.Endpoint != "" {
+		cleanEP, err := RedactEndpoint(m.Endpoint)
+		if err != nil {
+			return err
+		}
+		if cleanEP != m.Endpoint {
+			return fmt.Errorf("journal endpoint %q contains unredacted userinfo, query, or fragment", m.Endpoint)
+		}
 	}
 	return nil
 }
@@ -138,6 +175,7 @@ type JournalRecord struct {
 	Scope               string `json:"scope"`
 	Region              string `json:"region"`
 	Endpoint            string `json:"endpoint,omitempty"`
+	StartedAtUnix       int64  `json:"started_at_unix,omitempty"`
 	Kind                string `json:"kind,omitempty"`
 	Parent              string `json:"parent,omitempty"`
 	Location            string `json:"location,omitempty"`
@@ -152,21 +190,27 @@ type JournalRecord struct {
 	ServerCreatedAtUnix int64  `json:"server_created_at_unix,omitempty"`
 	ReservedNanoUSD     int64  `json:"reserved_nano_usd,omitempty"`
 	ChargedNanoUSD      int64  `json:"charged_nano_usd,omitempty"`
+	PayloadBytes        int64  `json:"payload_bytes,omitempty"`
+	BucketsCreated      int    `json:"buckets_created,omitempty"`
+	QueuesCreated       int    `json:"queues_created,omitempty"`
+	ObjectsCreated      int    `json:"objects_created,omitempty"`
+	MessagesSent        int    `json:"messages_sent,omitempty"`
 	Reason              string `json:"reason,omitempty"`
 	Retain              bool   `json:"retain,omitempty"`
 }
 
 func (r JournalRecord) meta() JournalMeta {
 	return JournalMeta{
-		RunID:      r.RunID,
-		SessionID:  r.SessionID,
-		PolicyHash: r.PolicyHash,
-		Provider:   r.Provider,
-		Account:    r.Account,
-		Tenant:     r.Tenant,
-		Scope:      r.Scope,
-		Region:     r.Region,
-		Endpoint:   r.Endpoint,
+		RunID:         r.RunID,
+		SessionID:     r.SessionID,
+		PolicyHash:    r.PolicyHash,
+		Provider:      r.Provider,
+		Account:       r.Account,
+		Tenant:        r.Tenant,
+		Scope:         r.Scope,
+		Region:        r.Region,
+		Endpoint:      r.Endpoint,
+		StartedAtUnix: r.StartedAtUnix,
 	}
 }
 
@@ -184,6 +228,7 @@ type LedgerEntry struct {
 	IntentAtUnix        int64
 	ConfirmedAtUnix     int64
 	ServerCreatedAtUnix int64
+	ReservedNanoUSD     int64
 	State               string // StatePending, StateConfirmed, StateRetained
 	Retain              bool
 	Reason              string
@@ -196,11 +241,17 @@ func resourceKey(kind, parent, name string) string {
 
 // LedgerState represents the validated, replayed state of a run journal.
 type LedgerState struct {
-	Meta            JournalMeta
-	LastSeq         uint64
-	Entries         []LedgerEntry
-	ReservedNanoUSD int64
-	ChargedNanoUSD  int64
+	Meta              JournalMeta
+	StartedAtUnix     int64
+	LastSeq           uint64
+	Entries           []LedgerEntry
+	ReservedNanoUSD   int64
+	ChargedNanoUSD    int64
+	BucketsCreated    int
+	QueuesCreated     int
+	ObjectsCreated    int
+	MessagesSent      int
+	TotalPayloadBytes int64
 
 	byKey map[string]int
 }
@@ -238,6 +289,7 @@ type ConfirmDetails struct {
 	ConfirmedAtUnix     int64
 	ServerCreatedAtUnix int64
 	ChargedNanoUSD      int64
+	PayloadBytes        int64
 }
 
 // EnsureStateDir creates dir (if missing) with mode 0700 and verifies that the
@@ -288,21 +340,33 @@ func JournalPath(dir, runID string) (string, error) {
 }
 
 // Journal is an append-only, fsync-backed per-run recovery journal with an
-// exclusive POSIX flock lease.
+// exclusive POSIX flock lease held on a dedicated `<run_id>.lock` file that is
+// never renamed or unlinked during compaction.
 type Journal struct {
-	mu    sync.Mutex
-	path  string
-	dir   string
-	f     *os.File
-	meta  JournalMeta
-	state *LedgerState
+	mu         sync.Mutex
+	path       string
+	lockPath   string
+	dir        string
+	f          *os.File
+	lockFile   *os.File
+	goodOffset int64
+	poisoned   error
+	meta       JournalMeta
+	state      *LedgerState
 }
 
 // OpenJournal opens or creates `<dir>/<meta.RunID>.jsonl`, acquires an exclusive
-// non-blocking flock lease, truncates any incomplete torn final line, replays
-// and validates existing records (or writes the initial `meta` header), and
-// returns the active Journal.
+// non-blocking flock lease on `<dir>/<meta.RunID>.lock`, truncates any
+// incomplete torn final line, replays and validates existing records (or writes
+// the initial `meta` header), and returns the active Journal.
 func OpenJournal(dir string, meta JournalMeta) (*Journal, error) {
+	if meta.Endpoint != "" {
+		cleanEP, err := RedactEndpoint(meta.Endpoint)
+		if err != nil {
+			return nil, err
+		}
+		meta.Endpoint = cleanEP
+	}
 	if err := meta.Validate(); err != nil {
 		return nil, err
 	}
@@ -311,21 +375,31 @@ func OpenJournal(dir string, meta JournalMeta) (*Journal, error) {
 		return nil, err
 	}
 	cleanDir := filepath.Dir(path)
+	lockPath := strings.TrimSuffix(path, ".jsonl") + ".lock"
 
-	f, created, err := openJournalFileNoFollow(path)
+	lockFile, lockCreated, err := openJournalFileNoFollow(lockPath)
 	if err != nil {
 		return nil, err
 	}
-	if err := lockJournalFile(f); err != nil {
-		_ = f.Close()
+	if err := lockJournalFile(lockFile); err != nil {
+		_ = lockFile.Close()
+		return nil, err
+	}
+
+	f, created, err := openJournalFileNoFollow(path)
+	if err != nil {
+		_ = unlockJournalFile(lockFile)
+		_ = lockFile.Close()
 		return nil, err
 	}
 
 	j := &Journal{
-		path: path,
-		dir:  cleanDir,
-		f:    f,
-		meta: meta,
+		path:     path,
+		lockPath: lockPath,
+		dir:      cleanDir,
+		f:        f,
+		lockFile: lockFile,
+		meta:     meta,
 	}
 
 	raw, err := io.ReadAll(f)
@@ -354,18 +428,25 @@ func OpenJournal(dir string, meta JournalMeta) (*Journal, error) {
 	}
 
 	if len(raw) == 0 {
+		startedUnix := meta.StartedAtUnix
+		if startedUnix <= 0 {
+			startedUnix = time.Now().UTC().Unix()
+		}
+		j.meta.StartedAtUnix = startedUnix
 		j.state = &LedgerState{
-			Meta:  meta,
-			byKey: make(map[string]int),
+			Meta:          j.meta,
+			StartedAtUnix: startedUnix,
+			byKey:         make(map[string]int),
 		}
 		if err := j.appendLocked(JournalRecord{
-			Event:    EventMeta,
-			Endpoint: meta.Endpoint,
+			Event:         EventMeta,
+			Endpoint:      j.meta.Endpoint,
+			StartedAtUnix: startedUnix,
 		}); err != nil {
 			_ = j.Close()
 			return nil, err
 		}
-		if created {
+		if created || lockCreated {
 			if err := syncDir(cleanDir); err != nil {
 				_ = j.Close()
 				return nil, err
@@ -392,9 +473,14 @@ func OpenJournal(dir string, meta JournalMeta) (*Journal, error) {
 			meta.Provider, meta.Account, meta.Scope, meta.Region, meta.PolicyHash,
 		)
 	}
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+	endOff, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
 		_ = j.Close()
 		return nil, fmt.Errorf("seek journal end %s: %w", path, err)
+	}
+	j.goodOffset = endOff
+	if state.StartedAtUnix > 0 {
+		j.meta.StartedAtUnix = state.StartedAtUnix
 	}
 	j.state = state
 	return j, nil
@@ -475,9 +561,12 @@ func (j *Journal) Lookup(kind, parent, name string) (LedgerEntry, bool) {
 func (j *Journal) BeginCreate(kind, parent, location, name string, reservedNanoUSD int64) (CreateIntent, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return CreateIntent{}, j.poisoned
+	}
 
 	if existing, ok := j.state.Lookup(kind, parent, name); ok {
-		if existing.State == StateConfirmed || existing.State == StateRetained {
+		if existing.State == StateConfirmed || existing.State == StateRetained || existing.Retain {
 			return CreateIntent{
 				Kind:             existing.Kind,
 				Parent:           existing.Parent,
@@ -539,6 +628,9 @@ func (j *Journal) Confirm(kind, parent, name string, details ConfirmDetails) err
 	if !ok {
 		return fmt.Errorf("cannot confirm %s %s/%s without prior intent", kind, parent, name)
 	}
+	if existing.State == StateRetained || existing.Retain {
+		return fmt.Errorf("cannot confirm retained %s %s/%s (%s)", kind, parent, name, existing.Reason)
+	}
 	loc := details.Location
 	if loc == "" {
 		loc = existing.Location
@@ -562,6 +654,9 @@ func (j *Journal) Confirm(kind, parent, name string, details ConfirmDetails) err
 		ConfirmedAtUnix:     confAt,
 		ServerCreatedAtUnix: details.ServerCreatedAtUnix,
 		ChargedNanoUSD:      details.ChargedNanoUSD,
+		PayloadBytes:        details.PayloadBytes,
+		Retain:              existing.Retain,
+		Reason:              existing.Reason,
 	}
 	return j.appendLocked(rec)
 }
@@ -580,7 +675,7 @@ func (j *Journal) Failed(kind, parent, name, reason string, chargedNanoUSD int64
 	if !ok {
 		return nil
 	}
-	if existing.State == StateConfirmed || existing.State == StateRetained {
+	if existing.State == StateConfirmed || existing.State == StateRetained || existing.Retain {
 		if chargedNanoUSD > 0 {
 			return j.appendLocked(JournalRecord{
 				Event:          EventCost,
@@ -611,25 +706,26 @@ func (j *Journal) Retain(kind, parent, name, reason string) error {
 	defer j.mu.Unlock()
 
 	existing, ok := j.state.Lookup(kind, parent, name)
-	loc := ""
-	ownerNonce := ""
-	createToken := ""
-	if ok {
-		loc = existing.Location
-		ownerNonce = existing.OwnerNonce
-		createToken = existing.CreateToken
+	rec := JournalRecord{
+		Event:  EventRetained,
+		Kind:   kind,
+		Parent: parent,
+		Name:   name,
+		Reason: reason,
+		Retain: true,
 	}
-	return j.appendLocked(JournalRecord{
-		Event:       EventRetained,
-		Kind:        kind,
-		Parent:      parent,
-		Location:    loc,
-		Name:        name,
-		OwnerNonce:  ownerNonce,
-		CreateToken: createToken,
-		Reason:      reason,
-		Retain:      true,
-	})
+	if ok {
+		rec.Location = existing.Location
+		rec.ProviderID = existing.ProviderID
+		rec.OwnerNonce = existing.OwnerNonce
+		rec.CreateToken = existing.CreateToken
+		rec.ETag = existing.ETag
+		rec.Generation = existing.Generation
+		rec.IntentAtUnix = existing.IntentAtUnix
+		rec.ConfirmedAtUnix = existing.ConfirmedAtUnix
+		rec.ServerCreatedAtUnix = existing.ServerCreatedAtUnix
+	}
+	return j.appendLocked(rec)
 }
 
 // Deleted durably records that a tracked resource has been verified deleted/absent.
@@ -653,6 +749,11 @@ func (j *Journal) Deleted(kind, parent, name string, chargedNanoUSD int64) error
 
 // RecordCost records an operation's charged cost in nano-USD.
 func (j *Journal) RecordCost(kind, parent, name, reason string, chargedNanoUSD int64) error {
+	return j.RecordCostWithBytes(kind, parent, name, reason, chargedNanoUSD, 0)
+}
+
+// RecordCostWithBytes records an operation's charged cost in nano-USD and payload bytes.
+func (j *Journal) RecordCostWithBytes(kind, parent, name, reason string, chargedNanoUSD, payloadBytes int64) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
@@ -662,13 +763,28 @@ func (j *Journal) RecordCost(kind, parent, name, reason string, chargedNanoUSD i
 		Parent:         parent,
 		Name:           name,
 		ChargedNanoUSD: chargedNanoUSD,
+		PayloadBytes:   payloadBytes,
 		Reason:         reason,
 	})
+}
+
+func (j *Journal) rollbackAndPoisonLocked(prevOffset int64, cause error) {
+	if j.f != nil {
+		_ = j.f.Truncate(prevOffset)
+		_, _ = j.f.Seek(prevOffset, io.SeekStart)
+		_ = j.f.Sync()
+	}
+	if j.poisoned == nil {
+		j.poisoned = cause
+	}
 }
 
 func (j *Journal) appendLocked(rec JournalRecord) error {
 	if j.f == nil {
 		return errors.New("journal is closed")
+	}
+	if j.poisoned != nil {
+		return j.poisoned
 	}
 	rec.Version = JournalVersion
 	rec.Seq = j.state.LastSeq + 1
@@ -685,6 +801,12 @@ func (j *Journal) appendLocked(rec JournalRecord) error {
 	rec.Region = j.meta.Region
 	if rec.Endpoint == "" {
 		rec.Endpoint = j.meta.Endpoint
+	} else {
+		cleanEP, err := RedactEndpoint(rec.Endpoint)
+		if err != nil {
+			return err
+		}
+		rec.Endpoint = cleanEP
 	}
 
 	if err := validateRecord(rec, j.meta, rec.Seq); err != nil {
@@ -697,29 +819,67 @@ func (j *Journal) appendLocked(rec JournalRecord) error {
 	}
 	line = append(line, '\n')
 
+	prevOffset := j.goodOffset
 	n, err := j.f.Write(line)
 	if err != nil {
-		return fmt.Errorf("write journal %s: %w", j.path, err)
+		j.rollbackAndPoisonLocked(prevOffset, fmt.Errorf("write journal %s: %w", j.path, err))
+		return j.poisoned
 	}
 	if n != len(line) {
-		return fmt.Errorf("short write on journal %s (%d/%d bytes)", j.path, n, len(line))
+		j.rollbackAndPoisonLocked(prevOffset, fmt.Errorf("short write on journal %s (%d/%d bytes)", j.path, n, len(line)))
+		return j.poisoned
 	}
 	if err := j.f.Sync(); err != nil {
-		return fmt.Errorf("fsync journal %s: %w", j.path, err)
+		j.rollbackAndPoisonLocked(prevOffset, fmt.Errorf("fsync journal %s: %w", j.path, err))
+		return j.poisoned
 	}
+	j.goodOffset = prevOffset + int64(len(line))
 
 	return applyRecordToState(j.state, rec)
 }
 
 // Compact rewrites the journal atomically via a temporary file (fsync temp ->
 // atomic rename -> fsync parent dir) containing only the `meta` header, active
-// (`pending`, `confirmed`, `retained`) entries, and accumulated cost, then
-// re-acquires the flock lease on the compacted file.
+// (`pending`, `confirmed`, `retained`) entries, and accumulated cost/counters,
+// while holding the dedicated `<run_id>.lock` flock lease continuously.
 func (j *Journal) Compact() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.f == nil {
 		return errors.New("journal is closed")
+	}
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+
+	var (
+		activeBuckets int
+		activeQueues  int
+		activeObjects int
+	)
+	for _, e := range j.state.Entries {
+		if e.State == StateConfirmed && !e.Retain {
+			switch e.Kind {
+			case KindBucket:
+				activeBuckets++
+			case KindQueue:
+				activeQueues++
+			case KindObject:
+				activeObjects++
+			}
+		}
+	}
+	baseBuckets := j.state.BucketsCreated - activeBuckets
+	if baseBuckets < 0 {
+		baseBuckets = 0
+	}
+	baseQueues := j.state.QueuesCreated - activeQueues
+	if baseQueues < 0 {
+		baseQueues = 0
+	}
+	baseObjects := j.state.ObjectsCreated - activeObjects
+	if baseObjects < 0 {
+		baseObjects = 0
 	}
 
 	var compacted []JournalRecord
@@ -740,19 +900,27 @@ func (j *Journal) Compact() error {
 		Scope:           j.meta.Scope,
 		Region:          j.meta.Region,
 		Endpoint:        j.meta.Endpoint,
+		StartedAtUnix:   j.state.StartedAtUnix,
 		ReservedNanoUSD: j.state.ReservedNanoUSD,
 		ChargedNanoUSD:  j.state.ChargedNanoUSD,
+		PayloadBytes:    j.state.TotalPayloadBytes,
+		BucketsCreated:  baseBuckets,
+		QueuesCreated:   baseQueues,
+		ObjectsCreated:  baseObjects,
+		MessagesSent:    j.state.MessagesSent,
 	})
 
 	for _, e := range j.state.Entries {
 		seq++
 		ev := EventIntent
-		switch e.State {
-		case StateConfirmed:
-			ev = EventConfirmed
-		case StateRetained:
+		retainFlag := e.Retain
+		switch {
+		case e.Retain || e.State == StateRetained:
 			ev = EventRetained
-		case StatePending:
+			retainFlag = true
+		case e.State == StateConfirmed:
+			ev = EventConfirmed
+		case e.State == StatePending:
 			ev = EventIntent
 		default:
 			continue
@@ -784,13 +952,20 @@ func (j *Journal) Compact() error {
 			ConfirmedAtUnix:     e.ConfirmedAtUnix,
 			ServerCreatedAtUnix: e.ServerCreatedAtUnix,
 			Reason:              e.Reason,
-			Retain:              e.Retain,
+			Retain:              retainFlag,
 		})
 	}
 
 	newState, err := ReplayJournal(compacted)
 	if err != nil {
 		return fmt.Errorf("validate compacted journal: %w", err)
+	}
+	// Preserve per-entry pending reservations in memory.
+	for i := range newState.Entries {
+		ne := &newState.Entries[i]
+		if old, ok := j.state.Lookup(ne.Kind, ne.Parent, ne.Name); ok {
+			ne.ReservedNanoUSD = old.ReservedNanoUSD
+		}
 	}
 
 	tmpPath := j.path + ".tmp"
@@ -828,41 +1003,50 @@ func (j *Journal) Compact() error {
 		return fmt.Errorf("rename compacted journal %s -> %s: %w", tmpPath, j.path, err)
 	}
 	if err := syncDir(j.dir); err != nil {
-		return err
+		j.poisoned = fmt.Errorf("journal poisoned after compaction dir sync failure: %w", err)
+		return j.poisoned
 	}
 
 	newF, _, err := openJournalFileNoFollow(j.path)
 	if err != nil {
-		return err
+		j.poisoned = fmt.Errorf("journal poisoned after compaction reopen failure: %w", err)
+		return j.poisoned
 	}
-	if err := lockJournalFile(newF); err != nil {
+	endOff, err := newF.Seek(0, io.SeekEnd)
+	if err != nil {
 		_ = newF.Close()
-		return err
-	}
-	if _, err := newF.Seek(0, io.SeekEnd); err != nil {
-		_ = unlockJournalFile(newF)
-		_ = newF.Close()
-		return err
+		j.poisoned = fmt.Errorf("journal poisoned after compaction seek failure: %w", err)
+		return j.poisoned
 	}
 	oldF := j.f
 	j.f = newF
+	j.goodOffset = endOff
 	j.state = newState
-	_ = unlockJournalFile(oldF)
 	_ = oldF.Close()
 	return nil
 }
 
-// Close releases the flock lease and closes the underlying file.
+// Close releases the flock lease and closes the underlying journal and lock files.
 func (j *Journal) Close() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.f == nil {
-		return nil
+	var firstErr error
+	if j.f != nil {
+		f := j.f
+		j.f = nil
+		if err := f.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	f := j.f
-	j.f = nil
-	_ = unlockJournalFile(f)
-	return f.Close()
+	if j.lockFile != nil {
+		lf := j.lockFile
+		j.lockFile = nil
+		_ = unlockJournalFile(lf)
+		if err := lf.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // LoadJournal reads, validates, and replays a journal file from disk without
@@ -956,8 +1140,9 @@ func ReplayJournal(records []JournalRecord) (*LedgerState, error) {
 		return nil, fmt.Errorf("meta record: %w", err)
 	}
 	state := &LedgerState{
-		Meta:  meta,
-		byKey: make(map[string]int),
+		Meta:          meta,
+		StartedAtUnix: meta.StartedAtUnix,
+		byKey:         make(map[string]int),
 	}
 	for i, rec := range records {
 		wantSeq := uint64(i + 1)
@@ -982,8 +1167,18 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 		return fmt.Errorf("record scope/policy mismatch against journal meta (got run=%q provider=%q account=%q scope=%q region=%q policy=%q)",
 			rec.RunID, rec.Provider, rec.Account, rec.Scope, rec.Region, rec.PolicyHash)
 	}
-	if rec.ReservedNanoUSD < 0 || rec.ChargedNanoUSD < 0 {
-		return errors.New("negative cost amount in journal record")
+	if rec.Endpoint != "" {
+		cleanEP, err := RedactEndpoint(rec.Endpoint)
+		if err != nil {
+			return err
+		}
+		if cleanEP != rec.Endpoint {
+			return fmt.Errorf("record endpoint %q contains unredacted userinfo, query, or fragment", rec.Endpoint)
+		}
+	}
+	if rec.ReservedNanoUSD < 0 || rec.ChargedNanoUSD < 0 || rec.PayloadBytes < 0 ||
+		rec.BucketsCreated < 0 || rec.QueuesCreated < 0 || rec.ObjectsCreated < 0 || rec.MessagesSent < 0 {
+		return errors.New("negative cost or counter amount in journal record")
 	}
 
 	switch rec.Event {
@@ -1038,12 +1233,41 @@ func validateResourceIdentity(runID, kind, parent, name string) error {
 	}
 }
 
+func incrementKindCreated(state *LedgerState, kind string) {
+	switch kind {
+	case KindBucket:
+		state.BucketsCreated++
+	case KindQueue:
+		state.QueuesCreated++
+	case KindObject:
+		state.ObjectsCreated++
+	}
+}
+
 func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 	state.LastSeq = rec.Seq
 	state.ReservedNanoUSD += rec.ReservedNanoUSD
 	state.ChargedNanoUSD += rec.ChargedNanoUSD
+	state.TotalPayloadBytes += rec.PayloadBytes
 
-	if rec.Event == EventMeta || rec.Event == EventCost {
+	if rec.Event == EventMeta {
+		if rec.StartedAtUnix > 0 {
+			state.StartedAtUnix = rec.StartedAtUnix
+		} else if state.StartedAtUnix == 0 && rec.Time != "" {
+			if t, err := time.Parse(time.RFC3339Nano, rec.Time); err == nil {
+				state.StartedAtUnix = t.UTC().Unix()
+			}
+		}
+		state.BucketsCreated += rec.BucketsCreated
+		state.QueuesCreated += rec.QueuesCreated
+		state.ObjectsCreated += rec.ObjectsCreated
+		state.MessagesSent += rec.MessagesSent
+		return nil
+	}
+	if rec.Event == EventCost {
+		if rec.Kind == KindQueueMessage && rec.Reason == "queue_send" {
+			state.MessagesSent++
+		}
 		return nil
 	}
 
@@ -1056,7 +1280,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			cur := state.Entries[idx]
 			// Duplicate intent on an already confirmed/retained resource never
 			// overwrites its OwnerNonce, CreateToken, or state.
-			if cur.State == StateConfirmed || cur.State == StateRetained {
+			if cur.State == StateConfirmed || cur.State == StateRetained || cur.Retain {
 				return nil
 			}
 			// Pending retry: preserve existing OwnerNonce if already set.
@@ -1064,20 +1288,24 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 				return fmt.Errorf("conflicting owner_nonce on pending %s %s/%s", rec.Kind, rec.Parent, rec.Name)
 			}
 			cur.CreateToken = rec.CreateToken
+			if rec.ReservedNanoUSD > 0 {
+				cur.ReservedNanoUSD += rec.ReservedNanoUSD
+			}
 			cur.Seq = rec.Seq
 			state.Entries[idx] = cur
 			return nil
 		}
 		entry := LedgerEntry{
-			Kind:         rec.Kind,
-			Parent:       rec.Parent,
-			Location:     rec.Location,
-			Name:         rec.Name,
-			OwnerNonce:   rec.OwnerNonce,
-			CreateToken:  rec.CreateToken,
-			IntentAtUnix: rec.IntentAtUnix,
-			State:        StatePending,
-			Seq:          rec.Seq,
+			Kind:            rec.Kind,
+			Parent:          rec.Parent,
+			Location:        rec.Location,
+			Name:            rec.Name,
+			OwnerNonce:      rec.OwnerNonce,
+			CreateToken:     rec.CreateToken,
+			IntentAtUnix:    rec.IntentAtUnix,
+			ReservedNanoUSD: rec.ReservedNanoUSD,
+			State:           StatePending,
+			Seq:             rec.Seq,
 		}
 		state.byKey[key] = len(state.Entries)
 		state.Entries = append(state.Entries, entry)
@@ -1089,7 +1317,20 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			if cur.OwnerNonce != "" && cur.OwnerNonce != rec.OwnerNonce {
 				return fmt.Errorf("confirmed owner_nonce mismatch for %s %s/%s", rec.Kind, rec.Parent, rec.Name)
 			}
-			cur.State = StateConfirmed
+			wasConfirmed := cur.State == StateConfirmed
+			if cur.Retain || cur.State == StateRetained || rec.Retain {
+				cur.State = StateRetained
+				cur.Retain = true
+				if rec.Reason != "" {
+					cur.Reason = rec.Reason
+				}
+			} else {
+				cur.State = StateConfirmed
+				if !wasConfirmed {
+					incrementKindCreated(state, rec.Kind)
+				}
+			}
+			cur.ReservedNanoUSD = 0
 			if rec.Location != "" {
 				cur.Location = rec.Location
 			}
@@ -1117,6 +1358,12 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			state.Entries[idx] = cur
 			return nil
 		}
+		st := StateConfirmed
+		if rec.Retain {
+			st = StateRetained
+		} else {
+			incrementKindCreated(state, rec.Kind)
+		}
 		entry := LedgerEntry{
 			Kind:                rec.Kind,
 			Parent:              rec.Parent,
@@ -1130,7 +1377,9 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			IntentAtUnix:        rec.IntentAtUnix,
 			ConfirmedAtUnix:     rec.ConfirmedAtUnix,
 			ServerCreatedAtUnix: rec.ServerCreatedAtUnix,
-			State:               StateConfirmed,
+			State:               st,
+			Retain:              rec.Retain,
+			Reason:              rec.Reason,
 			Seq:                 rec.Seq,
 		}
 		state.byKey[key] = len(state.Entries)
@@ -1143,7 +1392,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		}
 		cur := state.Entries[idx]
 		// CRITICAL: Failed NEVER cancels an already-confirmed or retained entry!
-		if cur.State == StateConfirmed || cur.State == StateRetained {
+		if cur.State == StateConfirmed || cur.State == StateRetained || cur.Retain {
 			return nil
 		}
 		removeEntryAt(state, idx)
@@ -1154,6 +1403,33 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			cur := state.Entries[idx]
 			cur.State = StateRetained
 			cur.Retain = true
+			if rec.Location != "" {
+				cur.Location = rec.Location
+			}
+			if rec.ProviderID != "" {
+				cur.ProviderID = rec.ProviderID
+			}
+			if rec.OwnerNonce != "" {
+				cur.OwnerNonce = rec.OwnerNonce
+			}
+			if rec.CreateToken != "" {
+				cur.CreateToken = rec.CreateToken
+			}
+			if rec.ETag != "" {
+				cur.ETag = rec.ETag
+			}
+			if rec.Generation != "" {
+				cur.Generation = rec.Generation
+			}
+			if rec.IntentAtUnix != 0 {
+				cur.IntentAtUnix = rec.IntentAtUnix
+			}
+			if rec.ConfirmedAtUnix != 0 {
+				cur.ConfirmedAtUnix = rec.ConfirmedAtUnix
+			}
+			if rec.ServerCreatedAtUnix != 0 {
+				cur.ServerCreatedAtUnix = rec.ServerCreatedAtUnix
+			}
 			if rec.Reason != "" {
 				cur.Reason = rec.Reason
 			}
@@ -1162,16 +1438,22 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			return nil
 		}
 		entry := LedgerEntry{
-			Kind:        rec.Kind,
-			Parent:      rec.Parent,
-			Location:    rec.Location,
-			Name:        rec.Name,
-			OwnerNonce:  rec.OwnerNonce,
-			CreateToken: rec.CreateToken,
-			State:       StateRetained,
-			Retain:      true,
-			Reason:      rec.Reason,
-			Seq:         rec.Seq,
+			Kind:                rec.Kind,
+			Parent:              rec.Parent,
+			Location:            rec.Location,
+			Name:                rec.Name,
+			ProviderID:          rec.ProviderID,
+			OwnerNonce:          rec.OwnerNonce,
+			CreateToken:         rec.CreateToken,
+			ETag:                rec.ETag,
+			Generation:          rec.Generation,
+			IntentAtUnix:        rec.IntentAtUnix,
+			ConfirmedAtUnix:     rec.ConfirmedAtUnix,
+			ServerCreatedAtUnix: rec.ServerCreatedAtUnix,
+			State:               StateRetained,
+			Retain:              true,
+			Reason:              rec.Reason,
+			Seq:                 rec.Seq,
 		}
 		state.byKey[key] = len(state.Entries)
 		state.Entries = append(state.Entries, entry)
