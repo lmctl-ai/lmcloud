@@ -820,13 +820,9 @@ func (s *GuardStore) PutObject(ctx context.Context, bucket, key string, body []b
 			if !hasObj && g.objectsMade > 0 {
 				g.objectsMade--
 			}
-			g.totalBytes -= sz
-			if g.totalBytes < 0 {
-				g.totalBytes = 0
-			}
 			g.mu.Unlock()
 			if hasObj && existingObj.State == StateConfirmed {
-				if jerr := journalWriteErr(g.journal.SettleAttempt(intent.AttemptID, charged, true)); jerr != nil {
+				if jerr := journalWriteErr(g.journal.SettleAttempt(intent.AttemptID, charged, false)); jerr != nil {
 					return hostkit.ObjectMeta{}, jerr
 				}
 			} else {
@@ -882,13 +878,15 @@ func (s *GuardStore) GetObject(ctx context.Context, bucket, key string, limit in
 		)
 		body = nil
 	}
-	actualQuote, qerr := s.guard.meter.QuoteAttempt(AttemptPricingInput{
-		Operation:   "object_get",
-		EgressBytes: int64(len(body)),
-	})
 	actualNano := int64(-1)
-	if qerr == nil {
-		actualNano = actualQuote.AttemptNanoUSD
+	if err == nil {
+		actualQuote, qerr := s.guard.meter.QuoteAttempt(AttemptPricingInput{
+			Operation:   "object_get",
+			EgressBytes: int64(len(body)),
+		})
+		if qerr == nil {
+			actualNano = actualQuote.AttemptNanoUSD
+		}
 	}
 	if _, scerr := da.settle(actualNano, false, false); scerr != nil && err == nil {
 		return nil, scerr
