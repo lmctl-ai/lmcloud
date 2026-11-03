@@ -1,9 +1,9 @@
-# Scenario 06: Default abort_on_error(true) aborts the _lmcode_ program with [COST_CAP_EXCEEDED] when the cost cap is exceeded.
+# Scenario 06: Default abort_on_error(true) aborts the _lmcode_ program with [COST_CAP_EXCEEDED] when the work cost cap is exceeded, and cleanup in a subsequent campaign invocation deletes the created bucket using reserved cleanup headroom.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 bkt = "lmcloud-cp06-" + run_id + "-bkt";
 
-# 1. Run a program with default abort_on_error() == true that sets cap to current cost after bucket_create and then attempts object_put.
+# 1. Run a program with default abort_on_error() == true that narrows the work sub-cap to current settled cost after bucket_create and then attempts object_put.
 abort_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
@@ -19,17 +19,21 @@ end _lmcode_
 r_abort = run_lmcode(abort_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(!r_abort.ok, "expected _lmcode_ block to abort when cost cap is exceeded with abort_on_error == true");
 
-# 2. Clean up the bucket created before the abort in a fresh host invocation.
+# 2. Clean up the bucket created before the abort in a second campaign invocation: non-cleanup work remains blocked by the persisted work sub-cap, while bucket_delete draws from the reserved cleanup headroom inside the durable total ceiling.
 cleanup_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
     cloud.set_endpoint("all", ep);
   }
   let b = ${bkt};
-  let existed = cloud.bucket_exists(b);
+  cloud.set_abort_on_error(false);
+  let ex_blocked = cloud.bucket_exists(b);
+  let err_ex = cloud.last_error();
   let deleted = cloud.bucket_delete(b);
-  lmcode_return_put("cleaned", existed && deleted);
+  let err_del = cloud.last_error();
+  lmcode_return_put("work_cap_persisted", !ex_blocked && err_ex.code() == ErrorCode.COST_CAP_EXCEEDED);
+  lmcode_return_put("cleaned", deleted && err_del.ok());
 end _lmcode_
 
 r_clean = run_lmcode(cleanup_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
-assert(r_clean.ok && r_clean.result.cleaned, "cleanup after cost-cap abort must delete the created bucket");
+assert(r_clean.ok && r_clean.result.work_cap_persisted && r_clean.result.cleaned, "cleanup after cost-cap abort must preserve the narrowed work sub-cap while deleting the created bucket via reserved cleanup headroom");

@@ -1,7 +1,8 @@
 # Scenario 03: Single message send, receive, and ack round-trip (using wait_seconds >= 1 for post-ack empty check, H3/L2).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-qname = "lmcloud-q03-" + run_id + "-msg";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+qname = len(name_prefix) > 0 ? (name_prefix + "q03-msg") : ("lmcloud-q03-" + run_id + "-msg");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

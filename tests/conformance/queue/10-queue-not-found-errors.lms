@@ -2,7 +2,8 @@
 # and error precedence: missing queue (ErrorCode.NOT_FOUND) precedes malformed non-empty receipt (ErrorCode.INVALID_ARGUMENT) (M5).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-missing_q = "lmcloud-q10-" + run_id + "-absent";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+missing_q = len(name_prefix) > 0 ? (name_prefix + "q10-absent") : ("lmcloud-q10-" + run_id + "-absent");
 
 # 1. Default abort mode: queue_send on missing queue must abort with [NOT_FOUND]
 abort_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";

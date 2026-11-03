@@ -1,7 +1,8 @@
 # Scenario 11: Pre-flight INVALID_ARGUMENT validation for bucket names (incl. S3/GCS reserved), Azure-unsafe keys, content_type, metadata keys, max_keys, and endpoint overrides.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-bucket = "lmcloud-c11-" + run_id + "-valid";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+bucket = len(name_prefix) > 0 ? (name_prefix + "c11-valid") : ("lmcloud-c11-" + run_id + "-valid");
 
 # 1. Default abort mode: invalid bucket name aborts before network I/O
 abort_invalid = _lmcode_ schema="../../../schema/lmcloud.dsl.json";

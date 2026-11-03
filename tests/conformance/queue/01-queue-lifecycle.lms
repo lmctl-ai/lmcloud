@@ -2,8 +2,9 @@
 # Uses bounded polling for queue_list inclusion and post-delete disappearance (SQS eventual consistency, M3).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-q1 = "lmcloud-q01-" + run_id + "-alpha";
-q2 = "lmcloud-q01-" + run_id + "-beta";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+q1 = len(name_prefix) > 0 ? (name_prefix + "q01-alpha") : ("lmcloud-q01-" + run_id + "-alpha");
+q2 = len(name_prefix) > 0 ? (name_prefix + "q01-beta") : ("lmcloud-q01-" + run_id + "-beta");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

@@ -59,6 +59,19 @@ func TestConformanceOpenMode(t *testing.T) {
 	}
 }
 
+func TestConformanceScenarioFilter(t *testing.T) {
+	bin := lmscript(t)
+	ref := buildRef(t)
+	out := runConformance(t, ref, []string{
+		"LMSCRIPT_BIN=" + bin,
+		"LMCLOUD_REF_STATE=" + filepath.Join(t.TempDir(), "s.json"),
+		"LMCLOUD_SCENARIO_FILTER=04-message-unicode-and-binary",
+	})
+	if !strings.Contains(out, "1..1\nok 1 - queue/04-message-unicode-and-binary\n# pass 1 / 1, skip 0, fail 0") {
+		t.Fatalf("unexpected filtered output:\n%s", out)
+	}
+}
+
 func TestConformanceEnforcedMode(t *testing.T) {
 	bin := lmscript(t)
 	ref := buildRef(t)

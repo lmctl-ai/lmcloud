@@ -1,8 +1,9 @@
 # Scenario 10: NOT_FOUND errors vs non-throwing existence probes (bucket_exists / object_head).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-bucket = "lmcloud-c10-" + run_id + "-present";
-missing_bucket = "lmcloud-c10-" + run_id + "-absent";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+bucket = len(name_prefix) > 0 ? (name_prefix + "c10-present") : ("lmcloud-c10-" + run_id + "-present");
+missing_bucket = len(name_prefix) > 0 ? (name_prefix + "c10-absent") : ("lmcloud-c10-" + run_id + "-absent");
 
 # 1. Default abort mode: object_get on missing bucket must abort with [NOT_FOUND]
 abort_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";

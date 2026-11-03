@@ -9,7 +9,8 @@
 #     inspect permission, which lmoci maps to PERMISSION_DENIED).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-denied_bucket = "lmcloud-c12-" + run_id + "-denied";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+denied_bucket = len(name_prefix) > 0 ? (name_prefix + "c12-denied") : ("lmcloud-c12-" + run_id + "-denied");
 
 # Save caller's configured policy-restricted credentials before overriding for Pass 1
 orig_aws_key = env("LMAWS_SIM_ACCESS_KEY_ID", "");
