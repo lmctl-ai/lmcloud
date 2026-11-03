@@ -39,7 +39,7 @@ const (
 	MaxAttrStringUTF16Units    = 32768
 	MaxItemAttrs               = 240
 	MaxItemCanonicalBytes      = 262144
-	MaxNativeItemOverheadBytes = 1024
+	MaxNativeItemOverheadBytes = 21 * 1024
 	MaxNativeItemBillableBytes = MaxItemCanonicalBytes + MaxNativeItemOverheadBytes
 	DefaultTablePageMax        = 100
 	MaxTablePageMax            = 500
@@ -388,33 +388,38 @@ func CanonicalItemBytes(attrs map[string]Attr) (int, *CloudError) {
 	return total, nil
 }
 
-// NativeItemBillableBytes computes the native provider billable byte size of it,
-// combining its canonical user attribute bytes with provider key (pk, sk),
-// version metadata (__lm_ver), and type-manifest (__lm_types) overhead without
-// reducing the public 262,144-byte canonical user quota.
+// NativeItemBillableBytes computes the conservative provider-native billable
+// byte size of it, combining its canonical user attribute bytes with provider
+// key (pk, sk), version metadata (__lmcloud_v), numeric encoding margin, and
+// float type-manifest (__lmt Map) overhead without reducing the public
+// 262,144-byte canonical user quota and without clamping.
 func NativeItemBillableBytes(it Item) int64 {
 	userBytes := 8 * len(it.Attrs)
+	var numericMargin int
+	var floatManifestBytes int
 	for name, a := range it.Attrs {
 		userBytes += len(name) + a.CanonicalValueBytes()
+		if a.I != nil || a.N != nil {
+			// DynamoDB N representation is up to 21 bytes vs 8 canonical bytes.
+			numericMargin += 13
+		}
+		if a.N != nil {
+			// __lmt Map entry: attribute name + string tag "number" + entry framing.
+			floatManifestBytes += len(name) + len(AttrNumber) + 3
+		}
 	}
-	overhead := 100 + len("pk") + len(it.PK)
+	if floatManifestBytes > 0 {
+		floatManifestBytes += len("__lmt") + 3
+	}
+	verLen := len(it.Version)
+	if verLen < 32 {
+		verLen = 32
+	}
+	overhead := 100 + len("pk") + len(it.PK) + len("__lmcloud_v") + verLen + numericMargin + floatManifestBytes
 	if it.SK != "" {
 		overhead += len("sk") + len(it.SK)
 	}
-	if it.Version != "" {
-		overhead += len("__lm_ver") + len(it.Version)
-	} else {
-		overhead += 40
-	}
-	overhead += 4 * len(it.Attrs)
-	if overhead > MaxNativeItemOverheadBytes {
-		overhead = MaxNativeItemOverheadBytes
-	}
-	total := int64(userBytes + overhead)
-	if total > MaxNativeItemBillableBytes && userBytes <= MaxItemCanonicalBytes {
-		total = MaxNativeItemBillableBytes
-	}
-	return total
+	return int64(userBytes + overhead)
 }
 
 // TablePageMax normalizes max_items on item_query / item_scan: 0 -> 100, 1..500 allowed.

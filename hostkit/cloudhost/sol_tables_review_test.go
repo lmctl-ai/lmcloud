@@ -458,3 +458,214 @@ func TestSolTablesReservedNamesAndKeysFailBeforeAdapter(t *testing.T) {
 		t.Fatalf("invalid args reached adapter: %v", f.Calls())
 	}
 }
+
+type r2UnmeteredDescribe struct {
+	*fakeadapter.Fake
+	physical int
+}
+
+func (a *r2UnmeteredDescribe) DescribeTable(ctx context.Context, table string) (hostkit.TableInfo, error) {
+	var info hostkit.TableInfo
+	for i := 0; i < 2; i++ {
+		last, _ := hostkit.DefaultRetryPolicy().Do(ctx, true, func(c context.Context, _ int) hostkit.Attempt {
+			a.physical++
+			var e error
+			info, e = a.Fake.DescribeTable(c, table)
+			return hostkit.Attempt{Status: 200, Err: e}
+		})
+		if last.Err != nil {
+			return info, last.Err
+		}
+	}
+	return info, nil
+}
+
+func TestOwnTablesR2DescribeBypassesAdmission(t *testing.T) {
+	f := fakeadapter.New(fakeadapter.Options{})
+	_, _ = f.CreateTable(context.Background(), "tab", false)
+	a := &r2UnmeteredDescribe{Fake: f}
+	h := solTabHost(a)
+	if e := h.SetCostCapUSD(0.000000001); e != nil {
+		t.Fatal(e)
+	}
+	for i := 0; i < 3; i++ {
+		_, _ = h.ItemScan(false, "tab", 1, "")
+		if h.LastError().Code != hostkit.CostCapExceeded {
+			t.Fatal(h.LastError())
+		}
+		_, _ = h.ItemQuery(false, "tab", "pk", "", "", 1, "")
+		if h.LastError().Code != hostkit.CostCapExceeded {
+			t.Fatal(h.LastError())
+		}
+	}
+	r := h.CostReport()
+	if a.physical != 0 || r.TotalRequests != 0 || r.EstimatedUSD != 0 || f.Calls()["Scan"] != 0 || f.Calls()["Query"] != 0 {
+		t.Fatalf("expected 0 physical DescribeTable calls under 1-nano cap; describes=%d report=%+v calls=%v", a.physical, r, f.Calls())
+	}
+
+	// Under a 400-nano cap (1 table_exists attempt), the 1st physical DescribeTable callback runs and settles,
+	// and the 2nd physical callback in r2UnmeteredDescribe is rejected by COST_CAP_EXCEEDED.
+	h2 := solTabHost(a)
+	if e := h2.SetCostCapUSD(0.0000004); e != nil {
+		t.Fatal(e)
+	}
+	_, _ = h2.ItemScan(false, "tab", 1, "")
+	r2 := h2.CostReport()
+	if a.physical != 1 || h2.LastError().Code != hostkit.CostCapExceeded || r2.TotalRequests != 1 || f.Calls()["Scan"] != 0 {
+		t.Fatalf("expected 1st physical DescribeTable settled and 2nd refused; describes=%d last=%+v report=%+v", a.physical, h2.LastError(), r2)
+	}
+}
+
+func TestOwnTablesR2DescribeBeforeInvalidLiveConfig(t *testing.T) {
+	f := fakeadapter.New(fakeadapter.Options{})
+	_, _ = f.CreateTable(context.Background(), "tab", false)
+	a := &r2UnmeteredDescribe{Fake: f}
+	t.Setenv("LMCLOUD_LIVE", "1")
+	h := New(Config{Provider: "aws", Tables: a})
+	h.SetAbortOnError(false)
+	_, _ = h.ItemScan(false, "tab", 1, "")
+	if a.physical != 0 || h.LastError().ProviderCode != "LiveCostMeterRequired" {
+		t.Fatalf("expected 0 physical DescribeTable calls on unconfigured live host (Scan); calls=%d last=%+v", a.physical, h.LastError())
+	}
+	_, _ = h.ItemQuery(false, "tab", "pk", "", "", 1, "")
+	if a.physical != 0 || h.LastError().ProviderCode != "LiveCostMeterRequired" {
+		t.Fatalf("expected 0 physical DescribeTable calls on unconfigured live host (Query); calls=%d last=%+v", a.physical, h.LastError())
+	}
+}
+
+func TestOwnTablesR2ManifestExceedsNativeBound(t *testing.T) {
+	attrs := map[string]hostkit.Attr{}
+	for i := 0; i < 232; i++ {
+		name := fmt.Sprintf("f%03d", i) + strings.Repeat("x", 59)
+		if len(name) != 63 {
+			t.Fatal(len(name))
+		}
+		attrs[name] = hostkit.NumberAttr(5)
+	}
+	remaining := 262144 - 232*79 - 80
+	for i := 0; i < 8; i++ {
+		n := remaining
+		if n > 32768 {
+			n = 32768
+		}
+		attrs[fmt.Sprintf("a%d", i)] = hostkit.StringAttr(strings.Repeat("x", n))
+		remaining -= n
+	}
+	if remaining != 0 {
+		t.Fatal(remaining)
+	}
+	if n, e := hostkit.CanonicalItemBytes(attrs); e != nil || n != 262144 {
+		t.Fatalf("canonical=%d err=%v", n, e)
+	}
+	item := hostkit.Item{PK: "pk", Version: strings.Repeat("a", 32), Attrs: attrs}
+	nativeLower := len("__lmt") + len("__lmcloud_v") + 32
+	for name, a := range attrs {
+		nativeLower += len(name)
+		if a.S != nil {
+			nativeLower += len(*a.S)
+		}
+		if a.N != nil {
+			nativeLower += len(name) + len("number")
+		}
+	}
+	claimed := hostkit.NativeItemBillableBytes(item)
+	if claimed <= int64(nativeLower) || hostkit.MaxNativeItemBillableBytes < claimed {
+		t.Fatalf("expected claimed (%d) > nativeLower (%d) and <= MaxNativeItemBillableBytes (%d)",
+			claimed, nativeLower, hostkit.MaxNativeItemBillableBytes)
+	}
+
+	// Narrowing work cap to 257 units ($0.00032125) must reject this 232-float item before dispatch.
+	f := fakeadapter.New(fakeadapter.Options{})
+	_, _ = f.CreateTable(context.Background(), "tab", false)
+	hTight := solTabHost(f)
+	if e := hTight.SetCostCapUSD(0.00032125); e != nil {
+		t.Fatal(e)
+	}
+	mutBefore := f.MutatorCalls()
+	_, _ = hTight.ItemPut(false, "tab", newTableItemFromHostkit(hTight, item), hostkit.PutUnconditional, "")
+	if hTight.LastError().Code != hostkit.CostCapExceeded || f.MutatorCalls() != mutBefore {
+		t.Fatalf("expected 257-unit cap to reject 232-float item before dispatch; last=%+v mut=%d->%d",
+			hTight.LastError(), mutBefore, f.MutatorCalls())
+	}
+
+	// With MaxNativeItemBillableBytes cap, ItemPut succeeds and bills >= (nativeLower+1023)/1024 (268) units.
+	h := solTabHost(f)
+	q, _ := h.cost.meter.QuoteAttempt(safety.AttemptPricingInput{Operation: "item_put", PayloadSize: hostkit.MaxNativeItemBillableBytes})
+	if e := h.SetCostCapUSD(safety.NanoToUSD(q.AttemptNanoUSD)); e != nil {
+		t.Fatal(e)
+	}
+	_, _ = h.ItemPut(false, "tab", newTableItemFromHostkit(h, item), hostkit.PutUnconditional, "")
+	r := h.CostReport().Item("item_put")
+	minUnits := int64((nativeLower + 1023) / 1024)
+	if h.LastError().Code != hostkit.OK || r.BillingUnits < minUnits {
+		t.Fatalf("expected ItemPut to succeed and bill >=%d units; last=%+v report=%+v", minUnits, h.LastError(), r)
+	}
+}
+
+type r2DryPager struct {
+	*fakeadapter.Fake
+	calls int
+}
+
+func (a *r2DryPager) Scan(_ context.Context, _ string, _ int, _ string) (hostkit.TablePage, error) {
+	a.calls++
+	return hostkit.TablePage{
+		Items:     []hostkit.Item{{PK: fmt.Sprintf("pk%d", a.calls), Version: "v", Exists: true, Attrs: map[string]hostkit.Attr{}}},
+		NextToken: "next",
+	}, nil
+}
+
+func (a *r2DryPager) Query(_ context.Context, _, _, _, _ string, _ int, _ string) (hostkit.TablePage, error) {
+	a.calls++
+	return hostkit.TablePage{
+		Items:     []hostkit.Item{{PK: "pk", SK: fmt.Sprintf("sk%d", a.calls), Version: "v", Exists: true, Attrs: map[string]hostkit.Attr{}}},
+		NextToken: "next",
+	}, nil
+}
+
+func TestOwnTablesR2DryPagesFailOpen(t *testing.T) {
+	for _, maxPages := range []int{1, 4} {
+		t.Run(fmt.Sprint(maxPages), func(t *testing.T) {
+			f := fakeadapter.New(fakeadapter.Options{})
+			_, _ = f.CreateTable(context.Background(), "tab", true)
+			a := &r2DryPager{Fake: f}
+			h := New(Config{Provider: "ref", Tables: a, MaxPages: maxPages})
+			h.SetAbortOnError(false)
+			page, _ := h.ItemScan(true, "tab", 100, "")
+			if h.LastError().Code != hostkit.Internal || len(page.Items) != 0 || page.NextToken != "" {
+				t.Fatalf("expected dry ItemScan with maxPages=%d to fail INTERNAL; last=%+v page=%+v", maxPages, h.LastError(), page)
+			}
+			qpage, _ := h.ItemQuery(true, "tab", "pk", "", "", 100, "")
+			if h.LastError().Code != hostkit.Internal || len(qpage.Items) != 0 || qpage.NextToken != "" {
+				t.Fatalf("expected dry ItemQuery with maxPages=%d to fail INTERNAL; last=%+v page=%+v", maxPages, h.LastError(), qpage)
+			}
+		})
+	}
+}
+
+type r2NoDescriber struct{ hostkit.Tables }
+
+func TestOwnTablesR2OptionalLayoutStillUnbound(t *testing.T) {
+	f := fakeadapter.New(fakeadapter.Options{})
+	h := solTabHost(&r2NoDescriber{Tables: f})
+	_, _ = h.TableCreate(false, "tab", true)
+	for _, sk := range []string{"a", "b"} {
+		it, _ := h.ItemNew("pk", sk, true)
+		_, _ = h.ItemPut(false, "tab", it, hostkit.PutUnconditional, "")
+	}
+	page, _ := h.ItemQuery(false, "tab", "pk", "", "", 1, "")
+	if page.NextToken == "" {
+		t.Fatal(h.LastError())
+	}
+	_, _ = h.TableDelete(false, "tab")
+	_, _ = h.TableCreate(false, "tab", false)
+	it, _ := h.ItemNew("pk", "", false)
+	_, _ = h.ItemPut(false, "tab", it, hostkit.PutUnconditional, "")
+	before := f.Calls()["Query"]
+	_, _ = h.ItemQuery(false, "tab", "pk", "", "", 1, page.NextToken)
+	if h.LastError().Code != hostkit.InvalidArgument || h.LastError().HTTPStatus != 0 || f.Calls()["Query"] != before {
+		t.Fatalf("expected token reuse across layout change on wrapped Tables interface to fail preflight INVALID_ARGUMENT; last=%+v calls=%d->%d",
+			h.LastError(), before, f.Calls()["Query"])
+	}
+}
+

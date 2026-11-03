@@ -174,11 +174,19 @@ type TableInfo struct {
 	CreateToken string
 }
 
-// TableDescriber is optional (and recommended for all Tables adapters): it
-// returns an existing table's key layout (sorted vs key-only) and creation
-// token in a single read-only probe.
+// TableDescriber returns an existing table's key layout (sorted vs key-only)
+// and creation token in a single read-only probe. It is part of the required
+// Tables interface and kept as a named sub-interface for callers that only
+// inspect table metadata.
 type TableDescriber interface {
 	DescribeTable(ctx context.Context, table string) (TableInfo, error)
+}
+
+// PriorItemSizer is an optional in-process adapter hook that reports the
+// conservative native billable byte size of the current stored item at
+// (table, pk, sk), or (0, true) when absent, without mutating state.
+type PriorItemSizer interface {
+	PriorItemBillableBytes(table, pk, sk string) (int64, bool)
 }
 
 // TableOpMetrics carries authoritative prior/deleted item billing telemetry
@@ -350,6 +358,9 @@ type Tables interface {
 	DeleteTable(ctx context.Context, name string) error
 	// HeadTable returns nil when the table exists and is accessible; NOT_FOUND when absent.
 	HeadTable(ctx context.Context, name string) error
+	// DescribeTable returns the authoritative key layout and creation token of
+	// an existing table; NOT_FOUND (Absent=table) when absent.
+	DescribeTable(ctx context.Context, name string) (TableInfo, error)
 	// ListTables returns one provider page of logical table names (excluding any
 	// internal metadata table such as lmcloudmeta).
 	ListTables(ctx context.Context, token string) (names []string, next string, err error)

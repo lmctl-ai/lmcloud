@@ -165,11 +165,15 @@ func (g guardTables) TableCreateToken(ctx context.Context, table string) (string
 }
 
 func (g guardTables) DescribeTable(ctx context.Context, table string) (hostkit.TableInfo, error) {
-	if d, ok := g.t.(hostkit.TableDescriber); ok {
-		v, err := d.DescribeTable(ctx, table)
-		return v, hostkit.NilIfTyped(err)
+	v, err := g.t.DescribeTable(ctx, table)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardTables) PriorItemBillableBytes(table, pk, sk string) (int64, bool) {
+	if s, ok := g.t.(hostkit.PriorItemSizer); ok {
+		return s.PriorItemBillableBytes(table, pk, sk)
 	}
-	return hostkit.TableInfo{}, errNoToken
+	return 0, false
 }
 
 var errNoToken = hostkit.ProviderError(hostkit.Internal, 0, "", "adapter does not store create tokens")

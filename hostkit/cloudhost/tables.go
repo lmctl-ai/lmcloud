@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -458,14 +459,40 @@ func (h *Host) describeTableInfo(ctx context.Context, name string) (hostkit.Tabl
 	if h.cfg.Tables == nil {
 		return hostkit.TableInfo{}, false, missingTables()
 	}
-	d, ok := h.cfg.Tables.(hostkit.TableDescriber)
-	if !ok {
-		return hostkit.TableInfo{}, false, nil
-	}
-	info, err := d.DescribeTable(ctx, name)
+	info, err := h.cfg.Tables.DescribeTable(ctx, name)
 	ce := hostkit.AsCloudError(err)
 	if ce != nil {
 		if ce == errNoToken {
+			return hostkit.TableInfo{}, false, nil
+		}
+		return hostkit.TableInfo{}, false, ce
+	}
+	return info, true, nil
+}
+
+func (h *Host) meteredDescribeTableInfo(ctx context.Context, name string) (hostkit.TableInfo, bool, *hostkit.CloudError) {
+	if h.cfg.Tables == nil {
+		return hostkit.TableInfo{}, false, missingTables()
+	}
+	mctx, scope, cerr := h.beginAttemptScope(ctx, "table_exists", safety.AttemptPricingInput{Operation: "table_exists"}, safety.KindTable, name)
+	if cerr != nil {
+		return hostkit.TableInfo{}, false, cerr
+	}
+	info, err := h.cfg.Tables.DescribeTable(mctx, name)
+	err = hostkit.NilIfTyped(err)
+	ce := hostkit.AsCloudError(err)
+	if ce != nil && ce.Preflight {
+		if relErr := h.cost.release(scope.res, scope.attemptID); relErr != nil {
+			ce = relErr
+		}
+		return hostkit.TableInfo{}, false, ce
+	}
+	_, _, aerr := scope.finish(0, 0, true, err == nil)
+	if aerr != nil {
+		return hostkit.TableInfo{}, false, aerr
+	}
+	if ce != nil {
+		if isNotFound(ce) {
 			return hostkit.TableInfo{}, false, nil
 		}
 		return hostkit.TableInfo{}, false, ce
@@ -917,7 +944,20 @@ func (h *Host) ItemPut(dry bool, table string, ti *TableItem, mode hostkit.PutMo
 		return none, h.fail(op, tgt, missingTables())
 	}
 	sz := int64(canonBytes)
-	mctx, scope, rerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: hostkit.MaxNativeItemBillableBytes}, safety.KindTableItem, tgt)
+	newBill := hostkit.NativeItemBillableBytes(rawItem)
+	reserveBytes := max(newBill, int64(hostkit.MaxItemCanonicalBytes+1024))
+	if sizer, ok := h.cfg.Tables.(hostkit.PriorItemSizer); ok {
+		if priorBytes, pok := sizer.PriorItemBillableBytes(table, rawItem.PK, rawItem.SK); pok {
+			if priorBytes > reserveBytes {
+				reserveBytes = priorBytes
+			}
+		} else if hostkit.MaxNativeItemBillableBytes > reserveBytes {
+			reserveBytes = hostkit.MaxNativeItemBillableBytes
+		}
+	} else if hostkit.MaxNativeItemBillableBytes > reserveBytes {
+		reserveBytes = hostkit.MaxNativeItemBillableBytes
+	}
+	mctx, scope, rerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: reserveBytes}, safety.KindTableItem, tgt)
 	if rerr != nil {
 		failed = true
 		return none, h.fail(op, tgt, rerr)
@@ -933,9 +973,9 @@ func (h *Host) ItemPut(dry bool, table string, ti *TableItem, mode hostkit.PutMo
 				ce = relErr
 			}
 		} else {
-			failCharge := int64(hostkit.MaxNativeItemBillableBytes)
+			failCharge := reserveBytes
 			if opMetrics.Authoritative {
-				failCharge = max(opMetrics.PriorBytes, max(opMetrics.NewBytes, hostkit.NativeItemBillableBytes(rawItem)))
+				failCharge = max(opMetrics.PriorBytes, max(opMetrics.NewBytes, newBill))
 			}
 			retries, throttles, abortErr = scope.finish(failCharge, sz, opMetrics.Authoritative, false)
 			if abortErr != nil {
@@ -947,14 +987,14 @@ func (h *Host) ItemPut(dry bool, table string, ti *TableItem, mode hostkit.PutMo
 	}
 	validStored, _, verr := h.validateReturnedItem(stored, true)
 	if verr != nil {
-		retries, throttles, abortErr = scope.finish(hostkit.MaxNativeItemBillableBytes, sz, true, false)
+		retries, throttles, abortErr = scope.finish(reserveBytes, sz, true, false)
 		if abortErr != nil {
 			verr = abortErr
 		}
 		failed = true
 		return none, h.fail(op, tgt, verr)
 	}
-	chargeBytes := int64(hostkit.MaxNativeItemBillableBytes)
+	chargeBytes := reserveBytes
 	if opMetrics.Authoritative {
 		chargeBytes = max(opMetrics.PriorBytes, max(opMetrics.NewBytes, hostkit.NativeItemBillableBytes(validStored)))
 	}
@@ -1040,7 +1080,7 @@ func (h *Host) ItemGet(dry bool, table, pk, sk string, hasSK bool) (*TableItem, 
 	mctx := ctx
 	if !dry {
 		var cerr *hostkit.CloudError
-		mctx, scope, cerr = h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: hostkit.MaxItemCanonicalBytes}, safety.KindTableItem, tgt)
+		mctx, scope, cerr = h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: hostkit.MaxNativeItemBillableBytes}, safety.KindTableItem, tgt)
 		if cerr != nil {
 			failed = true
 			return none, h.fail(op, tgt, cerr)
@@ -1050,15 +1090,16 @@ func (h *Host) ItemGet(dry bool, table, pk, sk string, hasSK bool) (*TableItem, 
 	var abortErr *hostkit.CloudError
 	if err == nil {
 		validGot, gotBytes, verr := h.validateReturnedItem(got, true)
+		gotBill := hostkit.NativeItemBillableBytes(validGot)
 		if verr != nil {
-			retries, throttles, abortErr = scope.finish(gotBytes, gotBytes, true, false)
+			retries, throttles, abortErr = scope.finish(max(gotBill, int64(hostkit.MaxNativeItemBillableBytes)), gotBytes, true, false)
 			if abortErr != nil {
 				verr = abortErr
 			}
 			failed = true
 			return none, h.fail(op, tgt, verr)
 		}
-		retries, throttles, abortErr = scope.finish(gotBytes, gotBytes, true, true)
+		retries, throttles, abortErr = scope.finish(gotBill, gotBytes, true, true)
 		if abortErr != nil {
 			failed = true
 			return none, h.fail(op, tgt, abortErr)
@@ -1494,18 +1535,49 @@ func (h *Host) ItemQuery(dry bool, table, pk, skFrom, skTo string, maxItems int6
 				failed = true
 				return empty, h.fail(op, tgt, missingTables())
 			}
+			const maxDryWalkBytes = 64 << 20
+			maxDryWalkItems := h.cfg.MaxPages * hostkit.MaxTablePageMax
 			var curTok string
+			seenTokens := map[string]bool{}
+			completed := false
+			var totalDryBytes int64
 			for pageNum := 0; pageNum < h.cfg.MaxPages; pageNum++ {
 				p, err := h.cfg.Tables.Query(ctx, table, pk, skFrom, skTo, hostkit.MaxTablePageMax, curTok)
 				if err != nil {
 					failed = true
 					return empty, h.fail(op, tgt, hostkit.AsCloudError(err))
 				}
-				backendItems = append(backendItems, p.Items...)
-				if p.NextToken == "" || p.NextToken == curTok {
+				if len(p.Items) > hostkit.MaxTablePageMax {
+					failed = true
+					return empty, h.fail(op, tgt, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned more items than max_items"))
+				}
+				for _, bit := range p.Items {
+					validBit, ib, verr := h.validateReturnedItem(bit, true)
+					if verr != nil {
+						failed = true
+						return empty, h.fail(op, tgt, verr)
+					}
+					totalDryBytes += ib
+					backendItems = append(backendItems, validBit)
+					if len(backendItems) > maxDryWalkItems || totalDryBytes > maxDryWalkBytes {
+						failed = true
+						return empty, h.fail(op, tgt, hostkit.ProviderError(hostkit.Internal, 0, "", "dry-run table walk exceeded memory bound"))
+					}
+				}
+				if p.NextToken == "" {
+					completed = true
 					break
 				}
+				if p.NextToken == curTok || seenTokens[p.NextToken] {
+					failed = true
+					return empty, h.fail(op, tgt, hostkit.ProviderError(hostkit.Internal, 0, "", "pagination stalled: continuation token repeated"))
+				}
+				seenTokens[p.NextToken] = true
 				curTok = p.NextToken
+			}
+			if !completed {
+				failed = true
+				return empty, h.fail(op, tgt, hostkit.ProviderError(hostkit.Internal, 0, "", fmt.Sprintf("%s exceeded %d pages without completing", op, h.cfg.MaxPages)))
 			}
 		}
 		merged := h.ov(ctx).mergeTableItems(table, backendItems, func(it hostkit.Item) bool {
@@ -1550,20 +1622,24 @@ func (h *Host) ItemQuery(dry bool, table, pk, skFrom, skTo string, maxItems int6
 		failed = true
 		return empty, h.fail(op, tgt, missingTables())
 	}
-	info, hasInfo, descErr := h.describeTableInfo(ctx, table)
+	info, hasInfo, descErr := h.meteredDescribeTableInfo(ctx, table)
 	if descErr != nil {
 		failed = true
 		return empty, h.fail(op, tgt, descErr)
 	}
 	if token != "" && hasInfo {
-		if (gotEnv.HasLayout && info.Sorted != gotEnv.Sorted) || (gotEnv.TableToken != "" && info.CreateToken != "" && info.CreateToken != gotEnv.TableToken) {
+		if info.CreateToken == "" {
+			failed = true
+			return empty, h.fail(op, tgt, hostkit.ProviderError(hostkit.Internal, 0, "TableMetadataUnavailable", "table adapter did not supply authoritative table metadata"))
+		}
+		if !gotEnv.HasLayout || gotEnv.TableToken == "" || info.Sorted != gotEnv.Sorted || info.CreateToken != gotEnv.TableToken {
 			failed = true
 			return empty, h.fail(op, tgt, hostkit.Preflightf("continuation token is not valid for current table %q state", table))
 		}
 	}
 	var scope *attemptScope
 	mctx := ctx
-	maxPageBytes := int64(max) * hostkit.MaxItemCanonicalBytes
+	maxPageBytes := int64(max) * hostkit.MaxNativeItemBillableBytes
 	if !dry {
 		var cerr *hostkit.CloudError
 		mctx, scope, cerr = h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: maxPageBytes}, safety.KindTable, table)
@@ -1610,12 +1686,17 @@ func (h *Host) ItemQuery(dry bool, table, pk, skFrom, skTo string, maxItems int6
 		return empty, h.fail(op, tgt, ce)
 	}
 	outItems := make([]*TableItem, 0, len(page.Items))
-	var pageBytes int64
+	var pageBytes, pageBillableBytes int64
 	for _, it := range page.Items {
 		validIt, ib, verr := h.validateReturnedItem(it, true)
 		pageBytes += ib
+		pageBillableBytes += hostkit.NativeItemBillableBytes(validIt)
 		if verr != nil {
-			retries, throttles, abortErr = scope.finish(pageBytes, pageBytes, true, false)
+			failBill := maxPageBytes
+			if pageBillableBytes > failBill {
+				failBill = pageBillableBytes
+			}
+			retries, throttles, abortErr = scope.finish(failBill, pageBytes, true, false)
 			if abortErr != nil {
 				verr = abortErr
 			}
@@ -1625,10 +1706,14 @@ func (h *Host) ItemQuery(dry bool, table, pk, skFrom, skTo string, maxItems int6
 		outItems = append(outItems, newTableItemFromHostkit(h, validIt))
 	}
 	sort.SliceStable(outItems, func(i, j int) bool { return outItems[i].SK() < outItems[j].SK() })
-	retries, throttles, abortErr = scope.finish(pageBytes, pageBytes, true, true)
+	retries, throttles, abortErr = scope.finish(pageBillableBytes, pageBytes, true, true)
 	if abortErr != nil {
 		failed = true
 		return empty, h.fail(op, tgt, abortErr)
+	}
+	if page.NextToken != "" && (!hasInfo || info.CreateToken == "") {
+		failed = true
+		return empty, h.fail(op, tgt, hostkit.ProviderError(hostkit.Internal, 0, "TableMetadataUnavailable", "table adapter did not supply authoritative table metadata"))
 	}
 	bytesIn = pageBytes
 	envWant.Raw = page.NextToken
@@ -1701,18 +1786,49 @@ func (h *Host) ItemScan(dry bool, table string, maxItems int64, token string) (*
 				failed = true
 				return empty, h.fail(op, table, missingTables())
 			}
+			const maxDryWalkBytes = 64 << 20
+			maxDryWalkItems := h.cfg.MaxPages * hostkit.MaxTablePageMax
 			var curTok string
+			seenTokens := map[string]bool{}
+			completed := false
+			var totalDryBytes int64
 			for pageNum := 0; pageNum < h.cfg.MaxPages; pageNum++ {
 				p, err := h.cfg.Tables.Scan(ctx, table, hostkit.MaxTablePageMax, curTok)
 				if err != nil {
 					failed = true
 					return empty, h.fail(op, table, hostkit.AsCloudError(err))
 				}
-				backendItems = append(backendItems, p.Items...)
-				if p.NextToken == "" || p.NextToken == curTok {
+				if len(p.Items) > hostkit.MaxTablePageMax {
+					failed = true
+					return empty, h.fail(op, table, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned more items than max_items"))
+				}
+				for _, bit := range p.Items {
+					validBit, ib, verr := h.validateReturnedItem(bit, true)
+					if verr != nil {
+						failed = true
+						return empty, h.fail(op, table, verr)
+					}
+					totalDryBytes += ib
+					backendItems = append(backendItems, validBit)
+					if len(backendItems) > maxDryWalkItems || totalDryBytes > maxDryWalkBytes {
+						failed = true
+						return empty, h.fail(op, table, hostkit.ProviderError(hostkit.Internal, 0, "", "dry-run table walk exceeded memory bound"))
+					}
+				}
+				if p.NextToken == "" {
+					completed = true
 					break
 				}
+				if p.NextToken == curTok || seenTokens[p.NextToken] {
+					failed = true
+					return empty, h.fail(op, table, hostkit.ProviderError(hostkit.Internal, 0, "", "pagination stalled: continuation token repeated"))
+				}
+				seenTokens[p.NextToken] = true
 				curTok = p.NextToken
+			}
+			if !completed {
+				failed = true
+				return empty, h.fail(op, table, hostkit.ProviderError(hostkit.Internal, 0, "", fmt.Sprintf("%s exceeded %d pages without completing", op, h.cfg.MaxPages)))
 			}
 		}
 		merged := h.ov(ctx).mergeTableItems(table, backendItems, nil)
@@ -1746,20 +1862,24 @@ func (h *Host) ItemScan(dry bool, table string, maxItems int64, token string) (*
 		failed = true
 		return empty, h.fail(op, table, missingTables())
 	}
-	info, hasInfo, descErr := h.describeTableInfo(ctx, table)
+	info, hasInfo, descErr := h.meteredDescribeTableInfo(ctx, table)
 	if descErr != nil {
 		failed = true
 		return empty, h.fail(op, table, descErr)
 	}
 	if token != "" && hasInfo {
-		if (gotEnv.HasLayout && info.Sorted != gotEnv.Sorted) || (gotEnv.TableToken != "" && info.CreateToken != "" && info.CreateToken != gotEnv.TableToken) {
+		if info.CreateToken == "" {
+			failed = true
+			return empty, h.fail(op, table, hostkit.ProviderError(hostkit.Internal, 0, "TableMetadataUnavailable", "table adapter did not supply authoritative table metadata"))
+		}
+		if !gotEnv.HasLayout || gotEnv.TableToken == "" || info.Sorted != gotEnv.Sorted || info.CreateToken != gotEnv.TableToken {
 			failed = true
 			return empty, h.fail(op, table, hostkit.Preflightf("continuation token is not valid for current table %q state", table))
 		}
 	}
 	var scope *attemptScope
 	mctx := ctx
-	maxPageBytes := int64(max) * hostkit.MaxItemCanonicalBytes
+	maxPageBytes := int64(max) * hostkit.MaxNativeItemBillableBytes
 	if !dry {
 		var cerr *hostkit.CloudError
 		mctx, scope, cerr = h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: maxPageBytes}, safety.KindTable, table)
@@ -1806,12 +1926,17 @@ func (h *Host) ItemScan(dry bool, table string, maxItems int64, token string) (*
 		return empty, h.fail(op, table, ce)
 	}
 	outItems := make([]*TableItem, 0, len(page.Items))
-	var pageBytes int64
+	var pageBytes, pageBillableBytes int64
 	for _, it := range page.Items {
 		validIt, ib, verr := h.validateReturnedItem(it, true)
 		pageBytes += ib
+		pageBillableBytes += hostkit.NativeItemBillableBytes(validIt)
 		if verr != nil {
-			retries, throttles, abortErr = scope.finish(pageBytes, pageBytes, true, false)
+			failBill := maxPageBytes
+			if pageBillableBytes > failBill {
+				failBill = pageBillableBytes
+			}
+			retries, throttles, abortErr = scope.finish(failBill, pageBytes, true, false)
 			if abortErr != nil {
 				verr = abortErr
 			}
@@ -1820,10 +1945,14 @@ func (h *Host) ItemScan(dry bool, table string, maxItems int64, token string) (*
 		}
 		outItems = append(outItems, newTableItemFromHostkit(h, validIt))
 	}
-	retries, throttles, abortErr = scope.finish(pageBytes, pageBytes, true, true)
+	retries, throttles, abortErr = scope.finish(pageBillableBytes, pageBytes, true, true)
 	if abortErr != nil {
 		failed = true
 		return empty, h.fail(op, table, abortErr)
+	}
+	if page.NextToken != "" && (!hasInfo || info.CreateToken == "") {
+		failed = true
+		return empty, h.fail(op, table, hostkit.ProviderError(hostkit.Internal, 0, "TableMetadataUnavailable", "table adapter did not supply authoritative table metadata"))
 	}
 	bytesIn = pageBytes
 	envWant.Raw = page.NextToken
