@@ -58,15 +58,16 @@ type SweepReport struct {
 	WouldDelete    []SweepItem
 	Deleted        []SweepItem
 	Absent         []SweepItem
+	Pending        []SweepItem
 	Retained       []SweepItem
 	UnownedSkipped []SweepItem
 	Failed         []SweepItem
 }
 
 // Clean reports whether the sweep left zero failed items and zero pending
-// un-swept items (in Apply mode).
+// unresolved items.
 func (r SweepReport) Clean() bool {
-	return len(r.Failed) == 0
+	return len(r.Failed) == 0 && len(r.Pending) == 0
 }
 
 // Sweep executes a LIFO ownership-revalidating recovery pass over a run journal.
@@ -138,8 +139,56 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 		DryRun: !opts.Apply,
 	}
 
+	// Active sweeps (Apply: true) MUST have a valid CostMeter; fail closed if
+	// no Meter was supplied and no regional price table can be loaded.
+	if opts.Apply && opts.Meter == nil {
+		pt, perr := LoadEmbeddedPriceTable(meta.Provider, meta.Region, nowFn().UTC())
+		if perr != nil {
+			return report, fmt.Errorf("sweep requires a valid price table for %s/%s: %w", meta.Provider, meta.Region, perr)
+		}
+		var costPol CostPolicy
+		if opts.Policy != nil {
+			costPol = opts.Policy.Cost
+		}
+		costPol.applyDefaults()
+		m, merr := NewCostMeter(costPol, pt, recovery)
+		if merr != nil {
+			return report, fmt.Errorf("sweep failed to initialize cost meter: %w", merr)
+		}
+		restoreMeterFromState(m, pt, state)
+		opts.Meter = m
+	}
+
+	reserveSweepOp := func(op, kind, parent, name, reason string) error {
+		if opts.Meter != nil && op != "" {
+			res, rerr := opts.Meter.ReserveAttempt(AttemptPricingInput{
+				Operation: op,
+				IsCleanup: true,
+			})
+			if rerr != nil {
+				return rerr
+			}
+			charged := res.Commit(-1, false)
+			if opts.Apply && j != nil {
+				if jerr := j.RecordCost(kind, parent, name, reason, charged); jerr != nil {
+					return jerr
+				}
+			}
+		} else if opts.Apply && j != nil {
+			if jerr := j.CheckHealth(); jerr != nil {
+				return jerr
+			}
+		}
+		return nil
+	}
+
 	// 1. Attest caller identity and target scope against journal meta (and policy if supplied).
-	ident, err := recovery.AttestIdentity(ctx)
+	if rerr := reserveSweepOp("bucket_exists", KindBucket, "", "", "sweep_attest_scope"); rerr != nil {
+		return report, fmt.Errorf("sweep attestation reservation failed: %w", rerr)
+	}
+	attestCtx, attestCancel := context.WithTimeout(ctx, time.Duration(DefaultMaxRequestTimeoutSeconds)*time.Second)
+	ident, err := recovery.AttestIdentity(attestCtx)
+	attestCancel()
 	if err != nil {
 		return report, fmt.Errorf("sweep identity attestation failed: %w", err)
 	}
@@ -147,7 +196,9 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 		return report, fmt.Errorf("sweep attested identity (%s/%s) does not match journal meta (%s/%s)",
 			ident.Provider, ident.Account, meta.Provider, meta.Account)
 	}
-	scope, err := recovery.ResolveScope(ctx, "storage")
+	scopeCtx, scopeCancel := context.WithTimeout(ctx, time.Duration(DefaultMaxRequestTimeoutSeconds)*time.Second)
+	scope, err := recovery.ResolveScope(scopeCtx, "storage")
+	scopeCancel()
 	if err != nil {
 		return report, fmt.Errorf("sweep scope resolution failed: %w", err)
 	}
@@ -190,23 +241,64 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 			ProviderID: entry.ProviderID,
 		}
 
-		ro, readErr := recovery.ReadOwnership(ctx, ref)
+		if rerr := reserveSweepOp(readOwnershipOpForKind(entry.Kind), entry.Kind, entry.Parent, entry.Name, "sweep_read_ownership"); rerr != nil {
+			report.Failed = append(report.Failed, SweepItem{
+				Kind:       entry.Kind,
+				Parent:     entry.Parent,
+				Name:       entry.Name,
+				ProviderID: entry.ProviderID,
+				Reason:     "sweep ownership read reservation failed: " + rerr.Error(),
+			})
+			return
+		}
+		if entry.Kind == KindBucket {
+			if rerr := reserveSweepOp("object_list", KindBucket, "", entry.Name, "sweep_list_bucket_children"); rerr != nil {
+				report.Failed = append(report.Failed, SweepItem{
+					Kind:       entry.Kind,
+					Parent:     entry.Parent,
+					Name:       entry.Name,
+					ProviderID: entry.ProviderID,
+					Reason:     "sweep bucket child listing reservation failed: " + rerr.Error(),
+				})
+				return
+			}
+		}
+
+		reqCtx, reqCancel := context.WithTimeout(ctx, time.Duration(DefaultMaxRequestTimeoutSeconds)*time.Second)
+		ro, readErr := recovery.ReadOwnership(reqCtx, ref)
+		reqCancel()
 		if (readErr == nil && !ro.Exists) || (readErr != nil && recovery.ClassifyAbsent(readErr) == AbsenceDefinitive) {
-			reason := "definitively absent"
 			inGraceWindow := entry.State == StatePending &&
 				entry.IntentAtUnix > 0 &&
 				nowFn().UTC().Unix() < entry.IntentAtUnix+pendingGraceSec
 			if inGraceWindow {
-				reason = "definitively absent (within pending-intent grace period; keeping intent for re-check)"
-			} else if opts.Apply && j != nil {
-				_ = j.Deleted(entry.Kind, entry.Parent, entry.Name, 0)
+				report.Pending = append(report.Pending, SweepItem{
+					Kind:       entry.Kind,
+					Parent:     entry.Parent,
+					Name:       entry.Name,
+					ProviderID: entry.ProviderID,
+					Reason:     "pending create intent within request-timeout grace window; requires re-sweep",
+				})
+				return
+			}
+			if opts.Apply && j != nil {
+				if jerr := j.Deleted(entry.Kind, entry.Parent, entry.Name, 0); jerr != nil {
+					report.Failed = append(report.Failed, SweepItem{
+						Kind:       entry.Kind,
+						Parent:     entry.Parent,
+						Name:       entry.Name,
+						ProviderID: entry.ProviderID,
+						Reason:     "write deleted tombstone failed: " + jerr.Error(),
+					})
+					return
+				}
 			}
 			report.Absent = append(report.Absent, SweepItem{
 				Kind:       entry.Kind,
 				Parent:     entry.Parent,
 				Name:       entry.Name,
 				ProviderID: entry.ProviderID,
-				Reason:     reason,
+				Reason:     "definitively absent",
 			})
 			sweptChildren[key] = true
 			return
@@ -318,33 +410,20 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 			return
 		}
 
-		var res *AttemptReservation
-		if opts.Meter != nil {
-			opName := deleteOpForKind(entry.Kind)
-			if opName != "" {
-				var rerr error
-				res, rerr = opts.Meter.ReserveAttempt(AttemptPricingInput{
-					Operation: opName,
-					IsCleanup: true,
-				})
-				if rerr != nil {
-					report.Failed = append(report.Failed, SweepItem{
-						Kind:       entry.Kind,
-						Parent:     entry.Parent,
-						Name:       entry.Name,
-						ProviderID: ro.ProviderID,
-						Reason:     "cleanup cost reservation failed: " + rerr.Error(),
-					})
-					return
-				}
-			}
+		if rerr := reserveSweepOp(deleteOpForKind(entry.Kind), entry.Kind, entry.Parent, entry.Name, "sweep_delete"); rerr != nil {
+			report.Failed = append(report.Failed, SweepItem{
+				Kind:       entry.Kind,
+				Parent:     entry.Parent,
+				Name:       entry.Name,
+				ProviderID: ro.ProviderID,
+				Reason:     "cleanup cost reservation failed: " + rerr.Error(),
+			})
+			return
 		}
 
-		delErr := recovery.DeleteOwned(ctx, ref, ro)
-		var charged int64
-		if res != nil {
-			charged = res.Commit(-1, false)
-		}
+		delCtx, delCancel := context.WithTimeout(ctx, time.Duration(DefaultMaxRequestTimeoutSeconds)*time.Second)
+		delErr := recovery.DeleteOwned(delCtx, ref, ro)
+		delCancel()
 		if delErr != nil && recovery.ClassifyAbsent(delErr) != AbsenceDefinitive {
 			if recovery.ClassifyAbsent(delErr) == AbsenceAmbiguous {
 				reason := "ambiguous delete response: " + delErr.Error()
@@ -358,7 +437,6 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 				})
 				return
 			}
-			_ = j.RecordCost(entry.Kind, entry.Parent, entry.Name, "failed_sweep_delete", charged)
 			report.Failed = append(report.Failed, SweepItem{
 				Kind:       entry.Kind,
 				Parent:     entry.Parent,
@@ -372,7 +450,19 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 		// Poll until the deletion has converged before writing the `deleted` tombstone.
 		confirmedDeleted := false
 		for attempt := 0; attempt < pollAttempts; attempt++ {
-			done, pollErr := recovery.PollDelete(ctx, ref)
+			if rerr := reserveSweepOp(readOwnershipOpForKind(entry.Kind), entry.Kind, entry.Parent, entry.Name, "sweep_poll_delete"); rerr != nil {
+				report.Failed = append(report.Failed, SweepItem{
+					Kind:       entry.Kind,
+					Parent:     entry.Parent,
+					Name:       entry.Name,
+					ProviderID: ro.ProviderID,
+					Reason:     "poll-delete cost reservation failed: " + rerr.Error(),
+				})
+				return
+			}
+			pollCtx, pollCancel := context.WithTimeout(ctx, time.Duration(DefaultMaxRequestTimeoutSeconds)*time.Second)
+			done, pollErr := recovery.PollDelete(pollCtx, ref)
+			pollCancel()
 			if (pollErr == nil && done) || (pollErr != nil && recovery.ClassifyAbsent(pollErr) == AbsenceDefinitive) {
 				confirmedDeleted = true
 				break
@@ -406,7 +496,6 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 		}
 
 		if !confirmedDeleted {
-			_ = j.RecordCost(entry.Kind, entry.Parent, entry.Name, "pending_async_delete", charged)
 			report.Failed = append(report.Failed, SweepItem{
 				Kind:       entry.Kind,
 				Parent:     entry.Parent,
@@ -417,7 +506,7 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 			return
 		}
 
-		if err := j.Deleted(entry.Kind, entry.Parent, entry.Name, charged); err != nil {
+		if err := j.Deleted(entry.Kind, entry.Parent, entry.Name, 0); err != nil {
 			report.Failed = append(report.Failed, SweepItem{
 				Kind:       entry.Kind,
 				Parent:     entry.Parent,
@@ -462,8 +551,22 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 				Name:   meta.RunID,
 				Reason: "compute expected live prefix failed: " + err.Error(),
 			})
+		} else if rerr := reserveSweepOp("bucket_list", KindBucket, "", "", "sweep_find_owned_buckets"); rerr != nil {
+			report.Failed = append(report.Failed, SweepItem{
+				Kind:   "prefix_scan",
+				Name:   pfx,
+				Reason: "FindOwned bucket_list cost reservation failed: " + rerr.Error(),
+			})
+		} else if rerr := reserveSweepOp("queue_list", KindQueue, "", "", "sweep_find_owned_queues"); rerr != nil {
+			report.Failed = append(report.Failed, SweepItem{
+				Kind:   "prefix_scan",
+				Name:   pfx,
+				Reason: "FindOwned queue_list cost reservation failed: " + rerr.Error(),
+			})
 		} else {
-			found, ferr := recovery.FindOwned(ctx, pfx)
+			findCtx, findCancel := context.WithTimeout(ctx, time.Duration(DefaultMaxRequestTimeoutSeconds)*time.Second)
+			found, ferr := recovery.FindOwned(findCtx, pfx)
+			findCancel()
 			if ferr != nil {
 				report.Failed = append(report.Failed, SweepItem{
 					Kind:   "prefix_scan",

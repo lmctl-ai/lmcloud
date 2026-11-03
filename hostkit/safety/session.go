@@ -246,6 +246,10 @@ func restoreMeterFromState(meter *CostMeter, pt *PriceTable, st LedgerState) {
 				chargedNano += opPrice.RequestNanoUSD + opPrice.CleanupReserveNanoUSD
 			}
 			activeCleanupNano += opPrice.CleanupReserveNanoUSD
+		case StateRetained:
+			if e.ReservedNanoUSD > 0 {
+				chargedNano += e.ReservedNanoUSD
+			}
 		}
 	}
 	meter.RestoreCharged(chargedNano, activeCleanupNano)
@@ -365,13 +369,23 @@ func SweepAllStale(ctx context.Context, journalDir string, policy *Policy, recov
 			continue
 		}
 		var meter *CostMeter
-		if pt, perr := LoadEmbeddedPriceTable(st.Meta.Provider, st.Meta.Region, time.Now().UTC()); perr == nil {
+		pt, perr := LoadEmbeddedPriceTable(st.Meta.Provider, st.Meta.Region, time.Now().UTC())
+		if perr != nil {
+			if apply {
+				return reports, fmt.Errorf("sweep stale journal %s: %w", runID, perr)
+			}
+		} else {
 			var costPol CostPolicy
 			if policy != nil {
 				costPol = policy.Cost
 			}
 			costPol.applyDefaults()
-			if m, merr := NewCostMeter(costPol, pt, recovery); merr == nil {
+			m, merr := NewCostMeter(costPol, pt, recovery)
+			if merr != nil {
+				if apply {
+					return reports, fmt.Errorf("sweep stale journal %s: %w", runID, merr)
+				}
+			} else {
 				restoreMeterFromState(m, pt, *st)
 				meter = m
 			}

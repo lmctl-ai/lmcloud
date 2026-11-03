@@ -1118,8 +1118,8 @@ func TestSafety_PendingGracePeriodFindOwnedErrorAndCrashReservationRestore(t *te
 	}
 	_ = sess2.Close()
 
-	// LOW 10: Sweeping 2 seconds after IntentAtUnix (within the 10s MaxRequestTimeout grace window)
-	// reports bktPending in Absent but keeps it in StatePending in the journal.
+	// LOW 10 & Finding 7: Sweeping 2 seconds after IntentAtUnix (within the 10s request-timeout grace window)
+	// reports bktPending in Pending (Clean() == false) and keeps it in StatePending in the journal.
 	repGrace, err := Sweep(ctx, backend, SweepOptions{
 		JournalDir: pol.JournalDir,
 		RunID:      runID,
@@ -1130,8 +1130,8 @@ func TestSafety_PendingGracePeriodFindOwnedErrorAndCrashReservationRestore(t *te
 	if err != nil {
 		t.Fatalf("Sweep within grace period: %v", err)
 	}
-	if len(repGrace.Absent) != 1 || repGrace.Absent[0].Name != bktPending {
-		t.Fatalf("expected bktPending in Absent during grace window, got %+v", repGrace)
+	if repGrace.Clean() || len(repGrace.Pending) != 1 || repGrace.Pending[0].Name != bktPending {
+		t.Fatalf("expected bktPending in Pending and Clean()==false during grace window, got %+v", repGrace)
 	}
 	stGrace, err := LoadJournal(filepath.Join(pol.JournalDir, runID+".jsonl"))
 	if err != nil {
@@ -1180,5 +1180,364 @@ func TestSafety_PendingGracePeriodFindOwnedErrorAndCrashReservationRestore(t *te
 	}
 	if e, ok := stAfter.Lookup(KindBucket, "", bktPending); ok && e.State != StateDeleted {
 		t.Fatalf("expected bktPending to be tombstoned/compacted after grace window, got %+v", e)
+	}
+}
+
+var probeNow = time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+func probeSession(t *testing.T, pol Policy, run string, b RecoveryAdapter, pt *PriceTable) *Session {
+	t.Helper()
+	s, e := OpenSession(context.Background(), SessionConfig{
+		Policy:     pol,
+		RunID:      run,
+		Recovery:   b,
+		PriceTable: pt,
+		Now:        func() time.Time { return probeNow },
+	})
+	if e != nil {
+		t.Fatal(e)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+func TestReviewerFirstForeignCreateOverwritesTags(t *testing.T) {
+	// Finding 1 regression test: first create on a pre-existing foreign bucket
+	// must prove absence before calling CreateBucket and NEVER overwrite foreign tags
+	// or adopt/delete the foreign bucket.
+	pol, run, b := newTestSetup(t)
+	name, _ := FormatLiveResourceName(run, "foreign", 1)
+	foreign := NewToken128()
+	b.SeedBucket(name, map[string]string{
+		TagKeyRunID:       NewRunID(time.Unix(1712000000, 0)),
+		TagKeyOwnerNonce:  foreign,
+		TagKeyCreateToken: NewToken128(),
+	}, "254332045686", "arn:aws:iam::254332045686:role/awsspot-admin")
+	b.SetOverwriteTagsOnDuplicateCreate(true)
+
+	s := probeSession(t, pol, run, b, nil)
+	created, e := s.WrapStore(b).CreateBucket(context.Background(), name)
+	ro, _ := b.ReadOwnership(context.Background(), ResourceRef{Kind: KindBucket, Name: name})
+	if e == nil || ro.OwnerNonce != foreign {
+		de := s.WrapStore(b).DeleteBucket(context.Background(), name)
+		t.Fatalf("fresh foreign resource adopted: created=%v err=%v foreignNoncePreserved=%v deleteErr=%v foreignBucketStillExists=%v",
+			created, e, ro.OwnerNonce == foreign, de, b.HasBucket(name))
+	}
+	if de := s.WrapStore(b).DeleteBucket(context.Background(), name); de == nil || !b.HasBucket(name) {
+		t.Fatalf("expected DeleteBucket on collided foreign bucket to be refused, got err=%v exists=%v", de, b.HasBucket(name))
+	}
+}
+
+func TestReviewerOwnedParentRetaggedStillMutates(t *testing.T) {
+	// Finding 2 regression test: parent ownership must be freshly re-verified
+	// remotely before object/queue mutations or consumption.
+	pol, run, b := newTestSetup(t)
+	s := probeSession(t, pol, run, b, nil)
+	name, _ := FormatLiveResourceName(run, "bucket", 1)
+	qName, _ := FormatLiveResourceName(run, "queue", 1)
+	store := s.WrapStore(b)
+	queue := s.WrapQueue(b)
+
+	if _, e := store.CreateBucket(context.Background(), name); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := queue.CreateQueue(context.Background(), qName); e != nil {
+		t.Fatal(e)
+	}
+
+	// Replace both parent resources out-of-band with foreign-tagged resources.
+	b.SeedBucket(name, map[string]string{
+		TagKeyRunID:       NewRunID(time.Unix(1712000000, 0)),
+		TagKeyOwnerNonce:  NewToken128(),
+		TagKeyCreateToken: NewToken128(),
+	}, "254332045686", "arn:aws:iam::254332045686:role/awsspot-admin")
+	b.SeedQueue(qName, map[string]string{
+		TagKeyRunID:       NewRunID(time.Unix(1712000000, 0)),
+		TagKeyOwnerNonce:  NewToken128(),
+		TagKeyCreateToken: NewToken128(),
+	}, "254332045686", "arn:aws:iam::254332045686:role/awsspot-admin")
+
+	if _, e := store.PutObject(context.Background(), name, "foreign-child", []byte("data"), "text/plain", nil); e == nil {
+		t.Fatalf("stale journal parent authority allowed write to replacement foreign bucket")
+	}
+	if _, e := queue.Send(context.Background(), qName, "foreign-msg"); e == nil {
+		t.Fatalf("stale journal parent authority allowed send to replacement foreign queue")
+	}
+	if _, e := queue.Receive(context.Background(), qName, 1, 0, 30); e == nil {
+		t.Fatalf("stale journal parent authority allowed receive from replacement foreign queue")
+	}
+}
+
+type probeSend struct {
+	*FakeRecoveryBackend
+	calls int
+	lost  bool
+}
+
+func (b *probeSend) Send(ctx context.Context, q, w string) (string, error) {
+	b.calls++
+	id, e := b.FakeRecoveryBackend.Send(ctx, q, w)
+	if b.lost && e == nil {
+		return "", errors.New("committed send reply lost")
+	}
+	return id, e
+}
+
+func TestReviewerPoisonedGuardStillSends(t *testing.T) {
+	// Finding 3 regression test: poisoned/closed journal must block provider
+	// dispatch across all guarded operations.
+	pol, run, b := newTestSetup(t)
+	s := probeSession(t, pol, run, b, nil)
+	q, _ := FormatLiveResourceName(run, "queue", 1)
+	wrapped := &probeSend{FakeRecoveryBackend: b}
+	queue := s.WrapQueue(wrapped)
+	if _, e := queue.CreateQueue(context.Background(), q); e != nil {
+		t.Fatal(e)
+	}
+	j := s.Journal()
+	j.mu.Lock()
+	_ = j.f.Close()
+	j.mu.Unlock()
+	if e := j.RecordCost(KindQueue, "", q, "force-write-failure", 1); e == nil {
+		t.Fatal("expected actual journal write failure")
+	}
+	if _, e := queue.Send(context.Background(), q, "should-not-send"); e == nil {
+		t.Fatal("expected poison error")
+	}
+	if wrapped.calls != 0 {
+		t.Fatalf("provider called %d times after failed write poisoned journal", wrapped.calls)
+	}
+}
+
+func TestReviewerPendingReservationCompaction(t *testing.T) {
+	// Finding 4 regression test: per-entry pending reservations must survive
+	// repeated compaction and disk reopen without loss or double-counting.
+	pol, run, b := newTestSetup(t)
+	s := probeSession(t, pol, run, b, nil)
+	name1, _ := FormatLiveResourceName(run, "pending", 1)
+	name2, _ := FormatLiveResourceName(run, "pending", 2)
+	if _, e := s.Journal().BeginCreate(KindBucket, "", "us-east-1", name1, 12_345_000); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := s.Journal().BeginCreate(KindQueue, "", "us-east-1", name2, 55_000); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.Journal().Compact(); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.Journal().Compact(); e != nil {
+		t.Fatal(e)
+	}
+	_ = s.Close()
+
+	s2 := probeSession(t, pol, run, b, nil)
+	got := s2.Meter().Snapshot().ChargedNanoUSD
+	if got != 12_400_000 {
+		t.Fatalf("pending reservation mismatch on compact/reopen: want=12400000 got=%d", got)
+	}
+}
+
+func TestReviewerStaleSweeperNoPriceStillDeletes(t *testing.T) {
+	// Finding 5a regression test: SweepAllStale and active Sweep must fail closed
+	// when a regional price table / CostMeter cannot be loaded.
+	pol, run, _ := newTestSetup(t)
+	pol.AllowedRegions = []string{"us-west-2"}
+	pol.AllowedEndpoints["storage"] = []string{"https://s3.us-west-2.amazonaws.com"}
+	b := NewFakeRecoveryBackend("aws", "254332045686", "arn:aws:iam::254332045686:role/awsspot-admin", "us-west-2")
+	pt, e := LoadEmbeddedPriceTable("aws", "us-east-1", probeNow)
+	if e != nil {
+		t.Fatal(e)
+	}
+	pt.Region = "us-west-2"
+	s := probeSession(t, pol, run, b, pt)
+	q, _ := FormatLiveResourceName(run, "queue", 1)
+	if _, e := s.WrapQueue(b).CreateQueue(context.Background(), q); e != nil {
+		t.Fatal(e)
+	}
+	_ = s.Close()
+
+	reports, e := SweepAllStale(context.Background(), pol.JournalDir, &pol, b, true)
+	if e == nil || !b.HasQueue(q) {
+		t.Fatalf("deleted without a regional janitor price table: err=%v reports=%+v", e, reports)
+	}
+}
+
+type probeOwnershipCount struct {
+	*FakeRecoveryBackend
+	reads int
+}
+
+func (b *probeOwnershipCount) ReadOwnership(ctx context.Context, r ResourceRef) (RemoteOwnership, error) {
+	b.reads++
+	return b.FakeRecoveryBackend.ReadOwnership(ctx, r)
+}
+
+func TestReviewerExhaustedCostStillDoesOwnershipReads(t *testing.T) {
+	// Finding 5b regression test: ownership reads are metered, so an exhausted
+	// cost cap refuses DeleteQueue before dispatching any ReadOwnership call.
+	pol, run, b := newTestSetup(t)
+	r := &probeOwnershipCount{FakeRecoveryBackend: b}
+	s := probeSession(t, pol, run, r, nil)
+	name, _ := FormatLiveResourceName(run, "queue", 1)
+	q := s.WrapQueue(b)
+	if _, e := q.CreateQueue(context.Background(), name); e != nil {
+		t.Fatal(e)
+	}
+	r.reads = 0
+	s.Meter().RestoreCharged(50_000_000, 0)
+	for i := 0; i < 3; i++ {
+		_ = q.DeleteQueue(context.Background(), name)
+	}
+	if r.reads > 0 {
+		t.Fatalf("exhausted total cost cap still dispatched %d unmetered ownership reads", r.reads)
+	}
+}
+
+func TestReviewerAmbiguousSendCampaignLimit(t *testing.T) {
+	// Finding 6 regression test: message and payload byte counters are durably
+	// reserved before provider dispatch so ambiguous/lost-reply sends count.
+	pol, run, b := newTestSetup(t)
+	pol.Limits.MaxMessages = 1
+	s := probeSession(t, pol, run, b, nil)
+	q, _ := FormatLiveResourceName(run, "queue", 1)
+	wrapped := &probeSend{FakeRecoveryBackend: b, lost: true}
+	queue := s.WrapQueue(wrapped)
+	if _, e := queue.CreateQueue(context.Background(), q); e != nil {
+		t.Fatal(e)
+	}
+	for i := 0; i < 2; i++ {
+		_, _ = queue.Send(context.Background(), q, "committed")
+	}
+	if wrapped.calls > 1 || s.Journal().State().MessagesSent != 1 {
+		t.Fatalf("MaxMessages=1 allowed %d committed sends; journal MessagesSent=%d",
+			wrapped.calls, s.Journal().State().MessagesSent)
+	}
+}
+
+func TestReviewerGraceReportsUnresolvedAsClean(t *testing.T) {
+	// Finding 7 regression test: pending intents within the request-timeout grace
+	// window are reported in Pending with Clean() == false, and retries update IntentAtUnix.
+	pol, run, b := newTestSetup(t)
+	s := probeSession(t, pol, run, b, nil)
+	name, _ := FormatLiveResourceName(run, "pending", 1)
+	if _, e := s.Journal().BeginCreate(KindBucket, "", "us-east-1", name, 10000); e != nil {
+		t.Fatal(e)
+	}
+	rep, e := Sweep(context.Background(), b, SweepOptions{
+		Journal: s.Journal(),
+		Policy:  &pol,
+		Meter:   s.Meter(),
+		Apply:   true,
+		Now:     func() time.Time { return probeNow.Add(time.Second) },
+	})
+	if e != nil {
+		t.Fatal(e)
+	}
+	entry, pending := s.Journal().Lookup(KindBucket, "", name)
+	if pending && entry.State == StatePending && rep.Clean() {
+		t.Fatalf("clean recovery result despite unresolved pending create: %+v", rep)
+	}
+
+	// Retrying BeginCreate 8 seconds later updates IntentAtUnix on disk so a sweep
+	// at +12s (4s after the retry) is STILL within the 10s grace window.
+	s.Journal().SetClock(func() time.Time { return probeNow.Add(8 * time.Second) })
+	if _, e := s.Journal().BeginCreate(KindBucket, "", "us-east-1", name, 10000); e != nil {
+		t.Fatal(e)
+	}
+	repRetry, e := Sweep(context.Background(), b, SweepOptions{
+		Journal: s.Journal(),
+		Policy:  &pol,
+		Meter:   s.Meter(),
+		Apply:   true,
+		Now:     func() time.Time { return probeNow.Add(12 * time.Second) },
+	})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if repRetry.Clean() || len(repRetry.Pending) != 1 {
+		t.Fatalf("expected retried pending intent to remain in grace window at +12s, got %+v", repRetry)
+	}
+}
+
+func TestReviewerSweepIgnoresDeletedJournalFailure(t *testing.T) {
+	pol, run, b := newTestSetup(t)
+	s := probeSession(t, pol, run, b, nil)
+	name, _ := FormatLiveResourceName(run, "pending", 1)
+	_, _ = s.Journal().BeginCreate(KindBucket, "", "us-east-1", name, 10000)
+	j := s.Journal()
+	j.mu.Lock()
+	_ = j.f.Close()
+	j.mu.Unlock()
+	rep, e := Sweep(context.Background(), b, SweepOptions{
+		Journal: j,
+		Policy:  &pol,
+		Meter:   s.Meter(),
+		Apply:   true,
+		Now:     func() time.Time { return probeNow.Add(time.Minute) },
+	})
+	if e == nil {
+		t.Fatalf("journal failure not surfaced: report=%+v", rep)
+	}
+}
+
+func TestReviewerRetainSurvivesDiskReplay(t *testing.T) {
+	pol, run, b := newTestSetup(t)
+	s := probeSession(t, pol, run, b, nil)
+	q, _ := FormatLiveResourceName(run, "retained", 1)
+	_, _ = s.Journal().BeginCreate(KindQueue, "", "us-east-1", q, 15000)
+	if e := s.Journal().Retain(KindQueue, "", q, "foreign"); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.Journal().Compact(); e != nil {
+		t.Fatal(e)
+	}
+	_ = s.Close()
+	s2 := probeSession(t, pol, run, b, nil)
+	e, ok := s2.Journal().Lookup(KindQueue, "", q)
+	if !ok || !e.Retain || e.State != StateRetained {
+		t.Fatalf("retention lost on disk replay: %+v", e)
+	}
+	if _, e := s2.WrapQueue(b).CreateQueue(context.Background(), q); e == nil {
+		t.Fatal("retained create allowed")
+	}
+	if b.HasQueue(q) {
+		t.Fatal("retained create reached backend")
+	}
+}
+
+func TestReviewerMalformedEndpointLeaksSecrets(t *testing.T) {
+	// Finding 8 regression test: malformed endpoint URLs must never echo credentials
+	// or query tokens in errors from RedactEndpoint, OpenJournal, or ValidateLiveOrigin.
+	badURLs := []string{
+		"https://user:review-password@example.test:bad/path?token=review-token",
+		"https://user:review-password@example.test/%zz?token=review-token",
+		"://user:review-password@example.test?token=review-token",
+		"user:review-password@example.test?token=review-token",
+	}
+	for _, raw := range badURLs {
+		if _, e := RedactEndpoint(raw); e == nil {
+			t.Fatalf("expected RedactEndpoint(%q) to fail", raw)
+		} else if strings.Contains(e.Error(), "review-password") || strings.Contains(e.Error(), "review-token") {
+			t.Fatalf("RedactEndpoint error exposes supplied credentials: %v", e)
+		}
+		if e := ValidateLiveOrigin(raw); e == nil {
+			t.Fatalf("expected ValidateLiveOrigin(%q) to fail", raw)
+		} else if strings.Contains(e.Error(), "review-password") || strings.Contains(e.Error(), "review-token") {
+			t.Fatalf("ValidateLiveOrigin error exposes supplied credentials: %v", e)
+		}
+	}
+}
+
+func TestReviewerUntaggedCollisionRetained(t *testing.T) {
+	pol, run, b := newTestSetup(t)
+	name, _ := FormatLiveResourceName(run, "untagged", 1)
+	b.SeedBucket(name, nil, "254332045686", "arn:aws:iam::254332045686:role/awsspot-admin")
+	s := probeSession(t, pol, run, b, nil)
+	if _, e := s.WrapStore(b).CreateBucket(context.Background(), name); e == nil {
+		t.Fatal("expected collision")
+	}
+	e, ok := s.Journal().Lookup(KindBucket, "", name)
+	if !ok || !e.Retain || e.State != StateRetained {
+		t.Fatalf("untagged collision not retained: %+v", e)
 	}
 }
