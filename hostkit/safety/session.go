@@ -217,6 +217,12 @@ func (s *Session) FinishAndSweep(ctx context.Context) (SweepReport, error) {
 	return rep, closeErr
 }
 
+// RestoreMeterFromState seeds meter with the cumulative ChargedNanoUSD and
+// active/pending reservations replayed from st.
+func RestoreMeterFromState(meter *CostMeter, pt *PriceTable, st LedgerState) {
+	restoreMeterFromState(meter, pt, st)
+}
+
 func restoreMeterFromState(meter *CostMeter, pt *PriceTable, st LedgerState) {
 	if meter == nil || pt == nil {
 		return

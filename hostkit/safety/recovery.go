@@ -78,17 +78,18 @@ type ResourceRef struct {
 
 // RemoteOwnership is the ownership metadata read back from a live cloud resource.
 type RemoteOwnership struct {
-	Exists        bool
-	ProviderID    string
-	Account       string
-	Scope         string
-	Location      string
-	RunID         string
-	OwnerNonce    string
-	CreateToken   string
-	ETag          string
-	Generation    string
-	CreatedAtUnix int64
+	Exists              bool
+	ProviderID          string
+	Account             string
+	Scope               string
+	Location            string
+	RunID               string
+	OwnerNonce          string
+	CreateToken         string
+	ETag                string
+	Generation          string
+	CreatedAtUnix       int64
+	ServerCreatedAtUnix int64
 	// ChildrenVerified must be set to true by ReadOwnership for a KindBucket
 	// after completing a full paginated listing of the bucket's child objects.
 	// If ChildrenVerified is false on an existing bucket, GuardStore.DeleteBucket
@@ -124,8 +125,19 @@ func (ro RemoteOwnership) VerifyMatchesEntry(entry LedgerEntry, meta JournalMeta
 	if ro.OwnerNonce != entry.OwnerNonce {
 		return fmt.Errorf("remote %s %q does not match journal owner_nonce %q", TagKeyOwnerNonce, ro.OwnerNonce, entry.OwnerNonce)
 	}
-	if ro.CreateToken != "" && entry.CreateToken != "" && ro.CreateToken != entry.CreateToken {
+	if entry.CreateToken != "" && ro.CreateToken != "" && ro.CreateToken != entry.CreateToken {
 		return fmt.Errorf("remote %s %q does not match journal create_token %q", TagKeyCreateToken, ro.CreateToken, entry.CreateToken)
+	}
+	if entry.Kind == KindObject && entry.ETag != "" && ro.ETag != "" && ro.ETag != entry.ETag {
+		return fmt.Errorf("remote ETag %q does not match journal ETag %q", ro.ETag, entry.ETag)
+	}
+	if entry.IntentAtUnix > 0 {
+		if ro.CreatedAtUnix > 0 && ro.CreatedAtUnix < entry.IntentAtUnix {
+			return fmt.Errorf("remote %s (%d) precedes journal intent timestamp (%d)", TagKeyCreatedAt, ro.CreatedAtUnix, entry.IntentAtUnix)
+		}
+		if ro.ServerCreatedAtUnix > 0 && ro.ServerCreatedAtUnix < entry.IntentAtUnix {
+			return fmt.Errorf("remote server creation timestamp (%d) precedes journal intent timestamp (%d)", ro.ServerCreatedAtUnix, entry.IntentAtUnix)
+		}
 	}
 	return nil
 }
