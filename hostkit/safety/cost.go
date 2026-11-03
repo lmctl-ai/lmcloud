@@ -289,6 +289,7 @@ func SyntheticSimPriceTable(provider string) *PriceTable {
 			},
 			"item_delete": {
 				RequestNanoUSD: 1250,
+				ChunkBytes:     1024,
 			},
 			"item_update": {
 				RequestNanoUSD: 1250,

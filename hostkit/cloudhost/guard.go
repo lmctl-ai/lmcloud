@@ -164,4 +164,12 @@ func (g guardTables) TableCreateToken(ctx context.Context, table string) (string
 	return "", errNoToken
 }
 
+func (g guardTables) DescribeTable(ctx context.Context, table string) (hostkit.TableInfo, error) {
+	if d, ok := g.t.(hostkit.TableDescriber); ok {
+		v, err := d.DescribeTable(ctx, table)
+		return v, hostkit.NilIfTyped(err)
+	}
+	return hostkit.TableInfo{}, errNoToken
+}
+
 var errNoToken = hostkit.ProviderError(hostkit.Internal, 0, "", "adapter does not store create tokens")

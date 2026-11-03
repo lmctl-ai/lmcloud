@@ -110,7 +110,8 @@
       "chunk_bytes": 4096
     },
     "item_delete": {
-      "request_nano_usd": 1250
+      "request_nano_usd": 1250,
+      "chunk_bytes": 1024
     },
     "item_update": {
       "request_nano_usd": 1250,

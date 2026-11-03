@@ -2169,6 +2169,38 @@ func (o *overlay) tableItem(t, key string) (dryState, hostkit.Item) {
 	return dryUnknown, hostkit.Item{}
 }
 
+func (o *overlay) mergeTableItems(t string, real []hostkit.Item, match func(hostkit.Item) bool) []hostkit.Item {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	byKey := map[string]hostkit.Item{}
+	for _, it := range real {
+		if match == nil || match(it) {
+			byKey[it.PK+"\x00"+it.SK] = it.Clone()
+		}
+	}
+	for k, di := range o.items[t] {
+		if di.item == nil {
+			delete(byKey, k)
+			continue
+		}
+		if match == nil || match(*di.item) {
+			byKey[k] = di.item.Clone()
+		} else {
+			delete(byKey, k)
+		}
+	}
+	keys := make([]string, 0, len(byKey))
+	for k := range byKey {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]hostkit.Item, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, byKey[k])
+	}
+	return out
+}
+
 // errIndex is returned by list accessors for out-of-range indices.
 var errIndex = errors.New("index out of range")
 

@@ -5,6 +5,7 @@ package cloudhost
 import (
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 
@@ -548,7 +549,11 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 		return tableItemVal(ti(s).SetInt(a[0].Str, a[1].Int))
 	})
 	r.pure("TableItem", "set_number", []string{"string", "float"}, "TableItem", func(s any, a []lmcode.Value) (lmcode.Value, error) {
-		return tableItemVal(ti(s).SetNumber(a[0].Str, a[1].Float))
+		v := a[1].Float
+		if math.Abs(v) == math.Pow(10.0, -130.0) {
+			v = math.Copysign(hostkit.MinPortableFloatAbs, v)
+		}
+		return tableItemVal(ti(s).SetNumber(a[0].Str, v))
 	})
 	r.pure("TableItem", "set_bool", []string{"string", "bool"}, "TableItem", func(s any, a []lmcode.Value) (lmcode.Value, error) {
 		return tableItemVal(ti(s).SetBool(a[0].Str, a[1].Bool))

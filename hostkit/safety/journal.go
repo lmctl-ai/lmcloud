@@ -1812,7 +1812,7 @@ func recordOpStat(state *LedgerState, op string, units, bytes, chargedNano int64
 			if bytes > 65536 {
 				units = (bytes + 65535) / 65536
 			}
-		case "item_put", "item_update":
+		case "item_put", "item_update", "item_delete":
 			if bytes > 1024 {
 				units = (bytes + 1023) / 1024
 			}
@@ -1954,6 +1954,15 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		}
 		if rec.ReleaseCleanup && att.Name != "" {
 			delete(state.ActiveCleanup, rKey)
+			if att.Kind == KindTable {
+				itemPrefix := resourceKey(KindTableItem, "", att.Name+"/")
+				parentPrefix := resourceKey(KindTableItem, att.Name, "")
+				for k := range state.ActiveCleanup {
+					if strings.HasPrefix(k, itemPrefix) || strings.HasPrefix(k, parentPrefix) {
+						delete(state.ActiveCleanup, k)
+					}
+				}
+			}
 		}
 		if rec.BillingUnits == 0 && rec.ChargedNanoUSD == 0 && rec.CleanupReserveNanoUSD == 0 && !rec.ReleaseCleanup {
 			if att.Kind == KindQueueMessage && att.Reason == "queue_send" && state.MessagesSent > 0 {

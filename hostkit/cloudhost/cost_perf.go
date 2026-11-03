@@ -256,48 +256,117 @@ type liveGuardProvider interface {
 	LiveGuard() *safety.LiveGuard
 }
 
-func extractLiveGuard(store hostkit.ObjectStore, queue hostkit.Queue, tables hostkit.Tables) *safety.LiveGuard {
+type liveTablesOwnershipProvider interface {
+	LiveTablesGuard() *safety.LiveGuard
+}
+
+func extractStoreLiveGuard(store hostkit.ObjectStore) *safety.LiveGuard {
 	if gs, ok := store.(guardStore); ok {
 		store = gs.s
 	}
 	if lp, ok := store.(liveGuardProvider); ok && lp.LiveGuard() != nil {
 		return lp.LiveGuard()
 	}
+	return nil
+}
+
+func extractQueueLiveGuard(queue hostkit.Queue) *safety.LiveGuard {
 	if gq, ok := queue.(guardQueue); ok {
 		queue = gq.q
 	}
 	if lp, ok := queue.(liveGuardProvider); ok && lp.LiveGuard() != nil {
 		return lp.LiveGuard()
 	}
+	return nil
+}
+
+func extractTablesLiveGuard(tables hostkit.Tables) *safety.LiveGuard {
 	if gt, ok := tables.(guardTables); ok {
 		tables = gt.t
 	}
-	if lp, ok := tables.(liveGuardProvider); ok && lp.LiveGuard() != nil {
-		return lp.LiveGuard()
+	if lp, ok := tables.(liveTablesOwnershipProvider); ok && lp.LiveTablesGuard() != nil {
+		return lp.LiveTablesGuard()
 	}
 	return nil
 }
 
 type costTracker struct {
-	mu                   sync.Mutex
-	provider             string
-	scope                string
-	meter                *safety.CostMeter
-	journal              *safety.Journal
-	liveGuard            *safety.LiveGuard
-	delegatedToLiveGuard bool
-	unconfiguredLive     bool
-	poisoned             *hostkit.CloudError
-	statePath            string
-	onSetWorkCap         func(workCapNanoUSD int64) error
-	capExceededCount     int64
-	ops                  map[string]persistedOpCost
-	activeBuckets        map[string]int64
-	activeObjects        map[string]int64
-	activeQueues         map[string]int64
-	activeTables         map[string]int64
-	activeItems          map[string]int64
-	inFlightAttempts     map[string]bool
+	mu               sync.Mutex
+	provider         string
+	scope            string
+	meter            *safety.CostMeter
+	journal          *safety.Journal
+	liveGuard        *safety.LiveGuard
+	storeDelegated   bool
+	queueDelegated   bool
+	tablesDelegated  bool
+	liveMode         bool
+	unconfiguredLive bool
+	poisoned         *hostkit.CloudError
+	statePath        string
+	onSetWorkCap     func(workCapNanoUSD int64) error
+	capExceededCount int64
+	ops              map[string]persistedOpCost
+	activeBuckets    map[string]int64
+	activeObjects    map[string]int64
+	activeQueues     map[string]int64
+	activeTables     map[string]int64
+	activeItems      map[string]int64
+	inFlightAttempts map[string]bool
+}
+
+func isTablesOp(op, resKind string) bool {
+	if resKind == safety.KindTable || resKind == safety.KindTableItem {
+		return true
+	}
+	return strings.HasPrefix(op, "table_") || strings.HasPrefix(op, "item_")
+}
+
+func hasTableChildItems(activeItems map[string]int64, table string) bool {
+	if table == "" || len(activeItems) == 0 {
+		return false
+	}
+	prefix := table + "/"
+	for k := range activeItems {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasJournalTableChildItems(activeCleanup map[string]int64, table string) bool {
+	if table == "" || len(activeCleanup) == 0 {
+		return false
+	}
+	itemPrefix := safety.KindTableItem + "\x00\x00" + table + "/"
+	parentPrefix := safety.KindTableItem + "\x00" + table + "\x00"
+	for k := range activeCleanup {
+		if strings.HasPrefix(k, itemPrefix) || strings.HasPrefix(k, parentPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (ct *costTracker) isServiceDelegated(op, resKind string) bool {
+	switch resKind {
+	case safety.KindBucket, safety.KindObject:
+		return ct.storeDelegated
+	case safety.KindQueue, safety.KindQueueMessage:
+		return ct.queueDelegated
+	case safety.KindTable, safety.KindTableItem:
+		return ct.tablesDelegated
+	}
+	switch {
+	case strings.HasPrefix(op, "bucket_"), strings.HasPrefix(op, "object_"):
+		return ct.storeDelegated
+	case strings.HasPrefix(op, "queue_"):
+		return ct.queueDelegated
+	case strings.HasPrefix(op, "table_"), strings.HasPrefix(op, "item_"):
+		return ct.tablesDelegated
+	}
+	return false
 }
 
 func resolveCampaignScope() string {
@@ -347,7 +416,21 @@ func newCostTracker(cfg Config) *costTracker {
 		provider = "ref"
 	}
 
-	lg := extractLiveGuard(cfg.Store, cfg.Queue, cfg.Tables)
+	storeGuard := extractStoreLiveGuard(cfg.Store)
+	queueGuard := extractQueueLiveGuard(cfg.Queue)
+	tablesGuard := extractTablesLiveGuard(cfg.Tables)
+	var lg *safety.LiveGuard
+	var guardMismatch bool
+	for _, g := range []*safety.LiveGuard{storeGuard, queueGuard, tablesGuard} {
+		if g == nil {
+			continue
+		}
+		if lg == nil {
+			lg = g
+		} else if lg != g {
+			guardMismatch = true
+		}
+	}
 	liveMode := isLiveModeEnv() || lg != nil
 
 	ct := &costTracker{
@@ -355,6 +438,10 @@ func newCostTracker(cfg Config) *costTracker {
 		scope:            resolveCampaignScope(),
 		journal:          cfg.Journal,
 		liveGuard:        lg,
+		storeDelegated:   storeGuard != nil,
+		queueDelegated:   queueGuard != nil,
+		tablesDelegated:  tablesGuard != nil,
+		liveMode:         liveMode,
 		statePath:        strings.TrimSpace(cfg.CampaignStatePath),
 		onSetWorkCap:     cfg.OnSetWorkCap,
 		ops:              map[string]persistedOpCost{},
@@ -366,8 +453,14 @@ func newCostTracker(cfg Config) *costTracker {
 		inFlightAttempts: map[string]bool{},
 	}
 
+	if guardMismatch {
+		ct.unconfiguredLive = true
+		ct.poisoned = hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveGuardMismatch",
+			"all guarded services on a host must share the same safety.LiveGuard instance")
+		return ct
+	}
+
 	if lg != nil {
-		ct.delegatedToLiveGuard = true
 		ct.meter = lg.Meter()
 		ct.journal = lg.Journal()
 		if ct.meter == nil || ct.journal == nil || ct.meter.Table() == nil || ct.meter.Table().IsSynthetic() {
@@ -758,6 +851,12 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 					delete(st.activeQueues, p.ResKey)
 				case safety.KindTable:
 					delete(st.activeTables, p.ResKey)
+					prefix := p.ResKey + "/"
+					for k := range st.activeItems {
+						if strings.HasPrefix(k, prefix) {
+							delete(st.activeItems, k)
+						}
+					}
 				case safety.KindTableItem:
 					delete(st.activeItems, p.ResKey)
 				}
@@ -1007,7 +1106,7 @@ func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey st
 	if ct.poisoned != nil {
 		return nil, "", ct.poisoned
 	}
-	if ct.delegatedToLiveGuard {
+	if ct.isServiceDelegated(in.Operation, resKind) {
 		return nil, "", nil
 	}
 
@@ -1029,6 +1128,11 @@ func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey st
 			}
 			return nil, "", hostkit.ProviderError(hostkit.Internal, 0, "PricingFailure", err.Error())
 		}
+		if ct.liveGuard != nil || (ct.liveMode && isTablesOp(in.Operation, resKind)) {
+			res.Release()
+			return nil, "", hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveGuardRequired",
+				fmt.Sprintf("live mode refuses unguarded adapter for %s (%s): LiveGuard ownership and recovery enforcement is required", in.Operation, resKind))
+		}
 		reservedBytes := in.PayloadSize
 		if in.Operation == "object_get" {
 			reservedBytes = in.EgressBytes
@@ -1042,6 +1146,11 @@ func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey st
 		}
 		ct.inFlightAttempts[attID] = true
 		return res, attID, nil
+	}
+
+	if ct.liveGuard != nil || (ct.liveMode && isTablesOp(in.Operation, resKind)) {
+		return nil, "", hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveGuardRequired",
+			fmt.Sprintf("live mode refuses unguarded adapter for %s (%s): LiveGuard ownership and recovery enforcement is required", in.Operation, resKind))
 	}
 
 	if ct.statePath != "" {
@@ -1212,8 +1321,12 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 					lockCleanup = true
 					cleanupNano = res.Quote().CleanupReserveNanoUSD
 				}
-			case "bucket_delete", "object_delete", "queue_delete", "table_delete", "item_delete":
+			case "bucket_delete", "object_delete", "queue_delete", "item_delete":
 				if inActiveCleanup {
+					releaseCleanup = true
+				}
+			case "table_delete":
+				if inActiveCleanup || hasJournalTableChildItems(st.ActiveCleanup, resKey) {
 					releaseCleanup = true
 				}
 			}
@@ -1271,7 +1384,7 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 						releaseCleanup = true
 					}
 				case "table_delete":
-					if _, exists := st.activeTables[resKey]; exists {
+					if _, exists := st.activeTables[resKey]; exists || hasTableChildItems(st.activeItems, resKey) {
 						releaseCleanup = true
 					}
 				case "item_delete":
@@ -1338,6 +1451,13 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 					if v, ok := st.activeTables[resKey]; ok {
 						delete(st.activeTables, resKey)
 						st.resourceCleanupNanoUSD -= v
+					}
+					prefix := resKey + "/"
+					for k, v := range st.activeItems {
+						if strings.HasPrefix(k, prefix) {
+							delete(st.activeItems, k)
+							st.resourceCleanupNanoUSD -= v
+						}
 					}
 				case safety.KindTableItem:
 					if v, ok := st.activeItems[resKey]; ok {
@@ -1416,6 +1536,13 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 				delete(ct.activeTables, resKey)
 				ct.meter.ReleaseResourceCleanup(v)
 			}
+			prefix := resKey + "/"
+			for k, v := range ct.activeItems {
+				if strings.HasPrefix(k, prefix) {
+					delete(ct.activeItems, k)
+					ct.meter.ReleaseResourceCleanup(v)
+				}
+			}
 		case "item_delete":
 			if v, exists := ct.activeItems[resKey]; exists {
 				delete(ct.activeItems, resKey)
@@ -1440,7 +1567,7 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 func (ct *costTracker) lockResourceCleanupIfNeeded(op, resKind, resKey string) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	if ct.delegatedToLiveGuard || ct.meter == nil || ct.meter.Table() == nil {
+	if ct.isServiceDelegated(op, resKind) || ct.meter == nil || ct.meter.Table() == nil {
 		return
 	}
 	resNano := ct.meter.Table().Operations[op].CleanupReserveNanoUSD
@@ -1556,7 +1683,7 @@ func (ct *costTracker) setWorkCapUSD(capUSD float64) *hostkit.CloudError {
 	if ct.poisoned != nil {
 		return ct.poisoned
 	}
-	if ct.delegatedToLiveGuard {
+	if ct.liveGuard != nil {
 		return ct.liveGuard.SetWorkCapUSD(capUSD)
 	}
 	if ct.journal != nil {
@@ -1719,19 +1846,21 @@ func (s *attemptScope) settlePreviousAttemptLocked() *hostkit.CloudError {
 	if s.hasLastAttempt && s.lastAttempt.NotSent {
 		return s.ct.release(res, attID)
 	}
-	if s.op == "object_put" || s.op == "queue_send" {
+	switch s.op {
+	case "object_put", "queue_send", "item_put", "item_update", "item_delete":
 		return s.ct.settle(res, attID, s.op, s.in.PayloadSize, s.in.PayloadSize, s.resKind, s.resKey, false, false)
 	}
+	isPayloadRead := s.op == "object_get" || s.op == "queue_receive" || s.op == "item_get" || s.op == "item_query" || s.op == "item_scan" || s.in.PayloadSize > 0 || s.in.EgressBytes > 0
 	headerOnlyNoPayload := s.hasLastAttempt &&
 		s.lastAttempt.Err == nil &&
-		((s.op != "object_get" && s.op != "queue_receive") || s.lastAttempt.Status >= 400)
+		(!isPayloadRead || s.lastAttempt.Status >= 400)
 	if headerOnlyNoPayload {
 		// HTTP status response without payload transfer (e.g. 429/503 status header, or completed non-payload Do).
 		return s.ct.settle(res, attID, s.op, 0, 0, s.resKind, s.resKey, true, false)
 	}
-	// Completed 2xx GET/Receive or mid-stream/ambiguous transport failure: preserve full reserved bound.
+	// Completed 2xx GET/Receive/Query/Scan or mid-stream/ambiguous transport failure: preserve full reserved bound.
 	boundBytes := s.in.PayloadSize
-	if s.op == "object_get" {
+	if s.op == "object_get" || s.in.EgressBytes > boundBytes {
 		boundBytes = s.in.EgressBytes
 	}
 	return s.ct.settle(res, attID, s.op, boundBytes, boundBytes, s.resKind, s.resKey, false, false)

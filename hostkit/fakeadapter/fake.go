@@ -701,6 +701,23 @@ func (f *Fake) TableCreateToken(_ context.Context, name string) (string, error) 
 	return tok, err
 }
 
+// DescribeTable returns the key layout and creation token of an existing table.
+func (f *Fake) DescribeTable(_ context.Context, name string) (hostkit.TableInfo, error) {
+	var info hostkit.TableInfo
+	err := f.do("DescribeTable", func(s *state) error {
+		tbl, ok := s.Tables[name]
+		if !ok {
+			return f.notFound(hostkit.AbsentTable, "ResourceNotFoundException", "table not found")
+		}
+		info = hostkit.TableInfo{
+			Sorted:      tbl.Sorted,
+			CreateToken: s.TableTokens[name],
+		}
+		return nil
+	})
+	return info, err
+}
+
 func (f *Fake) CreateTable(ctx context.Context, name string, sorted bool) (bool, error) {
 	if f.opts.EchoCreateToken {
 		f.mu.Lock()
@@ -765,7 +782,7 @@ func (f *Fake) ListTables(_ context.Context, token string) ([]string, string, er
 	return names, next, err
 }
 
-func (f *Fake) PutItem(_ context.Context, table string, item hostkit.Item, mode hostkit.PutMode, expectVersion string) (hostkit.Item, error) {
+func (f *Fake) PutItem(ctx context.Context, table string, item hostkit.Item, mode hostkit.PutMode, expectVersion string) (hostkit.Item, error) {
 	var out hostkit.Item
 	err := f.do("PutItem", func(s *state) error {
 		tbl, ok := s.Tables[table]
@@ -780,17 +797,38 @@ func (f *Fake) PutItem(_ context.Context, table string, item hostkit.Item, mode 
 		}
 		ik := tableItemKey(item.PK, item.SK)
 		existing, exists := tbl.Items[ik]
+		var priorBytes int64
+		if exists {
+			priorBytes = hostkit.NativeItemBillableBytes(existing.toHostkit())
+		}
 		switch mode {
 		case hostkit.PutUnconditional:
 		case hostkit.PutIfAbsent:
 			if exists {
+				hostkit.ReportTableOpMetrics(ctx, hostkit.TableOpMetrics{
+					PriorExists:   true,
+					PriorBytes:    priorBytes,
+					NewBytes:      hostkit.NativeItemBillableBytes(item),
+					Authoritative: true,
+				})
 				return hostkit.ProviderError(hostkit.Conflict, 409, "ConditionalCheckFailedException", "item already exists")
 			}
 		case hostkit.PutIfVersion:
 			if !exists {
+				hostkit.ReportTableOpMetrics(ctx, hostkit.TableOpMetrics{
+					PriorExists:   false,
+					NewBytes:      hostkit.NativeItemBillableBytes(item),
+					Authoritative: true,
+				})
 				return f.notFound(hostkit.AbsentItem, "ConditionalCheckFailedException", "item not found")
 			}
 			if existing.Version != expectVersion {
+				hostkit.ReportTableOpMetrics(ctx, hostkit.TableOpMetrics{
+					PriorExists:   true,
+					PriorBytes:    priorBytes,
+					NewBytes:      hostkit.NativeItemBillableBytes(item),
+					Authoritative: true,
+				})
 				return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "ConditionalCheckFailedException", "item version mismatch")
 			}
 		default:
@@ -808,6 +846,12 @@ func (f *Fake) PutItem(_ context.Context, table string, item hostkit.Item, mode 
 		}
 		tbl.Items[ik] = stored
 		out = stored.toHostkit()
+		hostkit.ReportTableOpMetrics(ctx, hostkit.TableOpMetrics{
+			PriorExists:   exists,
+			PriorBytes:    priorBytes,
+			NewBytes:      hostkit.NativeItemBillableBytes(out),
+			Authoritative: true,
+		})
 		return nil
 	})
 	return out, err
@@ -833,7 +877,7 @@ func (f *Fake) GetItem(_ context.Context, table, pk, sk string) (hostkit.Item, e
 	return out, err
 }
 
-func (f *Fake) DeleteItem(_ context.Context, table, pk, sk string) error {
+func (f *Fake) DeleteItem(ctx context.Context, table, pk, sk string) error {
 	return f.do("DeleteItem", func(s *state) error {
 		tbl, ok := s.Tables[table]
 		if !ok {
@@ -843,15 +887,26 @@ func (f *Fake) DeleteItem(_ context.Context, table, pk, sk string) error {
 			return e
 		}
 		ik := tableItemKey(pk, sk)
-		if _, ok := tbl.Items[ik]; !ok {
+		existing, ok := tbl.Items[ik]
+		if !ok {
+			hostkit.ReportTableOpMetrics(ctx, hostkit.TableOpMetrics{
+				PriorExists:   false,
+				Authoritative: true,
+			})
 			return f.notFound(hostkit.AbsentItem, "ItemNotFound", "item not found")
 		}
+		priorBytes := hostkit.NativeItemBillableBytes(existing.toHostkit())
 		delete(tbl.Items, ik)
+		hostkit.ReportTableOpMetrics(ctx, hostkit.TableOpMetrics{
+			PriorExists:   true,
+			PriorBytes:    priorBytes,
+			Authoritative: true,
+		})
 		return nil
 	})
 }
 
-func (f *Fake) UpdateItem(_ context.Context, table, pk, sk string, changes hostkit.Item) (hostkit.Item, error) {
+func (f *Fake) UpdateItem(ctx context.Context, table, pk, sk string, changes hostkit.Item) (hostkit.Item, error) {
 	var out hostkit.Item
 	err := f.do("UpdateItem", func(s *state) error {
 		tbl, ok := s.Tables[table]
@@ -864,8 +919,13 @@ func (f *Fake) UpdateItem(_ context.Context, table, pk, sk string, changes hostk
 		ik := tableItemKey(pk, sk)
 		existing, ok := tbl.Items[ik]
 		if !ok {
+			hostkit.ReportTableOpMetrics(ctx, hostkit.TableOpMetrics{
+				PriorExists:   false,
+				Authoritative: true,
+			})
 			return f.notFound(hostkit.AbsentItem, "ResourceNotFoundException", "item not found")
 		}
+		priorBytes := hostkit.NativeItemBillableBytes(existing.toHostkit())
 		merged := make(map[string]hostkit.Attr, len(existing.Attrs)+len(changes.Attrs))
 		for k, v := range existing.Attrs {
 			merged[k] = v.Clone()
@@ -879,6 +939,12 @@ func (f *Fake) UpdateItem(_ context.Context, table, pk, sk string, changes hostk
 		existing.Attrs = merged
 		existing.Version = nextItemVersion(s, table, pk, sk)
 		out = existing.toHostkit()
+		hostkit.ReportTableOpMetrics(ctx, hostkit.TableOpMetrics{
+			PriorExists:   true,
+			PriorBytes:    priorBytes,
+			NewBytes:      hostkit.NativeItemBillableBytes(out),
+			Authoritative: true,
+		})
 		return nil
 	})
 	return out, err

@@ -298,6 +298,17 @@ func (r Router) TableCreateToken(ctx context.Context, table string) (string, err
 	return "", errNoToken
 }
 
+func (r Router) DescribeTable(ctx context.Context, table string) (TableInfo, error) {
+	be, err := r.pick(ctx)
+	if err != nil {
+		return TableInfo{}, err
+	}
+	if d, ok := be.(TableDescriber); ok {
+		return d.DescribeTable(ctx, table)
+	}
+	return TableInfo{}, errNoTables
+}
+
 var errNoTables = ProviderError(Internal, 0, "", "backend does not support tables")
 
 func (r Router) pickTables(ctx context.Context) (Tables, error) {

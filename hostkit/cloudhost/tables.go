@@ -294,13 +294,19 @@ type TablePage struct {
 }
 
 type tableCursorEnvelope struct {
-	EP     string `json:"ep"`
-	Op     string `json:"op"`
-	Table  string `json:"t"`
-	PK     string `json:"pk,omitempty"`
-	SKFrom string `json:"f,omitempty"`
-	SKTo   string `json:"to,omitempty"`
-	Raw    string `json:"r"`
+	Provider   string `json:"prv,omitempty"`
+	Scope      string `json:"scp,omitempty"`
+	EP         string `json:"ep"`
+	Op         string `json:"op"`
+	Table      string `json:"t"`
+	PK         string `json:"pk,omitempty"`
+	SKFrom     string `json:"f,omitempty"`
+	SKTo       string `json:"to,omitempty"`
+	Max        int    `json:"m"`
+	Sorted     bool   `json:"srt,omitempty"`
+	HasLayout  bool   `json:"hl,omitempty"`
+	TableToken string `json:"tt,omitempty"`
+	Raw        string `json:"r"`
 }
 
 func encodeTableCursor(env tableCursorEnvelope) string {
@@ -314,26 +320,28 @@ func encodeTableCursor(env tableCursorEnvelope) string {
 	return "lmc1." + base64.RawURLEncoding.EncodeToString(raw)
 }
 
-func decodeTableCursor(token string, want tableCursorEnvelope) (string, *hostkit.CloudError) {
+func decodeTableCursor(token string, want tableCursorEnvelope) (tableCursorEnvelope, *hostkit.CloudError) {
 	if token == "" {
-		return "", nil
+		return tableCursorEnvelope{}, nil
 	}
 	if !strings.HasPrefix(token, "lmc1.") {
-		return "", hostkit.Preflightf("invalid continuation token")
+		return tableCursorEnvelope{}, hostkit.Preflightf("invalid continuation token")
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(token, "lmc1."))
 	if err != nil {
-		return "", hostkit.Preflightf("invalid continuation token")
+		return tableCursorEnvelope{}, hostkit.Preflightf("invalid continuation token")
 	}
 	var got tableCursorEnvelope
 	if err := json.Unmarshal(raw, &got); err != nil || got.Raw == "" {
-		return "", hostkit.Preflightf("invalid continuation token")
+		return tableCursorEnvelope{}, hostkit.Preflightf("invalid continuation token")
 	}
-	if got.EP != want.EP || got.Op != want.Op || got.Table != want.Table ||
-		got.PK != want.PK || got.SKFrom != want.SKFrom || got.SKTo != want.SKTo {
-		return "", hostkit.Preflightf("continuation token does not match query/scan parameters")
+	if got.Provider != want.Provider || got.Scope != want.Scope ||
+		got.EP != want.EP || got.Op != want.Op || got.Table != want.Table ||
+		got.PK != want.PK || got.SKFrom != want.SKFrom || got.SKTo != want.SKTo ||
+		got.Max != want.Max {
+		return tableCursorEnvelope{}, hostkit.Preflightf("continuation token does not match query/scan parameters")
 	}
-	return got.Raw, nil
+	return got, nil
 }
 
 func (h *Host) validateReturnedItem(it hostkit.Item, requireVersion bool) (hostkit.Item, int64, *hostkit.CloudError) {
@@ -446,11 +454,64 @@ func (h *Host) meteredTableCreateToken(ctx context.Context, name, token string) 
 	return got == token, nil
 }
 
+func (h *Host) describeTableInfo(ctx context.Context, name string) (hostkit.TableInfo, bool, *hostkit.CloudError) {
+	if h.cfg.Tables == nil {
+		return hostkit.TableInfo{}, false, missingTables()
+	}
+	d, ok := h.cfg.Tables.(hostkit.TableDescriber)
+	if !ok {
+		return hostkit.TableInfo{}, false, nil
+	}
+	info, err := d.DescribeTable(ctx, name)
+	ce := hostkit.AsCloudError(err)
+	if ce != nil {
+		if ce == errNoToken {
+			return hostkit.TableInfo{}, false, nil
+		}
+		return hostkit.TableInfo{}, false, ce
+	}
+	return info, true, nil
+}
+
+func (h *Host) dryResolveTable(ctx context.Context, name string) (dryTable, *hostkit.CloudError) {
+	if dt, ok := h.ov(ctx).table(name); ok {
+		if !dt.exists || dt.hasSorted {
+			return dt, nil
+		}
+		if info, hasInfo, cerr := h.describeTableInfo(ctx, name); cerr == nil && hasInfo {
+			dt.sorted = info.Sorted
+			dt.hasSorted = true
+			h.ov(ctx).setTable(name, true, dt.sorted, true, dt.createdNow)
+		}
+		return dt, nil
+	}
+	if h.cfg.Tables == nil {
+		return dryTable{}, missingTables()
+	}
+	if info, hasInfo, cerr := h.describeTableInfo(ctx, name); cerr != nil {
+		if isNotFound(cerr) {
+			return dryTable{exists: false}, nil
+		}
+		return dryTable{}, cerr
+	} else if hasInfo {
+		dt := dryTable{exists: true, sorted: info.Sorted, hasSorted: true, createdNow: false}
+		h.ov(ctx).setTable(name, true, info.Sorted, true, false)
+		return dt, nil
+	}
+	exists, e := h.realTableExists(ctx, name)
+	if e != nil {
+		return dryTable{}, e
+	}
+	return dryTable{exists: exists}, nil
+}
+
 func (h *Host) tableExists(ctx context.Context, dry bool, name string) (bool, *hostkit.CloudError) {
 	if dry {
-		if dt, ok := h.ov(ctx).table(name); ok {
-			return dt.exists, nil
+		dt, e := h.dryResolveTable(ctx, name)
+		if e != nil {
+			return false, e
 		}
+		return dt.exists, nil
 	}
 	return h.realTableExists(ctx, name)
 }
@@ -462,6 +523,19 @@ func (h *Host) requireTable(ctx context.Context, dry bool, name string) *hostkit
 	}
 	if !exists {
 		return notFound(hostkit.AbsentTable, "table does not exist (dry-run preview)")
+	}
+	return nil
+}
+
+func checkDryKeyLayout(dt dryTable, name string, hasSK bool) *hostkit.CloudError {
+	if !dt.hasSorted {
+		return nil
+	}
+	if dt.sorted && !hasSK {
+		return hostkit.Preflightf("table %q has a composite key and requires a sort key (sk)", name)
+	}
+	if !dt.sorted && hasSK {
+		return hostkit.Preflightf("table %q is partition-key-only and does not accept a sort key (sk)", name)
 	}
 	return nil
 }
@@ -488,7 +562,12 @@ func (h *Host) TableCreate(dry bool, name string, sorted bool) (bool, error) {
 	}
 	defer cancel()
 	if dry {
-		if dt, ok := h.ov(ctx).table(name); ok && dt.exists {
+		dt, e := h.dryResolveTable(ctx, name)
+		if e != nil {
+			failed = true
+			return false, h.fail(op, name, e)
+		}
+		if dt.exists {
 			if dt.hasSorted && dt.sorted != sorted {
 				failed = true
 				return false, h.fail(op, name, hostkit.ProviderError(hostkit.Conflict, 409, "ResourceInUseException", "table already exists with a different key layout (dry-run preview)"))
@@ -496,14 +575,9 @@ func (h *Host) TableCreate(dry bool, name string, sorted bool) (bool, error) {
 			h.ok()
 			return false, nil
 		}
-		exists, e := h.tableExists(ctx, true, name)
-		if e != nil {
-			failed = true
-			return false, h.fail(op, name, e)
-		}
-		h.ov(ctx).setTable(name, true, sorted, true, !exists)
+		h.ov(ctx).setTable(name, true, sorted, true, true)
 		h.ok()
-		return !exists, nil
+		return true, nil
 	}
 	if h.cfg.Tables == nil {
 		failed = true
@@ -778,22 +852,43 @@ func (h *Host) ItemPut(dry bool, table string, ti *TableItem, mode hostkit.PutMo
 	}
 	defer cancel()
 	if dry {
-		if e := h.requireTable(ctx, true, table); e != nil {
+		dt, e := h.dryResolveTable(ctx, table)
+		if e != nil {
 			failed = true
 			return none, h.fail(op, tgt, e)
 		}
-		if dt, ok := h.ov(ctx).table(table); ok && dt.hasSorted {
-			if dt.sorted && rawItem.SK == "" {
-				failed = true
-				return none, h.fail(op, tgt, hostkit.Preflightf("table %q has a composite key and requires a sort key (sk)", table))
-			}
-			if !dt.sorted && rawItem.SK != "" {
-				failed = true
-				return none, h.fail(op, tgt, hostkit.Preflightf("table %q is partition-key-only and does not accept a sort key (sk)", table))
-			}
+		if !dt.exists {
+			failed = true
+			return none, h.fail(op, tgt, notFound(hostkit.AbsentTable, "table does not exist (dry-run preview)"))
+		}
+		if e := checkDryKeyLayout(dt, table, rawItem.SK != ""); e != nil {
+			failed = true
+			return none, h.fail(op, tgt, e)
 		}
 		ik := rawItem.PK + "\x00" + rawItem.SK
 		st, cur := h.ov(ctx).tableItem(table, ik)
+		if st == dryUnknown && !dt.createdNow && (mode == hostkit.PutIfAbsent || mode == hostkit.PutIfVersion) {
+			if h.cfg.Tables == nil {
+				failed = true
+				return none, h.fail(op, tgt, missingTables())
+			}
+			got, err := h.cfg.Tables.GetItem(ctx, table, rawItem.PK, rawItem.SK)
+			if err == nil {
+				st = dryPresent
+				cur = got
+			} else {
+				ce := hostkit.AsCloudError(err)
+				if !isNotFound(ce) {
+					failed = true
+					return none, h.fail(op, tgt, ce)
+				}
+				if ce.Absent == hostkit.AbsentTable {
+					failed = true
+					return none, h.fail(op, tgt, ce)
+				}
+				st = dryObjectGone
+			}
+		}
 		switch mode {
 		case hostkit.PutIfAbsent:
 			if st == dryPresent {
@@ -801,11 +896,11 @@ func (h *Host) ItemPut(dry bool, table string, ti *TableItem, mode hostkit.PutMo
 				return none, h.fail(op, tgt, hostkit.ProviderError(hostkit.Conflict, 409, "ConditionalCheckFailedException", "item already exists (dry-run preview)"))
 			}
 		case hostkit.PutIfVersion:
-			if st == dryObjectGone {
+			if st == dryObjectGone || st != dryPresent {
 				failed = true
 				return none, h.fail(op, tgt, notFound(hostkit.AbsentItem, "item does not exist (dry-run preview)"))
 			}
-			if st == dryPresent && cur.Version != expectVersion {
+			if cur.Version != expectVersion {
 				failed = true
 				return none, h.fail(op, tgt, hostkit.ProviderError(hostkit.PreconditionFailed, 412, "ConditionalCheckFailedException", "item version mismatch (dry-run preview)"))
 			}
@@ -822,11 +917,13 @@ func (h *Host) ItemPut(dry bool, table string, ti *TableItem, mode hostkit.PutMo
 		return none, h.fail(op, tgt, missingTables())
 	}
 	sz := int64(canonBytes)
-	mctx, scope, rerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: sz}, safety.KindTableItem, tgt)
+	mctx, scope, rerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: hostkit.MaxNativeItemBillableBytes}, safety.KindTableItem, tgt)
 	if rerr != nil {
 		failed = true
 		return none, h.fail(op, tgt, rerr)
 	}
+	var opMetrics hostkit.TableOpMetrics
+	mctx = hostkit.WithTableOpMetrics(mctx, &opMetrics)
 	stored, err := h.cfg.Tables.PutItem(mctx, table, rawItem, mode, expectVersion)
 	var abortErr *hostkit.CloudError
 	if err != nil {
@@ -836,7 +933,11 @@ func (h *Host) ItemPut(dry bool, table string, ti *TableItem, mode hostkit.PutMo
 				ce = relErr
 			}
 		} else {
-			retries, throttles, abortErr = scope.finish(sz, sz, false, false)
+			failCharge := int64(hostkit.MaxNativeItemBillableBytes)
+			if opMetrics.Authoritative {
+				failCharge = max(opMetrics.PriorBytes, max(opMetrics.NewBytes, hostkit.NativeItemBillableBytes(rawItem)))
+			}
+			retries, throttles, abortErr = scope.finish(failCharge, sz, opMetrics.Authoritative, false)
 			if abortErr != nil {
 				ce = abortErr
 			}
@@ -846,14 +947,18 @@ func (h *Host) ItemPut(dry bool, table string, ti *TableItem, mode hostkit.PutMo
 	}
 	validStored, _, verr := h.validateReturnedItem(stored, true)
 	if verr != nil {
-		retries, throttles, abortErr = scope.finish(sz, sz, true, false)
+		retries, throttles, abortErr = scope.finish(hostkit.MaxNativeItemBillableBytes, sz, true, false)
 		if abortErr != nil {
 			verr = abortErr
 		}
 		failed = true
 		return none, h.fail(op, tgt, verr)
 	}
-	retries, throttles, abortErr = scope.finish(sz, sz, true, true)
+	chargeBytes := int64(hostkit.MaxNativeItemBillableBytes)
+	if opMetrics.Authoritative {
+		chargeBytes = max(opMetrics.PriorBytes, max(opMetrics.NewBytes, hostkit.NativeItemBillableBytes(validStored)))
+	}
+	retries, throttles, abortErr = scope.finish(chargeBytes, sz, true, true)
 	if abortErr != nil {
 		failed = true
 		return none, h.fail(op, tgt, abortErr)
@@ -897,6 +1002,19 @@ func (h *Host) ItemGet(dry bool, table, pk, sk string, hasSK bool) (*TableItem, 
 	}
 	defer cancel()
 	if dry {
+		dt, e := h.dryResolveTable(ctx, table)
+		if e != nil {
+			failed = true
+			return none, h.fail(op, tgt, e)
+		}
+		if !dt.exists {
+			failed = true
+			return none, h.fail(op, tgt, notFound(hostkit.AbsentTable, "table does not exist (dry-run preview)"))
+		}
+		if e := checkDryKeyLayout(dt, table, hasSK); e != nil {
+			failed = true
+			return none, h.fail(op, tgt, e)
+		}
 		ik := pk + "\x00" + sk
 		switch st, cur := h.ov(ctx).tableItem(table, ik); st {
 		case dryBucketGone:
@@ -908,6 +1026,10 @@ func (h *Host) ItemGet(dry bool, table, pk, sk string, hasSK bool) (*TableItem, 
 		case dryPresent:
 			h.ok()
 			return newTableItemFromHostkit(h, cur), nil
+		}
+		if dt.createdNow {
+			h.ok()
+			return none, nil
 		}
 	}
 	if h.cfg.Tables == nil {
@@ -1037,7 +1159,16 @@ func (h *Host) ItemDelete(dry bool, table, pk, sk string, hasSK bool) error {
 	}
 	defer cancel()
 	if dry {
-		if e := h.requireTable(ctx, true, table); e != nil {
+		dt, e := h.dryResolveTable(ctx, table)
+		if e != nil {
+			failed = true
+			return h.fail(op, tgt, e)
+		}
+		if !dt.exists {
+			failed = true
+			return h.fail(op, tgt, notFound(hostkit.AbsentTable, "table does not exist (dry-run preview)"))
+		}
+		if e := checkDryKeyLayout(dt, table, hasSK); e != nil {
 			failed = true
 			return h.fail(op, tgt, e)
 		}
@@ -1049,15 +1180,25 @@ func (h *Host) ItemDelete(dry bool, table, pk, sk string, hasSK bool) error {
 		failed = true
 		return h.fail(op, tgt, missingTables())
 	}
-	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, IsCleanup: true}, safety.KindTableItem, tgt)
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: hostkit.MaxNativeItemBillableBytes, IsCleanup: true}, safety.KindTableItem, tgt)
 	if cerr != nil {
 		failed = true
 		return h.fail(op, tgt, cerr)
 	}
+	var opMetrics hostkit.TableOpMetrics
+	mctx = hostkit.WithTableOpMetrics(mctx, &opMetrics)
 	ce := hostkit.AsCloudError(h.cfg.Tables.DeleteItem(mctx, table, pk, sk))
 	var abortErr *hostkit.CloudError
 	if ce == nil {
-		retries, throttles, abortErr = scope.finish(0, 0, true, true)
+		delBytes := int64(hostkit.MaxNativeItemBillableBytes)
+		if opMetrics.Authoritative {
+			if opMetrics.PriorExists {
+				delBytes = opMetrics.PriorBytes
+			} else {
+				delBytes = 0
+			}
+		}
+		retries, throttles, abortErr = scope.finish(delBytes, delBytes, true, true)
 		if abortErr != nil {
 			failed = true
 			return h.fail(op, tgt, abortErr)
@@ -1073,7 +1214,7 @@ func (h *Host) ItemDelete(dry bool, table, pk, sk string, hasSK bool) error {
 		return h.fail(op, tgt, ce)
 	}
 	if !isNotFound(ce) {
-		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		retries, throttles, abortErr = scope.finish(hostkit.MaxNativeItemBillableBytes, 0, false, false)
 		if abortErr != nil {
 			ce = abortErr
 		}
@@ -1159,7 +1300,16 @@ func (h *Host) ItemUpdate(dry bool, table, pk, sk string, hasSK bool, changes *T
 	}
 	defer cancel()
 	if dry {
-		if e := h.requireTable(ctx, true, table); e != nil {
+		dt, e := h.dryResolveTable(ctx, table)
+		if e != nil {
+			failed = true
+			return none, h.fail(op, tgt, e)
+		}
+		if !dt.exists {
+			failed = true
+			return none, h.fail(op, tgt, notFound(hostkit.AbsentTable, "table does not exist (dry-run preview)"))
+		}
+		if e := checkDryKeyLayout(dt, table, hasSK); e != nil {
 			failed = true
 			return none, h.fail(op, tgt, e)
 		}
@@ -1205,11 +1355,13 @@ func (h *Host) ItemUpdate(dry bool, table, pk, sk string, hasSK bool, changes *T
 	}
 	rawChanges.PK = pk
 	rawChanges.SK = sk
-	mctx, scope, rerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: hostkit.MaxItemCanonicalBytes}, safety.KindTableItem, tgt)
+	mctx, scope, rerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: hostkit.MaxNativeItemBillableBytes}, safety.KindTableItem, tgt)
 	if rerr != nil {
 		failed = true
 		return none, h.fail(op, tgt, rerr)
 	}
+	var opMetrics hostkit.TableOpMetrics
+	mctx = hostkit.WithTableOpMetrics(mctx, &opMetrics)
 	updated, err := h.cfg.Tables.UpdateItem(mctx, table, pk, sk, rawChanges)
 	var abortErr *hostkit.CloudError
 	if err != nil {
@@ -1219,7 +1371,14 @@ func (h *Host) ItemUpdate(dry bool, table, pk, sk string, hasSK bool, changes *T
 				ce = relErr
 			}
 		} else {
-			retries, throttles, abortErr = scope.finish(int64(chgBytes), int64(chgBytes), false, false)
+			failBytes := int64(hostkit.MaxNativeItemBillableBytes)
+			if opMetrics.Authoritative {
+				failBytes = opMetrics.PriorBytes
+				if chgBill := hostkit.NativeItemBillableBytes(rawChanges); chgBill > failBytes {
+					failBytes = chgBill
+				}
+			}
+			retries, throttles, abortErr = scope.finish(failBytes, int64(chgBytes), false, false)
 			if abortErr != nil {
 				ce = abortErr
 			}
@@ -1229,16 +1388,25 @@ func (h *Host) ItemUpdate(dry bool, table, pk, sk string, hasSK bool, changes *T
 	}
 	validUpdated, updBytes, verr := h.validateReturnedItem(updated, true)
 	if verr != nil {
-		retries, throttles, abortErr = scope.finish(updBytes, updBytes, true, false)
+		retries, throttles, abortErr = scope.finish(hostkit.MaxNativeItemBillableBytes, updBytes, true, false)
 		if abortErr != nil {
 			verr = abortErr
 		}
 		failed = true
 		return none, h.fail(op, tgt, verr)
 	}
-	chargeBytes := updBytes
-	if int64(chgBytes) > chargeBytes {
-		chargeBytes = int64(chgBytes)
+	chargeBytes := int64(hostkit.MaxNativeItemBillableBytes)
+	if opMetrics.Authoritative {
+		chargeBytes = hostkit.NativeItemBillableBytes(validUpdated)
+		if opMetrics.NewBytes > chargeBytes {
+			chargeBytes = opMetrics.NewBytes
+		}
+		if opMetrics.PriorBytes > chargeBytes {
+			chargeBytes = opMetrics.PriorBytes
+		}
+		if chgBill := hostkit.NativeItemBillableBytes(rawChanges); chgBill > chargeBytes {
+			chargeBytes = chgBill
+		}
 	}
 	retries, throttles, abortErr = scope.finish(chargeBytes, int64(chgBytes), true, true)
 	if abortErr != nil {
@@ -1286,37 +1454,112 @@ func (h *Host) ItemQuery(dry bool, table, pk, skFrom, skTo string, maxItems int6
 	defer cancel()
 	ep := hostkit.EndpointFrom(ctx)
 	envWant := tableCursorEnvelope{
-		EP:     ep,
-		Op:     op,
-		Table:  table,
-		PK:     pk,
-		SKFrom: skFrom,
-		SKTo:   skTo,
+		Provider: h.cost.provider,
+		Scope:    h.cost.scope,
+		EP:       ep,
+		Op:       op,
+		Table:    table,
+		PK:       pk,
+		SKFrom:   skFrom,
+		SKTo:     skTo,
+		Max:      max,
 	}
-	rawToken, e := decodeTableCursor(token, envWant)
+	gotEnv, e := decodeTableCursor(token, envWant)
 	if e != nil {
 		failed = true
 		return empty, h.fail(op, tgt, e)
 	}
+	rawToken := gotEnv.Raw
 	if dry {
-		if dt, ok := h.ov(ctx).table(table); ok {
-			if !dt.exists {
+		dt, e := h.dryResolveTable(ctx, table)
+		if e != nil {
+			failed = true
+			return empty, h.fail(op, tgt, e)
+		}
+		if !dt.exists {
+			failed = true
+			return empty, h.fail(op, tgt, notFound(hostkit.AbsentTable, "table does not exist (dry-run preview)"))
+		}
+		if dt.hasSorted && !dt.sorted && (skFrom != "" || skTo != "") {
+			failed = true
+			return empty, h.fail(op, tgt, hostkit.Preflightf("sort key range [sk_from, sk_to) is not valid on partition-key-only table %q", table))
+		}
+		if token != "" && gotEnv.HasLayout && dt.hasSorted && gotEnv.Sorted != dt.sorted {
+			failed = true
+			return empty, h.fail(op, tgt, hostkit.Preflightf("continuation token key layout does not match table %q", table))
+		}
+		var backendItems []hostkit.Item
+		if !dt.createdNow {
+			if h.cfg.Tables == nil {
 				failed = true
-				return empty, h.fail(op, tgt, notFound(hostkit.AbsentTable, "table does not exist (dry-run preview)"))
+				return empty, h.fail(op, tgt, missingTables())
 			}
-			if dt.hasSorted && !dt.sorted && (skFrom != "" || skTo != "") {
-				failed = true
-				return empty, h.fail(op, tgt, hostkit.Preflightf("sort key range [sk_from, sk_to) is not valid on partition-key-only table %q", table))
-			}
-			if dt.createdNow {
-				h.ok()
-				return empty, nil
+			var curTok string
+			for pageNum := 0; pageNum < h.cfg.MaxPages; pageNum++ {
+				p, err := h.cfg.Tables.Query(ctx, table, pk, skFrom, skTo, hostkit.MaxTablePageMax, curTok)
+				if err != nil {
+					failed = true
+					return empty, h.fail(op, tgt, hostkit.AsCloudError(err))
+				}
+				backendItems = append(backendItems, p.Items...)
+				if p.NextToken == "" || p.NextToken == curTok {
+					break
+				}
+				curTok = p.NextToken
 			}
 		}
+		merged := h.ov(ctx).mergeTableItems(table, backendItems, func(it hostkit.Item) bool {
+			if it.PK != pk {
+				return false
+			}
+			if skFrom != "" && it.SK < skFrom {
+				return false
+			}
+			if skTo != "" && it.SK >= skTo {
+				return false
+			}
+			return true
+		})
+		outItems := make([]*TableItem, 0, max)
+		var nextRaw string
+		for idx, it := range merged {
+			ik := it.PK + "\x00" + it.SK
+			if rawToken != "" && ik <= rawToken {
+				continue
+			}
+			validIt, _, verr := h.validateReturnedItem(it, true)
+			if verr != nil {
+				failed = true
+				return empty, h.fail(op, tgt, verr)
+			}
+			outItems = append(outItems, newTableItemFromHostkit(h, validIt))
+			if len(outItems) == max {
+				if idx+1 < len(merged) {
+					nextRaw = ik
+				}
+				break
+			}
+		}
+		envWant.Raw = nextRaw
+		envWant.Sorted = dt.sorted
+		envWant.HasLayout = dt.hasSorted
+		h.ok()
+		return &TablePage{Items: outItems, NextToken: encodeTableCursor(envWant)}, nil
 	}
 	if h.cfg.Tables == nil {
 		failed = true
 		return empty, h.fail(op, tgt, missingTables())
+	}
+	info, hasInfo, descErr := h.describeTableInfo(ctx, table)
+	if descErr != nil {
+		failed = true
+		return empty, h.fail(op, tgt, descErr)
+	}
+	if token != "" && hasInfo {
+		if (gotEnv.HasLayout && info.Sorted != gotEnv.Sorted) || (gotEnv.TableToken != "" && info.CreateToken != "" && info.CreateToken != gotEnv.TableToken) {
+			failed = true
+			return empty, h.fail(op, tgt, hostkit.Preflightf("continuation token is not valid for current table %q state", table))
+		}
 	}
 	var scope *attemptScope
 	mctx := ctx
@@ -1389,6 +1632,9 @@ func (h *Host) ItemQuery(dry bool, table, pk, skFrom, skTo string, maxItems int6
 	}
 	bytesIn = pageBytes
 	envWant.Raw = page.NextToken
+	envWant.Sorted = info.Sorted
+	envWant.HasLayout = hasInfo
+	envWant.TableToken = info.CreateToken
 	h.ok()
 	return &TablePage{Items: outItems, NextToken: encodeTableCursor(envWant)}, nil
 }
@@ -1422,30 +1668,94 @@ func (h *Host) ItemScan(dry bool, table string, maxItems int64, token string) (*
 	defer cancel()
 	ep := hostkit.EndpointFrom(ctx)
 	envWant := tableCursorEnvelope{
-		EP:    ep,
-		Op:    op,
-		Table: table,
+		Provider: h.cost.provider,
+		Scope:    h.cost.scope,
+		EP:       ep,
+		Op:       op,
+		Table:    table,
+		Max:      max,
 	}
-	rawToken, e := decodeTableCursor(token, envWant)
+	gotEnv, e := decodeTableCursor(token, envWant)
 	if e != nil {
 		failed = true
 		return empty, h.fail(op, table, e)
 	}
+	rawToken := gotEnv.Raw
 	if dry {
-		if dt, ok := h.ov(ctx).table(table); ok {
-			if !dt.exists {
+		dt, e := h.dryResolveTable(ctx, table)
+		if e != nil {
+			failed = true
+			return empty, h.fail(op, table, e)
+		}
+		if !dt.exists {
+			failed = true
+			return empty, h.fail(op, table, notFound(hostkit.AbsentTable, "table does not exist (dry-run preview)"))
+		}
+		if token != "" && gotEnv.HasLayout && dt.hasSorted && gotEnv.Sorted != dt.sorted {
+			failed = true
+			return empty, h.fail(op, table, hostkit.Preflightf("continuation token key layout does not match table %q", table))
+		}
+		var backendItems []hostkit.Item
+		if !dt.createdNow {
+			if h.cfg.Tables == nil {
 				failed = true
-				return empty, h.fail(op, table, notFound(hostkit.AbsentTable, "table does not exist (dry-run preview)"))
+				return empty, h.fail(op, table, missingTables())
 			}
-			if dt.createdNow {
-				h.ok()
-				return empty, nil
+			var curTok string
+			for pageNum := 0; pageNum < h.cfg.MaxPages; pageNum++ {
+				p, err := h.cfg.Tables.Scan(ctx, table, hostkit.MaxTablePageMax, curTok)
+				if err != nil {
+					failed = true
+					return empty, h.fail(op, table, hostkit.AsCloudError(err))
+				}
+				backendItems = append(backendItems, p.Items...)
+				if p.NextToken == "" || p.NextToken == curTok {
+					break
+				}
+				curTok = p.NextToken
 			}
 		}
+		merged := h.ov(ctx).mergeTableItems(table, backendItems, nil)
+		outItems := make([]*TableItem, 0, max)
+		var nextRaw string
+		for idx, it := range merged {
+			ik := it.PK + "\x00" + it.SK
+			if rawToken != "" && ik <= rawToken {
+				continue
+			}
+			validIt, _, verr := h.validateReturnedItem(it, true)
+			if verr != nil {
+				failed = true
+				return empty, h.fail(op, table, verr)
+			}
+			outItems = append(outItems, newTableItemFromHostkit(h, validIt))
+			if len(outItems) == max {
+				if idx+1 < len(merged) {
+					nextRaw = ik
+				}
+				break
+			}
+		}
+		envWant.Raw = nextRaw
+		envWant.Sorted = dt.sorted
+		envWant.HasLayout = dt.hasSorted
+		h.ok()
+		return &TablePage{Items: outItems, NextToken: encodeTableCursor(envWant)}, nil
 	}
 	if h.cfg.Tables == nil {
 		failed = true
 		return empty, h.fail(op, table, missingTables())
+	}
+	info, hasInfo, descErr := h.describeTableInfo(ctx, table)
+	if descErr != nil {
+		failed = true
+		return empty, h.fail(op, table, descErr)
+	}
+	if token != "" && hasInfo {
+		if (gotEnv.HasLayout && info.Sorted != gotEnv.Sorted) || (gotEnv.TableToken != "" && info.CreateToken != "" && info.CreateToken != gotEnv.TableToken) {
+			failed = true
+			return empty, h.fail(op, table, hostkit.Preflightf("continuation token is not valid for current table %q state", table))
+		}
 	}
 	var scope *attemptScope
 	mctx := ctx
@@ -1517,6 +1827,9 @@ func (h *Host) ItemScan(dry bool, table string, maxItems int64, token string) (*
 	}
 	bytesIn = pageBytes
 	envWant.Raw = page.NextToken
+	envWant.Sorted = info.Sorted
+	envWant.HasLayout = hasInfo
+	envWant.TableToken = info.CreateToken
 	h.ok()
 	return &TablePage{Items: outItems, NextToken: encodeTableCursor(envWant)}, nil
 }

@@ -168,6 +168,53 @@ type TableCreateTokenReader interface {
 	TableCreateToken(ctx context.Context, table string) (string, error)
 }
 
+// TableInfo describes an existing table's authoritative key layout and creation token.
+type TableInfo struct {
+	Sorted      bool
+	CreateToken string
+}
+
+// TableDescriber is optional (and recommended for all Tables adapters): it
+// returns an existing table's key layout (sorted vs key-only) and creation
+// token in a single read-only probe.
+type TableDescriber interface {
+	DescribeTable(ctx context.Context, table string) (TableInfo, error)
+}
+
+// TableOpMetrics carries authoritative prior/deleted item billing telemetry
+// reported by a Tables adapter during PutItem, UpdateItem, or DeleteItem.
+type TableOpMetrics struct {
+	PriorExists   bool
+	PriorBytes    int64
+	NewBytes      int64
+	Authoritative bool
+}
+
+type tableOpMetricsKey struct{}
+
+// WithTableOpMetrics attaches a TableOpMetrics sink to ctx.
+func WithTableOpMetrics(ctx context.Context, sink *TableOpMetrics) context.Context {
+	return context.WithValue(ctx, tableOpMetricsKey{}, sink)
+}
+
+// ReportTableOpMetrics records m into the TableOpMetrics sink attached to ctx, if any.
+func ReportTableOpMetrics(ctx context.Context, m TableOpMetrics) {
+	if sink, ok := ctx.Value(tableOpMetricsKey{}).(*TableOpMetrics); ok && sink != nil {
+		if m.PriorExists {
+			sink.PriorExists = true
+		}
+		if m.PriorBytes > sink.PriorBytes {
+			sink.PriorBytes = m.PriorBytes
+		}
+		if m.NewBytes > sink.NewBytes {
+			sink.NewBytes = m.NewBytes
+		}
+		if m.Authoritative {
+			sink.Authoritative = true
+		}
+	}
+}
+
 // PutMode selects the write precondition for Tables.PutItem.
 type PutMode int
 

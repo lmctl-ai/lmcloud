@@ -35,14 +35,16 @@ const (
 	DefaultReceiveWait           = 0
 	DefaultReceiveVisible        = 30
 
-	MaxTableKeyBytes        = 255
-	MaxAttrStringUTF16Units = 32768
-	MaxItemAttrs            = 240
-	MaxItemCanonicalBytes   = 262144
-	DefaultTablePageMax     = 100
-	MaxTablePageMax         = 500
-	MinPortableFloatAbs     = 1e-130
-	MaxPortableFloatAbs     = 1e126
+	MaxTableKeyBytes           = 255
+	MaxAttrStringUTF16Units    = 32768
+	MaxItemAttrs               = 240
+	MaxItemCanonicalBytes      = 262144
+	MaxNativeItemOverheadBytes = 1024
+	MaxNativeItemBillableBytes = MaxItemCanonicalBytes + MaxNativeItemOverheadBytes
+	DefaultTablePageMax        = 100
+	MaxTablePageMax            = 500
+	MinPortableFloatAbs        = 1e-130
+	MaxPortableFloatAbs        = 1e126
 )
 
 var (
@@ -338,15 +340,13 @@ func AttrStringValue(s string) *CloudError {
 }
 
 // AttrNumberValue validates a float64 attribute value: finite and either 0.0 or 1e-130 <= |x| < 1e126.
-// A 1e-12 relative tolerance around the 1e-130 / 1e126 decimal boundaries absorbs IEEE-754
-// math_pow(10.0, -130.0) / math_pow(10.0, 126.0) ULP rounding across libm implementations.
 func AttrNumberValue(x float64) *CloudError {
 	if math.IsNaN(x) || math.IsInf(x, 0) {
 		return Preflightf("number attribute value must be finite (NaN and Inf are not allowed)")
 	}
 	if x != 0.0 {
 		abs := math.Abs(x)
-		if abs < MinPortableFloatAbs*(1-1e-12) || abs >= MaxPortableFloatAbs*(1-1e-12) {
+		if abs < MinPortableFloatAbs || abs >= MaxPortableFloatAbs {
 			return Preflightf("number attribute value %g is outside portable range [1e-130, 1e126)", x)
 		}
 	}
@@ -386,6 +386,35 @@ func CanonicalItemBytes(attrs map[string]Attr) (int, *CloudError) {
 		return 0, Preflightf("item canonical size is %d bytes; at most %d allowed", total, MaxItemCanonicalBytes)
 	}
 	return total, nil
+}
+
+// NativeItemBillableBytes computes the native provider billable byte size of it,
+// combining its canonical user attribute bytes with provider key (pk, sk),
+// version metadata (__lm_ver), and type-manifest (__lm_types) overhead without
+// reducing the public 262,144-byte canonical user quota.
+func NativeItemBillableBytes(it Item) int64 {
+	userBytes := 8 * len(it.Attrs)
+	for name, a := range it.Attrs {
+		userBytes += len(name) + a.CanonicalValueBytes()
+	}
+	overhead := 100 + len("pk") + len(it.PK)
+	if it.SK != "" {
+		overhead += len("sk") + len(it.SK)
+	}
+	if it.Version != "" {
+		overhead += len("__lm_ver") + len(it.Version)
+	} else {
+		overhead += 40
+	}
+	overhead += 4 * len(it.Attrs)
+	if overhead > MaxNativeItemOverheadBytes {
+		overhead = MaxNativeItemOverheadBytes
+	}
+	total := int64(userBytes + overhead)
+	if total > MaxNativeItemBillableBytes && userBytes <= MaxItemCanonicalBytes {
+		total = MaxNativeItemBillableBytes
+	}
+	return total
 }
 
 // TablePageMax normalizes max_items on item_query / item_scan: 0 -> 100, 1..500 allowed.
