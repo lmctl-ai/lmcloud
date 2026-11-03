@@ -1,7 +1,8 @@
 # Scenario 08: Receiving from an empty existing queue returns len() == 0 with ErrorCode.OK (both 1-arg default and 4-arg with wait_seconds=1, H3).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-qname = "lmcloud-q08-" + run_id + "-empty";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+qname = len(name_prefix) > 0 ? (name_prefix + "q08-empty") : ("lmcloud-q08-" + run_id + "-empty");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

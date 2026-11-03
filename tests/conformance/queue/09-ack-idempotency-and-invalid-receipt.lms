@@ -1,7 +1,8 @@
 # Scenario 09: Duplicate queue_ack idempotency and invalid receipt rejection on queue_nack.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-qname = "lmcloud-q09-" + run_id + "-rcpt";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+qname = len(name_prefix) > 0 ? (name_prefix + "q09-rcpt") : ("lmcloud-q09-" + run_id + "-rcpt");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

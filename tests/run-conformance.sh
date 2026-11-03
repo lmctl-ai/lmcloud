@@ -6,10 +6,39 @@ LMSCRIPT_BIN="${LMSCRIPT_BIN:-/home/ubuntu/lmctl-mono/lmscript/bin/lmscript}"
 CONF_DIR="$ROOT/tests/conformance"
 
 usage() {
-  echo "Usage: $0 <host-binary> [endpoint] [object-storage|queue|all] [run-id]" >&2
-  echo "       $0 --check [object-storage|queue|all]" >&2
+  echo "Usage: $0 [--live] [--name-prefix <prefix>] <host-binary> [endpoint] [object-storage|queue|all] [run-id]" >&2
+  echo "       $0 [--live] --check [object-storage|queue|all]" >&2
   exit 2
 }
+
+LIVE_PROFILE="${LMCLOUD_LIVE_PROFILE:-0}"
+NAME_PREFIX="${LMCLOUD_NAME_PREFIX:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --live)
+      LIVE_PROFILE=1
+      shift
+      ;;
+    --name-prefix)
+      if [[ $# -lt 2 ]]; then
+        usage
+      fi
+      NAME_PREFIX="$2"
+      shift 2
+      ;;
+    --name-prefix=*)
+      NAME_PREFIX="${1#*=}"
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ -n "$NAME_PREFIX" ]]; then
+  export LMCLOUD_NAME_PREFIX="$NAME_PREFIX"
+fi
 
 if [[ $# -lt 1 ]]; then
   usage
@@ -20,21 +49,43 @@ if [[ ! -x "$LMSCRIPT_BIN" ]]; then
   exit 2
 fi
 
+is_live_excluded_scenario() {
+  local base
+  base="$(basename "$1")"
+  case "$base" in
+    12-auth-enforced-denial.lms|13-queue-auth-enforced-denial.lms)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 collect_scenarios() {
   local slice="$1"
+  local raw=()
   case "$slice" in
     object-storage|queue)
-      find "$CONF_DIR/$slice" -maxdepth 1 -name '*.lms' | sort
+      mapfile -t raw < <(find "$CONF_DIR/$slice" -maxdepth 1 -name '*.lms' | sort)
       ;;
     all|"")
-      find "$CONF_DIR/object-storage" -maxdepth 1 -name '*.lms' | sort
-      find "$CONF_DIR/queue" -maxdepth 1 -name '*.lms' | sort
+      mapfile -t raw < <(
+        find "$CONF_DIR/object-storage" -maxdepth 1 -name '*.lms' | sort
+        find "$CONF_DIR/queue" -maxdepth 1 -name '*.lms' | sort
+      )
       ;;
     *)
       echo "error: unknown slice '$slice' (expected: object-storage | queue | all)" >&2
       exit 2
       ;;
   esac
+  for f in "${raw[@]}"; do
+    if [[ "$LIVE_PROFILE" == "1" ]] && is_live_excluded_scenario "$f"; then
+      continue
+    fi
+    printf '%s\n' "$f"
+  done
 }
 
 pass=0
@@ -63,14 +114,29 @@ if [[ "${1:-}" == "--check" ]]; then
 else
   HOST_BIN="$1"
   ARG2="${2:-}"
+  DEFAULT_RUN_ID="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+  if [[ "$LIVE_PROFILE" == "1" ]]; then
+    DEFAULT_RUN_ID="run-$(date -u +%s)-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+  fi
   if [[ "$ARG2" == "object-storage" || "$ARG2" == "queue" || "$ARG2" == "all" ]]; then
     ENDPOINT=""
     SLICE="$ARG2"
-    RUN_ID="${3:-${LMCLOUD_RUN_ID:-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')}}"
+    RUN_ID="${3:-${LMCLOUD_RUN_ID:-${LMAWS_RUN_ID:-$DEFAULT_RUN_ID}}}"
   else
     ENDPOINT="$ARG2"
     SLICE="${3:-all}"
-    RUN_ID="${4:-${LMCLOUD_RUN_ID:-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')}}"
+    RUN_ID="${4:-${LMCLOUD_RUN_ID:-${LMAWS_RUN_ID:-$DEFAULT_RUN_ID}}}"
+  fi
+  if [[ "$LIVE_PROFILE" == "1" ]]; then
+    export LMCLOUD_RUN_ID="$RUN_ID"
+    export LMAWS_RUN_ID="${LMAWS_RUN_ID:-$RUN_ID}"
+    if [[ -z "${LMCLOUD_NAME_PREFIX:-}" ]]; then
+      if [[ "$RUN_ID" =~ ^run-[0-9]{10,}-([0-9a-f]{12})$ ]]; then
+        export LMCLOUD_NAME_PREFIX="lmcloud-conf-${BASH_REMATCH[1]}-"
+      else
+        export LMCLOUD_NAME_PREFIX="lmcloud-conf-${RUN_ID}-"
+      fi
+    fi
   fi
   if [[ -n "$ENDPOINT" ]]; then
     export LMCLOUD_STORAGE_ENDPOINT="$ENDPOINT"

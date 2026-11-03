@@ -3,8 +3,9 @@
 #   - Exact 49,152-byte raw binary payload (\x00\xff\x7f\x80 * 12288) round-trips; 49,153-byte binary fails pre-flight with INVALID_ARGUMENT.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-q_txt = "lmcloud-q12-" + run_id + "-txt";
-q_bin = "lmcloud-q12-" + run_id + "-bin";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+q_txt = len(name_prefix) > 0 ? (name_prefix + "q12-txt") : ("lmcloud-q12-" + run_id + "-txt");
+q_bin = len(name_prefix) > 0 ? (name_prefix + "q12-bin") : ("lmcloud-q12-" + run_id + "-bin");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

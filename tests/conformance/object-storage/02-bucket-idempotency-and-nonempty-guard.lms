@@ -1,7 +1,8 @@
 # Scenario 02: Bucket create idempotency (incl. S3 us-east-1 HEAD-before-PUT), non-empty delete CONFLICT guard, and missing bucket delete idempotency.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-bucket = "lmcloud-c02-" + run_id + "-idem";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+bucket = len(name_prefix) > 0 ? (name_prefix + "c02-idem") : ("lmcloud-c02-" + run_id + "-idem");
 
 setup_and_idem = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

@@ -1,7 +1,8 @@
 # Scenario 11: Pre-flight INVALID_ARGUMENT validation for queue names, receive bounds (max_messages, wait_seconds, visibility_timeout), and empty receipts.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-valid_q = "lmcloud-q11-" + run_id + "-valid";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+valid_q = len(name_prefix) > 0 ? (name_prefix + "q11-valid") : ("lmcloud-q11-" + run_id + "-valid");
 
 # 1. Default abort mode: invalid queue name aborts before network I/O
 abort_invalid = _lmcode_ schema="../../../schema/lmcloud.dsl.json";

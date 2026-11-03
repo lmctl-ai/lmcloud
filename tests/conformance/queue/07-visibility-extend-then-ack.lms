@@ -2,7 +2,8 @@
 # window and verify the message does NOT come back (H1 — proves Azure PopReceipt rotation is honored on subsequent ack).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-qname = "lmcloud-q07-" + run_id + "-extack";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+qname = len(name_prefix) > 0 ? (name_prefix + "q07-extack") : ("lmcloud-q07-" + run_id + "-extack");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};

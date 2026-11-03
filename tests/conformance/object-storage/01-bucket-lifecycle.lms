@@ -1,8 +1,9 @@
 # Scenario 01: Bucket create, exists, list (following all pages, sorted), and delete lifecycle.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-b1 = "lmcloud-c01-" + run_id + "-alpha";
-b2 = "lmcloud-c01-" + run_id + "-beta";
+name_prefix = env("LMCLOUD_NAME_PREFIX", "");
+b1 = len(name_prefix) > 0 ? (name_prefix + "c01-alpha") : ("lmcloud-c01-" + run_id + "-alpha");
+b2 = len(name_prefix) > 0 ? (name_prefix + "c01-beta") : ("lmcloud-c01-" + run_id + "-beta");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
