@@ -2,7 +2,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LMSCRIPT_BIN="${LMSCRIPT_BIN:-/home/ubuntu/lmctl-mono/lmscript/bin/lmscript}"
+if [[ -z "${LMSCRIPT_BIN:-}" ]]; then
+  if [[ -x "/home/ubuntu/lmctl-mono/lmscript/bin/lmscript" ]]; then
+    LMSCRIPT_BIN="/home/ubuntu/lmctl-mono/lmscript/bin/lmscript"
+  elif command -v lmscript >/dev/null 2>&1; then
+    LMSCRIPT_BIN="$(command -v lmscript)"
+  else
+    LMSCRIPT_BIN="/home/ubuntu/lmctl-mono/lmscript/bin/lmscript"
+  fi
+fi
 CONF_DIR="$ROOT/tests/conformance"
 
 usage() {
@@ -62,6 +70,19 @@ is_live_excluded_scenario() {
   esac
 }
 
+validate_slice() {
+  local slice="$1"
+  case "$slice" in
+    object-storage|queue|all|"")
+      return 0
+      ;;
+    *)
+      echo "error: unknown slice '$slice' (expected: object-storage | queue | all)" >&2
+      exit 2
+      ;;
+  esac
+}
+
 collect_scenarios() {
   local slice="$1"
   local raw=()
@@ -95,8 +116,13 @@ idx=0
 
 if [[ "${1:-}" == "--check" ]]; then
   SLICE="${2:-all}"
+  validate_slice "$SLICE"
   mapfile -t SCENARIOS < <(collect_scenarios "$SLICE")
   total="${#SCENARIOS[@]}"
+  if [[ "$total" -eq 0 ]]; then
+    echo "error: no conformance scenarios found for slice '$SLICE'" >&2
+    exit 2
+  fi
   echo "1..$total"
   for f in "${SCENARIOS[@]}"; do
     idx=$((idx + 1))
@@ -131,10 +157,11 @@ else
     export LMCLOUD_RUN_ID="$RUN_ID"
     export LMAWS_RUN_ID="${LMAWS_RUN_ID:-$RUN_ID}"
     if [[ -z "${LMCLOUD_NAME_PREFIX:-}" ]]; then
+      RAND_SUFFIX="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
       if [[ "$RUN_ID" =~ ^run-[0-9]{10,}-([0-9a-f]{12})$ ]]; then
-        export LMCLOUD_NAME_PREFIX="lmcloud-conf-${BASH_REMATCH[1]}-"
+        export LMCLOUD_NAME_PREFIX="lmcloud-conf-${BASH_REMATCH[1]}-${RAND_SUFFIX}-"
       else
-        export LMCLOUD_NAME_PREFIX="lmcloud-conf-${RUN_ID}-"
+        export LMCLOUD_NAME_PREFIX="lmcloud-conf-${RUN_ID}-${RAND_SUFFIX}-"
       fi
     fi
   fi
@@ -143,8 +170,13 @@ else
     export LMCLOUD_QUEUE_ENDPOINT="$ENDPOINT"
     export LMCLOUD_ENDPOINT="$ENDPOINT"
   fi
+  validate_slice "$SLICE"
   mapfile -t SCENARIOS < <(collect_scenarios "$SLICE")
   total="${#SCENARIOS[@]}"
+  if [[ "$total" -eq 0 ]]; then
+    echo "error: no conformance scenarios found for slice '$SLICE'" >&2
+    exit 2
+  fi
   echo "1..$total"
   for f in "${SCENARIOS[@]}"; do
     idx=$((idx + 1))
