@@ -169,11 +169,4 @@ func (g guardTables) DescribeTable(ctx context.Context, table string) (hostkit.T
 	return v, hostkit.NilIfTyped(err)
 }
 
-func (g guardTables) PriorItemBillableBytes(table, pk, sk string) (int64, bool) {
-	if s, ok := g.t.(hostkit.PriorItemSizer); ok {
-		return s.PriorItemBillableBytes(table, pk, sk)
-	}
-	return 0, false
-}
-
 var errNoToken = hostkit.ProviderError(hostkit.Internal, 0, "", "adapter does not store create tokens")

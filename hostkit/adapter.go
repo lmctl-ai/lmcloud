@@ -182,13 +182,6 @@ type TableDescriber interface {
 	DescribeTable(ctx context.Context, table string) (TableInfo, error)
 }
 
-// PriorItemSizer is an optional in-process adapter hook that reports the
-// conservative native billable byte size of the current stored item at
-// (table, pk, sk), or (0, true) when absent, without mutating state.
-type PriorItemSizer interface {
-	PriorItemBillableBytes(table, pk, sk string) (int64, bool)
-}
-
 // TableOpMetrics carries authoritative prior/deleted item billing telemetry
 // reported by a Tables adapter during PutItem, UpdateItem, or DeleteItem.
 type TableOpMetrics struct {

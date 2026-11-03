@@ -718,38 +718,6 @@ func (f *Fake) DescribeTable(_ context.Context, name string) (hostkit.TableInfo,
 	return info, err
 }
 
-// PriorItemBillableBytes returns the conservative native billable byte size of
-// the stored item at (table, pk, sk) without recording a synthetic adapter call.
-func (f *Fake) PriorItemBillableBytes(table, pk, sk string) (int64, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	s := f.mem
-	if f.opts.StatePath != "" {
-		lock, err := lockFile(f.opts.StatePath + ".lock")
-		if err != nil {
-			return 0, false
-		}
-		defer lock.unlock()
-		s = newState()
-		if raw, err := os.ReadFile(f.opts.StatePath); err == nil && len(raw) > 0 {
-			if err := json.Unmarshal(raw, s); err != nil {
-				return 0, false
-			}
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return 0, false
-		}
-	}
-	tbl, ok := s.Tables[table]
-	if !ok || tbl.Items == nil {
-		return 0, true
-	}
-	existing, exists := tbl.Items[tableItemKey(pk, sk)]
-	if !exists {
-		return 0, true
-	}
-	return hostkit.NativeItemBillableBytes(existing.toHostkit()), true
-}
-
 func (f *Fake) CreateTable(ctx context.Context, name string, sorted bool) (bool, error) {
 	if f.opts.EchoCreateToken {
 		f.mu.Lock()

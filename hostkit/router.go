@@ -306,20 +306,6 @@ func (r Router) DescribeTable(ctx context.Context, table string) (TableInfo, err
 	return t.DescribeTable(ctx, table)
 }
 
-func (r Router) PriorItemBillableBytes(table, pk, sk string) (int64, bool) {
-	if r.Pick == nil {
-		return 0, false
-	}
-	be, err := r.Pick(context.Background())
-	if err != nil || be == nil || isNilPointer(be) {
-		return 0, false
-	}
-	if s, ok := be.(PriorItemSizer); ok {
-		return s.PriorItemBillableBytes(table, pk, sk)
-	}
-	return 0, false
-}
-
 var errNoTables = ProviderError(Internal, 0, "", "backend does not support tables")
 
 func (r Router) pickTables(ctx context.Context) (Tables, error) {

@@ -163,9 +163,8 @@ func TestSolTablesPerPhysicalWriteUndercharge(t *testing.T) {
 	a := &solTwoTableWrites{Fake: f}
 	h := solTabHost(a)
 	it := newTableItemFromHostkit(h, hostkit.Item{PK: "pk", Attrs: solFullAttrs()})
-	quote, _ := h.cost.meter.QuoteAttempt(safety.AttemptPricingInput{Operation: "item_put", PayloadSize: 262144})
-	base := h.cost.meter.Table().Operations["item_put"].RequestNanoUSD
-	capNano := quote.AttemptNanoUSD + base
+	quote, _ := h.cost.meter.QuoteAttempt(safety.AttemptPricingInput{Operation: "item_put", PayloadSize: hostkit.MaxNativeItemBillableBytes})
+	capNano := quote.AttemptNanoUSD
 	if e := h.SetCostCapUSD(safety.NanoToUSD(capNano)); e != nil {
 		t.Fatal(e)
 	}
@@ -668,4 +667,186 @@ func TestOwnTablesR2OptionalLayoutStillUnbound(t *testing.T) {
 			h.LastError(), before, f.Calls()["Query"])
 	}
 }
+
+// ---- Sol Round 3 Regression Probes ----
+
+func r3BigNativeItem() hostkit.Item {
+	attrs := map[string]hostkit.Attr{}
+	for i := 0; i < 232; i++ {
+		attrs[fmt.Sprintf("f%03d", i)+strings.Repeat("x", 59)] = hostkit.NumberAttr(5)
+	}
+	left := 262144 - 232*79 - 80
+	for i := 0; i < 8; i++ {
+		n := left
+		if n > 32768 {
+			n = 32768
+		}
+		attrs[fmt.Sprintf("a%d", i)] = hostkit.StringAttr(strings.Repeat("x", n))
+		left -= n
+	}
+	return hostkit.Item{PK: "pk", Attrs: attrs}
+}
+
+type r3StaleSizer struct {
+	*fakeadapter.Fake
+}
+
+func (a *r3StaleSizer) PriorItemBillableBytes(_, _, _ string) (int64, bool) {
+	// Simulates a non-atomic snapshot that observed the item absent before a
+	// concurrent writer installed r3BigNativeItem().
+	return 0, true
+}
+
+func r3AssertRefusedBeforeOverwrite(t *testing.T, h *Host, f *fakeadapter.Fake) {
+	t.Helper()
+	h.SetAbortOnError(false)
+	oldBound, _ := h.cost.meter.QuoteAttempt(safety.AttemptPricingInput{
+		Operation:   "item_put",
+		PayloadSize: hostkit.MaxItemCanonicalBytes + 1024,
+	})
+	if e := h.SetCostCapUSD(safety.NanoToUSD(oldBound.AttemptNanoUSD)); e != nil {
+		t.Fatal(e)
+	}
+	putsBefore := f.Calls()["PutItem"]
+	tiny, _ := h.ItemNew("pk", "", false)
+	_, _ = tiny.SetBool("small", true)
+	_, _ = h.ItemPut(false, "tab", tiny, hostkit.PutUnconditional, "")
+	last := h.LastError()
+	report := h.CostReport().Item("item_put")
+	if last.Code != hostkit.CostCapExceeded || f.Calls()["PutItem"] != putsBefore || report.Requests != 0 || report.EstimatedUSD != 0 {
+		t.Fatalf("expected under-funded overwrite to be refused before dispatch with COST_CAP_EXCEEDED; last=%+v report=%+v puts=%d->%d",
+			last, report, putsBefore, f.Calls()["PutItem"])
+	}
+	got, e := f.GetItem(context.Background(), "tab", "pk", "")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, ok := got.Attrs["small"]; ok {
+		t.Fatal("overwrite must not mutate stored item when conservative reservation exceeds cap")
+	}
+}
+
+func TestOwnTablesR3PriorSizerRaceUnderAdmits(t *testing.T) {
+	f := fakeadapter.New(fakeadapter.Options{})
+	_, _ = f.CreateTable(context.Background(), "tab", false)
+	if _, e := f.PutItem(context.Background(), "tab", r3BigNativeItem(), hostkit.PutUnconditional, ""); e != nil {
+		t.Fatal(e)
+	}
+	h := solTabHost(&r3StaleSizer{Fake: f})
+	r3AssertRefusedBeforeOverwrite(t, h, f)
+}
+
+func TestOwnTablesR3PriorSizerWrongRoute(t *testing.T) {
+	offline := fakeadapter.New(fakeadapter.Options{})
+	online := fakeadapter.New(fakeadapter.Options{})
+	_, _ = offline.CreateTable(context.Background(), "tab", false)
+	_, _ = online.CreateTable(context.Background(), "tab", false)
+	if _, e := online.PutItem(context.Background(), "tab", r3BigNativeItem(), hostkit.PutUnconditional, ""); e != nil {
+		t.Fatal(e)
+	}
+	var defaultPicks, overridePicks int
+	router := hostkit.Router{
+		Pick: func(ctx context.Context) (hostkit.Backend, error) {
+			if hostkit.EndpointFrom(ctx) != "" {
+				overridePicks++
+				return online, nil
+			}
+			defaultPicks++
+			return offline, nil
+		},
+	}
+	h := solTabHost(router)
+	if e := h.SetEndpoint("tables", "http://127.0.0.1:12345"); e != nil {
+		t.Fatal(e)
+	}
+	r3AssertRefusedBeforeOverwrite(t, h, online)
+	if defaultPicks != 0 || overridePicks != 0 {
+		t.Fatalf("expected 0 router picks when admission fails before dispatch; default=%d override=%d", defaultPicks, overridePicks)
+	}
+
+	// When funded for MaxNativeItemBillableBytes on a fresh host, only the context-routed backend is picked.
+	h2 := solTabHost(router)
+	if e := h2.SetEndpoint("tables", "http://127.0.0.1:12345"); e != nil {
+		t.Fatal(e)
+	}
+	fullBound, _ := h2.cost.meter.QuoteAttempt(safety.AttemptPricingInput{
+		Operation:   "item_put",
+		PayloadSize: hostkit.MaxNativeItemBillableBytes,
+	})
+	if e := h2.SetCostCapUSD(safety.NanoToUSD(fullBound.AttemptNanoUSD)); e != nil {
+		t.Fatal(e)
+	}
+	tiny, _ := h2.ItemNew("pk", "", false)
+	_, _ = tiny.SetBool("small", true)
+	_, _ = h2.ItemPut(false, "tab", tiny, hostkit.PutUnconditional, "")
+	if h2.LastError().Code != hostkit.OK || defaultPicks != 0 || overridePicks != 1 {
+		t.Fatalf("expected funded overwrite to succeed with 0 default picks and 1 override pick; last=%+v default=%d override=%d",
+			h2.LastError(), defaultPicks, overridePicks)
+	}
+}
+
+type r3AuditedDescribe struct {
+	*fakeadapter.Fake
+	j       *safety.Journal
+	calls   int
+	durable bool
+}
+
+func (a *r3AuditedDescribe) DescribeTable(ctx context.Context, name string) (hostkit.TableInfo, error) {
+	var info hostkit.TableInfo
+	for i := 0; i < 2; i++ {
+		last, _ := hostkit.DefaultRetryPolicy().Do(ctx, true, func(c context.Context, _ int) hostkit.Attempt {
+			a.calls++
+			if len(a.j.State().PendingAttempts) > 0 {
+				a.durable = true
+			}
+			var e error
+			info, e = a.Fake.DescribeTable(c, name)
+			return hostkit.Attempt{Status: 200, Err: e}
+		})
+		if last.Err != nil {
+			return info, last.Err
+		}
+	}
+	return info, nil
+}
+
+func TestOwnTablesR3DescribeDurableAdmission(t *testing.T) {
+	m, j, _ := solJournal(t)
+	f := fakeadapter.New(fakeadapter.Options{})
+	_, _ = f.CreateTable(context.Background(), "tab", false)
+	a := &r3AuditedDescribe{Fake: f, j: j}
+	h := New(Config{Provider: "aws", Tables: a, Meter: m, Journal: j})
+	h.SetAbortOnError(false)
+	if e := h.SetCostCapUSD(0.0000004); e != nil {
+		t.Fatal(e)
+	}
+	_, _ = h.ItemScan(false, "tab", 1, "")
+	r := h.CostReport().Item("table_exists")
+	if a.calls != 1 || !a.durable || r.Requests != 1 || r.EstimatedUSD != 0.0000004 || h.LastError().Code != hostkit.CostCapExceeded || len(j.State().PendingAttempts) != 0 || f.Calls()["Scan"] != 0 {
+		t.Fatalf("calls=%d durable=%v report=%+v last=%+v state=%+v", a.calls, a.durable, r, h.LastError(), j.State())
+	}
+}
+
+func TestOwnTablesR3PriorSizerRaceHardCeiling(t *testing.T) {
+	f := fakeadapter.New(fakeadapter.Options{})
+	_, _ = f.CreateTable(context.Background(), "tab", false)
+	if _, e := f.PutItem(context.Background(), "tab", r3BigNativeItem(), hostkit.PutUnconditional, ""); e != nil {
+		t.Fatal(e)
+	}
+	pt := safety.SyntheticSimPriceTable("ref")
+	fee := pt.Operations["item_put"]
+	fee.RequestNanoUSD = 930000
+	pt.Operations["item_put"] = fee
+	meter, e := safety.NewCostMeter(safety.CostPolicy{CapUSD: 0.25, CeilingUSD: 0.25, CleanupReserveUSD: 0.01}, pt, nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	h := New(Config{Provider: "ref", Tables: &r3StaleSizer{Fake: f}, Meter: meter})
+	r3AssertRefusedBeforeOverwrite(t, h, f)
+	if h.CostReport().EstimatedUSD != 0 {
+		t.Fatalf("expected 0 spend when conservative reservation exceeds ceiling/cap, got %+v", h.CostReport())
+	}
+}
+
 

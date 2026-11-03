@@ -945,18 +945,7 @@ func (h *Host) ItemPut(dry bool, table string, ti *TableItem, mode hostkit.PutMo
 	}
 	sz := int64(canonBytes)
 	newBill := hostkit.NativeItemBillableBytes(rawItem)
-	reserveBytes := max(newBill, int64(hostkit.MaxItemCanonicalBytes+1024))
-	if sizer, ok := h.cfg.Tables.(hostkit.PriorItemSizer); ok {
-		if priorBytes, pok := sizer.PriorItemBillableBytes(table, rawItem.PK, rawItem.SK); pok {
-			if priorBytes > reserveBytes {
-				reserveBytes = priorBytes
-			}
-		} else if hostkit.MaxNativeItemBillableBytes > reserveBytes {
-			reserveBytes = hostkit.MaxNativeItemBillableBytes
-		}
-	} else if hostkit.MaxNativeItemBillableBytes > reserveBytes {
-		reserveBytes = hostkit.MaxNativeItemBillableBytes
-	}
+	reserveBytes := max(newBill, int64(hostkit.MaxNativeItemBillableBytes))
 	mctx, scope, rerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, PayloadSize: reserveBytes}, safety.KindTableItem, tgt)
 	if rerr != nil {
 		failed = true
