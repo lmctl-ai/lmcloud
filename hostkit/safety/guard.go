@@ -1385,13 +1385,18 @@ func (q *GuardQueue) Send(ctx context.Context, queue, wire string) (string, erro
 		return "", cerr
 	}
 
+	// The guard sees the wire form. A logical payload of MaxMessageBytes may
+	// travel base64-encoded behind Base64Prefix, so bound the wire size by the
+	// worst-case encoding of a maximal logical payload (the logical limit
+	// itself is enforced before the adapter is reached).
 	sz := int64(len(wire))
-	if sz > g.pol.Limits.MaxMessageBytes {
+	wireLimit := (g.pol.Limits.MaxMessageBytes+2)/3*4 + int64(len(hostkit.Base64Prefix))
+	if sz > wireLimit {
 		return "", hostkit.ProviderError(
 			hostkit.PermissionDenied,
 			0,
 			"LiveLimitExceeded",
-			fmt.Sprintf("message size %d exceeds max_message_bytes (%d)", sz, g.pol.Limits.MaxMessageBytes),
+			fmt.Sprintf("message wire size %d exceeds the encoded form of max_message_bytes (%d > %d)", sz, sz, wireLimit),
 		)
 	}
 
