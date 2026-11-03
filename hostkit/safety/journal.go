@@ -193,16 +193,19 @@ type JournalRecord struct {
 	ConfirmedAtUnix     int64  `json:"confirmed_at_unix,omitempty"`
 	ServerCreatedAtUnix int64  `json:"server_created_at_unix,omitempty"`
 	AttemptID           string `json:"attempt_id,omitempty"`
-	ReservedNanoUSD     int64  `json:"reserved_nano_usd,omitempty"`
-	ChargedNanoUSD      int64  `json:"charged_nano_usd,omitempty"`
-	WorkCapNanoUSD      int64                   `json:"work_cap_nano_usd,omitempty"`
-	PayloadBytes        int64                   `json:"payload_bytes,omitempty"`
-	Operation           string                  `json:"operation,omitempty"`
-	BillingUnits        int64                   `json:"billing_units,omitempty"`
-	SettledBytes        int64                   `json:"settled_bytes,omitempty"`
-	CapExceededCount    int64                   `json:"cap_exceeded_count,omitempty"`
-	OpStats             map[string]OpLedgerStat `json:"op_stats,omitempty"`
-	BucketsCreated      int                     `json:"buckets_created,omitempty"`
+	ReservedNanoUSD       int64                   `json:"reserved_nano_usd,omitempty"`
+	ChargedNanoUSD        int64                   `json:"charged_nano_usd,omitempty"`
+	CleanupReserveNanoUSD int64                   `json:"cleanup_reserve_nano_usd,omitempty"`
+	ReleaseCleanup        bool                    `json:"release_cleanup,omitempty"`
+	ActiveCleanup         map[string]int64        `json:"active_cleanup,omitempty"`
+	WorkCapNanoUSD        int64                   `json:"work_cap_nano_usd,omitempty"`
+	PayloadBytes          int64                   `json:"payload_bytes,omitempty"`
+	Operation             string                  `json:"operation,omitempty"`
+	BillingUnits          int64                   `json:"billing_units,omitempty"`
+	SettledBytes          int64                   `json:"settled_bytes,omitempty"`
+	CapExceededCount      int64                   `json:"cap_exceeded_count,omitempty"`
+	OpStats               map[string]OpLedgerStat `json:"op_stats,omitempty"`
+	BucketsCreated        int                     `json:"buckets_created,omitempty"`
 	QueuesCreated       int    `json:"queues_created,omitempty"`
 	ObjectsCreated      int    `json:"objects_created,omitempty"`
 	MessagesSent        int    `json:"messages_sent,omitempty"`
@@ -284,6 +287,7 @@ type LedgerState struct {
 	WorkCapNanoUSD    int64
 	CapExceededCount  int64
 	OpStats           map[string]OpLedgerStat
+	ActiveCleanup     map[string]int64
 	BucketsCreated    int
 	QueuesCreated     int
 	ObjectsCreated    int
@@ -521,6 +525,7 @@ func OpenJournal(dir string, meta JournalMeta) (*Journal, error) {
 			Meta:          j.meta,
 			StartedAtUnix: startedUnix,
 			OpStats:       make(map[string]OpLedgerStat),
+			ActiveCleanup: make(map[string]int64),
 			byKey:         make(map[string]int),
 			byAttemptID:   make(map[string]int),
 		}
@@ -623,6 +628,10 @@ func (j *Journal) State() LedgerState {
 	for k, v := range j.state.OpStats {
 		cp.OpStats[k] = v
 	}
+	cp.ActiveCleanup = make(map[string]int64, len(j.state.ActiveCleanup))
+	for k, v := range j.state.ActiveCleanup {
+		cp.ActiveCleanup[k] = v
+	}
 	cp.byKey = make(map[string]int, len(j.state.byKey))
 	for k, v := range j.state.byKey {
 		cp.byKey[k] = v
@@ -680,12 +689,23 @@ func (j *Journal) BeginAttempt(kind, parent, name, reason string, reservedNanoUS
 // TotalPayloadBytes. Settling an already-settled or unknown attemptID is an
 // idempotent no-op.
 func (j *Journal) SettleAttempt(attemptID string, chargedNanoUSD int64, refundBytes bool) error {
-	return j.SettleAttemptWithDetails(attemptID, chargedNanoUSD, 0, 0, refundBytes)
+	units := int64(0)
+	if chargedNanoUSD > 0 {
+		units = 1
+	}
+	return j.SettleAttemptWithDetails(attemptID, chargedNanoUSD, 0, units, refundBytes)
 }
 
 // SettleAttemptWithDetails durably settles an unresolved attempt by attemptID,
 // recording actual chargedNanoUSD, settledBytes, and billingUnits.
 func (j *Journal) SettleAttemptWithDetails(attemptID string, chargedNanoUSD, settledBytes, billingUnits int64, refundBytes bool) error {
+	return j.SettleAttemptWithCleanup(attemptID, chargedNanoUSD, settledBytes, billingUnits, 0, false, refundBytes)
+}
+
+// SettleAttemptWithCleanup durably settles an unresolved attempt by attemptID,
+// recording actual chargedNanoUSD, settledBytes, billingUnits, and any
+// resource-level cleanup reserve lock or release.
+func (j *Journal) SettleAttemptWithCleanup(attemptID string, chargedNanoUSD, settledBytes, billingUnits, cleanupReserveNanoUSD int64, releaseCleanup, refundBytes bool) error {
 	if strings.TrimSpace(attemptID) == "" {
 		return nil
 	}
@@ -703,17 +723,19 @@ func (j *Journal) SettleAttemptWithDetails(attemptID string, chargedNanoUSD, set
 		refund = att.PayloadBytes
 	}
 	return j.appendLocked(JournalRecord{
-		Event:          EventSettle,
-		Operation:      att.Operation,
-		Kind:           att.Kind,
-		Parent:         att.Parent,
-		Name:           att.Name,
-		AttemptID:      attemptID,
-		ChargedNanoUSD: chargedNanoUSD,
-		PayloadBytes:   refund,
-		SettledBytes:   settledBytes,
-		BillingUnits:   billingUnits,
-		Reason:         att.Reason,
+		Event:                 EventSettle,
+		Operation:             att.Operation,
+		Kind:                  att.Kind,
+		Parent:                att.Parent,
+		Name:                  att.Name,
+		AttemptID:             attemptID,
+		ChargedNanoUSD:        chargedNanoUSD,
+		CleanupReserveNanoUSD: cleanupReserveNanoUSD,
+		ReleaseCleanup:        releaseCleanup,
+		PayloadBytes:          refund,
+		SettledBytes:          settledBytes,
+		BillingUnits:          billingUnits,
+		Reason:                att.Reason,
 	})
 }
 
@@ -1188,6 +1210,12 @@ func (j *Journal) Compact() error {
 	for k, v := range j.state.OpStats {
 		baseOpStats[k] = v
 	}
+	baseActiveCleanup := make(map[string]int64, len(j.state.ActiveCleanup))
+	for k, v := range j.state.ActiveCleanup {
+		if v > 0 {
+			baseActiveCleanup[k] = v
+		}
+	}
 
 	compacted = append(compacted, JournalRecord{
 		Version:          JournalVersion,
@@ -1208,6 +1236,7 @@ func (j *Journal) Compact() error {
 		WorkCapNanoUSD:   j.state.WorkCapNanoUSD,
 		CapExceededCount: j.state.CapExceededCount,
 		OpStats:          baseOpStats,
+		ActiveCleanup:    baseActiveCleanup,
 		PayloadBytes:     BasePayloadBytes,
 		BucketsCreated:   baseBuckets,
 		QueuesCreated:    baseQueues,
@@ -1472,6 +1501,7 @@ func ReplayJournal(records []JournalRecord) (*LedgerState, error) {
 		Meta:          meta,
 		StartedAtUnix: meta.StartedAtUnix,
 		OpStats:       make(map[string]OpLedgerStat),
+		ActiveCleanup: make(map[string]int64),
 		byKey:         make(map[string]int),
 		byAttemptID:   make(map[string]int),
 	}
@@ -1507,7 +1537,7 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 			return errors.New("record endpoint contains unredacted userinfo, query, or fragment")
 		}
 	}
-	if rec.ReservedNanoUSD < 0 || rec.ChargedNanoUSD < 0 || rec.WorkCapNanoUSD < 0 || rec.PayloadBytes < 0 ||
+	if rec.ReservedNanoUSD < 0 || rec.ChargedNanoUSD < 0 || rec.CleanupReserveNanoUSD < 0 || rec.WorkCapNanoUSD < 0 || rec.PayloadBytes < 0 ||
 		rec.BillingUnits < 0 || rec.SettledBytes < 0 || rec.CapExceededCount < 0 ||
 		rec.BucketsCreated < 0 || rec.QueuesCreated < 0 || rec.ObjectsCreated < 0 || rec.MessagesSent < 0 {
 		return errors.New("negative cost or counter amount in journal record")
@@ -1766,6 +1796,9 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 	if state.OpStats == nil {
 		state.OpStats = make(map[string]OpLedgerStat)
 	}
+	if state.ActiveCleanup == nil {
+		state.ActiveCleanup = make(map[string]int64)
+	}
 	state.LastSeq = rec.Seq
 	if rec.Event != EventSettle {
 		state.ChargedNanoUSD += rec.ChargedNanoUSD
@@ -1792,6 +1825,11 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			cur.Bytes += v.Bytes
 			cur.ChargedNanoUSD += v.ChargedNanoUSD
 			state.OpStats[k] = cur
+		}
+		for k, v := range rec.ActiveCleanup {
+			if v > 0 {
+				state.ActiveCleanup[k] = v
+			}
 		}
 		if rec.WorkCapNanoUSD > 0 && (state.WorkCapNanoUSD == 0 || rec.WorkCapNanoUSD < state.WorkCapNanoUSD) {
 			state.WorkCapNanoUSD = rec.WorkCapNanoUSD
@@ -1866,6 +1904,22 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 				state.TotalPayloadBytes = 0
 			}
 		}
+		rKey := resourceKey(att.Kind, att.Parent, att.Name)
+		if rec.CleanupReserveNanoUSD > 0 && att.Name != "" {
+			if _, inEntries := state.byKey[rKey]; !inEntries {
+				state.ActiveCleanup[rKey] = rec.CleanupReserveNanoUSD
+			}
+		}
+		if rec.ReleaseCleanup && att.Name != "" {
+			delete(state.ActiveCleanup, rKey)
+		}
+		if rec.BillingUnits == 0 && rec.ChargedNanoUSD == 0 && rec.CleanupReserveNanoUSD == 0 && !rec.ReleaseCleanup {
+			if att.Kind == KindQueueMessage && att.Reason == "queue_send" && state.MessagesSent > 0 {
+				state.MessagesSent--
+			}
+			removeAttemptAt(state, aIdx)
+			return nil
+		}
 		settledBytes := rec.SettledBytes
 		if settledBytes == 0 && att.PayloadBytes > 0 && rec.PayloadBytes < att.PayloadBytes {
 			settledBytes = att.PayloadBytes - rec.PayloadBytes
@@ -1876,6 +1930,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 	}
 
 	key := resourceKey(rec.Kind, rec.Parent, rec.Name)
+	delete(state.ActiveCleanup, key)
 	idx, exists := state.byKey[key]
 
 	switch rec.Event {

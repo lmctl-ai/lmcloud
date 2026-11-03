@@ -1631,6 +1631,10 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 	}
 	caps := hostkit.CapsFor(ctx, h.cfg.Queue, q)
 	maxWire := maxQueueReceiveWireBytes(int(max), caps.TextOnlyWire)
+	perMsgWireLimit := int64(65_536)
+	if caps.TextOnlyWire {
+		perMsgWireLimit = 2 * 65_536
+	}
 	pricingIn := safety.AttemptPricingInput{Operation: op, PayloadSize: maxWire}
 
 	parseRawMessages := func(raw []hostkit.RawMessage) ([]Message, int64, int64, *hostkit.CloudError) {
@@ -1643,17 +1647,26 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 			if m.ID == "" || m.Receipt == "" {
 				return nil, maxWire, maxWire, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned a message without id or receipt")
 			}
+			wireSz := int64(len(m.Wire))
+			if wireSz > perMsgWireLimit {
+				return nil, maxWire, maxWire, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a message exceeding the per-message wire bound")
+			}
 			body, e := hostkit.DecodeQueueBody(m.Wire)
 			if e != nil {
 				return nil, maxWire, maxWire, e
 			}
 			decSz := int64(len(body))
-			wireSz := int64(len(m.Wire))
+			if decSz > hostkit.MaxQueueBodyBytes {
+				return nil, maxWire, maxWire, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a message body exceeding the 48 KiB limit")
+			}
 			if decSz > wireSz {
 				wireSz = decSz
 			}
 			totalDecoded += decSz
 			totalCharge += wireSz
+			if totalCharge > maxWire {
+				return nil, maxWire, maxWire, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a batch exceeding the quoted wire bound")
+			}
 			out = append(out, Message{ID: m.ID, Body: body, Receipt: m.Receipt})
 		}
 		return out, totalCharge, totalDecoded, nil

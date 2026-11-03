@@ -4,6 +4,7 @@ package cloudhost
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -789,4 +790,362 @@ func TestSolFailedSetterPersistence(t *testing.T) {
 		t.Fatalf("expected subsequent operation to fail closed after persistence failure, got last=%+v", h2.LastError())
 	}
 }
+
+// ---- SolReviewer Round 2 Regression Suite (TestOwnR2*) ----
+
+type ownUnusedRecovery struct {
+	safety.RecoveryAdapter
+}
+
+func ownRegionalJournal(t *testing.T) (*safety.PriceTable, *safety.CostMeter, *safety.Journal, safety.Policy) {
+	t.Helper()
+	dir, err := safety.EnsureStateDir(filepath.Join(t.TempDir(), "journals"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := safety.DefaultAWSLivePolicy(dir, true)
+	pt, err := safety.LoadEmbeddedPriceTable("aws", "us-east-1", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	meter, err := safety.NewCostMeter(pol.Cost, pt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := safety.OpenJournal(dir, safety.JournalMeta{
+		RunID:      "run-1700000000-abcdef012345",
+		PolicyHash: pol.Hash(),
+		Provider:   "aws",
+		Account:    "254332045686",
+		Scope:      "scope",
+		Region:     "us-east-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = j.Close() })
+	return pt, meter, j, pol
+}
+
+type ownMultiStore struct {
+	*fakeadapter.Fake
+	calls int
+}
+
+func (a *ownMultiStore) HeadBucket(ctx context.Context, _ string) error {
+	for i := 0; i < 2; i++ {
+		p := hostkit.DefaultRetryPolicy()
+		_, _ = p.Do(ctx, true, func(context.Context, int) hostkit.Attempt {
+			a.calls++
+			return hostkit.Attempt{Status: 200}
+		})
+	}
+	return nil
+}
+
+type ownCountStore struct {
+	*fakeadapter.Fake
+	calls int
+}
+
+func (a *ownCountStore) HeadBucket(context.Context, string) error {
+	a.calls++
+	return nil
+}
+
+type ownNotSentStore struct {
+	*fakeadapter.Fake
+}
+
+func (a *ownNotSentStore) HeadBucket(ctx context.Context, _ string) error {
+	p := hostkit.DefaultRetryPolicy()
+	last, _ := p.Do(ctx, false, func(context.Context, int) hostkit.Attempt {
+		return hostkit.Attempt{Err: fmt.Errorf("request build failed before dispatch"), NotSent: true}
+	})
+	return last.Err
+}
+
+func TestOwnR2PhysicalAdmission(t *testing.T) {
+	a := &ownMultiStore{Fake: fakeadapter.New(fakeadapter.Options{})}
+	h := New(Config{Store: a})
+	h.SetAbortOnError(false)
+	if err := h.SetCostCapUSD(0.0000004); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = h.BucketExists(false, "probe-bucket")
+	r := h.CostReport().Item("bucket_exists")
+	if a.calls != 1 || r.Requests != 1 || h.LastError().Code != hostkit.CostCapExceeded {
+		t.Fatalf("calls=%d report=%+v last=%+v", a.calls, r, h.LastError())
+	}
+}
+
+type ownMultiRecovery struct {
+	safety.RecoveryAdapter
+	calls int
+}
+
+func (r *ownMultiRecovery) ReadOwnership(ctx context.Context, _ safety.ResourceRef) (safety.RemoteOwnership, error) {
+	for i := 0; i < 2; i++ {
+		p := hostkit.DefaultRetryPolicy()
+		_, _ = p.Do(ctx, true, func(context.Context, int) hostkit.Attempt {
+			r.calls++
+			return hostkit.Attempt{Status: 200}
+		})
+	}
+	return safety.RemoteOwnership{Exists: false}, nil
+}
+
+func TestOwnR2DelegatedPhysicalAdmissionStillBroken(t *testing.T) {
+	_, m, j, pol := ownRegionalJournal(t)
+	g, err := safety.NewLiveGuard(safety.GuardConfig{Policy: pol, Meter: m, Journal: j, Recovery: &ownUnusedRecovery{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &ownMultiStore{Fake: fakeadapter.New(fakeadapter.Options{})}
+	h := New(Config{Provider: "aws", Store: g.WrapStore(a)})
+	h.SetAbortOnError(false)
+	if err := h.SetCostCapUSD(0.0000004); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = h.BucketExists(false, "probe-bucket")
+	report := h.CostReport().Item("bucket_exists")
+	if a.calls != 1 || report.Requests != 1 || h.LastError().Code != hostkit.CostCapExceeded {
+		t.Fatalf("expected 1 physical call and CostCapExceeded, got calls=%d item=%+v last=%+v", a.calls, report, h.LastError())
+	}
+
+	// Also verify ReadOwnership probe physical admission under LiveGuard.
+	_, m2, j2, pol2 := ownRegionalJournal(t)
+	rec := &ownMultiRecovery{}
+	g2, err := safety.NewLiveGuard(safety.GuardConfig{Policy: pol2, Meter: m2, Journal: j2, Recovery: rec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2 := fakeadapter.New(fakeadapter.Options{})
+	h2 := New(Config{Provider: "aws", Store: g2.WrapStore(f2)})
+	h2.SetAbortOnError(false)
+	// bucket_create (5000ns) + 1 bucket_read_ownership probe (400ns) = 5400ns ($0.0000054); 2nd probe Do must be refused.
+	if err := h2.SetCostCapUSD(0.0000054); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = h2.BucketCreate(false, "lmcloud-conf-abcdef012345-probe")
+	if rec.calls != 1 || h2.LastError().Code != hostkit.CostCapExceeded {
+		t.Fatalf("expected 1 physical ReadOwnership call and CostCapExceeded, got calls=%d last=%+v", rec.calls, h2.LastError())
+	}
+}
+
+func TestOwnR2SafetyJournalDropsResourceCleanup(t *testing.T) {
+	pt, m, j, pol := ownRegionalJournal(t)
+	f := fakeadapter.New(fakeadapter.Options{})
+	h := New(Config{Provider: "aws", Store: f, Meter: m, Journal: j})
+	h.SetAbortOnError(false)
+	made, _ := h.BucketCreate(false, "probe-bucket")
+	if !made || h.LastError().Code != hostkit.OK {
+		t.Fatalf("create failed %+v", h.LastError())
+	}
+	got := m.Snapshot().ResourceCleanupNanoUSD
+	if got != 10_000 {
+		t.Fatalf("ResourceCleanupNanoUSD = %d, want 10000", got)
+	}
+
+	// Child meter synced from the same journal must also restore the 10000ns cleanup reserve.
+	mChild, err := safety.NewCostMeter(pol.Cost, pt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hChild := New(Config{Provider: "aws", Store: f, Meter: mChild, Journal: j})
+	hChild.SetAbortOnError(false)
+	if gotChild := mChild.Snapshot().ResourceCleanupNanoUSD; gotChild != 10_000 {
+		t.Fatalf("child ResourceCleanupNanoUSD = %d, want 10000", gotChild)
+	}
+
+	// Verify deletion releases the cleanup lock in the journal and meter.
+	deleted, _ := h.BucketDelete(false, "probe-bucket")
+	if !deleted || h.LastError().Code != hostkit.OK {
+		t.Fatalf("delete failed %+v", h.LastError())
+	}
+	if gotAfter := m.Snapshot().ResourceCleanupNanoUSD; gotAfter != 0 {
+		t.Fatalf("ResourceCleanupNanoUSD after delete = %d, want 0", gotAfter)
+	}
+}
+
+func TestOwnR2PendingSettleDoubleCount(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "campaign.jsonl")
+	h := New(Config{Provider: "ref", Store: fakeadapter.New(fakeadapter.Options{}), CampaignStatePath: p})
+	h.SetAbortOnError(false)
+	res, id, e := h.cost.reserve(safety.AttemptPricingInput{Operation: "bucket_exists"}, safety.KindBucket, "probe-bucket")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e := h.cost.settle(res, id, "bucket_exists", 0, 0, safety.KindBucket, "probe-bucket", true, true); e != nil {
+		t.Fatal(e)
+	}
+	s := h.cost.meter.Snapshot()
+	if s.ChargedNanoUSD != 400 {
+		t.Fatalf("ChargedNanoUSD immediately after settle = %d, want 400 (snapshot %+v)", s.ChargedNanoUSD, s)
+	}
+	if actual := h.EstimatedCost(); actual != 0.0000004 {
+		t.Fatalf("EstimatedCost = %g, want 0.0000004", actual)
+	}
+
+	// Also verify two overlapping in-flight attempts without an intervening getter.
+	res1, id1, e := h.cost.reserve(safety.AttemptPricingInput{Operation: "bucket_exists"}, safety.KindBucket, "b1")
+	if e != nil {
+		t.Fatal(e)
+	}
+	res2, id2, e := h.cost.reserve(safety.AttemptPricingInput{Operation: "bucket_exists"}, safety.KindBucket, "b2")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e := h.cost.settle(res1, id1, "bucket_exists", 0, 0, safety.KindBucket, "b1", true, true); e != nil {
+		t.Fatal(e)
+	}
+	sMid := h.cost.meter.Snapshot()
+	if sMid.ChargedNanoUSD != 800 || sMid.InFlightNanoUSD != 400 {
+		t.Fatalf("mid-settle snapshot = %+v, want Charged=800 InFlight=400", sMid)
+	}
+	if e := h.cost.settle(res2, id2, "bucket_exists", 0, 0, safety.KindBucket, "b2", true, true); e != nil {
+		t.Fatal(e)
+	}
+	sEnd := h.cost.meter.Snapshot()
+	if sEnd.ChargedNanoUSD != 1200 || sEnd.InFlightNanoUSD != 0 {
+		t.Fatalf("end snapshot = %+v, want Charged=1200 InFlight=0", sEnd)
+	}
+}
+
+func TestOwnR2CampaignProviderMismatchAccepted(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "campaign.jsonl")
+	f := fakeadapter.New(fakeadapter.Options{})
+	a := New(Config{Provider: "aws", Store: f, CampaignStatePath: p})
+	a.SetAbortOnError(false)
+	_, _ = a.BucketExists(false, "probe-bucket")
+
+	z := New(Config{Provider: "azure", Store: f, CampaignStatePath: p})
+	z.SetAbortOnError(false)
+	_, _ = z.BucketExists(false, "probe-bucket")
+	if z.LastError().Code != hostkit.Internal {
+		t.Fatalf("expected provider mismatch to fail closed with INTERNAL, got %+v", z.LastError())
+	}
+	if z.CostReport().TotalRequests != 0 {
+		t.Fatalf("expected mismatched tracker to have 0 requests, got %d", z.CostReport().TotalRequests)
+	}
+}
+
+func TestOwnR2UnboundedQueueWireClamped(t *testing.T) {
+	// 1. Oversized raw message (400,000 bytes).
+	f := fakeadapter.New(fakeadapter.Options{LongPoll: true})
+	_, _ = f.CreateQueue(context.Background(), "probe-queue")
+	_, _ = f.Send(context.Background(), "probe-queue", strings.Repeat("x", 400000))
+	h := New(Config{Queue: f})
+	h.SetAbortOnError(false)
+	msgs, _ := h.QueueReceive(false, "probe-queue", 1, 0, 30)
+	if len(msgs) != 0 {
+		t.Fatalf("expected oversized wire message to be rejected, got %d messages", len(msgs))
+	}
+	if h.LastError().Code != hostkit.Internal {
+		t.Fatalf("expected INTERNAL error on oversized queue message, got %+v", h.LastError())
+	}
+	r := h.CostReport().Item("queue_receive")
+	if r.BillingUnits != 2 || math.Abs(float64(r.BillingUnits)*r.UnitPriceUSD-r.EstimatedUSD) > 1e-12 {
+		t.Fatalf("expected settled billing units to match quoted bound (units=%d unitPrice=%g est=%g)", r.BillingUnits, r.UnitPriceUSD, r.EstimatedUSD)
+	}
+
+	// 2. Base64-encoded envelope whose wire size fits in 2*65536 (80,012 bytes) but decoded body is 60,000 > 49,152.
+	f2 := fakeadapter.New(fakeadapter.Options{LongPoll: true})
+	_, _ = f2.CreateQueue(context.Background(), "probe-queue-b64")
+	_, _ = f2.Send(context.Background(), "probe-queue-b64", hostkit.EncodeQueueBody(strings.Repeat("\xff", 60000), true))
+	h2 := New(Config{Queue: f2})
+	h2.SetAbortOnError(false)
+	msgs2, _ := h2.QueueReceive(false, "probe-queue-b64", 1, 0, 30)
+	if len(msgs2) != 0 || h2.LastError().Code != hostkit.Internal {
+		t.Fatalf("expected oversized decoded b64 message to be rejected with INTERNAL, got len=%d last=%+v", len(msgs2), h2.LastError())
+	}
+}
+
+func TestOwnR2DelegatedCapErrorMapping(t *testing.T) {
+	_, m, j, pol := ownRegionalJournal(t)
+	g, err := safety.NewLiveGuard(safety.GuardConfig{Policy: pol, Meter: m, Journal: j, Recovery: &ownUnusedRecovery{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &ownCountStore{Fake: fakeadapter.New(fakeadapter.Options{})}
+	h := New(Config{Provider: "aws", Store: g.WrapStore(a)})
+	h.SetAbortOnError(false)
+	if err := h.SetCostCapUSD(0.0000004); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = h.BucketExists(false, "probe-bucket")
+	_, _ = h.BucketExists(false, "probe-bucket")
+	e := h.LastError()
+	if e.Code != hostkit.CostCapExceeded || e.ProviderCode != "CostCapExceeded" {
+		t.Fatalf("expected COST_CAP_EXCEEDED/CostCapExceeded, got %+v", e)
+	}
+}
+
+func TestOwnR2BuildFailureIsBilled(t *testing.T) {
+	// 1. Direct path.
+	a := &ownNotSentStore{Fake: fakeadapter.New(fakeadapter.Options{})}
+	h := New(Config{Store: a})
+	h.SetAbortOnError(false)
+	_, _ = h.BucketExists(false, "probe-bucket")
+	r := h.CostReport().Item("bucket_exists")
+	if r.Requests != 0 || r.EstimatedUSD != 0 {
+		t.Fatalf("expected NotSent build failure to bill 0 requests and $0, got %+v", r)
+	}
+	m := h.Metrics().Op("bucket_exists")
+	if m.Calls != 1 || m.Errors != 1 || m.Retries != 0 {
+		t.Fatalf("expected metrics to record 1 logical call/error and 0 retries, got %+v", m)
+	}
+
+	// 2. Delegated LiveGuard path.
+	_, gm, gj, pol := ownRegionalJournal(t)
+	g, err := safety.NewLiveGuard(safety.GuardConfig{Policy: pol, Meter: gm, Journal: gj, Recovery: &ownUnusedRecovery{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hLive := New(Config{Provider: "aws", Store: g.WrapStore(a)})
+	hLive.SetAbortOnError(false)
+	_, _ = hLive.BucketExists(false, "probe-bucket")
+	rLive := hLive.CostReport().Item("bucket_exists")
+	if rLive.Requests != 0 || rLive.EstimatedUSD != 0 {
+		t.Fatalf("expected delegated NotSent build failure to bill 0 requests and $0, got %+v", rLive)
+	}
+}
+
+func TestOwnR2InsecureCampaignParentDirRejected(t *testing.T) {
+	for _, perm := range []os.FileMode{0o777, 0o775, 0o755} {
+		parent := filepath.Join(t.TempDir(), fmt.Sprintf("dir-%04o", perm))
+		if err := os.Mkdir(parent, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(parent, perm); err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(parent, "campaign.jsonl")
+		c := &ownCountStore{Fake: fakeadapter.New(fakeadapter.Options{})}
+		h := New(Config{Store: c, CampaignStatePath: p})
+		h.SetAbortOnError(false)
+		_, _ = h.BucketExists(false, "probe-bucket")
+		if c.calls != 0 || h.LastError().Code != hostkit.Internal {
+			t.Fatalf("perm %04o: expected campaign parent dir to be rejected before dispatch, got calls=%d last=%+v", perm, c.calls, h.LastError())
+		}
+	}
+
+	// Symlinked parent directory must also be rejected.
+	realDir := filepath.Join(t.TempDir(), "real")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	symDir := filepath.Join(t.TempDir(), "sym")
+	if err := os.Symlink(realDir, symDir); err != nil {
+		t.Fatal(err)
+	}
+	c := &ownCountStore{Fake: fakeadapter.New(fakeadapter.Options{})}
+	h := New(Config{Store: c, CampaignStatePath: filepath.Join(symDir, "campaign.jsonl")})
+	h.SetAbortOnError(false)
+	_, _ = h.BucketExists(false, "probe-bucket")
+	if c.calls != 0 || h.LastError().Code != hostkit.Internal {
+		t.Fatalf("symlink parent: expected campaign parent dir to be rejected before dispatch, got calls=%d last=%+v", c.calls, h.LastError())
+	}
+}
+
 

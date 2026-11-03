@@ -142,10 +142,20 @@ func (g *LiveGuard) withReceiveTimeout(ctx context.Context, waitSeconds int) (co
 }
 
 type durableAttempt struct {
-	guard     *LiveGuard
-	res       *AttemptReservation
-	attemptID string
-	settled   bool
+	guard           *LiveGuard
+	in              AttemptPricingInput
+	kind            string
+	parent          string
+	name            string
+	reason          string
+	payloadBytes    int64
+	res             *AttemptReservation
+	attemptID       string
+	initialConsumed bool
+	lastAttempt     hostkit.Attempt
+	hasLastAttempt  bool
+	abortErr        *hostkit.CloudError
+	settled         bool
 }
 
 func (g *LiveGuard) beginDurableAttempt(in AttemptPricingInput, kind, parent, name, reason string, payloadBytes int64) (*durableAttempt, *hostkit.CloudError) {
@@ -156,28 +166,168 @@ func (g *LiveGuard) beginDurableAttempt(in AttemptPricingInput, kind, parent, na
 	reservedNano := res.Quote().AttemptNanoUSD + res.Quote().CleanupReserveNanoUSD
 	attemptID, err := g.journal.BeginAttempt(kind, parent, name, reason, reservedNano, payloadBytes)
 	if err != nil {
-		res.Commit(0, false)
+		res.Release()
 		return nil, journalWriteErr(err)
 	}
 	return &durableAttempt{
-		guard:     g,
-		res:       res,
-		attemptID: attemptID,
+		guard:        g,
+		in:           in,
+		kind:         kind,
+		parent:       parent,
+		name:         name,
+		reason:       reason,
+		payloadBytes: payloadBytes,
+		res:          res,
+		attemptID:    attemptID,
 	}, nil
 }
 
+func (da *durableAttempt) settlePreviousAttempt() *hostkit.CloudError {
+	if da == nil || da.res == nil {
+		return nil
+	}
+	res := da.res
+	attID := da.attemptID
+	da.res = nil
+	da.attemptID = ""
+
+	if da.hasLastAttempt && da.lastAttempt.NotSent {
+		res.Release()
+		if attID != "" {
+			if err := da.guard.journal.SettleAttemptWithDetails(attID, 0, 0, 0, true); err != nil {
+				return journalWriteErr(err)
+			}
+		}
+		return nil
+	}
+
+	actualNano := int64(-1)
+	settledBytes := da.in.PayloadSize
+	if da.in.Operation == "object_get" {
+		settledBytes = da.in.EgressBytes
+	}
+	var units int64 = 1
+	if pt := da.guard.meter.Table(); pt != nil {
+		if t, ok := pt.Operations[da.in.Operation]; ok && t.ChunkBytes > 0 && settledBytes > t.ChunkBytes {
+			units = (settledBytes + t.ChunkBytes - 1) / t.ChunkBytes
+		}
+	}
+	if da.in.Operation != "object_put" && da.in.Operation != "queue_send" && da.hasLastAttempt && da.lastAttempt.Err == nil {
+		settledBytes = 0
+		units = 1
+		if q, err := da.guard.meter.QuoteAttempt(AttemptPricingInput{
+			Operation: da.in.Operation,
+			IsCleanup: da.in.IsCleanup,
+		}); err == nil {
+			actualNano = q.AttemptNanoUSD
+		}
+	}
+	charged := res.Commit(actualNano, false)
+	if attID != "" {
+		if err := da.guard.journal.SettleAttemptWithDetails(attID, charged, settledBytes, units, false); err != nil {
+			return journalWriteErr(err)
+		}
+	}
+	return nil
+}
+
+func (da *durableAttempt) withRetryHooks(ctx context.Context) context.Context {
+	if da == nil {
+		return ctx
+	}
+	outer := hostkit.RetryHooksFrom(ctx)
+	return hostkit.WithRetryHooks(ctx, hostkit.RetryHooks{
+		BeforeAttempt: func(callCtx context.Context, attempt int) error {
+			if da.abortErr != nil {
+				return da.abortErr
+			}
+			if !da.initialConsumed {
+				da.initialConsumed = true
+			} else {
+				if scerr := da.settlePreviousAttempt(); scerr != nil {
+					da.abortErr = scerr
+					return scerr
+				}
+				nextDA, cerr := da.guard.beginDurableAttempt(da.in, da.kind, da.parent, da.name, da.reason, da.payloadBytes)
+				if cerr != nil {
+					da.abortErr = cerr
+					return cerr
+				}
+				da.res = nextDA.res
+				da.attemptID = nextDA.attemptID
+				da.hasLastAttempt = false
+			}
+			if outer.BeforeAttempt != nil {
+				if err := outer.BeforeAttempt(callCtx, attempt); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		AfterAttempt: func(callCtx context.Context, attempt int, a hostkit.Attempt) {
+			da.lastAttempt = a
+			da.hasLastAttempt = true
+			if a.NotSent && da.res != nil {
+				if scerr := da.settlePreviousAttempt(); scerr != nil && da.abortErr == nil {
+					da.abortErr = scerr
+				}
+			}
+			if outer.AfterAttempt != nil {
+				outer.AfterAttempt(callCtx, attempt, a)
+			}
+		},
+	})
+}
+
+func (da *durableAttempt) commitCreate(lockCleanupReserve bool) int64 {
+	if da == nil || da.res == nil {
+		return 0
+	}
+	if da.hasLastAttempt && da.lastAttempt.NotSent {
+		da.res.Release()
+		da.res = nil
+		return 0
+	}
+	c := da.res.Commit(-1, lockCleanupReserve)
+	da.res = nil
+	return c
+}
+
 func (da *durableAttempt) settle(actualAttemptNanoUSD int64, lockCleanupReserve, refundBytes bool) (int64, *hostkit.CloudError) {
-	return da.settleWithDetails(actualAttemptNanoUSD, 0, 0, lockCleanupReserve, refundBytes)
+	return da.settleWithDetails(actualAttemptNanoUSD, 0, 1, lockCleanupReserve, refundBytes)
 }
 
 func (da *durableAttempt) settleWithDetails(actualAttemptNanoUSD, settledBytes, billingUnits int64, lockCleanupReserve, refundBytes bool) (int64, *hostkit.CloudError) {
 	if da == nil || da.settled {
+		if da != nil && da.abortErr != nil {
+			return 0, da.abortErr
+		}
 		return 0, nil
 	}
 	da.settled = true
+	if da.res == nil {
+		return 0, da.abortErr
+	}
+	if da.hasLastAttempt && da.lastAttempt.NotSent {
+		da.res.Release()
+		da.res = nil
+		if da.attemptID != "" {
+			if err := da.guard.journal.SettleAttemptWithDetails(da.attemptID, 0, 0, 0, true); err != nil {
+				return 0, journalWriteErr(err)
+			}
+		}
+		return 0, da.abortErr
+	}
+	if billingUnits <= 0 {
+		billingUnits = 1
+	}
 	charged := da.res.Commit(actualAttemptNanoUSD, lockCleanupReserve)
+	da.res = nil
 	if err := da.guard.journal.SettleAttemptWithDetails(da.attemptID, charged, settledBytes, billingUnits, refundBytes); err != nil {
 		return charged, journalWriteErr(err)
+	}
+	if da.abortErr != nil {
+		return charged, da.abortErr
 	}
 	return charged, nil
 }
@@ -202,7 +352,7 @@ func (g *LiveGuard) readOwnershipMetered(ctx context.Context, ref ResourceRef, i
 		return RemoteOwnership{}, nil, cerr
 	}
 	reqCtx, cancel := g.withRequestTimeout(ctx)
-	ro, err := g.recovery.ReadOwnership(reqCtx, ref)
+	ro, err := g.recovery.ReadOwnership(da.withRetryHooks(reqCtx), ref)
 	cancel()
 	if _, scerr := da.settle(-1, false, false); scerr != nil {
 		return RemoteOwnership{}, nil, scerr
@@ -553,10 +703,23 @@ func (s *GuardStore) CreateBucket(ctx context.Context, bucket string) (bool, err
 		CreateToken:   intent.CreateToken,
 		CreatedAtUnix: intent.IntentAtUnix,
 	})
+	createDA := &durableAttempt{
+		guard:     g,
+		in:        AttemptPricingInput{Operation: "bucket_create"},
+		kind:      KindBucket,
+		name:      bucket,
+		reason:    "bucket_create",
+		res:       res,
+		attemptID: intent.AttemptID,
+	}
 	reqCtx, cancel := g.withRequestTimeout(ctxWithTags)
-	created, callErr := s.store.CreateBucket(reqCtx, bucket)
+	created, callErr := s.store.CreateBucket(createDA.withRetryHooks(reqCtx), bucket)
 	cancel()
 	callErr = hostkit.NilIfTyped(callErr)
+	if createDA.abortErr != nil {
+		callErr = createDA.abortErr
+	}
+	intent.AttemptID = createDA.attemptID
 
 	// Always read back remote ownership to verify whether the bucket now exists
 	// and carries our RunID + OwnerNonce.
@@ -566,7 +729,7 @@ func (s *GuardStore) CreateBucket(ctx context.Context, bucket string) (bool, err
 		Name:     bucket,
 	}, false, "post_create_bucket_check")
 	if rcerr != nil {
-		res.Commit(-1, true)
+		createDA.commitCreate(true)
 		return false, rcerr
 	}
 
@@ -576,14 +739,14 @@ func (s *GuardStore) CreateBucket(ctx context.Context, bucket string) (bool, err
 			// Record as Retain (not Failed) so repeat creates in this run never
 			// adopt or overwrite its tags and so any untagged bucket created before
 			// a tagging failure remains visible in the journal and sweep report.
-			charged := res.Commit(-1, false)
+			charged := createDA.commitCreate(false)
 			if jerr := journalWriteErr(g.journal.RetainWithCost(KindBucket, "", bucket, "foreign or untagged collision: "+verr.Error(), charged)); jerr != nil {
 				return false, jerr
 			}
 			return false, hostkit.ProviderError(hostkit.Conflict, 409, "ForeignResourceCollision", verr.Error())
 		}
 		if callErr == nil {
-			charged := res.Commit(-1, true)
+			charged := createDA.commitCreate(true)
 			if err := g.journal.Confirm(KindBucket, "", bucket, ConfirmDetails{
 				ProviderID:          ro.ProviderID,
 				Location:            ro.Location,
@@ -610,13 +773,13 @@ func (s *GuardStore) CreateBucket(ctx context.Context, bucket string) (bool, err
 
 	if callErr != nil {
 		if (readErr == nil && !ro.Exists) || (readErr != nil && g.recovery.ClassifyAbsent(readErr) == AbsenceDefinitive) {
-			charged := res.Commit(-1, false)
+			charged := createDA.commitCreate(false)
 			if jerr := journalWriteErr(g.journal.Failed(KindBucket, "", bucket, callErr.Error(), charged)); jerr != nil {
 				return false, jerr
 			}
 		} else {
 			// Ambiguous outcome: keep intent + cleanup reserve in journal for recovery.
-			charged := res.Commit(-1, true)
+			charged := createDA.commitCreate(true)
 			if jerr := journalWriteErr(g.journal.SettleAttempt(intent.AttemptID, charged, false)); jerr != nil {
 				return false, jerr
 			}
@@ -625,7 +788,7 @@ func (s *GuardStore) CreateBucket(ctx context.Context, bucket string) (bool, err
 	}
 
 	// Adapter reported success, but ReadOwnership could not verify our tags!
-	charged := res.Commit(-1, true)
+	charged := createDA.commitCreate(true)
 	if jerr := journalWriteErr(g.journal.RetainWithCost(KindBucket, "", bucket, "post-create ownership verification failed", charged)); jerr != nil {
 		return false, jerr
 	}
@@ -717,7 +880,7 @@ func (s *GuardStore) DeleteBucket(ctx context.Context, bucket string) error {
 		return cerr
 	}
 	reqCtx, cancel := g.withRequestTimeout(ctx)
-	err := hostkit.NilIfTyped(s.store.DeleteBucket(reqCtx, bucket))
+	err := hostkit.NilIfTyped(s.store.DeleteBucket(delDA.withRetryHooks(reqCtx), bucket))
 	cancel()
 	if _, scerr := delDA.settle(-1, false, false); scerr != nil {
 		return scerr
@@ -744,7 +907,7 @@ func (s *GuardStore) HeadBucket(ctx context.Context, bucket string) error {
 		return cerr
 	}
 	reqCtx, cancel := s.guard.withRequestTimeout(ctx)
-	err := hostkit.NilIfTyped(s.store.HeadBucket(reqCtx, bucket))
+	err := hostkit.NilIfTyped(s.store.HeadBucket(da.withRetryHooks(reqCtx), bucket))
 	cancel()
 	if _, scerr := da.settle(-1, false, false); scerr != nil {
 		return scerr
@@ -758,7 +921,7 @@ func (s *GuardStore) ListBuckets(ctx context.Context, token string) ([]string, s
 		return nil, "", cerr
 	}
 	reqCtx, cancel := s.guard.withRequestTimeout(ctx)
-	names, next, err := s.store.ListBuckets(reqCtx, token)
+	names, next, err := s.store.ListBuckets(da.withRetryHooks(reqCtx), token)
 	cancel()
 	if _, scerr := da.settle(-1, false, false); scerr != nil {
 		return nil, "", scerr
@@ -847,10 +1010,25 @@ func (s *GuardStore) PutObject(ctx context.Context, bucket, key string, body []b
 	maps.Copy(mergedMeta, tags.Map())
 
 	ctxWithTags := WithOwnershipTags(ctx, tags)
+	putDA := &durableAttempt{
+		guard:        g,
+		in:           AttemptPricingInput{Operation: "object_put", PayloadSize: sz},
+		kind:         KindObject,
+		parent:       bucket,
+		name:         key,
+		reason:       "object_put",
+		payloadBytes: sz,
+		res:          res,
+		attemptID:    intent.AttemptID,
+	}
 	reqCtx, cancel := g.withRequestTimeout(ctxWithTags)
-	om, callErr := s.store.PutObject(reqCtx, bucket, key, body, contentType, mergedMeta)
+	om, callErr := s.store.PutObject(putDA.withRetryHooks(reqCtx), bucket, key, body, contentType, mergedMeta)
 	cancel()
 	callErr = hostkit.NilIfTyped(callErr)
+	if putDA.abortErr != nil {
+		callErr = putDA.abortErr
+	}
+	intent.AttemptID = putDA.attemptID
 	if callErr != nil {
 		ro, rerr, rcerr := g.readOwnershipMetered(ctxWithTags, ResourceRef{
 			Kind:     KindObject,
@@ -859,11 +1037,11 @@ func (s *GuardStore) PutObject(ctx context.Context, bucket, key string, body []b
 			Name:     key,
 		}, false, "post_failed_object_put_check")
 		if rcerr != nil {
-			res.Commit(-1, true)
+			putDA.commitCreate(true)
 			return hostkit.ObjectMeta{}, rcerr
 		}
 		if (rerr == nil && !ro.Exists) || (rerr != nil && g.recovery.ClassifyAbsent(rerr) == AbsenceDefinitive) {
-			charged := res.Commit(-1, false)
+			charged := putDA.commitCreate(false)
 			g.mu.Lock()
 			if !hasObj && g.objectsMade > 0 {
 				g.objectsMade--
@@ -879,7 +1057,7 @@ func (s *GuardStore) PutObject(ctx context.Context, bucket, key string, body []b
 				}
 			}
 		} else {
-			charged := res.Commit(-1, true)
+			charged := putDA.commitCreate(true)
 			if jerr := journalWriteErr(g.journal.SettleAttempt(intent.AttemptID, charged, false)); jerr != nil {
 				return hostkit.ObjectMeta{}, jerr
 			}
@@ -887,7 +1065,7 @@ func (s *GuardStore) PutObject(ctx context.Context, bucket, key string, body []b
 		return hostkit.ObjectMeta{}, callErr
 	}
 
-	charged := res.Commit(-1, !hasObj)
+	charged := putDA.commitCreate(!hasObj)
 	if err := g.journal.Confirm(KindObject, bucket, key, ConfirmDetails{
 		Location:        jMeta.Region,
 		ETag:            om.ETag,
@@ -914,7 +1092,7 @@ func (s *GuardStore) GetObject(ctx context.Context, bucket, key string, limit in
 		return nil, cerr
 	}
 	reqCtx, cancel := s.guard.withRequestTimeout(ctx)
-	body, err := s.store.GetObject(reqCtx, bucket, key, clampedLimit)
+	body, err := s.store.GetObject(da.withRetryHooks(reqCtx), bucket, key, clampedLimit)
 	cancel()
 	err = hostkit.NilIfTyped(err)
 	if err == nil && maxBytes > 0 && int64(len(body)) > maxBytes {
@@ -938,7 +1116,7 @@ func (s *GuardStore) GetObject(ctx context.Context, bucket, key string, limit in
 			actualNano = actualQuote.AttemptNanoUSD
 		}
 	}
-	if _, scerr := da.settleWithDetails(actualNano, settledBytes, 1, false, false); scerr != nil && err == nil {
+	if _, scerr := da.settleWithDetails(actualNano, settledBytes, 1, false, false); scerr != nil {
 		return nil, scerr
 	}
 	return body, err
@@ -950,7 +1128,7 @@ func (s *GuardStore) HeadObject(ctx context.Context, bucket, key string) (hostki
 		return hostkit.ObjectMeta{}, cerr
 	}
 	reqCtx, cancel := s.guard.withRequestTimeout(ctx)
-	om, err := s.store.HeadObject(reqCtx, bucket, key)
+	om, err := s.store.HeadObject(da.withRetryHooks(reqCtx), bucket, key)
 	cancel()
 	if _, scerr := da.settle(-1, false, false); scerr != nil {
 		return hostkit.ObjectMeta{}, scerr
@@ -1010,7 +1188,7 @@ func (s *GuardStore) DeleteObject(ctx context.Context, bucket, key string) error
 		return cerr
 	}
 	reqCtx, cancel := g.withRequestTimeout(ctx)
-	err := hostkit.NilIfTyped(s.store.DeleteObject(reqCtx, bucket, key))
+	err := hostkit.NilIfTyped(s.store.DeleteObject(delDA.withRetryHooks(reqCtx), bucket, key))
 	cancel()
 	if _, scerr := delDA.settle(-1, false, false); scerr != nil {
 		return scerr
@@ -1037,7 +1215,7 @@ func (s *GuardStore) ListObjects(ctx context.Context, bucket, prefix string, max
 		return hostkit.ObjectPage{}, cerr
 	}
 	reqCtx, cancel := s.guard.withRequestTimeout(ctx)
-	page, err := s.store.ListObjects(reqCtx, bucket, prefix, max, token)
+	page, err := s.store.ListObjects(da.withRetryHooks(reqCtx), bucket, prefix, max, token)
 	cancel()
 	if _, scerr := da.settle(-1, false, false); scerr != nil {
 		return hostkit.ObjectPage{}, scerr
@@ -1055,7 +1233,7 @@ func (s *GuardStore) BucketCreateToken(ctx context.Context, bucket string) (stri
 			return "", cerr
 		}
 		reqCtx, cancel := s.guard.withRequestTimeout(ctx)
-		tok, err := r.BucketCreateToken(reqCtx, bucket)
+		tok, err := r.BucketCreateToken(da.withRetryHooks(reqCtx), bucket)
 		cancel()
 		if _, scerr := da.settle(-1, false, false); scerr != nil {
 			return "", scerr
@@ -1256,10 +1434,23 @@ func (q *GuardQueue) CreateQueue(ctx context.Context, queue string) (bool, error
 		CreateToken:   intent.CreateToken,
 		CreatedAtUnix: intent.IntentAtUnix,
 	})
+	createDA := &durableAttempt{
+		guard:     g,
+		in:        AttemptPricingInput{Operation: "queue_create"},
+		kind:      KindQueue,
+		name:      queue,
+		reason:    "queue_create",
+		res:       res,
+		attemptID: intent.AttemptID,
+	}
 	reqCtx, cancel := g.withRequestTimeout(ctxWithTags)
-	created, callErr := q.queue.CreateQueue(reqCtx, queue)
+	created, callErr := q.queue.CreateQueue(createDA.withRetryHooks(reqCtx), queue)
 	cancel()
 	callErr = hostkit.NilIfTyped(callErr)
+	if createDA.abortErr != nil {
+		callErr = createDA.abortErr
+	}
+	intent.AttemptID = createDA.attemptID
 
 	ro, readErr, rcerr := g.readOwnershipMetered(ctxWithTags, ResourceRef{
 		Kind:     KindQueue,
@@ -1267,20 +1458,20 @@ func (q *GuardQueue) CreateQueue(ctx context.Context, queue string) (bool, error
 		Name:     queue,
 	}, false, "post_create_queue_check")
 	if rcerr != nil {
-		res.Commit(-1, true)
+		createDA.commitCreate(true)
 		return false, rcerr
 	}
 
 	if readErr == nil && ro.Exists {
 		if verr := ro.VerifyMatchesEntry(pendingEntry, meta); verr != nil {
-			charged := res.Commit(-1, false)
+			charged := createDA.commitCreate(false)
 			if jerr := journalWriteErr(g.journal.RetainWithCost(KindQueue, "", queue, "foreign or untagged collision: "+verr.Error(), charged)); jerr != nil {
 				return false, jerr
 			}
 			return false, hostkit.ProviderError(hostkit.Conflict, 409, "ForeignResourceCollision", verr.Error())
 		}
 		if callErr == nil {
-			charged := res.Commit(-1, true)
+			charged := createDA.commitCreate(true)
 			if err := g.journal.Confirm(KindQueue, "", queue, ConfirmDetails{
 				ProviderID:          ro.ProviderID,
 				Location:            ro.Location,
@@ -1305,12 +1496,12 @@ func (q *GuardQueue) CreateQueue(ctx context.Context, queue string) (bool, error
 
 	if callErr != nil {
 		if (readErr == nil && !ro.Exists) || (readErr != nil && g.recovery.ClassifyAbsent(readErr) == AbsenceDefinitive) {
-			charged := res.Commit(-1, false)
+			charged := createDA.commitCreate(false)
 			if jerr := journalWriteErr(g.journal.Failed(KindQueue, "", queue, callErr.Error(), charged)); jerr != nil {
 				return false, jerr
 			}
 		} else {
-			charged := res.Commit(-1, true)
+			charged := createDA.commitCreate(true)
 			if jerr := journalWriteErr(g.journal.SettleAttempt(intent.AttemptID, charged, false)); jerr != nil {
 				return false, jerr
 			}
@@ -1318,7 +1509,7 @@ func (q *GuardQueue) CreateQueue(ctx context.Context, queue string) (bool, error
 		return false, callErr
 	}
 
-	charged := res.Commit(-1, true)
+	charged := createDA.commitCreate(true)
 	if jerr := journalWriteErr(g.journal.RetainWithCost(KindQueue, "", queue, "post-create queue ownership verification failed", charged)); jerr != nil {
 		return false, jerr
 	}
@@ -1384,7 +1575,7 @@ func (q *GuardQueue) DeleteQueue(ctx context.Context, queue string) error {
 		return cerr
 	}
 	reqCtx, cancel := g.withRequestTimeout(ctx)
-	err := hostkit.NilIfTyped(q.queue.DeleteQueue(reqCtx, queue))
+	err := hostkit.NilIfTyped(q.queue.DeleteQueue(delDA.withRetryHooks(reqCtx), queue))
 	cancel()
 	if _, scerr := delDA.settle(-1, false, false); scerr != nil {
 		return scerr
@@ -1411,9 +1602,9 @@ func (q *GuardQueue) LookupQueue(ctx context.Context, queue string) error {
 		return cerr
 	}
 	reqCtx, cancel := q.guard.withRequestTimeout(ctx)
-	err := hostkit.NilIfTyped(q.queue.LookupQueue(reqCtx, queue))
+	err := hostkit.NilIfTyped(q.queue.LookupQueue(da.withRetryHooks(reqCtx), queue))
 	cancel()
-	if _, scerr := da.settle(-1, false, false); scerr != nil && err == nil {
+	if _, scerr := da.settle(-1, false, false); scerr != nil {
 		return scerr
 	}
 	return err
@@ -1425,10 +1616,10 @@ func (q *GuardQueue) ListQueues(ctx context.Context, token string) ([]string, st
 		return nil, "", cerr
 	}
 	reqCtx, cancel := q.guard.withRequestTimeout(ctx)
-	names, next, err := q.queue.ListQueues(reqCtx, token)
+	names, next, err := q.queue.ListQueues(da.withRetryHooks(reqCtx), token)
 	cancel()
 	err = hostkit.NilIfTyped(err)
-	if _, scerr := da.settle(-1, false, false); scerr != nil && err == nil {
+	if _, scerr := da.settle(-1, false, false); scerr != nil {
 		return nil, "", scerr
 	}
 	return names, next, err
@@ -1492,10 +1683,14 @@ func (q *GuardQueue) Send(ctx context.Context, queue, wire string) (string, erro
 	g.mu.Unlock()
 
 	reqCtx, cancel := g.withRequestTimeout(ctx)
-	id, err := q.queue.Send(reqCtx, queue, wire)
+	id, err := q.queue.Send(da.withRetryHooks(reqCtx), queue, wire)
 	cancel()
 	err = hostkit.NilIfTyped(err)
-	if _, scerr := da.settle(-1, false, false); scerr != nil && err == nil {
+	sendUnits := int64(1)
+	if sz > 65536 {
+		sendUnits = (sz + 65535) / 65536
+	}
+	if _, scerr := da.settleWithDetails(-1, sz, sendUnits, false, false); scerr != nil {
 		return "", scerr
 	}
 	return id, err
@@ -1514,36 +1709,86 @@ func (q *GuardQueue) Receive(ctx context.Context, queue string, max, waitSeconds
 		boundMax = hostkit.MaxReceiveMessages
 	}
 	caps := hostkit.CapsFor(ctx, q.queue, queue)
-	maxWireBytes := int64(boundMax) * 65536
+	perMsgWireLimit := int64(65536)
 	if caps.TextOnlyWire {
-		maxWireBytes = int64(boundMax) * 2 * 65536
+		perMsgWireLimit = 2 * 65536
 	}
+	maxWireBytes := int64(boundMax) * perMsgWireLimit
 	da, cerr := g.beginDurableAttempt(AttemptPricingInput{Operation: "queue_receive", PayloadSize: maxWireBytes}, KindQueue, "", queue, "queue_receive", 0)
 	if cerr != nil {
 		return nil, cerr
 	}
 	reqCtx, cancel := g.withReceiveTimeout(ctx, waitSeconds)
-	msgs, err := q.queue.Receive(reqCtx, queue, max, waitSeconds, visibility)
+	msgs, err := q.queue.Receive(da.withRetryHooks(reqCtx), queue, max, waitSeconds, visibility)
 	cancel()
 	err = hostkit.NilIfTyped(err)
 	actualNano := int64(-1)
 	settledBytes := maxWireBytes
 	units := (maxWireBytes + 65535) / 65536
-	if err == nil && len(msgs) <= boundMax {
-		var wireBytes int64
-		for _, m := range msgs {
-			wireBytes += int64(len(m.Wire))
-		}
-		settledBytes = wireBytes
-		units = 1
-		if wireBytes > 65536 {
-			units = (wireBytes + 65535) / 65536
-		}
-		if qQuote, qerr := g.meter.QuoteAttempt(AttemptPricingInput{Operation: "queue_receive", PayloadSize: wireBytes}); qerr == nil {
-			actualNano = qQuote.AttemptNanoUSD
+	if err == nil {
+		if len(msgs) > boundMax {
+			err = hostkit.ProviderError(
+				hostkit.PermissionDenied,
+				0,
+				"LiveLimitExceeded",
+				fmt.Sprintf("received %d messages exceeding max_messages (%d)", len(msgs), boundMax),
+			)
+			msgs = nil
+		} else {
+			var wireBytes int64
+			for _, m := range msgs {
+				wLen := int64(len(m.Wire))
+				if wLen > perMsgWireLimit {
+					err = hostkit.ProviderError(
+						hostkit.PermissionDenied,
+						0,
+						"LiveLimitExceeded",
+						fmt.Sprintf("received message wire size %d exceeds bound (%d)", wLen, perMsgWireLimit),
+					)
+					msgs = nil
+					break
+				}
+				body, derr := hostkit.DecodeQueueBody(m.Wire)
+				if derr != nil {
+					err = derr
+					msgs = nil
+					break
+				}
+				if int64(len(body)) > g.pol.Limits.MaxMessageBytes || len(body) > hostkit.MaxQueueBodyBytes {
+					err = hostkit.ProviderError(
+						hostkit.PermissionDenied,
+						0,
+						"LiveLimitExceeded",
+						fmt.Sprintf("received message body size %d exceeds max_message_bytes (%d)", len(body), g.pol.Limits.MaxMessageBytes),
+					)
+					msgs = nil
+					break
+				}
+				wireBytes += wLen
+				if wireBytes > maxWireBytes {
+					err = hostkit.ProviderError(
+						hostkit.PermissionDenied,
+						0,
+						"LiveLimitExceeded",
+						fmt.Sprintf("received batch wire size %d exceeds bound (%d)", wireBytes, maxWireBytes),
+					)
+					msgs = nil
+					break
+				}
+			}
+			if err == nil {
+				settledBytes = wireBytes
+				units = 1
+				if wireBytes > 65536 {
+					units = (wireBytes + 65535) / 65536
+				}
+				if qQuote, qerr := g.meter.QuoteAttempt(AttemptPricingInput{Operation: "queue_receive", PayloadSize: wireBytes}); qerr == nil {
+					actualNano = qQuote.AttemptNanoUSD
+				}
+			}
 		}
 	}
-	if _, scerr := da.settleWithDetails(actualNano, settledBytes, units, false, false); scerr != nil && err == nil {
+	if _, scerr := da.settleWithDetails(actualNano, settledBytes, units, false, false); scerr != nil {
 		return nil, scerr
 	}
 	return msgs, err
@@ -1562,9 +1807,9 @@ func (q *GuardQueue) Ack(ctx context.Context, queue, receipt string) error {
 		return cerr
 	}
 	reqCtx, cancel := g.withRequestTimeout(ctx)
-	err := hostkit.NilIfTyped(q.queue.Ack(reqCtx, queue, receipt))
+	err := hostkit.NilIfTyped(q.queue.Ack(da.withRetryHooks(reqCtx), queue, receipt))
 	cancel()
-	if _, scerr := da.settle(-1, false, false); scerr != nil && err == nil {
+	if _, scerr := da.settle(-1, false, false); scerr != nil {
 		return scerr
 	}
 	return err
@@ -1583,10 +1828,10 @@ func (q *GuardQueue) Nack(ctx context.Context, queue, receipt string, visibility
 		return "", cerr
 	}
 	reqCtx, cancel := g.withRequestTimeout(ctx)
-	newReceipt, err := q.queue.Nack(reqCtx, queue, receipt, visibility)
+	newReceipt, err := q.queue.Nack(da.withRetryHooks(reqCtx), queue, receipt, visibility)
 	cancel()
 	err = hostkit.NilIfTyped(err)
-	if _, scerr := da.settle(-1, false, false); scerr != nil && err == nil {
+	if _, scerr := da.settle(-1, false, false); scerr != nil {
 		return "", scerr
 	}
 	return newReceipt, err
@@ -1602,10 +1847,10 @@ func (q *GuardQueue) QueueCreateToken(ctx context.Context, queue string) (string
 			return "", cerr
 		}
 		reqCtx, cancel := q.guard.withRequestTimeout(ctx)
-		tok, err := r.QueueCreateToken(reqCtx, queue)
+		tok, err := r.QueueCreateToken(da.withRetryHooks(reqCtx), queue)
 		cancel()
 		err = hostkit.NilIfTyped(err)
-		if _, scerr := da.settle(-1, false, false); scerr != nil && err == nil {
+		if _, scerr := da.settle(-1, false, false); scerr != nil {
 			return "", scerr
 		}
 		return tok, err

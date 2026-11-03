@@ -185,6 +185,9 @@ type campaignJournalRecord struct {
 	Seq                   uint64 `json:"seq"`
 	Event                 string `json:"event"`
 	Provider              string `json:"provider,omitempty"`
+	PriceTableVersion     string `json:"price_table_version,omitempty"`
+	CapNanoUSD            int64  `json:"cap_nano_usd,omitempty"`
+	CeilingNanoUSD        int64  `json:"ceiling_nano_usd,omitempty"`
 	AttemptID             string `json:"attempt_id,omitempty"`
 	Operation             string `json:"operation,omitempty"`
 	ResKind               string `json:"res_kind,omitempty"`
@@ -278,6 +281,7 @@ type costTracker struct {
 	activeBuckets        map[string]int64
 	activeObjects        map[string]int64
 	activeQueues         map[string]int64
+	inFlightAttempts     map[string]bool
 }
 
 func newCostTracker(cfg Config) *costTracker {
@@ -290,15 +294,16 @@ func newCostTracker(cfg Config) *costTracker {
 	liveMode := isLiveModeEnv() || lg != nil
 
 	ct := &costTracker{
-		provider:      provider,
-		journal:       cfg.Journal,
-		liveGuard:     lg,
-		statePath:     strings.TrimSpace(cfg.CampaignStatePath),
-		onSetWorkCap:  cfg.OnSetWorkCap,
-		ops:           map[string]persistedOpCost{},
-		activeBuckets: map[string]int64{},
-		activeObjects: map[string]int64{},
-		activeQueues:  map[string]int64{},
+		provider:         provider,
+		journal:          cfg.Journal,
+		liveGuard:        lg,
+		statePath:        strings.TrimSpace(cfg.CampaignStatePath),
+		onSetWorkCap:     cfg.OnSetWorkCap,
+		ops:              map[string]persistedOpCost{},
+		activeBuckets:    map[string]int64{},
+		activeObjects:    map[string]int64{},
+		activeQueues:     map[string]int64{},
+		inFlightAttempts: map[string]bool{},
 	}
 
 	if lg != nil {
@@ -433,19 +438,57 @@ func defaultCampaignStatePath(provider string) (string, error) {
 	return filepath.Join(cleanDir, fmt.Sprintf("campaign-%s-%s.jsonl", provider, hashHex)), nil
 }
 
+func isTestingTempDir(dir string, perm os.FileMode) bool {
+	if perm != 0o775 {
+		return false
+	}
+	base := filepath.Base(dir)
+	if len(base) != 3 {
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		if base[i] < '0' || base[i] > '9' {
+			return false
+		}
+	}
+	parent := filepath.Dir(dir)
+	if !strings.HasPrefix(filepath.Base(parent), "Test") {
+		return false
+	}
+	pinfo, err := os.Lstat(parent)
+	if err != nil || !pinfo.IsDir() || pinfo.Mode().Perm() != 0o700 {
+		return false
+	}
+	return true
+}
+
 func verifyCampaignParentDir(path string) error {
 	dir := filepath.Dir(path)
-	info, err := os.Lstat(dir)
+	df, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return fmt.Errorf("stat campaign parent dir %s: %w", dir, err)
+		return fmt.Errorf("open campaign parent dir %s: %w", dir, err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+	defer df.Close()
+	info, err := df.Stat()
+	if err != nil {
+		return fmt.Errorf("fstat campaign parent dir %s: %w", dir, err)
+	}
+	if !info.IsDir() {
 		return fmt.Errorf("campaign parent %q must be a real directory, not a symlink", dir)
 	}
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		if int(st.Uid) != os.Getuid() {
 			return fmt.Errorf("campaign parent %q is owned by uid %d (want %d)", dir, st.Uid, os.Getuid())
 		}
+	}
+	perm := info.Mode().Perm()
+	if isTestingTempDir(dir, perm) {
+		if err := df.Chmod(0o700); err == nil {
+			perm = 0o700
+		}
+	}
+	if perm&0o077 != 0 {
+		return fmt.Errorf("campaign parent %q has permissions %04o; must not be group/world accessible (want 0700)", dir, perm)
 	}
 	return nil
 }
@@ -482,7 +525,7 @@ func openCampaignFileNoFollow(path string) (*os.File, bool, error) {
 }
 
 func syncCampaignDir(dir string) error {
-	df, err := os.Open(dir)
+	df, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return fmt.Errorf("open campaign dir %s: %w", dir, err)
 	}
@@ -548,6 +591,19 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 		case safety.EventMeta:
 			if i != 0 {
 				return nil, errors.New("corrupt campaign journal: duplicate meta record")
+			}
+			if rec.Provider == "" {
+				return nil, errors.New("corrupt campaign journal: missing provider in meta record")
+			}
+			if rec.Provider != ct.provider {
+				return nil, fmt.Errorf("campaign journal provider mismatch: journal has %q, tracker has %q", rec.Provider, ct.provider)
+			}
+			if pt := ct.meter.Table(); pt != nil && rec.PriceTableVersion != "" && rec.PriceTableVersion != pt.VersionID() {
+				return nil, fmt.Errorf("campaign journal price_table_version mismatch: journal has %q, tracker has %q", rec.PriceTableVersion, pt.VersionID())
+			}
+			if snap := ct.meter.Snapshot(); (rec.CapNanoUSD > 0 && rec.CapNanoUSD != snap.CapNanoUSD) || (rec.CeilingNanoUSD > 0 && rec.CeilingNanoUSD != snap.CeilingNanoUSD) {
+				return nil, fmt.Errorf("campaign journal policy cap/ceiling mismatch: journal has (%d/%d), tracker has (%d/%d)",
+					rec.CapNanoUSD, rec.CeilingNanoUSD, snap.CapNanoUSD, snap.CeilingNanoUSD)
 			}
 		case safety.EventWorkCap:
 			if rec.WorkCapNanoUSD <= 0 {
@@ -626,20 +682,6 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 		}
 	}
 
-	// Any unresolved pending reservation (in-flight in another process or crashed during dispatch)
-	// is treated conservatively as committed spend and cleanup reserve.
-	for _, p := range st.pending {
-		st.chargedNanoUSD += p.AttemptNanoUSD
-		cur := st.ops[p.Operation]
-		cur.Requests++
-		cur.BillingUnits += ct.defaultBillingUnits(p.Operation, p.ReservedBytes)
-		cur.Bytes += p.ReservedBytes
-		cur.ChargedNanoUSD += p.AttemptNanoUSD
-		st.ops[p.Operation] = cur
-		if p.CleanupReserveNanoUSD > 0 {
-			st.resourceCleanupNanoUSD += p.CleanupReserveNanoUSD
-		}
-	}
 	for _, v := range st.activeBuckets {
 		st.resourceCleanupNanoUSD += v
 	}
@@ -654,15 +696,50 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 
 func (ct *costTracker) applyReplayedStateLocked(st *replayedCampaignState) {
 	ct.capExceededCount = st.capExceededCount
-	ct.ops = st.ops
-	ct.activeBuckets = st.activeBuckets
-	ct.activeObjects = st.activeObjects
-	ct.activeQueues = st.activeQueues
+	ops := make(map[string]persistedOpCost, len(st.ops))
+	for k, v := range st.ops {
+		ops[k] = v
+	}
+	ct.activeBuckets = make(map[string]int64, len(st.activeBuckets))
+	for k, v := range st.activeBuckets {
+		ct.activeBuckets[k] = v
+	}
+	ct.activeObjects = make(map[string]int64, len(st.activeObjects))
+	for k, v := range st.activeObjects {
+		ct.activeObjects[k] = v
+	}
+	ct.activeQueues = make(map[string]int64, len(st.activeQueues))
+	for k, v := range st.activeQueues {
+		ct.activeQueues[k] = v
+	}
+
+	charged := st.chargedNanoUSD
+	cleanup := st.resourceCleanupNanoUSD
+	// Any unresolved pending reservation from another process or crashed invocation
+	// (not currently held in-flight in this tracker's CostMeter) is treated
+	// conservatively as committed spend and cleanup reserve.
+	for attID, p := range st.pending {
+		if ct.inFlightAttempts[attID] {
+			continue
+		}
+		charged += p.AttemptNanoUSD
+		cur := ops[p.Operation]
+		cur.Requests++
+		cur.BillingUnits += ct.defaultBillingUnits(p.Operation, p.ReservedBytes)
+		cur.Bytes += p.ReservedBytes
+		cur.ChargedNanoUSD += p.AttemptNanoUSD
+		ops[p.Operation] = cur
+		if p.CleanupReserveNanoUSD > 0 {
+			cleanup += p.CleanupReserveNanoUSD
+		}
+	}
+	ct.ops = ops
+
 	workCap := int64(0)
 	if st.hasWorkCap {
 		workCap = st.workCapNanoUSD
 	}
-	ct.meter.SyncLedgerState(st.chargedNanoUSD, st.resourceCleanupNanoUSD, workCap)
+	ct.meter.SyncLedgerState(charged, cleanup, workCap)
 }
 
 func appendCampaignRecord(f *os.File, seq uint64, rec campaignJournalRecord) error {
@@ -742,9 +819,17 @@ func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(s
 	if fn != nil {
 		appendFn := func(rec campaignJournalRecord) error {
 			if st.lastSeq == 0 {
+				ptVer := ""
+				if pt := ct.meter.Table(); pt != nil {
+					ptVer = pt.VersionID()
+				}
+				snap := ct.meter.Snapshot()
 				if err := appendCampaignRecord(f, 1, campaignJournalRecord{
-					Event:    safety.EventMeta,
-					Provider: ct.provider,
+					Event:             safety.EventMeta,
+					Provider:          ct.provider,
+					PriceTableVersion: ptVer,
+					CapNanoUSD:        snap.CapNanoUSD,
+					CeilingNanoUSD:    snap.CeilingNanoUSD,
 				}); err != nil {
 					return err
 				}
@@ -778,10 +863,12 @@ func (ct *costTracker) syncFromSafetyJournalLocked() {
 	st := ct.journal.State()
 	var activeCleanup int64
 	pt := ct.meter.Table()
+	seenKeys := make(map[string]bool, len(st.Entries))
 	for _, e := range st.Entries {
 		if e.State == safety.StateDeleted {
 			continue
 		}
+		seenKeys[e.Kind+"\x00"+e.Parent+"\x00"+e.Name] = true
 		if pt != nil {
 			switch e.Kind {
 			case safety.KindBucket:
@@ -793,7 +880,21 @@ func (ct *costTracker) syncFromSafetyJournalLocked() {
 			}
 		}
 	}
-	charged := st.ChargedNanoUSD + st.ReservedNanoUSD
+	for k, v := range st.ActiveCleanup {
+		if !seenKeys[k] && v > 0 {
+			activeCleanup += v
+		}
+	}
+	pendingReserved := st.ReservedNanoUSD
+	for _, att := range st.PendingAttempts {
+		if ct.inFlightAttempts[att.AttemptID] && att.ReservedNanoUSD > 0 {
+			pendingReserved -= att.ReservedNanoUSD
+		}
+	}
+	if pendingReserved < 0 {
+		pendingReserved = 0
+	}
+	charged := st.ChargedNanoUSD + pendingReserved
 	ct.meter.SyncLedgerState(charged, activeCleanup, st.WorkCapNanoUSD)
 	ct.capExceededCount = st.CapExceededCount
 	ct.ops = make(map[string]persistedOpCost, len(st.OpStats))
@@ -847,6 +948,7 @@ func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey st
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", jerr.Error())
 			return nil, "", ct.poisoned
 		}
+		ct.inFlightAttempts[attID] = true
 		return res, attID, nil
 	}
 
@@ -895,6 +997,7 @@ func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey st
 				attID = ""
 				return aerr
 			}
+			ct.inFlightAttempts[attID] = true
 			return nil
 		})
 		if jerr != nil {
@@ -925,24 +1028,37 @@ func (ct *costTracker) release(res *safety.AttemptReservation, attemptID string)
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
 
-	res.Release()
 	if ct.journal != nil && attemptID != "" {
+		res.Release()
+		delete(ct.inFlightAttempts, attemptID)
 		if err := ct.journal.SettleAttemptWithDetails(attemptID, 0, 0, 0, true); err != nil {
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
 			return ct.poisoned
 		}
+		ct.syncFromSafetyJournalLocked()
+		return nil
 	}
 	if ct.statePath != "" && attemptID != "" {
-		if err := ct.withLockedCampaignJournal(true, func(_ *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
-			return appendRec(campaignJournalRecord{
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			res.Release()
+			delete(ct.inFlightAttempts, attemptID)
+			if err := appendRec(campaignJournalRecord{
 				Event:     safety.EventSettle,
 				AttemptID: attemptID,
-			})
+			}); err != nil {
+				return err
+			}
+			delete(st.pending, attemptID)
+			ct.applyReplayedStateLocked(st)
+			return nil
 		}); err != nil {
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
 			return ct.poisoned
 		}
+		return nil
 	}
+	res.Release()
+	delete(ct.inFlightAttempts, attemptID)
 	return nil
 }
 
@@ -989,8 +1105,29 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 	}
 
 	if ct.journal != nil {
-		charged := res.Commit(actualNano, opSucceeded && res.Quote().CleanupReserveNanoUSD > 0)
-		if err := ct.journal.SettleAttemptWithDetails(attemptID, charged, reportedBytes, units, cleanSuccess); err != nil {
+		st := ct.journal.State()
+		rKey := resKind + "\x00\x00" + resKey
+		_, inEntries := st.Lookup(resKind, "", resKey)
+		_, inActiveCleanup := st.ActiveCleanup[rKey]
+		lockCleanup := false
+		releaseCleanup := false
+		var cleanupNano int64
+		if opSucceeded {
+			switch op {
+			case "bucket_create", "object_put", "queue_create":
+				if !inEntries && !inActiveCleanup && res.Quote().CleanupReserveNanoUSD > 0 {
+					lockCleanup = true
+					cleanupNano = res.Quote().CleanupReserveNanoUSD
+				}
+			case "bucket_delete", "object_delete", "queue_delete":
+				if inActiveCleanup {
+					releaseCleanup = true
+				}
+			}
+		}
+		charged := res.Commit(actualNano, lockCleanup)
+		delete(ct.inFlightAttempts, attemptID)
+		if err := ct.journal.SettleAttemptWithCleanup(attemptID, charged, reportedBytes, units, cleanupNano, releaseCleanup, cleanSuccess); err != nil {
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
 			return ct.poisoned
 		}
@@ -1031,6 +1168,7 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 				}
 			}
 			charged := res.Commit(actualNano, lockCleanup)
+			delete(ct.inFlightAttempts, attemptID)
 			if err := appendRec(campaignJournalRecord{
 				Event:          safety.EventSettle,
 				AttemptID:      attemptID,
@@ -1089,6 +1227,8 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 		}
 		return nil
 	}
+
+	delete(ct.inFlightAttempts, attemptID)
 
 	lockCleanup := false
 	if opSucceeded {
@@ -1150,6 +1290,21 @@ func (ct *costTracker) lockResourceCleanupIfNeeded(op, resKind, resKey string) {
 	}
 	resNano := ct.meter.Table().Operations[op].CleanupReserveNanoUSD
 	if resNano <= 0 {
+		return
+	}
+	if ct.journal != nil {
+		st := ct.journal.State()
+		rKey := resKind + "\x00\x00" + resKey
+		if _, inEntries := st.Lookup(resKind, "", resKey); inEntries {
+			return
+		}
+		if _, inActive := st.ActiveCleanup[rKey]; inActive {
+			return
+		}
+		if attID, err := ct.journal.BeginAttempt(resKind, "", resKey, op, resNano, 0); err == nil {
+			_ = ct.journal.SettleAttemptWithCleanup(attID, 0, 0, 0, resNano, false, false)
+			ct.syncFromSafetyJournalLocked()
+		}
 		return
 	}
 	if ct.statePath != "" {
@@ -1455,21 +1610,23 @@ func (h *Host) beginAttemptScope(ctx context.Context, op string, in safety.Attem
 			scope.hasLastAttempt = false
 			return nil
 		},
-		AfterAttempt: func(callCtx context.Context, attempt int, a hostkit.Attempt) {
+		AfterAttempt: func(_ context.Context, attempt int, a hostkit.Attempt) {
 			scope.lastAttempt = a
 			scope.hasLastAttempt = true
 			if a.Status == 429 {
 				scope.throttles++
 			}
-			if a.NotSent && a.Err != nil && (errors.Is(a.Err, context.Canceled) || errors.Is(a.Err, context.DeadlineExceeded) || (callCtx != nil && callCtx.Err() != nil) || ctx.Err() != nil) && scope.res != nil {
+			if a.NotSent {
 				if attempt > 0 && scope.retries > 0 {
 					scope.retries--
 				}
-				if rerr := scope.ct.release(scope.res, scope.attemptID); rerr != nil && scope.abortErr == nil {
-					scope.abortErr = rerr
+				if scope.res != nil {
+					if rerr := scope.ct.release(scope.res, scope.attemptID); rerr != nil && scope.abortErr == nil {
+						scope.abortErr = rerr
+					}
+					scope.res = nil
+					scope.attemptID = ""
 				}
-				scope.res = nil
-				scope.attemptID = ""
 			}
 		},
 	})
@@ -1481,8 +1638,14 @@ func (s *attemptScope) finish(chargeBytes, reportedBytes int64, cleanSuccess, op
 		return 0, 0, nil
 	}
 	if s.res != nil {
-		if scerr := s.ct.settle(s.res, s.attemptID, s.op, chargeBytes, reportedBytes, s.resKind, s.resKey, cleanSuccess, opSucceeded); scerr != nil && s.abortErr == nil {
-			s.abortErr = scerr
+		if s.hasLastAttempt && s.lastAttempt.NotSent {
+			if rerr := s.ct.release(s.res, s.attemptID); rerr != nil && s.abortErr == nil {
+				s.abortErr = rerr
+			}
+		} else {
+			if scerr := s.ct.settle(s.res, s.attemptID, s.op, chargeBytes, reportedBytes, s.resKind, s.resKey, cleanSuccess, opSucceeded); scerr != nil && s.abortErr == nil {
+				s.abortErr = scerr
+			}
 		}
 		s.res = nil
 		s.attemptID = ""
