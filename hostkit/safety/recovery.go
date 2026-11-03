@@ -89,8 +89,13 @@ type RemoteOwnership struct {
 	ETag          string
 	Generation    string
 	CreatedAtUnix int64
-	// ChildKeys optionally lists object keys currently inside a bucket when
-	// inspected during recovery.
+	// ChildrenVerified must be set to true by ReadOwnership for a KindBucket
+	// after completing a full paginated listing of the bucket's child objects.
+	// If ChildrenVerified is false on an existing bucket, GuardStore.DeleteBucket
+	// and Sweep fail closed and refuse to delete the bucket.
+	ChildrenVerified bool
+	// ChildKeys lists all object keys currently inside a bucket when inspected
+	// during deletion or recovery.
 	ChildKeys []string
 }
 

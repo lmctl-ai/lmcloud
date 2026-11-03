@@ -72,28 +72,32 @@ type fakePersistentStore struct {
 // implementation of RecoveryAdapter, hostkit.ObjectStore, and hostkit.Queue
 // used by Stage 1 safety and recovery tests without making any network calls.
 type FakeRecoveryBackend struct {
-	mu               sync.Mutex
-	statePath        string
-	provider         string
-	account          string
-	tenant           string
-	scope            string
-	region           string
-	storageEndpoint  string
-	asyncDeletePolls int
-	echoTokenOnOp    map[string]bool
-	data             fakePersistentStore
+	mu                     sync.Mutex
+	statePath              string
+	provider               string
+	account                string
+	tenant                 string
+	scope                  string
+	region                 string
+	storageEndpoint        string
+	asyncDeletePolls       int
+	echoTokenOnOp          map[string]bool
+	unverifiedChildBuckets map[string]bool
+	overwriteTagsOnDup     bool
+	findOwnedErr           error
+	data                   fakePersistentStore
 }
 
 // NewFakeRecoveryBackend creates an in-memory FakeRecoveryBackend.
 func NewFakeRecoveryBackend(provider, account, scope, region string) *FakeRecoveryBackend {
 	return &FakeRecoveryBackend{
-		provider:        provider,
-		account:         account,
-		scope:           scope,
-		region:          region,
-		storageEndpoint: fmt.Sprintf("https://s3.%s.amazonaws.com", region),
-		echoTokenOnOp:   make(map[string]bool),
+		provider:               provider,
+		account:                account,
+		scope:                  scope,
+		region:                 region,
+		storageEndpoint:        fmt.Sprintf("https://s3.%s.amazonaws.com", region),
+		echoTokenOnOp:          make(map[string]bool),
+		unverifiedChildBuckets: make(map[string]bool),
 		data: fakePersistentStore{
 			Buckets:       make(map[string]*fakeBucketState),
 			Queues:        make(map[string]*fakeQueueState),
@@ -201,6 +205,30 @@ func (b *FakeRecoveryBackend) SetEchoTokenOnOp(op string, enabled bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.echoTokenOnOp[op] = enabled
+}
+
+// SetUnverifiedChildren configures whether ReadOwnership for bucket leaves
+// ChildrenVerified=false (to test fail-closed child listing verification).
+func (b *FakeRecoveryBackend) SetUnverifiedChildren(bucket string, unverified bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.unverifiedChildBuckets[bucket] = unverified
+}
+
+// SetOverwriteTagsOnDuplicateCreate simulates an S3 us-east-1 adapter that
+// returns 200 on CreateBucket for an existing same-account bucket and then
+// overwrites its tags via PutBucketTagging.
+func (b *FakeRecoveryBackend) SetOverwriteTagsOnDuplicateCreate(enabled bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.overwriteTagsOnDup = enabled
+}
+
+// SetFindOwnedError configures FindOwned to return err.
+func (b *FakeRecoveryBackend) SetFindOwnedError(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.findOwnedErr = err
 }
 
 // SeedBucket pre-creates a bucket in the simulated cloud with custom tags and
@@ -369,16 +397,17 @@ func (b *FakeRecoveryBackend) ReadOwnership(_ context.Context, ref ResourceRef) 
 			createdAt = bkt.CreatedUnix
 		}
 		return RemoteOwnership{
-			Exists:        true,
-			ProviderID:    bkt.ProviderID,
-			Account:       bkt.Account,
-			Scope:         bkt.Scope,
-			Location:      bkt.Location,
-			RunID:         bkt.Tags[TagKeyRunID],
-			OwnerNonce:    bkt.Tags[TagKeyOwnerNonce],
-			CreateToken:   bkt.Tags[TagKeyCreateToken],
-			CreatedAtUnix: createdAt,
-			ChildKeys:     children,
+			Exists:           true,
+			ProviderID:       bkt.ProviderID,
+			Account:          bkt.Account,
+			Scope:            bkt.Scope,
+			Location:         bkt.Location,
+			RunID:            bkt.Tags[TagKeyRunID],
+			OwnerNonce:       bkt.Tags[TagKeyOwnerNonce],
+			CreateToken:      bkt.Tags[TagKeyCreateToken],
+			CreatedAtUnix:    createdAt,
+			ChildrenVerified: !b.unverifiedChildBuckets[ref.Name],
+			ChildKeys:        children,
 		}, nil
 
 	case KindObject:
@@ -455,6 +484,9 @@ func (b *FakeRecoveryBackend) ReadOwnership(_ context.Context, ref ResourceRef) 
 func (b *FakeRecoveryBackend) FindOwned(_ context.Context, prefix string) ([]ResourceRef, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.findOwnedErr != nil {
+		return nil, b.findOwnedErr
+	}
 	_ = b.loadLocked()
 
 	var out []ResourceRef
@@ -599,6 +631,11 @@ func (b *FakeRecoveryBackend) CreateBucket(ctx context.Context, bucket string) (
 	if existing, ok := b.data.Buckets[bucket]; ok {
 		if existing.Account != b.account {
 			return false, hostkit.ProviderError(hostkit.Conflict, 409, "BucketAlreadyExists", "bucket owned by another account")
+		}
+		if b.overwriteTagsOnDup {
+			existing.Tags = tags.Map()
+			_ = b.saveLocked()
+			return true, nil
 		}
 		if tags.CreateToken != "" && existing.Tags[TagKeyCreateToken] == tags.CreateToken {
 			return true, nil

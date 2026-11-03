@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+// DefaultPendingIntentGraceSeconds is the default grace period (10 seconds,
+// matching the per-attempt cloud request timeout) before a StatePending intent
+// that reads as absent is tombstoned as StateDeleted.
+const DefaultPendingIntentGraceSeconds = 10
+
 // SweepOptions configures a dry-run or active LIFO recovery sweep.
 type SweepOptions struct {
 	// JournalDir is the directory containing `<RunID>.jsonl` when Journal is nil.
@@ -31,6 +36,10 @@ type SweepOptions struct {
 	PollAttempts int
 	// PollInterval is the delay between PollDelete checks when > 1 attempt is needed.
 	PollInterval time.Duration
+	// PendingGraceSeconds overrides DefaultPendingIntentGraceSeconds when > 0.
+	PendingGraceSeconds int
+	// Now returns the current time for evaluating the pending-intent grace period.
+	Now func() time.Time
 }
 
 // SweepItem describes the outcome of inspecting or sweeping one resource.
@@ -83,6 +92,14 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 	pollAttempts := opts.PollAttempts
 	if pollAttempts <= 0 {
 		pollAttempts = 5
+	}
+	nowFn := opts.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	pendingGraceSec := int64(DefaultPendingIntentGraceSeconds)
+	if opts.PendingGraceSeconds > 0 {
+		pendingGraceSec = int64(opts.PendingGraceSeconds)
 	}
 
 	var (
@@ -175,7 +192,13 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 
 		ro, readErr := recovery.ReadOwnership(ctx, ref)
 		if (readErr == nil && !ro.Exists) || (readErr != nil && recovery.ClassifyAbsent(readErr) == AbsenceDefinitive) {
-			if opts.Apply && j != nil {
+			reason := "definitively absent"
+			inGraceWindow := entry.State == StatePending &&
+				entry.IntentAtUnix > 0 &&
+				nowFn().UTC().Unix() < entry.IntentAtUnix+pendingGraceSec
+			if inGraceWindow {
+				reason = "definitively absent (within pending-intent grace period; keeping intent for re-check)"
+			} else if opts.Apply && j != nil {
 				_ = j.Deleted(entry.Kind, entry.Parent, entry.Name, 0)
 			}
 			report.Absent = append(report.Absent, SweepItem{
@@ -183,7 +206,7 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 				Parent:     entry.Parent,
 				Name:       entry.Name,
 				ProviderID: entry.ProviderID,
-				Reason:     "definitively absent",
+				Reason:     reason,
 			})
 			sweptChildren[key] = true
 			return
@@ -228,42 +251,57 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 			return
 		}
 
-		// If this is a bucket and RemoteOwnership reports remaining ChildKeys,
-		// verify and empty proven-owned child objects first, or retain the bucket
-		// if any unexpected/unowned child object is present.
-		if entry.Kind == KindBucket && len(ro.ChildKeys) > 0 {
-			for _, childKey := range ro.ChildKeys {
-				cKey := resourceKey(KindObject, entry.Name, childKey)
-				if sweptChildren[cKey] {
-					continue
+		// If this is a bucket, ReadOwnership MUST have verified child object listing
+		// (ChildrenVerified == true). Any remaining ChildKeys must be proven-owned
+		// and swept first, or the bucket is retained.
+		if entry.Kind == KindBucket {
+			if !ro.ChildrenVerified {
+				reason := fmt.Sprintf("bucket %q child object listing was not verified by ReadOwnership", entry.Name)
+				if opts.Apply && j != nil {
+					_ = j.Retain(KindBucket, "", entry.Name, reason)
 				}
-				childEntry, ok := state.Lookup(KindObject, entry.Name, childKey)
-				if !ok || childEntry.Retain || childEntry.State == StateRetained {
-					reason := fmt.Sprintf("bucket %q contains unjournaled or retained child object %q", entry.Name, childKey)
-					if opts.Apply && j != nil {
-						_ = j.Retain(KindBucket, "", entry.Name, reason)
+				report.Retained = append(report.Retained, SweepItem{
+					Kind:       KindBucket,
+					Name:       entry.Name,
+					ProviderID: ro.ProviderID,
+					Reason:     reason,
+				})
+				return
+			}
+			if len(ro.ChildKeys) > 0 {
+				for _, childKey := range ro.ChildKeys {
+					cKey := resourceKey(KindObject, entry.Name, childKey)
+					if sweptChildren[cKey] {
+						continue
 					}
-					report.Retained = append(report.Retained, SweepItem{
-						Kind:       KindBucket,
-						Name:       entry.Name,
-						ProviderID: ro.ProviderID,
-						Reason:     reason,
-					})
-					return
-				}
-				sweepEntry(childEntry)
-				if !sweptChildren[cKey] {
-					reason := fmt.Sprintf("bucket %q child object %q could not be swept", entry.Name, childKey)
-					if opts.Apply && j != nil {
-						_ = j.Retain(KindBucket, "", entry.Name, reason)
+					childEntry, ok := state.Lookup(KindObject, entry.Name, childKey)
+					if !ok || childEntry.Retain || childEntry.State == StateRetained {
+						reason := fmt.Sprintf("bucket %q contains unjournaled or retained child object %q", entry.Name, childKey)
+						if opts.Apply && j != nil {
+							_ = j.Retain(KindBucket, "", entry.Name, reason)
+						}
+						report.Retained = append(report.Retained, SweepItem{
+							Kind:       KindBucket,
+							Name:       entry.Name,
+							ProviderID: ro.ProviderID,
+							Reason:     reason,
+						})
+						return
 					}
-					report.Retained = append(report.Retained, SweepItem{
-						Kind:       KindBucket,
-						Name:       entry.Name,
-						ProviderID: ro.ProviderID,
-						Reason:     reason,
-					})
-					return
+					sweepEntry(childEntry)
+					if !sweptChildren[cKey] {
+						reason := fmt.Sprintf("bucket %q child object %q could not be swept", entry.Name, childKey)
+						if opts.Apply && j != nil {
+							_ = j.Retain(KindBucket, "", entry.Name, reason)
+						}
+						report.Retained = append(report.Retained, SweepItem{
+							Kind:       KindBucket,
+							Name:       entry.Name,
+							ProviderID: ro.ProviderID,
+							Reason:     reason,
+						})
+						return
+					}
 				}
 			}
 		}
@@ -418,9 +456,21 @@ func Sweep(ctx context.Context, recovery RecoveryAdapter, opts SweepOptions) (Sw
 	// on the provider and refuse to delete any unowned sibling.
 	if opts.ScanPrefix {
 		pfx, err := ExpectedLivePrefix(meta.RunID)
-		if err == nil {
+		if err != nil {
+			report.Failed = append(report.Failed, SweepItem{
+				Kind:   "prefix_scan",
+				Name:   meta.RunID,
+				Reason: "compute expected live prefix failed: " + err.Error(),
+			})
+		} else {
 			found, ferr := recovery.FindOwned(ctx, pfx)
-			if ferr == nil {
+			if ferr != nil {
+				report.Failed = append(report.Failed, SweepItem{
+					Kind:   "prefix_scan",
+					Name:   pfx,
+					Reason: "FindOwned failed: " + ferr.Error(),
+				})
+			} else {
 				for _, ref := range found {
 					key := resourceKey(ref.Kind, ref.Parent, ref.Name)
 					if sweptChildren[key] {

@@ -350,6 +350,14 @@ func (m *CostMeter) QuoteAttempt(in AttemptPricingInput) (AttemptQuote, error) {
 		if q.AttemptNanoUSD < 0 || q.CleanupReserveNanoUSD < 0 {
 			return AttemptQuote{}, errors.New("AttemptQuoter returned negative cost")
 		}
+		if q.AttemptNanoUSD < base.AttemptNanoUSD {
+			q.AttemptNanoUSD = base.AttemptNanoUSD
+		}
+		if q.CleanupReserveNanoUSD < base.CleanupReserveNanoUSD {
+			q.CleanupReserveNanoUSD = base.CleanupReserveNanoUSD
+		}
+		q.Operation = base.Operation
+		q.IsCleanup = base.IsCleanup
 		return q, nil
 	}
 	return base, nil

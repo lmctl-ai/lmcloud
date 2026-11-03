@@ -353,6 +353,21 @@ type Journal struct {
 	poisoned   error
 	meta       JournalMeta
 	state      *LedgerState
+	now        func() time.Time
+}
+
+// SetClock configures the clock used for timestamps on subsequent journal writes.
+func (j *Journal) SetClock(now func() time.Time) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.now = now
+}
+
+func (j *Journal) nowTime() time.Time {
+	if j.now != nil {
+		return j.now()
+	}
+	return time.Now()
 }
 
 // OpenJournal opens or creates `<dir>/<meta.RunID>.jsonl`, acquires an exclusive
@@ -591,7 +606,7 @@ func (j *Journal) BeginCreate(kind, parent, location, name string, reservedNanoU
 		}
 	}
 
-	nowUnix := time.Now().UTC().Unix()
+	nowUnix := j.nowTime().UTC().Unix()
 	intent := CreateIntent{
 		Kind:         kind,
 		Parent:       parent,
@@ -637,7 +652,7 @@ func (j *Journal) Confirm(kind, parent, name string, details ConfirmDetails) err
 	}
 	confAt := details.ConfirmedAtUnix
 	if confAt == 0 {
-		confAt = time.Now().UTC().Unix()
+		confAt = j.nowTime().UTC().Unix()
 	}
 	rec := JournalRecord{
 		Event:               EventConfirmed,
@@ -789,7 +804,7 @@ func (j *Journal) appendLocked(rec JournalRecord) error {
 	rec.Version = JournalVersion
 	rec.Seq = j.state.LastSeq + 1
 	if rec.Time == "" {
-		rec.Time = time.Now().UTC().Format(time.RFC3339Nano)
+		rec.Time = j.nowTime().UTC().Format(time.RFC3339Nano)
 	}
 	rec.RunID = j.meta.RunID
 	rec.SessionID = j.meta.SessionID

@@ -17,6 +17,12 @@ func (c customQuoter) QuoteAttempt(_ AttemptPricingInput, base AttemptQuote) (At
 	return base, nil
 }
 
+type zeroQuoter struct{}
+
+func (zeroQuoter) QuoteAttempt(in AttemptPricingInput, _ AttemptQuote) (AttemptQuote, error) {
+	return AttemptQuote{Operation: in.Operation, AttemptNanoUSD: 0, CleanupReserveNanoUSD: 0}, nil
+}
+
 func TestLoadEmbeddedPriceTable_FailClosedAndStaleness(t *testing.T) {
 	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 
@@ -111,5 +117,22 @@ func TestCostMeter_ReservationsAndCleanupReserve(t *testing.T) {
 	// SetCapUSD rejects > $0.25 ceiling.
 	if err := meter.SetCapUSD(0.30); !errors.Is(err, ErrCostCapExceeded) {
 		t.Fatalf("expected SetCapUSD(0.30) to fail with ErrCostCapExceeded, got %v", err)
+	}
+
+	// AttemptQuoter returning 0 is clamped to max(base, q) so adapters cannot make operations free.
+	zeroMeter, err := NewCostMeter(CostPolicy{
+		CapUSD:            DefaultCostCapUSD,
+		CeilingUSD:        HardCostCeilingUSD,
+		CleanupReserveUSD: DefaultCleanupReserveUSD,
+	}, pt, zeroQuoter{})
+	if err != nil {
+		t.Fatalf("NewCostMeter zeroQuoter: %v", err)
+	}
+	zq, err := zeroMeter.QuoteAttempt(AttemptPricingInput{Operation: "bucket_create"})
+	if err != nil {
+		t.Fatalf("QuoteAttempt zeroQuoter: %v", err)
+	}
+	if zq.AttemptNanoUSD != 5000 || zq.CleanupReserveNanoUSD != 10000 {
+		t.Fatalf("expected zeroQuoter to be clamped to base (5000, 10000), got %+v", zq)
 	}
 }

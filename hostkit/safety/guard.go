@@ -63,35 +63,39 @@ func NewLiveGuard(cfg GuardConfig) (*LiveGuard, error) {
 	if nowFn == nil {
 		nowFn = time.Now
 	}
+	st := cfg.Journal.State()
 	started := cfg.StartedAt
-	if started.IsZero() {
+	if st.StartedAtUnix > 0 {
+		started = time.Unix(st.StartedAtUnix, 0).UTC()
+	} else if started.IsZero() {
 		started = nowFn()
 	}
 	g := &LiveGuard{
-		pol:       cfg.Policy,
-		journal:   cfg.Journal,
-		meter:     cfg.Meter,
-		recovery:  cfg.Recovery,
-		errors:    cfg.Errors,
-		startedAt: started,
-		now:       nowFn,
+		pol:         cfg.Policy,
+		journal:     cfg.Journal,
+		meter:       cfg.Meter,
+		recovery:    cfg.Recovery,
+		errors:      cfg.Errors,
+		startedAt:   started,
+		now:         nowFn,
+		bucketsMade: st.BucketsCreated,
+		queuesMade:  st.QueuesCreated,
+		objectsMade: st.ObjectsCreated,
+		msgsSent:    st.MessagesSent,
+		totalBytes:  st.TotalPayloadBytes,
 	}
 
-	st := cfg.Journal.State()
 	for _, e := range st.Entries {
 		g.registerRedactions(e.OwnerNonce, e.CreateToken)
-		switch e.Kind {
-		case KindBucket:
-			g.bucketsMade++
-		case KindQueue:
-			g.queuesMade++
-		case KindObject:
-			g.objectsMade++
-		case KindQueueMessage:
-			g.msgsSent++
-		}
 	}
 	return g, nil
+}
+
+func journalWriteErr(err error) *hostkit.CloudError {
+	if err == nil {
+		return nil
+	}
+	return hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
 }
 
 func (g *LiveGuard) registerRedactions(tokens ...string) {
@@ -217,6 +221,15 @@ func (s *GuardStore) CreateBucket(ctx context.Context, bucket string) (bool, err
 
 	g.mu.Lock()
 	existing, hasExisting := g.journal.Lookup(KindBucket, "", bucket)
+	if hasExisting && (existing.State == StateRetained || existing.Retain) {
+		g.mu.Unlock()
+		return false, hostkit.ProviderError(
+			hostkit.Conflict,
+			409,
+			"ForeignResourceCollision",
+			nonEmptyReason(existing.Reason, "bucket is marked retained in journal"),
+		)
+	}
 	if !hasExisting && g.bucketsMade >= g.pol.Limits.MaxBuckets {
 		g.mu.Unlock()
 		return false, hostkit.ProviderError(
@@ -241,25 +254,40 @@ func (s *GuardStore) CreateBucket(ctx context.Context, bucket string) (bool, err
 	}
 	g.registerRedactions(intent.OwnerNonce, intent.CreateToken)
 
-	if intent.AlreadyConfirmed && existing.State == StateConfirmed {
-		// Already confirmed in this run: verify remote ownership is still intact
-		// and return created=false without overwriting tokens.
-		ro, rerr := g.recovery.ReadOwnership(ctx, ResourceRef{
-			Kind:       KindBucket,
-			Location:   meta.Region,
-			Name:       bucket,
-			ProviderID: existing.ProviderID,
-		})
-		charged := res.Commit(-1, false)
-		_ = g.journal.RecordCost(KindBucket, "", bucket, "duplicate_bucket_create_check", charged)
-		if rerr != nil {
-			return false, hostkit.AsCloudError(rerr)
+	if intent.AlreadyConfirmed {
+		if existing.State == StateRetained || existing.Retain {
+			res.Commit(0, false)
+			return false, hostkit.ProviderError(
+				hostkit.Conflict,
+				409,
+				"ForeignResourceCollision",
+				nonEmptyReason(existing.Reason, "bucket is marked retained in journal"),
+			)
 		}
-		if verr := ro.VerifyMatchesEntry(existing, meta); verr != nil {
-			_ = g.journal.Retain(KindBucket, "", bucket, verr.Error())
-			return false, hostkit.ProviderError(hostkit.Conflict, 409, "ForeignResourceCollision", verr.Error())
+		if existing.State == StateConfirmed {
+			// Already confirmed in this run: verify remote ownership is still intact
+			// and return created=false without overwriting tokens.
+			ro, rerr := g.recovery.ReadOwnership(ctx, ResourceRef{
+				Kind:       KindBucket,
+				Location:   meta.Region,
+				Name:       bucket,
+				ProviderID: existing.ProviderID,
+			})
+			charged := res.Commit(-1, false)
+			if jerr := journalWriteErr(g.journal.RecordCost(KindBucket, "", bucket, "duplicate_bucket_create_check", charged)); jerr != nil {
+				return false, jerr
+			}
+			if rerr != nil {
+				return false, hostkit.AsCloudError(rerr)
+			}
+			if verr := ro.VerifyMatchesEntry(existing, meta); verr != nil {
+				if jerr := journalWriteErr(g.journal.Retain(KindBucket, "", bucket, verr.Error())); jerr != nil {
+					return false, jerr
+				}
+				return false, hostkit.ProviderError(hostkit.Conflict, 409, "ForeignResourceCollision", verr.Error())
+			}
+			return false, nil
 		}
-		return false, nil
 	}
 
 	ctxWithTags := WithOwnershipTags(ctx, OwnershipTags{
@@ -291,9 +319,16 @@ func (s *GuardStore) CreateBucket(ctx context.Context, bucket string) (bool, err
 	if readErr == nil && ro.Exists {
 		if verr := ro.VerifyMatchesEntry(pendingEntry, meta); verr != nil {
 			// A foreign or untagged resource with the same name exists!
-			// Drop our pending intent (so we never claim or delete it) and fail closed.
+			// Record as Retain (not Failed) so repeat creates in this run never
+			// adopt or overwrite its tags and so any untagged bucket created before
+			// a tagging failure remains visible in the journal and sweep report.
 			charged := res.Commit(-1, false)
-			_ = g.journal.Failed(KindBucket, "", bucket, "foreign collision: "+verr.Error(), charged)
+			if jerr := journalWriteErr(g.journal.Retain(KindBucket, "", bucket, "foreign or untagged collision: "+verr.Error())); jerr != nil {
+				return false, jerr
+			}
+			if jerr := journalWriteErr(g.journal.RecordCost(KindBucket, "", bucket, "foreign_or_untagged_bucket_collision", charged)); jerr != nil {
+				return false, jerr
+			}
 			return false, hostkit.ProviderError(hostkit.Conflict, 409, "ForeignResourceCollision", verr.Error())
 		}
 		if callErr == nil {
@@ -324,19 +359,27 @@ func (s *GuardStore) CreateBucket(ctx context.Context, bucket string) (bool, err
 	if callErr != nil {
 		if (readErr == nil && !ro.Exists) || (readErr != nil && g.recovery.ClassifyAbsent(readErr) == AbsenceDefinitive) {
 			charged := res.Commit(-1, false)
-			_ = g.journal.Failed(KindBucket, "", bucket, callErr.Error(), charged)
+			if jerr := journalWriteErr(g.journal.Failed(KindBucket, "", bucket, callErr.Error(), charged)); jerr != nil {
+				return false, jerr
+			}
 		} else {
 			// Ambiguous outcome: keep intent + cleanup reserve in journal for recovery.
 			charged := res.Commit(-1, true)
-			_ = g.journal.RecordCost(KindBucket, "", bucket, "ambiguous_bucket_create", charged)
+			if jerr := journalWriteErr(g.journal.RecordCost(KindBucket, "", bucket, "ambiguous_bucket_create", charged)); jerr != nil {
+				return false, jerr
+			}
 		}
 		return false, callErr
 	}
 
 	// Adapter reported success, but ReadOwnership could not verify our tags!
 	charged := res.Commit(-1, true)
-	_ = g.journal.Retain(KindBucket, "", bucket, "post-create ownership verification failed")
-	_ = g.journal.RecordCost(KindBucket, "", bucket, "unverified_bucket_create", charged)
+	if jerr := journalWriteErr(g.journal.Retain(KindBucket, "", bucket, "post-create ownership verification failed")); jerr != nil {
+		return false, jerr
+	}
+	if jerr := journalWriteErr(g.journal.RecordCost(KindBucket, "", bucket, "unverified_bucket_create", charged)); jerr != nil {
+		return false, jerr
+	}
 	if readErr != nil {
 		return false, hostkit.ProviderError(hostkit.Internal, 0, "OwnershipVerificationFailed", readErr.Error())
 	}
@@ -354,6 +397,14 @@ func (s *GuardStore) DeleteBucket(ctx context.Context, bucket string) error {
 	}
 
 	entry, ok := g.journal.Lookup(KindBucket, "", bucket)
+	if ok && (entry.Retain || entry.State == StateRetained) {
+		return hostkit.ProviderError(
+			hostkit.PermissionDenied,
+			0,
+			"RetainedResourceDeleteRefused",
+			fmt.Sprintf("refusing to delete retained bucket %q: %s", bucket, nonEmptyReason(entry.Reason, "marked retained in journal")),
+		)
+	}
 	ref := ResourceRef{Kind: KindBucket, Location: meta.Region, Name: bucket}
 	if ok {
 		ref.ProviderID = entry.ProviderID
@@ -362,7 +413,9 @@ func (s *GuardStore) DeleteBucket(ctx context.Context, bucket string) error {
 	ro, readErr := g.recovery.ReadOwnership(ctx, ref)
 	if (readErr == nil && !ro.Exists) || (readErr != nil && g.recovery.ClassifyAbsent(readErr) == AbsenceDefinitive) {
 		if ok {
-			_ = g.journal.Deleted(KindBucket, "", bucket, 0)
+			if jerr := journalWriteErr(g.journal.Deleted(KindBucket, "", bucket, 0)); jerr != nil {
+				return jerr
+			}
 			g.meter.ReleaseResourceCleanup(g.meter.table.Operations["bucket_create"].CleanupReserveNanoUSD)
 		}
 		return hostkit.ProviderError(hostkit.NotFound, 404, "NoSuchBucket", "bucket does not exist").WithAbsent(hostkit.AbsentBucket)
@@ -375,8 +428,29 @@ func (s *GuardStore) DeleteBucket(ctx context.Context, bucket string) error {
 			fmt.Sprintf("bucket %q is not tracked in journal %s", bucket, meta.RunID))
 	}
 	if verr := ro.VerifyMatchesEntry(entry, meta); verr != nil {
-		_ = g.journal.Retain(KindBucket, "", bucket, verr.Error())
+		if jerr := journalWriteErr(g.journal.Retain(KindBucket, "", bucket, verr.Error())); jerr != nil {
+			return jerr
+		}
 		return hostkit.ProviderError(hostkit.PermissionDenied, 0, "OwnershipMismatch", verr.Error())
+	}
+	if !ro.ChildrenVerified {
+		if jerr := journalWriteErr(g.journal.Retain(KindBucket, "", bucket, "bucket child listing was not verified by ReadOwnership")); jerr != nil {
+			return jerr
+		}
+		return hostkit.ProviderError(
+			hostkit.PermissionDenied,
+			0,
+			"ChildListingRequired",
+			fmt.Sprintf("refusing to delete bucket %q: ReadOwnership did not verify child object listing", bucket),
+		)
+	}
+	if len(ro.ChildKeys) > 0 {
+		return hostkit.ProviderError(
+			hostkit.Conflict,
+			409,
+			"BucketNotEmpty",
+			fmt.Sprintf("bucket %q is not empty (%d child object(s) present)", bucket, len(ro.ChildKeys)),
+		)
 	}
 
 	res, cerr := g.reserveOp(AttemptPricingInput{Operation: "bucket_delete", IsCleanup: true})
@@ -387,10 +461,14 @@ func (s *GuardStore) DeleteBucket(ctx context.Context, bucket string) error {
 	charged := res.Commit(-1, false)
 	if err != nil {
 		if g.recovery.ClassifyAbsent(err) == AbsenceDefinitive {
-			_ = g.journal.Deleted(KindBucket, "", bucket, charged)
+			if jerr := journalWriteErr(g.journal.Deleted(KindBucket, "", bucket, charged)); jerr != nil {
+				return jerr
+			}
 			g.meter.ReleaseResourceCleanup(g.meter.table.Operations["bucket_create"].CleanupReserveNanoUSD)
 		} else {
-			_ = g.journal.RecordCost(KindBucket, "", bucket, "failed_bucket_delete", charged)
+			if jerr := journalWriteErr(g.journal.RecordCost(KindBucket, "", bucket, "failed_bucket_delete", charged)); jerr != nil {
+				return jerr
+			}
 		}
 		return err
 	}
@@ -408,7 +486,9 @@ func (s *GuardStore) HeadBucket(ctx context.Context, bucket string) error {
 	}
 	err := hostkit.NilIfTyped(s.store.HeadBucket(ctx, bucket))
 	charged := res.Commit(-1, false)
-	_ = s.guard.journal.RecordCost(KindBucket, "", bucket, "bucket_exists", charged)
+	if jerr := journalWriteErr(s.guard.journal.RecordCost(KindBucket, "", bucket, "bucket_exists", charged)); jerr != nil && err == nil {
+		return jerr
+	}
 	return err
 }
 
@@ -420,7 +500,9 @@ func (s *GuardStore) ListBuckets(ctx context.Context, token string) ([]string, s
 	names, next, err := s.store.ListBuckets(ctx, token)
 	err = hostkit.NilIfTyped(err)
 	charged := res.Commit(-1, false)
-	_ = s.guard.journal.RecordCost(KindBucket, "", "", "bucket_list", charged)
+	if jerr := journalWriteErr(s.guard.journal.RecordCost(KindBucket, "", "", "bucket_list", charged)); jerr != nil && err == nil {
+		return nil, "", jerr
+	}
 	return names, next, err
 }
 
@@ -444,7 +526,16 @@ func (s *GuardStore) PutObject(ctx context.Context, bucket, key string, body []b
 	}
 
 	g.mu.Lock()
-	_, hasObj := g.journal.Lookup(KindObject, bucket, key)
+	existingObj, hasObj := g.journal.Lookup(KindObject, bucket, key)
+	if hasObj && (existingObj.Retain || existingObj.State == StateRetained) {
+		g.mu.Unlock()
+		return hostkit.ObjectMeta{}, hostkit.ProviderError(
+			hostkit.Conflict,
+			409,
+			"ForeignResourceCollision",
+			nonEmptyReason(existingObj.Reason, "object is marked retained in journal"),
+		)
+	}
 	if !hasObj && g.objectsMade >= g.pol.Limits.MaxObjects {
 		g.mu.Unlock()
 		return hostkit.ObjectMeta{}, hostkit.ProviderError(
@@ -501,10 +592,14 @@ func (s *GuardStore) PutObject(ctx context.Context, bucket, key string, body []b
 		})
 		if (rerr == nil && !ro.Exists) || (rerr != nil && g.recovery.ClassifyAbsent(rerr) == AbsenceDefinitive) {
 			charged := res.Commit(-1, false)
-			_ = g.journal.Failed(KindObject, bucket, key, callErr.Error(), charged)
+			if jerr := journalWriteErr(g.journal.Failed(KindObject, bucket, key, callErr.Error(), charged)); jerr != nil {
+				return hostkit.ObjectMeta{}, jerr
+			}
 		} else {
 			charged := res.Commit(-1, true)
-			_ = g.journal.RecordCost(KindObject, bucket, key, "ambiguous_object_put", charged)
+			if jerr := journalWriteErr(g.journal.RecordCost(KindObject, bucket, key, "ambiguous_object_put", charged)); jerr != nil {
+				return hostkit.ObjectMeta{}, jerr
+			}
 		}
 		return hostkit.ObjectMeta{}, callErr
 	}
@@ -515,6 +610,7 @@ func (s *GuardStore) PutObject(ctx context.Context, bucket, key string, body []b
 		ETag:            om.ETag,
 		ConfirmedAtUnix: g.now().UTC().Unix(),
 		ChargedNanoUSD:  charged,
+		PayloadBytes:    sz,
 	}); err != nil {
 		return hostkit.ObjectMeta{}, hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
 	}
@@ -528,16 +624,26 @@ func (s *GuardStore) PutObject(ctx context.Context, bucket, key string, body []b
 }
 
 func (s *GuardStore) GetObject(ctx context.Context, bucket, key string, limit int64) ([]byte, error) {
-	egressEst := limit
-	if egressEst <= 0 || egressEst > s.guard.pol.Limits.MaxObjectBytes {
-		egressEst = s.guard.pol.Limits.MaxObjectBytes
+	maxBytes := s.guard.pol.Limits.MaxObjectBytes
+	clampedLimit := limit
+	if clampedLimit <= 0 || (maxBytes > 0 && clampedLimit > maxBytes) {
+		clampedLimit = maxBytes
 	}
-	res, cerr := s.guard.reserveOp(AttemptPricingInput{Operation: "object_get", EgressBytes: egressEst})
+	res, cerr := s.guard.reserveOp(AttemptPricingInput{Operation: "object_get", EgressBytes: clampedLimit})
 	if cerr != nil {
 		return nil, cerr
 	}
-	body, err := s.store.GetObject(ctx, bucket, key, limit)
+	body, err := s.store.GetObject(ctx, bucket, key, clampedLimit)
 	err = hostkit.NilIfTyped(err)
+	if err == nil && maxBytes > 0 && int64(len(body)) > maxBytes {
+		err = hostkit.ProviderError(
+			hostkit.PermissionDenied,
+			0,
+			"LiveLimitExceeded",
+			fmt.Sprintf("downloaded object size %d exceeds max_object_bytes (%d)", len(body), maxBytes),
+		)
+		body = nil
+	}
 	actualQuote, qerr := s.guard.meter.QuoteAttempt(AttemptPricingInput{
 		Operation:   "object_get",
 		EgressBytes: int64(len(body)),
@@ -547,7 +653,9 @@ func (s *GuardStore) GetObject(ctx context.Context, bucket, key string, limit in
 		actualNano = actualQuote.AttemptNanoUSD
 	}
 	charged := res.Commit(actualNano, false)
-	_ = s.guard.journal.RecordCost(KindObject, bucket, key, "object_get", charged)
+	if jerr := journalWriteErr(s.guard.journal.RecordCost(KindObject, bucket, key, "object_get", charged)); jerr != nil && err == nil {
+		return nil, jerr
+	}
 	return body, err
 }
 
@@ -559,7 +667,9 @@ func (s *GuardStore) HeadObject(ctx context.Context, bucket, key string) (hostki
 	om, err := s.store.HeadObject(ctx, bucket, key)
 	err = hostkit.NilIfTyped(err)
 	charged := res.Commit(-1, false)
-	_ = s.guard.journal.RecordCost(KindObject, bucket, key, "object_head", charged)
+	if jerr := journalWriteErr(s.guard.journal.RecordCost(KindObject, bucket, key, "object_head", charged)); jerr != nil && err == nil {
+		return hostkit.ObjectMeta{}, jerr
+	}
 	return om, err
 }
 
@@ -573,12 +683,22 @@ func (s *GuardStore) DeleteObject(ctx context.Context, bucket, key string) error
 	}
 	meta := g.journal.Meta()
 	entry, ok := g.journal.Lookup(KindObject, bucket, key)
+	if ok && (entry.Retain || entry.State == StateRetained) {
+		return hostkit.ProviderError(
+			hostkit.PermissionDenied,
+			0,
+			"RetainedResourceDeleteRefused",
+			fmt.Sprintf("refusing to delete retained object %s/%s: %s", bucket, key, nonEmptyReason(entry.Reason, "marked retained in journal")),
+		)
+	}
 	ref := ResourceRef{Kind: KindObject, Parent: bucket, Location: meta.Region, Name: key}
 
 	ro, readErr := g.recovery.ReadOwnership(ctx, ref)
 	if (readErr == nil && !ro.Exists) || (readErr != nil && g.recovery.ClassifyAbsent(readErr) == AbsenceDefinitive) {
 		if ok {
-			_ = g.journal.Deleted(KindObject, bucket, key, 0)
+			if jerr := journalWriteErr(g.journal.Deleted(KindObject, bucket, key, 0)); jerr != nil {
+				return jerr
+			}
 			g.meter.ReleaseResourceCleanup(g.meter.table.Operations["object_put"].CleanupReserveNanoUSD)
 		}
 		return hostkit.ProviderError(hostkit.NotFound, 404, "NoSuchKey", "object does not exist").WithAbsent(hostkit.AbsentObject)
@@ -591,7 +711,9 @@ func (s *GuardStore) DeleteObject(ctx context.Context, bucket, key string) error
 			fmt.Sprintf("object %s/%s is not tracked in journal %s", bucket, key, meta.RunID))
 	}
 	if verr := ro.VerifyMatchesEntry(entry, meta); verr != nil {
-		_ = g.journal.Retain(KindObject, bucket, key, verr.Error())
+		if jerr := journalWriteErr(g.journal.Retain(KindObject, bucket, key, verr.Error())); jerr != nil {
+			return jerr
+		}
 		return hostkit.ProviderError(hostkit.PermissionDenied, 0, "OwnershipMismatch", verr.Error())
 	}
 
@@ -603,10 +725,14 @@ func (s *GuardStore) DeleteObject(ctx context.Context, bucket, key string) error
 	charged := res.Commit(-1, false)
 	if err != nil {
 		if g.recovery.ClassifyAbsent(err) == AbsenceDefinitive {
-			_ = g.journal.Deleted(KindObject, bucket, key, charged)
+			if jerr := journalWriteErr(g.journal.Deleted(KindObject, bucket, key, charged)); jerr != nil {
+				return jerr
+			}
 			g.meter.ReleaseResourceCleanup(g.meter.table.Operations["object_put"].CleanupReserveNanoUSD)
 		} else {
-			_ = g.journal.RecordCost(KindObject, bucket, key, "failed_object_delete", charged)
+			if jerr := journalWriteErr(g.journal.RecordCost(KindObject, bucket, key, "failed_object_delete", charged)); jerr != nil {
+				return jerr
+			}
 		}
 		return err
 	}
@@ -625,7 +751,9 @@ func (s *GuardStore) ListObjects(ctx context.Context, bucket, prefix string, max
 	page, err := s.store.ListObjects(ctx, bucket, prefix, max, token)
 	err = hostkit.NilIfTyped(err)
 	charged := res.Commit(-1, false)
-	_ = s.guard.journal.RecordCost(KindObject, bucket, prefix, "object_list", charged)
+	if jerr := journalWriteErr(s.guard.journal.RecordCost(KindObject, bucket, prefix, "object_list", charged)); jerr != nil && err == nil {
+		return hostkit.ObjectPage{}, jerr
+	}
 	return page, err
 }
 
@@ -673,6 +801,15 @@ func (q *GuardQueue) CreateQueue(ctx context.Context, queue string) (bool, error
 
 	g.mu.Lock()
 	existing, hasExisting := g.journal.Lookup(KindQueue, "", queue)
+	if hasExisting && (existing.State == StateRetained || existing.Retain) {
+		g.mu.Unlock()
+		return false, hostkit.ProviderError(
+			hostkit.Conflict,
+			409,
+			"ForeignResourceCollision",
+			nonEmptyReason(existing.Reason, "queue is marked retained in journal"),
+		)
+	}
 	if !hasExisting && g.queuesMade >= g.pol.Limits.MaxQueues {
 		g.mu.Unlock()
 		return false, hostkit.ProviderError(
@@ -697,23 +834,38 @@ func (q *GuardQueue) CreateQueue(ctx context.Context, queue string) (bool, error
 	}
 	g.registerRedactions(intent.OwnerNonce, intent.CreateToken)
 
-	if intent.AlreadyConfirmed && existing.State == StateConfirmed {
-		ro, rerr := g.recovery.ReadOwnership(ctx, ResourceRef{
-			Kind:       KindQueue,
-			Location:   meta.Region,
-			Name:       queue,
-			ProviderID: existing.ProviderID,
-		})
-		charged := res.Commit(-1, false)
-		_ = g.journal.RecordCost(KindQueue, "", queue, "duplicate_queue_create_check", charged)
-		if rerr != nil {
-			return false, hostkit.AsCloudError(rerr)
+	if intent.AlreadyConfirmed {
+		if existing.State == StateRetained || existing.Retain {
+			res.Commit(0, false)
+			return false, hostkit.ProviderError(
+				hostkit.Conflict,
+				409,
+				"ForeignResourceCollision",
+				nonEmptyReason(existing.Reason, "queue is marked retained in journal"),
+			)
 		}
-		if verr := ro.VerifyMatchesEntry(existing, meta); verr != nil {
-			_ = g.journal.Retain(KindQueue, "", queue, verr.Error())
-			return false, hostkit.ProviderError(hostkit.Conflict, 409, "ForeignResourceCollision", verr.Error())
+		if existing.State == StateConfirmed {
+			ro, rerr := g.recovery.ReadOwnership(ctx, ResourceRef{
+				Kind:       KindQueue,
+				Location:   meta.Region,
+				Name:       queue,
+				ProviderID: existing.ProviderID,
+			})
+			charged := res.Commit(-1, false)
+			if jerr := journalWriteErr(g.journal.RecordCost(KindQueue, "", queue, "duplicate_queue_create_check", charged)); jerr != nil {
+				return false, jerr
+			}
+			if rerr != nil {
+				return false, hostkit.AsCloudError(rerr)
+			}
+			if verr := ro.VerifyMatchesEntry(existing, meta); verr != nil {
+				if jerr := journalWriteErr(g.journal.Retain(KindQueue, "", queue, verr.Error())); jerr != nil {
+					return false, jerr
+				}
+				return false, hostkit.ProviderError(hostkit.Conflict, 409, "ForeignResourceCollision", verr.Error())
+			}
+			return false, nil
 		}
-		return false, nil
 	}
 
 	ctxWithTags := WithOwnershipTags(ctx, OwnershipTags{
@@ -743,7 +895,12 @@ func (q *GuardQueue) CreateQueue(ctx context.Context, queue string) (bool, error
 	if readErr == nil && ro.Exists {
 		if verr := ro.VerifyMatchesEntry(pendingEntry, meta); verr != nil {
 			charged := res.Commit(-1, false)
-			_ = g.journal.Failed(KindQueue, "", queue, "foreign collision: "+verr.Error(), charged)
+			if jerr := journalWriteErr(g.journal.Retain(KindQueue, "", queue, "foreign or untagged collision: "+verr.Error())); jerr != nil {
+				return false, jerr
+			}
+			if jerr := journalWriteErr(g.journal.RecordCost(KindQueue, "", queue, "foreign_or_untagged_queue_collision", charged)); jerr != nil {
+				return false, jerr
+			}
 			return false, hostkit.ProviderError(hostkit.Conflict, 409, "ForeignResourceCollision", verr.Error())
 		}
 		if callErr == nil {
@@ -772,17 +929,25 @@ func (q *GuardQueue) CreateQueue(ctx context.Context, queue string) (bool, error
 	if callErr != nil {
 		if (readErr == nil && !ro.Exists) || (readErr != nil && g.recovery.ClassifyAbsent(readErr) == AbsenceDefinitive) {
 			charged := res.Commit(-1, false)
-			_ = g.journal.Failed(KindQueue, "", queue, callErr.Error(), charged)
+			if jerr := journalWriteErr(g.journal.Failed(KindQueue, "", queue, callErr.Error(), charged)); jerr != nil {
+				return false, jerr
+			}
 		} else {
 			charged := res.Commit(-1, true)
-			_ = g.journal.RecordCost(KindQueue, "", queue, "ambiguous_queue_create", charged)
+			if jerr := journalWriteErr(g.journal.RecordCost(KindQueue, "", queue, "ambiguous_queue_create", charged)); jerr != nil {
+				return false, jerr
+			}
 		}
 		return false, callErr
 	}
 
 	charged := res.Commit(-1, true)
-	_ = g.journal.Retain(KindQueue, "", queue, "post-create queue ownership verification failed")
-	_ = g.journal.RecordCost(KindQueue, "", queue, "unverified_queue_create", charged)
+	if jerr := journalWriteErr(g.journal.Retain(KindQueue, "", queue, "post-create queue ownership verification failed")); jerr != nil {
+		return false, jerr
+	}
+	if jerr := journalWriteErr(g.journal.RecordCost(KindQueue, "", queue, "unverified_queue_create", charged)); jerr != nil {
+		return false, jerr
+	}
 	if readErr != nil {
 		return false, hostkit.ProviderError(hostkit.Internal, 0, "OwnershipVerificationFailed", readErr.Error())
 	}
@@ -800,6 +965,14 @@ func (q *GuardQueue) DeleteQueue(ctx context.Context, queue string) error {
 	}
 
 	entry, ok := g.journal.Lookup(KindQueue, "", queue)
+	if ok && (entry.Retain || entry.State == StateRetained) {
+		return hostkit.ProviderError(
+			hostkit.PermissionDenied,
+			0,
+			"RetainedResourceDeleteRefused",
+			fmt.Sprintf("refusing to delete retained queue %q: %s", queue, nonEmptyReason(entry.Reason, "marked retained in journal")),
+		)
+	}
 	ref := ResourceRef{Kind: KindQueue, Location: meta.Region, Name: queue}
 	if ok {
 		ref.ProviderID = entry.ProviderID
@@ -808,7 +981,9 @@ func (q *GuardQueue) DeleteQueue(ctx context.Context, queue string) error {
 	ro, readErr := g.recovery.ReadOwnership(ctx, ref)
 	if (readErr == nil && !ro.Exists) || (readErr != nil && g.recovery.ClassifyAbsent(readErr) == AbsenceDefinitive) {
 		if ok {
-			_ = g.journal.Deleted(KindQueue, "", queue, 0)
+			if jerr := journalWriteErr(g.journal.Deleted(KindQueue, "", queue, 0)); jerr != nil {
+				return jerr
+			}
 			g.meter.ReleaseResourceCleanup(g.meter.table.Operations["queue_create"].CleanupReserveNanoUSD)
 		}
 		return hostkit.ProviderError(hostkit.NotFound, 404, "NonExistentQueue", "queue does not exist").WithAbsent(hostkit.AbsentQueue)
@@ -821,7 +996,9 @@ func (q *GuardQueue) DeleteQueue(ctx context.Context, queue string) error {
 			fmt.Sprintf("queue %q is not tracked in journal %s", queue, meta.RunID))
 	}
 	if verr := ro.VerifyMatchesEntry(entry, meta); verr != nil {
-		_ = g.journal.Retain(KindQueue, "", queue, verr.Error())
+		if jerr := journalWriteErr(g.journal.Retain(KindQueue, "", queue, verr.Error())); jerr != nil {
+			return jerr
+		}
 		return hostkit.ProviderError(hostkit.PermissionDenied, 0, "OwnershipMismatch", verr.Error())
 	}
 
@@ -833,10 +1010,14 @@ func (q *GuardQueue) DeleteQueue(ctx context.Context, queue string) error {
 	charged := res.Commit(-1, false)
 	if err != nil {
 		if g.recovery.ClassifyAbsent(err) == AbsenceDefinitive {
-			_ = g.journal.Deleted(KindQueue, "", queue, charged)
+			if jerr := journalWriteErr(g.journal.Deleted(KindQueue, "", queue, charged)); jerr != nil {
+				return jerr
+			}
 			g.meter.ReleaseResourceCleanup(g.meter.table.Operations["queue_create"].CleanupReserveNanoUSD)
 		} else {
-			_ = g.journal.RecordCost(KindQueue, "", queue, "failed_queue_delete", charged)
+			if jerr := journalWriteErr(g.journal.RecordCost(KindQueue, "", queue, "failed_queue_delete", charged)); jerr != nil {
+				return jerr
+			}
 		}
 		return err
 	}
@@ -854,7 +1035,9 @@ func (q *GuardQueue) LookupQueue(ctx context.Context, queue string) error {
 	}
 	err := hostkit.NilIfTyped(q.queue.LookupQueue(ctx, queue))
 	charged := res.Commit(-1, false)
-	_ = q.guard.journal.RecordCost(KindQueue, "", queue, "queue_exists", charged)
+	if jerr := journalWriteErr(q.guard.journal.RecordCost(KindQueue, "", queue, "queue_exists", charged)); jerr != nil && err == nil {
+		return jerr
+	}
 	return err
 }
 
@@ -866,7 +1049,9 @@ func (q *GuardQueue) ListQueues(ctx context.Context, token string) ([]string, st
 	names, next, err := q.queue.ListQueues(ctx, token)
 	err = hostkit.NilIfTyped(err)
 	charged := res.Commit(-1, false)
-	_ = q.guard.journal.RecordCost(KindQueue, "", "", "queue_list", charged)
+	if jerr := journalWriteErr(q.guard.journal.RecordCost(KindQueue, "", "", "queue_list", charged)); jerr != nil && err == nil {
+		return nil, "", jerr
+	}
 	return names, next, err
 }
 
@@ -919,7 +1104,9 @@ func (q *GuardQueue) Send(ctx context.Context, queue, wire string) (string, erro
 	err = hostkit.NilIfTyped(err)
 	if err != nil {
 		charged := res.Commit(-1, false)
-		_ = g.journal.RecordCost(KindQueueMessage, queue, "send", "failed_queue_send", charged)
+		if jerr := journalWriteErr(g.journal.RecordCost(KindQueueMessage, queue, "send", "failed_queue_send", charged)); jerr != nil {
+			return "", jerr
+		}
 		return "", err
 	}
 
@@ -928,7 +1115,9 @@ func (q *GuardQueue) Send(ctx context.Context, queue, wire string) (string, erro
 	if msgName == "" {
 		msgName = "msg"
 	}
-	_ = g.journal.RecordCost(KindQueueMessage, queue, msgName, "queue_send", charged)
+	if jerr := journalWriteErr(g.journal.RecordCostWithBytes(KindQueueMessage, queue, msgName, "queue_send", charged, sz)); jerr != nil {
+		return "", jerr
+	}
 
 	g.mu.Lock()
 	g.msgsSent++
@@ -949,7 +1138,9 @@ func (q *GuardQueue) Receive(ctx context.Context, queue string, max, waitSeconds
 	msgs, err := q.queue.Receive(ctx, queue, max, waitSeconds, visibility)
 	err = hostkit.NilIfTyped(err)
 	charged := res.Commit(-1, false)
-	_ = g.journal.RecordCost(KindQueue, "", queue, "queue_receive", charged)
+	if jerr := journalWriteErr(g.journal.RecordCost(KindQueue, "", queue, "queue_receive", charged)); jerr != nil && err == nil {
+		return nil, jerr
+	}
 	return msgs, err
 }
 
@@ -961,13 +1152,15 @@ func (q *GuardQueue) Ack(ctx context.Context, queue, receipt string) error {
 	if _, cerr := g.verifyOwnedParent(ctx, KindQueue, queue, hostkit.AbsentQueue); cerr != nil {
 		return cerr
 	}
-	res, cerr := g.reserveOp(AttemptPricingInput{Operation: "queue_ack", IsCleanup: true})
+	res, cerr := g.reserveOp(AttemptPricingInput{Operation: "queue_ack"})
 	if cerr != nil {
 		return cerr
 	}
 	err := hostkit.NilIfTyped(q.queue.Ack(ctx, queue, receipt))
 	charged := res.Commit(-1, false)
-	_ = g.journal.RecordCost(KindQueueMessage, queue, "ack", "queue_ack", charged)
+	if jerr := journalWriteErr(g.journal.RecordCost(KindQueueMessage, queue, "ack", "queue_ack", charged)); jerr != nil && err == nil {
+		return jerr
+	}
 	return err
 }
 
@@ -986,7 +1179,9 @@ func (q *GuardQueue) Nack(ctx context.Context, queue, receipt string, visibility
 	newReceipt, err := q.queue.Nack(ctx, queue, receipt, visibility)
 	err = hostkit.NilIfTyped(err)
 	charged := res.Commit(-1, false)
-	_ = g.journal.RecordCost(KindQueueMessage, queue, "nack", "queue_nack", charged)
+	if jerr := journalWriteErr(g.journal.RecordCost(KindQueueMessage, queue, "nack", "queue_nack", charged)); jerr != nil && err == nil {
+		return "", jerr
+	}
 	return newReceipt, err
 }
 

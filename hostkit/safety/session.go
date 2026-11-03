@@ -108,35 +108,27 @@ func OpenSession(ctx context.Context, cfg SessionConfig) (*Session, error) {
 	}
 
 	meta := JournalMeta{
-		RunID:      runID,
-		SessionID:  sessID,
-		PolicyHash: cfg.Policy.Hash(),
-		Provider:   cfg.Policy.Provider,
-		Account:    ident.Account,
-		Tenant:     ident.Tenant,
-		Scope:      scope.Scope,
-		Region:     scope.Region,
-		Endpoint:   scope.Endpoint,
+		RunID:         runID,
+		SessionID:     sessID,
+		PolicyHash:    cfg.Policy.Hash(),
+		Provider:      cfg.Policy.Provider,
+		Account:       ident.Account,
+		Tenant:        ident.Tenant,
+		Scope:         scope.Scope,
+		Region:        scope.Region,
+		Endpoint:      scope.Endpoint,
+		StartedAtUnix: nowFn().UTC().Unix(),
 	}
 
 	j, err := OpenJournal(cfg.Policy.JournalDir, meta)
 	if err != nil {
 		return nil, err
 	}
+	j.SetClock(nowFn)
+	meta = j.Meta()
 
 	st := j.State()
-	var activeCleanupNano int64
-	for _, e := range st.Entries {
-		switch e.Kind {
-		case KindBucket:
-			activeCleanupNano += pt.Operations["bucket_create"].CleanupReserveNanoUSD
-		case KindQueue:
-			activeCleanupNano += pt.Operations["queue_create"].CleanupReserveNanoUSD
-		case KindObject:
-			activeCleanupNano += pt.Operations["object_put"].CleanupReserveNanoUSD
-		}
-	}
-	meter.RestoreCharged(st.ChargedNanoUSD, activeCleanupNano)
+	restoreMeterFromState(meter, pt, st)
 
 	guard, err := NewLiveGuard(GuardConfig{
 		Policy:    cfg.Policy,
@@ -216,12 +208,47 @@ func (s *Session) FinishAndSweep(ctx context.Context) (SweepReport, error) {
 		Meter:      s.meter,
 		Apply:      true,
 		ScanPrefix: true,
+		Now:        s.now,
 	})
 	closeErr := s.journal.Close()
 	if sweepErr != nil {
 		return rep, sweepErr
 	}
 	return rep, closeErr
+}
+
+func restoreMeterFromState(meter *CostMeter, pt *PriceTable, st LedgerState) {
+	if meter == nil || pt == nil {
+		return
+	}
+	chargedNano := st.ChargedNanoUSD
+	var activeCleanupNano int64
+	for _, e := range st.Entries {
+		var opName string
+		switch e.Kind {
+		case KindBucket:
+			opName = "bucket_create"
+		case KindQueue:
+			opName = "queue_create"
+		case KindObject:
+			opName = "object_put"
+		}
+		opPrice := pt.Operations[opName]
+		switch e.State {
+		case StateConfirmed:
+			activeCleanupNano += opPrice.CleanupReserveNanoUSD
+		case StatePending:
+			// LOW 12: Account for unresolved pending intent reservations after a crash
+			// so subsequent work or recovery sweeps never undercount committed spend.
+			if e.ReservedNanoUSD > 0 {
+				chargedNano += e.ReservedNanoUSD
+			} else {
+				chargedNano += opPrice.RequestNanoUSD + opPrice.CleanupReserveNanoUSD
+			}
+			activeCleanupNano += opPrice.CleanupReserveNanoUSD
+		}
+	}
+	meter.RestoreCharged(chargedNano, activeCleanupNano)
 }
 
 // Supervisor coordinates a multi-invocation live campaign sharing a single
@@ -337,10 +364,23 @@ func SweepAllStale(ctx context.Context, journalDir string, policy *Policy, recov
 		if !hasActive {
 			continue
 		}
+		var meter *CostMeter
+		if pt, perr := LoadEmbeddedPriceTable(st.Meta.Provider, st.Meta.Region, time.Now().UTC()); perr == nil {
+			var costPol CostPolicy
+			if policy != nil {
+				costPol = policy.Cost
+			}
+			costPol.applyDefaults()
+			if m, merr := NewCostMeter(costPol, pt, recovery); merr == nil {
+				restoreMeterFromState(m, pt, *st)
+				meter = m
+			}
+		}
 		rep, err := Sweep(ctx, recovery, SweepOptions{
 			JournalDir: journalDir,
 			RunID:      runID,
 			Policy:     policy,
+			Meter:      meter,
 			Apply:      apply,
 			ScanPrefix: true,
 		})
