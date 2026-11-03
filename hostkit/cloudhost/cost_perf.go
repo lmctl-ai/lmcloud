@@ -181,27 +181,32 @@ type persistedOpCost struct {
 }
 
 type campaignJournalRecord struct {
-	Version               int    `json:"v"`
-	Seq                   uint64 `json:"seq"`
-	Event                 string `json:"event"`
-	Provider              string `json:"provider,omitempty"`
-	PriceTableVersion     string `json:"price_table_version,omitempty"`
-	CapNanoUSD            int64  `json:"cap_nano_usd,omitempty"`
-	CeilingNanoUSD        int64  `json:"ceiling_nano_usd,omitempty"`
-	AttemptID             string `json:"attempt_id,omitempty"`
-	Operation             string `json:"operation,omitempty"`
-	ResKind               string `json:"res_kind,omitempty"`
-	ResKey                string `json:"res_key,omitempty"`
-	IsCleanup             bool   `json:"is_cleanup,omitempty"`
-	AttemptNanoUSD        int64  `json:"attempt_nano_usd,omitempty"`
-	CleanupReserveNanoUSD int64  `json:"cleanup_reserve_nano_usd,omitempty"`
-	ReservedBytes         int64  `json:"reserved_bytes,omitempty"`
-	ChargedNanoUSD        int64  `json:"charged_nano_usd,omitempty"`
-	SettledBytes          int64  `json:"settled_bytes,omitempty"`
-	BillingUnits          int64  `json:"billing_units,omitempty"`
-	LockCleanup           bool   `json:"lock_cleanup,omitempty"`
-	ReleaseCleanup        bool   `json:"release_cleanup,omitempty"`
-	WorkCapNanoUSD        int64  `json:"work_cap_nano_usd,omitempty"`
+	Version                  int    `json:"v"`
+	Seq                      uint64 `json:"seq"`
+	Event                    string `json:"event"`
+	Provider                 string `json:"provider,omitempty"`
+	Region                   string `json:"region,omitempty"`
+	Scope                    string `json:"scope,omitempty"`
+	PriceTableVersion        string `json:"price_table_version,omitempty"`
+	PriceTableHash           string `json:"price_table_hash,omitempty"`
+	PolicyHash               string `json:"policy_hash,omitempty"`
+	CapNanoUSD               int64  `json:"cap_nano_usd,omitempty"`
+	CeilingNanoUSD           int64  `json:"ceiling_nano_usd,omitempty"`
+	MaxCleanupReserveNanoUSD int64  `json:"max_cleanup_reserve_nano_usd,omitempty"`
+	AttemptID                string `json:"attempt_id,omitempty"`
+	Operation                string `json:"operation,omitempty"`
+	ResKind                  string `json:"res_kind,omitempty"`
+	ResKey                   string `json:"res_key,omitempty"`
+	IsCleanup                bool   `json:"is_cleanup,omitempty"`
+	AttemptNanoUSD           int64  `json:"attempt_nano_usd,omitempty"`
+	CleanupReserveNanoUSD    int64  `json:"cleanup_reserve_nano_usd,omitempty"`
+	ReservedBytes            int64  `json:"reserved_bytes,omitempty"`
+	ChargedNanoUSD           int64  `json:"charged_nano_usd,omitempty"`
+	SettledBytes             int64  `json:"settled_bytes,omitempty"`
+	BillingUnits             int64  `json:"billing_units,omitempty"`
+	LockCleanup              bool   `json:"lock_cleanup,omitempty"`
+	ReleaseCleanup           bool   `json:"release_cleanup,omitempty"`
+	WorkCapNanoUSD           int64  `json:"work_cap_nano_usd,omitempty"`
 }
 
 type replayedCampaignState struct {
@@ -268,6 +273,7 @@ func extractLiveGuard(store hostkit.ObjectStore, queue hostkit.Queue) *safety.Li
 type costTracker struct {
 	mu                   sync.Mutex
 	provider             string
+	scope                string
 	meter                *safety.CostMeter
 	journal              *safety.Journal
 	liveGuard            *safety.LiveGuard
@@ -284,6 +290,47 @@ type costTracker struct {
 	inFlightAttempts     map[string]bool
 }
 
+func resolveCampaignScope() string {
+	for _, k := range []string{"LMCLOUD_SCOPE", "LMCLOUD_ACCOUNT", "AWS_ACCOUNT_ID", "AZURE_SUBSCRIPTION_ID", "GOOGLE_CLOUD_PROJECT", "OCI_TENANCY_OCID"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return k + "=" + v
+		}
+	}
+	return "default"
+}
+
+func (ct *costTracker) campaignMetaRecord() campaignJournalRecord {
+	var ptVer, ptHash, region string
+	if pt := ct.meter.Table(); pt != nil {
+		ptVer = pt.VersionID()
+		region = pt.Region
+		if raw, err := json.Marshal(pt); err == nil {
+			sum := sha256.Sum256(raw)
+			ptHash = hex.EncodeToString(sum[:])
+		}
+	}
+	snap := ct.meter.Snapshot()
+	scope := ct.scope
+	if scope == "" {
+		scope = "default"
+	}
+	polDigest := fmt.Sprintf("provider=%s\x00region=%s\x00scope=%s\x00pt_ver=%s\x00pt_hash=%s\x00cap=%d\x00ceil=%d\x00cleanup=%d",
+		ct.provider, region, scope, ptVer, ptHash, snap.CapNanoUSD, snap.CeilingNanoUSD, snap.CleanupReserveNanoUSD)
+	polSum := sha256.Sum256([]byte(polDigest))
+	return campaignJournalRecord{
+		Event:                    safety.EventMeta,
+		Provider:                 ct.provider,
+		Region:                   region,
+		Scope:                    scope,
+		PriceTableVersion:        ptVer,
+		PriceTableHash:           ptHash,
+		PolicyHash:               hex.EncodeToString(polSum[:]),
+		CapNanoUSD:               snap.CapNanoUSD,
+		CeilingNanoUSD:           snap.CeilingNanoUSD,
+		MaxCleanupReserveNanoUSD: snap.CleanupReserveNanoUSD,
+	}
+}
+
 func newCostTracker(cfg Config) *costTracker {
 	provider := strings.ToLower(strings.TrimSpace(cfg.Provider))
 	if provider == "" {
@@ -295,6 +342,7 @@ func newCostTracker(cfg Config) *costTracker {
 
 	ct := &costTracker{
 		provider:         provider,
+		scope:            resolveCampaignScope(),
 		journal:          cfg.Journal,
 		liveGuard:        lg,
 		statePath:        strings.TrimSpace(cfg.CampaignStatePath),
@@ -592,18 +640,32 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 			if i != 0 {
 				return nil, errors.New("corrupt campaign journal: duplicate meta record")
 			}
-			if rec.Provider == "" {
-				return nil, errors.New("corrupt campaign journal: missing provider in meta record")
+			wantMeta := ct.campaignMetaRecord()
+			if rec.Provider == "" || rec.PriceTableVersion == "" || rec.PriceTableHash == "" || rec.PolicyHash == "" || rec.CapNanoUSD <= 0 || rec.CeilingNanoUSD <= 0 {
+				return nil, errors.New("corrupt campaign journal: incomplete authority metadata in meta record")
 			}
-			if rec.Provider != ct.provider {
-				return nil, fmt.Errorf("campaign journal provider mismatch: journal has %q, tracker has %q", rec.Provider, ct.provider)
+			if rec.Provider != wantMeta.Provider {
+				return nil, fmt.Errorf("campaign journal provider mismatch: journal has %q, tracker has %q", rec.Provider, wantMeta.Provider)
 			}
-			if pt := ct.meter.Table(); pt != nil && rec.PriceTableVersion != "" && rec.PriceTableVersion != pt.VersionID() {
-				return nil, fmt.Errorf("campaign journal price_table_version mismatch: journal has %q, tracker has %q", rec.PriceTableVersion, pt.VersionID())
+			if rec.Region != wantMeta.Region {
+				return nil, fmt.Errorf("campaign journal region mismatch: journal has %q, tracker has %q", rec.Region, wantMeta.Region)
 			}
-			if snap := ct.meter.Snapshot(); (rec.CapNanoUSD > 0 && rec.CapNanoUSD != snap.CapNanoUSD) || (rec.CeilingNanoUSD > 0 && rec.CeilingNanoUSD != snap.CeilingNanoUSD) {
-				return nil, fmt.Errorf("campaign journal policy cap/ceiling mismatch: journal has (%d/%d), tracker has (%d/%d)",
-					rec.CapNanoUSD, rec.CeilingNanoUSD, snap.CapNanoUSD, snap.CeilingNanoUSD)
+			if rec.Scope != wantMeta.Scope {
+				return nil, fmt.Errorf("campaign journal scope mismatch: journal has %q, tracker has %q", rec.Scope, wantMeta.Scope)
+			}
+			if rec.PriceTableVersion != wantMeta.PriceTableVersion {
+				return nil, fmt.Errorf("campaign journal price_table_version mismatch: journal has %q, tracker has %q", rec.PriceTableVersion, wantMeta.PriceTableVersion)
+			}
+			if rec.PriceTableHash != wantMeta.PriceTableHash {
+				return nil, fmt.Errorf("campaign journal price_table_hash mismatch: journal has %q, tracker has %q", rec.PriceTableHash, wantMeta.PriceTableHash)
+			}
+			if rec.CapNanoUSD != wantMeta.CapNanoUSD || rec.CeilingNanoUSD != wantMeta.CeilingNanoUSD || rec.MaxCleanupReserveNanoUSD != wantMeta.MaxCleanupReserveNanoUSD {
+				return nil, fmt.Errorf("campaign journal policy cap/ceiling/cleanup mismatch: journal has (%d/%d/%d), tracker has (%d/%d/%d)",
+					rec.CapNanoUSD, rec.CeilingNanoUSD, rec.MaxCleanupReserveNanoUSD,
+					wantMeta.CapNanoUSD, wantMeta.CeilingNanoUSD, wantMeta.MaxCleanupReserveNanoUSD)
+			}
+			if rec.PolicyHash != wantMeta.PolicyHash {
+				return nil, fmt.Errorf("campaign journal policy_hash mismatch: journal has %q, tracker has %q", rec.PolicyHash, wantMeta.PolicyHash)
 			}
 		case safety.EventWorkCap:
 			if rec.WorkCapNanoUSD <= 0 {
@@ -819,18 +881,7 @@ func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(s
 	if fn != nil {
 		appendFn := func(rec campaignJournalRecord) error {
 			if st.lastSeq == 0 {
-				ptVer := ""
-				if pt := ct.meter.Table(); pt != nil {
-					ptVer = pt.VersionID()
-				}
-				snap := ct.meter.Snapshot()
-				if err := appendCampaignRecord(f, 1, campaignJournalRecord{
-					Event:             safety.EventMeta,
-					Provider:          ct.provider,
-					PriceTableVersion: ptVer,
-					CapNanoUSD:        snap.CapNanoUSD,
-					CeilingNanoUSD:    snap.CeilingNanoUSD,
-				}); err != nil {
+				if err := appendCampaignRecord(f, 1, ct.campaignMetaRecord()); err != nil {
 					return err
 				}
 				st.lastSeq = 1
@@ -1558,11 +1609,14 @@ func (s *attemptScope) settlePreviousAttemptLocked() *hostkit.CloudError {
 	if s.op == "object_put" || s.op == "queue_send" {
 		return s.ct.settle(res, attID, s.op, s.in.PayloadSize, s.in.PayloadSize, s.resKind, s.resKey, false, false)
 	}
-	if s.hasLastAttempt && s.lastAttempt.Err == nil {
-		// HTTP status response without stream transfer failure (e.g. 429/503 status header, or completed first Do).
+	headerOnlyNoPayload := s.hasLastAttempt &&
+		s.lastAttempt.Err == nil &&
+		((s.op != "object_get" && s.op != "queue_receive") || s.lastAttempt.Status >= 400)
+	if headerOnlyNoPayload {
+		// HTTP status response without payload transfer (e.g. 429/503 status header, or completed non-payload Do).
 		return s.ct.settle(res, attID, s.op, 0, 0, s.resKind, s.resKey, true, false)
 	}
-	// Mid-stream or ambiguous transport failure: preserve full reserved bound.
+	// Completed 2xx GET/Receive or mid-stream/ambiguous transport failure: preserve full reserved bound.
 	boundBytes := s.in.PayloadSize
 	if s.op == "object_get" {
 		boundBytes = s.in.EgressBytes

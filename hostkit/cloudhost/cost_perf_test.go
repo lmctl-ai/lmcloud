@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -468,7 +470,10 @@ func TestSolShortPollUndercharges(t *testing.T) {
 		},
 	})
 	h2.SetAbortOnError(false)
-	if err := h2.SetCostCapUSD(0.00000080); err != nil {
+	// Poll 1 reserves 1 MiB (16 units = 6,400 ns) and settles 1 unit (400 ns) on 0 messages;
+	// Poll 2 reserves 6,400 ns (400 + 6,400 = 6,800 ns <= cap) and settles 400 ns (total 800 ns);
+	// Poll 3 needs 800 + 6,400 = 7,200 ns > 6,800 ns and is refused pre-flight.
+	if err := h2.SetCostCapUSD(0.00000680); err != nil {
 		t.Fatal(err)
 	}
 	_, _ = h2.QueueReceive(false, "probe-queue", 1, 2, 30)
@@ -1045,8 +1050,8 @@ func TestOwnR2UnboundedQueueWireClamped(t *testing.T) {
 		t.Fatalf("expected INTERNAL error on oversized queue message, got %+v", h.LastError())
 	}
 	r := h.CostReport().Item("queue_receive")
-	if r.BillingUnits != 2 || math.Abs(float64(r.BillingUnits)*r.UnitPriceUSD-r.EstimatedUSD) > 1e-12 {
-		t.Fatalf("expected settled billing units to match quoted bound (units=%d unitPrice=%g est=%g)", r.BillingUnits, r.UnitPriceUSD, r.EstimatedUSD)
+	if r.BillingUnits != 7 || math.Abs(float64(r.BillingUnits)*r.UnitPriceUSD-r.EstimatedUSD) > 1e-12 {
+		t.Fatalf("expected settled billing units to match actual 400KB wire consumption (units=%d unitPrice=%g est=%g)", r.BillingUnits, r.UnitPriceUSD, r.EstimatedUSD)
 	}
 
 	// 2. Base64-encoded envelope whose wire size fits in 2*65536 (80,012 bytes) but decoded body is 60,000 > 49,152.
@@ -1147,5 +1152,445 @@ func TestOwnR2InsecureCampaignParentDirRejected(t *testing.T) {
 		t.Fatalf("symlink parent: expected campaign parent dir to be rejected before dispatch, got calls=%d last=%+v", c.calls, h.LastError())
 	}
 }
+
+// ---- SolReviewer Round 3 Regression Probes (TestOwnR3*) ----
+
+type r3LargeReceive struct {
+	*fakeadapter.Fake
+	consumed int
+}
+
+func (a *r3LargeReceive) Receive(ctx context.Context, _ string, _, _, _ int) ([]hostkit.RawMessage, error) {
+	p := hostkit.DefaultRetryPolicy()
+	var out []hostkit.RawMessage
+	last, _ := p.Do(ctx, false, func(context.Context, int) hostkit.Attempt {
+		wire := strings.Repeat("x", 400000)
+		a.consumed += len(wire)
+		out = []hostkit.RawMessage{{ID: "m", Receipt: "r", Wire: wire}}
+		return hostkit.Attempt{Status: 200}
+	})
+	return out, last.Err
+}
+
+func TestOwnR3ReceiveStillUnderAdmitsPhysicalBytes(t *testing.T) {
+	// 1. Under a $0.05 total cap ($0.04 work cap) with $0.01/unit tariff, a 1-message
+	// receive conservatively reserves 1 MiB (16 units = $0.16 > $0.04) and is refused BEFORE dispatch.
+	a := &r3LargeReceive{Fake: fakeadapter.New(fakeadapter.Options{LongPoll: true})}
+	pt := safety.SyntheticSimPriceTable("ref")
+	price := pt.Operations["queue_receive"]
+	price.RequestNanoUSD = 10_000_000
+	pt.Operations["queue_receive"] = price
+	meter, err := safety.NewCostMeter(safety.CostPolicy{CapUSD: 0.05, CeilingUSD: 0.25, CleanupReserveUSD: 0.01}, pt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(Config{Queue: a, Meter: meter})
+	h.SetAbortOnError(false)
+	msgs, _ := h.QueueReceive(false, "probe-queue", 1, 0, 30)
+	r := h.CostReport().Item("queue_receive")
+	if a.consumed != 0 || len(msgs) != 0 || h.LastError().Code != hostkit.CostCapExceeded {
+		t.Fatalf("expected pre-dispatch COST_CAP_EXCEEDED refusal, got consumed=%d msgs=%d last=%+v", a.consumed, len(msgs), h.LastError())
+	}
+	if r.Requests != 0 || r.EstimatedUSD != 0 {
+		t.Fatalf("expected 0 billed requests when refused before dispatch, got %+v", r)
+	}
+
+	// 2. When the cap can cover the 1 MiB conservative reservation ($0.20 total / $0.19 work cap >= $0.16),
+	// dispatch proceeds, the 400,000-byte payload is rejected as OversizedQueueMessage, and the actual
+	// 7 billing units ($0.07) consumed on the wire are settled (refunding the unused 9 units).
+	a2 := &r3LargeReceive{Fake: fakeadapter.New(fakeadapter.Options{LongPoll: true})}
+	meter2, err := safety.NewCostMeter(safety.CostPolicy{CapUSD: 0.20, CeilingUSD: 0.25, CleanupReserveUSD: 0.01}, pt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2 := New(Config{Queue: a2, Meter: meter2})
+	h2.SetAbortOnError(false)
+	msgs2, _ := h2.QueueReceive(false, "probe-queue", 1, 0, 30)
+	r2 := h2.CostReport().Item("queue_receive")
+	if a2.consumed != 400000 || len(msgs2) != 0 || h2.LastError().ProviderCode != "OversizedQueueMessage" {
+		t.Fatalf("expected post-dispatch OversizedQueueMessage rejection, got consumed=%d msgs=%d last=%+v", a2.consumed, len(msgs2), h2.LastError())
+	}
+	if r2.BillingUnits != 7 || r2.EstimatedUSD != 0.07 {
+		t.Fatalf("expected 7 units / $0.07 settled for 400KB rejected payload, got %+v", r2)
+	}
+}
+
+func TestOwnR3GenericJournalRestoreLosesCleanup(t *testing.T) {
+	pt, m, j, pol := ownRegionalJournal(t)
+	f := fakeadapter.New(fakeadapter.Options{})
+	h := New(Config{Provider: "aws", Store: f, Meter: m, Journal: j})
+	h.SetAbortOnError(false)
+	made, _ := h.BucketCreate(false, "probe-bucket")
+	if !made {
+		t.Fatal(h.LastError())
+	}
+	if got := m.Snapshot().ResourceCleanupNanoUSD; got != 10000 {
+		t.Fatalf("immediate lock=%d, want 10000", got)
+	}
+	if err := j.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	meta := j.Meta()
+	dir := filepath.Dir(j.Path())
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := safety.OpenJournal(dir, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	j = reopened
+	st := j.State()
+	if len(st.ActiveCleanup) != 1 {
+		t.Fatalf("lost durable lock %+v", st.ActiveCleanup)
+	}
+	restored, err := safety.NewCostMeter(pol.Cost, pt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	safety.RestoreMeterFromState(restored, pt, st)
+	if got := restored.Snapshot().ResourceCleanupNanoUSD; got != 10000 {
+		t.Fatalf("expected generic RestoreMeterFromState to restore 10000 cleanup lock, got %d", got)
+	}
+	h2 := New(Config{Provider: "aws", Store: f, Meter: restored, Journal: j})
+	_ = h2.CostReport()
+	if got := restored.Snapshot().ResourceCleanupNanoUSD; got != 10000 {
+		t.Fatalf("cloudhost restore got=%d, want 10000", got)
+	}
+	h2.SetAbortOnError(false)
+	deleted, _ := h2.BucketDelete(false, "probe-bucket")
+	if !deleted || restored.Snapshot().ResourceCleanupNanoUSD != 0 || len(j.State().ActiveCleanup) != 0 {
+		t.Fatalf("child cleanup release failed: deleted=%v last=%+v snapshot=%+v", deleted, h2.LastError(), restored.Snapshot())
+	}
+}
+
+type r3DoubleGet struct {
+	*fakeadapter.Fake
+	url            string
+	consumed       int64
+	failFirstAfter int64
+}
+
+func (a *r3DoubleGet) GetObject(ctx context.Context, _, _ string, _ int64) ([]byte, error) {
+	p := hostkit.DefaultRetryPolicy()
+	var body []byte
+	for i := 0; i < 2; i++ {
+		resp, _, err := p.DoHTTP(ctx, nil, true, func(c context.Context) (*http.Request, error) {
+			return http.NewRequestWithContext(c, "GET", a.url, nil)
+		})
+		if err != nil {
+			return nil, err
+		}
+		if i == 0 && a.failFirstAfter > 0 {
+			chunk, _ := io.ReadAll(io.LimitReader(resp.Body, a.failFirstAfter))
+			_ = resp.Body.Close()
+			a.consumed += int64(len(chunk))
+			continue
+		}
+		body, err = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		a.consumed += int64(len(body))
+		if err != nil {
+			return body, err
+		}
+	}
+	return body, nil
+}
+
+func TestOwnR3SuccessHeadersRefundPriorGetBytes(t *testing.T) {
+	const size = hostkit.MaxObjectBytes
+	payload := strings.Repeat("x", size)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, payload)
+	}))
+	defer srv.Close()
+
+	for _, delegated := range []bool{false, true} {
+		t.Run(fmt.Sprintf("delegated=%v", delegated), func(t *testing.T) {
+			newHost := func(a *r3DoubleGet) (*Host, *safety.CostMeter) {
+				if delegated {
+					_, m, j, pol := ownRegionalJournal(t)
+					g, e := safety.NewLiveGuard(safety.GuardConfig{Policy: pol, Meter: m, Journal: j, Recovery: &ownUnusedRecovery{}})
+					if e != nil {
+						t.Fatal(e)
+					}
+					return New(Config{Provider: "aws", Store: g.WrapStore(a)}), m
+				}
+				h := New(Config{Store: a})
+				return h, h.cost.meter
+			}
+
+			// 1. Under a cap of 1 full 16 MiB GET + 1 base request (400 ns), the 1st 16 MiB GET
+			// must retain its full 16 MiB egress charge so the 2nd 16 MiB GET is refused before dispatch.
+			a1 := &r3DoubleGet{Fake: fakeadapter.New(fakeadapter.Options{}), url: srv.URL}
+			h1, meter1 := newHost(a1)
+			h1.SetAbortOnError(false)
+			quote, e := meter1.QuoteAttempt(safety.AttemptPricingInput{Operation: "object_get", EgressBytes: size})
+			if e != nil {
+				t.Fatal(e)
+			}
+			base := meter1.Table().Operations["object_get"].RequestNanoUSD
+			capNano := quote.AttemptNanoUSD + base
+			if e := h1.SetCostCapUSD(safety.NanoToUSD(capNano)); e != nil {
+				t.Fatal(e)
+			}
+			body1, _ := h1.ObjectGet(false, "probe-bucket", "key")
+			rep1 := h1.CostReport().Item("object_get")
+			if a1.consumed != size || len(body1) != 0 || h1.LastError().Code != hostkit.CostCapExceeded {
+				t.Fatalf("expected 2nd GET refused under tight cap: consumed=%d body=%d last=%+v", a1.consumed, len(body1), h1.LastError())
+			}
+			if rep1.Requests != 1 || rep1.Bytes != size || rep1.EstimatedUSD != safety.NanoToUSD(quote.AttemptNanoUSD) {
+				t.Fatalf("unexpected report after refused 2nd GET: %+v", rep1)
+			}
+
+			// 2. When the 1st GET fails mid-stream after 200 OK headers, it still retains its full 16 MiB
+			// egress bound and refuses the 2nd GET under the same tight cap.
+			a2 := &r3DoubleGet{Fake: fakeadapter.New(fakeadapter.Options{}), url: srv.URL, failFirstAfter: 65536}
+			h2, _ := newHost(a2)
+			h2.SetAbortOnError(false)
+			if e := h2.SetCostCapUSD(safety.NanoToUSD(capNano)); e != nil {
+				t.Fatal(e)
+			}
+			body2, _ := h2.ObjectGet(false, "probe-bucket", "key")
+			rep2 := h2.CostReport().Item("object_get")
+			if a2.consumed != 65536 || len(body2) != 0 || h2.LastError().Code != hostkit.CostCapExceeded {
+				t.Fatalf("expected 2nd GET refused after partial 1st stream: consumed=%d body=%d last=%+v", a2.consumed, len(body2), h2.LastError())
+			}
+			if rep2.Requests != 1 || rep2.EstimatedUSD != safety.NanoToUSD(quote.AttemptNanoUSD) {
+				t.Fatalf("expected full 16 MiB bound charged for interrupted 1st GET, got %+v", rep2)
+			}
+
+			// 3. Under the default cap, both 16 MiB GETs succeed and the report bills 2 * quote.AttemptNanoUSD.
+			a3 := &r3DoubleGet{Fake: fakeadapter.New(fakeadapter.Options{}), url: srv.URL}
+			h3, _ := newHost(a3)
+			h3.SetAbortOnError(false)
+			body3, _ := h3.ObjectGet(false, "probe-bucket", "key")
+			rep3 := h3.CostReport().Item("object_get")
+			if a3.consumed != 2*size || len(body3) != size || h3.LastError().Code != hostkit.OK {
+				t.Fatalf("expected both GETs to succeed under default cap: consumed=%d body=%d last=%+v", a3.consumed, len(body3), h3.LastError())
+			}
+			if rep3.Requests != 2 || rep3.Bytes != 2*size || rep3.EstimatedUSD != safety.NanoToUSD(2*quote.AttemptNanoUSD) {
+				t.Fatalf("expected 2 full 16 MiB GETs billed ($0.00281330), got %+v", rep3)
+			}
+		})
+	}
+}
+
+type r3RealBuildFailure struct {
+	*fakeadapter.Fake
+}
+
+func (a *r3RealBuildFailure) HeadBucket(ctx context.Context, _ string) error {
+	_, _, err := hostkit.DefaultRetryPolicy().DoHTTP(ctx, nil, true, func(context.Context) (*http.Request, error) {
+		return nil, fmt.Errorf("synthetic build failure: zero network calls")
+	})
+	return err
+}
+
+func TestOwnR3DoHTTPBuildStillBilled(t *testing.T) {
+	// 1. Direct path.
+	a := &r3RealBuildFailure{Fake: fakeadapter.New(fakeadapter.Options{})}
+	h := New(Config{Store: a})
+	h.SetAbortOnError(false)
+	_, _ = h.BucketExists(false, "probe-bucket")
+	r := h.CostReport().Item("bucket_exists")
+	if r.Requests != 0 || r.EstimatedUSD != 0 {
+		t.Fatalf("expected DoHTTP builder failure to bill 0 requests and $0, got %+v", r)
+	}
+	m := h.Metrics().Op("bucket_exists")
+	if m.Calls != 1 || m.Errors != 1 || m.Retries != 0 {
+		t.Fatalf("expected 1 logical call/error and 0 retries, got %+v", m)
+	}
+
+	// 2. Delegated LiveGuard path.
+	_, gm, gj, pol := ownRegionalJournal(t)
+	g, err := safety.NewLiveGuard(safety.GuardConfig{Policy: pol, Meter: gm, Journal: gj, Recovery: &ownUnusedRecovery{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hLive := New(Config{Provider: "aws", Store: g.WrapStore(a)})
+	hLive.SetAbortOnError(false)
+	_, _ = hLive.BucketExists(false, "probe-bucket")
+	rLive := hLive.CostReport().Item("bucket_exists")
+	if rLive.Requests != 0 || rLive.EstimatedUSD != 0 {
+		t.Fatalf("expected delegated DoHTTP builder failure to bill 0 requests and $0, got %+v", rLive)
+	}
+}
+
+type r3RetryCreate struct {
+	*safety.FakeRecoveryBackend
+	calls int
+}
+
+func (a *r3RetryCreate) CreateBucket(ctx context.Context, name string) (bool, error) {
+	p := hostkit.DefaultRetryPolicy()
+	p.Sleep = func(context.Context, time.Duration) error { return nil }
+	var made bool
+	last, _ := p.Do(ctx, true, func(c context.Context, n int) hostkit.Attempt {
+		a.calls++
+		if n == 0 {
+			return hostkit.Attempt{Status: 503}
+		}
+		var err error
+		made, err = a.FakeRecoveryBackend.CreateBucket(c, name)
+		return hostkit.Attempt{Status: 200, Err: err}
+	})
+	return made, last.Err
+}
+
+func TestOwnR3DelegatedCreateRetrySettlesAttemptIDs(t *testing.T) {
+	_, m, j, pol := ownRegionalJournal(t)
+	backend := safety.NewFakeRecoveryBackend("aws", "254332045686", "scope", "us-east-1")
+	a := &r3RetryCreate{FakeRecoveryBackend: backend}
+	g, e := safety.NewLiveGuard(safety.GuardConfig{Policy: pol, Meter: m, Journal: j, Recovery: backend})
+	if e != nil {
+		t.Fatal(e)
+	}
+	h := New(Config{Provider: "aws", Store: g.WrapStore(a)})
+	h.SetAbortOnError(false)
+	made, _ := h.BucketCreate(false, "lmcloud-conf-abcdef012345-probe")
+	if !made || h.LastError().Code != hostkit.OK || a.calls != 2 {
+		t.Fatalf("create=%v last=%+v calls=%d", made, h.LastError(), a.calls)
+	}
+	st := j.State()
+	if len(st.PendingAttempts) != 0 {
+		t.Fatalf("pending attempts orphaned %+v", st.PendingAttempts)
+	}
+	if m.Snapshot().ResourceCleanupNanoUSD != 10000 {
+		t.Fatalf("wrong cleanup %+v", m.Snapshot())
+	}
+}
+
+func TestOwnR3DelegatedReceiveBoundStillUnderAdmits(t *testing.T) {
+	const name = "lmcloud-conf-abcdef012345-probe"
+
+	// 1. When narrowed cap only fits 2 units (800 ns) for queue_receive, LiveGuard must refuse
+	// BEFORE calling a.Receive because the conservative 1 MiB (16-unit = 6,400 ns) reservation exceeds cap.
+	_, m1, j1, pol1 := ownRegionalJournal(t)
+	backend1 := safety.NewFakeRecoveryBackend("aws", "254332045686", "scope", "us-east-1")
+	g1, e := safety.NewLiveGuard(safety.GuardConfig{Policy: pol1, Meter: m1, Journal: j1, Recovery: backend1})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if made, e := g1.WrapQueue(backend1).CreateQueue(context.Background(), name); e != nil || !made {
+		t.Fatalf("create=%v err=%v", made, e)
+	}
+	a1 := &r3LargeReceive{Fake: fakeadapter.New(fakeadapter.Options{LongPoll: true})}
+	h1 := New(Config{Provider: "aws", Queue: g1.WrapQueue(a1)})
+	h1.SetAbortOnError(false)
+	before1 := m1.Snapshot().ChargedNanoUSD
+	probe1, e := m1.QuoteAttempt(safety.AttemptPricingInput{Operation: "queue_read_ownership"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	twoUnitReceive, e := m1.QuoteAttempt(safety.AttemptPricingInput{Operation: "queue_receive", PayloadSize: 131072})
+	if e != nil {
+		t.Fatal(e)
+	}
+	capNano1 := before1 + probe1.AttemptNanoUSD + twoUnitReceive.AttemptNanoUSD
+	if e := h1.SetCostCapUSD(safety.NanoToUSD(capNano1)); e != nil {
+		t.Fatal(e)
+	}
+	msgs1, _ := h1.QueueReceive(false, name, 1, 0, 30)
+	if a1.consumed != 0 || len(msgs1) != 0 || h1.LastError().Code != hostkit.CostCapExceeded {
+		t.Fatalf("expected pre-dispatch COST_CAP_EXCEEDED under 2-unit cap, got consumed=%d msgs=%d last=%+v", a1.consumed, len(msgs1), h1.LastError())
+	}
+
+	// 2. When cap covers the 1 MiB (16-unit) conservative reservation, dispatch proceeds,
+	// LiveGuard rejects the 400,000-byte payload with LiveLimitExceeded, and settles the
+	// actual 7 units (2,800 ns) consumed on the wire (refunding the unused 9 units).
+	_, m2, j2, pol2 := ownRegionalJournal(t)
+	backend2 := safety.NewFakeRecoveryBackend("aws", "254332045686", "scope", "us-east-1")
+	g2, e := safety.NewLiveGuard(safety.GuardConfig{Policy: pol2, Meter: m2, Journal: j2, Recovery: backend2})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if made, e := g2.WrapQueue(backend2).CreateQueue(context.Background(), name); e != nil || !made {
+		t.Fatalf("create=%v err=%v", made, e)
+	}
+	a2 := &r3LargeReceive{Fake: fakeadapter.New(fakeadapter.Options{LongPoll: true})}
+	h2 := New(Config{Provider: "aws", Queue: g2.WrapQueue(a2)})
+	h2.SetAbortOnError(false)
+	before2 := m2.Snapshot().ChargedNanoUSD
+	reserve1MiB, e := m2.QuoteAttempt(safety.AttemptPricingInput{Operation: "queue_receive", PayloadSize: hostkit.MaxProviderQueueMessageBytes})
+	if e != nil {
+		t.Fatal(e)
+	}
+	capNano2 := before2 + probe1.AttemptNanoUSD + reserve1MiB.AttemptNanoUSD
+	if e := h2.SetCostCapUSD(safety.NanoToUSD(capNano2)); e != nil {
+		t.Fatal(e)
+	}
+	msgs2, _ := h2.QueueReceive(false, name, 1, 0, 30)
+	r2 := h2.CostReport().Item("queue_receive")
+	actualReceive, e := m2.QuoteAttempt(safety.AttemptPricingInput{Operation: "queue_receive", PayloadSize: int64(a2.consumed)})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if a2.consumed != 400000 || len(msgs2) != 0 || h2.LastError().Code != hostkit.PermissionDenied {
+		t.Fatalf("expected LiveLimitExceeded rejection, got consumed=%d msgs=%d last=%+v", a2.consumed, len(msgs2), h2.LastError())
+	}
+	wantCharged := before2 + probe1.AttemptNanoUSD + actualReceive.AttemptNanoUSD
+	if m2.Snapshot().ChargedNanoUSD != wantCharged || r2.BillingUnits != 7 {
+		t.Fatalf("expected 7 units (%d ns) settled, got snap=%+v report=%+v", wantCharged, m2.Snapshot(), r2)
+	}
+}
+
+func TestOwnR3CampaignMetaAndPrivateDirectory(t *testing.T) {
+	for _, which := range []string{"table", "table_hash", "cap", "cleanup_reserve", "scope", "legacy_partial_meta", "permissions"} {
+		t.Run(which, func(t *testing.T) {
+			dir := t.TempDir()
+			p := filepath.Join(dir, "campaign.jsonl")
+			first := New(Config{Provider: "ref", Store: fakeadapter.New(fakeadapter.Options{}), CampaignStatePath: p})
+			first.SetAbortOnError(false)
+			_, _ = first.BucketExists(false, "probe-bucket")
+
+			a := &ownCountStore{Fake: fakeadapter.New(fakeadapter.Options{})}
+			cfg := Config{Provider: "ref", Store: a, CampaignStatePath: p}
+			switch which {
+			case "table":
+				pt := safety.SyntheticSimPriceTable("ref")
+				pt.Version = "other-sim-table"
+				cfg.PriceTable = pt
+			case "table_hash":
+				pt := safety.SyntheticSimPriceTable("ref")
+				op := pt.Operations["bucket_exists"]
+				op.RequestNanoUSD = 999
+				pt.Operations["bucket_exists"] = op
+				cfg.PriceTable = pt
+			case "cap":
+				m, e := safety.NewCostMeter(safety.CostPolicy{CapUSD: 0.1, CeilingUSD: 0.25, CleanupReserveUSD: 0.01}, safety.SyntheticSimPriceTable("ref"), nil)
+				if e != nil {
+					t.Fatal(e)
+				}
+				cfg.Meter = m
+			case "cleanup_reserve":
+				m, e := safety.NewCostMeter(safety.CostPolicy{CapUSD: 0.05, CeilingUSD: 0.25, CleanupReserveUSD: 0.02}, safety.SyntheticSimPriceTable("ref"), nil)
+				if e != nil {
+					t.Fatal(e)
+				}
+				cfg.Meter = m
+			case "scope":
+				t.Setenv("LMCLOUD_ACCOUNT", "other-account-999")
+			case "legacy_partial_meta":
+				// Overwrite line 1 with a partial meta record missing price_table_hash/policy_hash/cap.
+				if e := os.WriteFile(p, []byte("{\"v\":1,\"seq\":1,\"event\":\"meta\",\"provider\":\"ref\"}\n"), 0o600); e != nil {
+					t.Fatal(e)
+				}
+			case "permissions":
+				if e := os.Chmod(dir, 0o777); e != nil {
+					t.Fatal(e)
+				}
+			}
+			second := New(cfg)
+			second.SetAbortOnError(false)
+			_, _ = second.BucketExists(false, "probe-bucket")
+			if a.calls != 0 || second.LastError().Code != hostkit.Internal {
+				t.Fatalf("%s: expected dispatch refusal with INTERNAL, got dispatched=%d last=%+v", which, a.calls, second.LastError())
+			}
+		})
+	}
+}
+
 
 

@@ -12,9 +12,10 @@ import (
 
 // Portable limits (design 02 §4/§7, 07 §4).
 const (
-	MaxObjectBytes        = 16 << 20 // 16,777,216
-	MaxQueueBodyBytes     = 49152
-	MaxKeyBytes           = 1024
+	MaxObjectBytes               = 16 << 20 // 16,777,216
+	MaxQueueBodyBytes            = 49152
+	MaxProviderQueueMessageBytes = 1 << 20 // 1,048,576 (conservative provider per-message wire ceiling, e.g. AWS SQS 1 MiB = 16 x 64 KiB chunks)
+	MaxKeyBytes                  = 1024
 	MaxContentTypeBytes   = 255
 	MaxMetadataEntries    = 32
 	MaxMetadataBytes      = 2048

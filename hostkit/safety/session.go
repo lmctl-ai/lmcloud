@@ -229,7 +229,11 @@ func restoreMeterFromState(meter *CostMeter, pt *PriceTable, st LedgerState) {
 	}
 	chargedNano := st.ChargedNanoUSD
 	var activeCleanupNano int64
+	seenKeys := make(map[string]bool, len(st.Entries))
 	for _, e := range st.Entries {
+		if e.State != StateDeleted {
+			seenKeys[e.Kind+"\x00"+e.Parent+"\x00"+e.Name] = true
+		}
 		var opName string
 		switch e.Kind {
 		case KindBucket:
@@ -252,6 +256,11 @@ func restoreMeterFromState(meter *CostMeter, pt *PriceTable, st LedgerState) {
 				chargedNano += opPrice.RequestNanoUSD + opPrice.CleanupReserveNanoUSD
 			}
 			activeCleanupNano += opPrice.CleanupReserveNanoUSD
+		}
+	}
+	for k, v := range st.ActiveCleanup {
+		if !seenKeys[k] && v > 0 {
+			activeCleanupNano += v
 		}
 	}
 	for _, a := range st.PendingAttempts {

@@ -57,6 +57,7 @@ type Attempt struct {
 	RetryAfter string
 	Err        error
 	NotSent    bool
+	noRetry    bool
 }
 
 // RetryHooks allows callers (such as cloudhost cost and performance metering)
@@ -114,6 +115,9 @@ func RequestNotSent(err error) bool {
 // 500/502/503/504 and in-flight transport errors only for idempotent
 // requests; transport errors that provably happened before sending, always.
 func retryable(a Attempt, idempotent bool) bool {
+	if a.noRetry {
+		return false
+	}
 	if a.Err != nil {
 		return a.NotSent || idempotent
 	}
@@ -268,7 +272,7 @@ func (p RetryPolicy) DoHTTP(ctx context.Context, client *http.Client, idempotent
 		req, err := build(ctx)
 		if err != nil {
 			buildErr = err
-			return Attempt{}
+			return Attempt{Err: err, NotSent: true, noRetry: true}
 		}
 		r, err := client.Do(req)
 		if err != nil {

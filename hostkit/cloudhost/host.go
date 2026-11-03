@@ -211,17 +211,14 @@ func isDefinitiveNonStreamError(err error) bool {
 	return false
 }
 
-func maxQueueReceiveWireBytes(max int, textOnlyWire bool) int64 {
+func maxQueueReceiveWireBytes(max int, _ bool) int64 {
 	if max <= 0 {
 		max = 1
 	}
 	if max > hostkit.MaxReceiveMessages {
 		max = hostkit.MaxReceiveMessages
 	}
-	if textOnlyWire {
-		return int64(max) * 2 * 65536
-	}
-	return int64(max) * 65536
+	return int64(max) * hostkit.MaxProviderQueueMessageBytes
 }
 
 func (h *Host) realBucketExists(ctx context.Context, b string) (bool, *hostkit.CloudError) {
@@ -770,7 +767,8 @@ func (h *Host) ObjectGet(dry bool, b, k string) (string, error) {
 	data, err := h.cfg.Store.GetObject(mctx, b, k, hostkit.MaxObjectBytes)
 	var abortErr *hostkit.CloudError
 	if err != nil {
-		if len(data) == 0 && isDefinitiveNonStreamError(err) {
+		headerStarted := scope != nil && scope.hasLastAttempt && scope.lastAttempt.Status >= 200 && scope.lastAttempt.Status < 400
+		if len(data) == 0 && !headerStarted && isDefinitiveNonStreamError(err) {
 			retries, throttles, abortErr = scope.finish(0, 0, true, false)
 		} else {
 			retries, throttles, abortErr = scope.finish(hostkit.MaxObjectBytes, hostkit.MaxObjectBytes, false, false)
@@ -1635,37 +1633,45 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 	if caps.TextOnlyWire {
 		perMsgWireLimit = 2 * 65_536
 	}
+	maxBatchWireLimit := int64(max) * perMsgWireLimit
 	pricingIn := safety.AttemptPricingInput{Operation: op, PayloadSize: maxWire}
 
 	parseRawMessages := func(raw []hostkit.RawMessage) ([]Message, int64, int64, *hostkit.CloudError) {
+		var rawWireTotal int64
+		for _, m := range raw {
+			rawWireTotal += int64(len(m.Wire))
+		}
+		if rawWireTotal <= 0 || rawWireTotal > maxWire {
+			rawWireTotal = maxWire
+		}
 		if len(raw) > int(max) {
-			return nil, maxWire, maxWire, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned more messages than max_messages")
+			return nil, rawWireTotal, rawWireTotal, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned more messages than max_messages")
 		}
 		out := make([]Message, 0, len(raw))
 		var totalDecoded, totalCharge int64
 		for _, m := range raw {
 			if m.ID == "" || m.Receipt == "" {
-				return nil, maxWire, maxWire, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned a message without id or receipt")
+				return nil, rawWireTotal, rawWireTotal, hostkit.ProviderError(hostkit.Internal, 0, "", "provider returned a message without id or receipt")
 			}
 			wireSz := int64(len(m.Wire))
 			if wireSz > perMsgWireLimit {
-				return nil, maxWire, maxWire, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a message exceeding the per-message wire bound")
+				return nil, rawWireTotal, rawWireTotal, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a message exceeding the per-message wire bound")
 			}
 			body, e := hostkit.DecodeQueueBody(m.Wire)
 			if e != nil {
-				return nil, maxWire, maxWire, e
+				return nil, rawWireTotal, rawWireTotal, e
 			}
 			decSz := int64(len(body))
 			if decSz > hostkit.MaxQueueBodyBytes {
-				return nil, maxWire, maxWire, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a message body exceeding the 48 KiB limit")
+				return nil, rawWireTotal, rawWireTotal, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a message body exceeding the 48 KiB limit")
 			}
 			if decSz > wireSz {
 				wireSz = decSz
 			}
 			totalDecoded += decSz
 			totalCharge += wireSz
-			if totalCharge > maxWire {
-				return nil, maxWire, maxWire, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a batch exceeding the quoted wire bound")
+			if totalCharge > maxBatchWireLimit {
+				return nil, rawWireTotal, rawWireTotal, hostkit.ProviderError(hostkit.Internal, 0, "OversizedQueueMessage", "provider returned a batch exceeding the quoted wire bound")
 			}
 			out = append(out, Message{ID: m.ID, Body: body, Receipt: m.Receipt})
 		}
@@ -1681,7 +1687,8 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 		raw, rerr := h.cfg.Queue.Receive(mctx, q, int(max), int(wait), int(vis))
 		var abortErr *hostkit.CloudError
 		if rerr != nil {
-			if len(raw) == 0 && isDefinitiveNonStreamError(rerr) {
+			headerStarted := scope != nil && scope.hasLastAttempt && scope.lastAttempt.Status >= 200 && scope.lastAttempt.Status < 400
+			if len(raw) == 0 && !headerStarted && isDefinitiveNonStreamError(rerr) {
 				retries, throttles, abortErr = scope.finish(0, 0, true, false)
 			} else {
 				retries, throttles, abortErr = scope.finish(maxWire, maxWire, false, false)
@@ -1695,7 +1702,7 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 		}
 		out, totalCharge, totalDecoded, perr := parseRawMessages(raw)
 		if perr != nil {
-			retries, throttles, abortErr = scope.finish(maxWire, maxWire, false, false)
+			retries, throttles, abortErr = scope.finish(totalCharge, totalDecoded, totalCharge < maxWire, false)
 			if abortErr != nil {
 				perr = abortErr
 			}
@@ -1722,7 +1729,8 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 		if err != nil {
 			var r, t int64
 			var abortErr *hostkit.CloudError
-			if len(raw) == 0 && isDefinitiveNonStreamError(err) {
+			headerStarted := scope != nil && scope.hasLastAttempt && scope.lastAttempt.Status >= 200 && scope.lastAttempt.Status < 400
+			if len(raw) == 0 && !headerStarted && isDefinitiveNonStreamError(err) {
 				r, t, abortErr = scope.finish(0, 0, true, false)
 			} else {
 				r, t, abortErr = scope.finish(maxWire, maxWire, false, false)
@@ -1736,7 +1744,7 @@ func (h *Host) QueueReceive(dry bool, q string, max, wait, vis int64) ([]Message
 		}
 		parsed, totalCharge, totalDecoded, perr := parseRawMessages(raw)
 		if perr != nil {
-			r, t, abortErr := scope.finish(maxWire, maxWire, false, false)
+			r, t, abortErr := scope.finish(totalCharge, totalDecoded, totalCharge < maxWire, false)
 			retries += r
 			throttles += t
 			if abortErr != nil {

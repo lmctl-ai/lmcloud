@@ -212,7 +212,12 @@ func (da *durableAttempt) settlePreviousAttempt() *hostkit.CloudError {
 			units = (settledBytes + t.ChunkBytes - 1) / t.ChunkBytes
 		}
 	}
-	if da.in.Operation != "object_put" && da.in.Operation != "queue_send" && da.hasLastAttempt && da.lastAttempt.Err == nil {
+	headerOnlyNoPayload := da.in.Operation != "object_put" &&
+		da.in.Operation != "queue_send" &&
+		da.hasLastAttempt &&
+		da.lastAttempt.Err == nil &&
+		((da.in.Operation != "object_get" && da.in.Operation != "queue_receive") || da.lastAttempt.Status >= 400)
+	if headerOnlyNoPayload {
 		settledBytes = 0
 		units = 1
 		if q, err := da.guard.meter.QuoteAttempt(AttemptPricingInput{
@@ -1713,7 +1718,8 @@ func (q *GuardQueue) Receive(ctx context.Context, queue string, max, waitSeconds
 	if caps.TextOnlyWire {
 		perMsgWireLimit = 2 * 65536
 	}
-	maxWireBytes := int64(boundMax) * perMsgWireLimit
+	maxBatchWireLimit := int64(boundMax) * perMsgWireLimit
+	maxWireBytes := int64(boundMax) * hostkit.MaxProviderQueueMessageBytes
 	da, cerr := g.beginDurableAttempt(AttemptPricingInput{Operation: "queue_receive", PayloadSize: maxWireBytes}, KindQueue, "", queue, "queue_receive", 0)
 	if cerr != nil {
 		return nil, cerr
@@ -1726,6 +1732,13 @@ func (q *GuardQueue) Receive(ctx context.Context, queue string, max, waitSeconds
 	settledBytes := maxWireBytes
 	units := (maxWireBytes + 65535) / 65536
 	if err == nil {
+		var rawWireTotal int64
+		for _, m := range msgs {
+			rawWireTotal += int64(len(m.Wire))
+		}
+		if rawWireTotal > maxWireBytes {
+			rawWireTotal = maxWireBytes
+		}
 		if len(msgs) > boundMax {
 			err = hostkit.ProviderError(
 				hostkit.PermissionDenied,
@@ -1765,12 +1778,12 @@ func (q *GuardQueue) Receive(ctx context.Context, queue string, max, waitSeconds
 					break
 				}
 				wireBytes += wLen
-				if wireBytes > maxWireBytes {
+				if wireBytes > maxBatchWireLimit {
 					err = hostkit.ProviderError(
 						hostkit.PermissionDenied,
 						0,
 						"LiveLimitExceeded",
-						fmt.Sprintf("received batch wire size %d exceeds bound (%d)", wireBytes, maxWireBytes),
+						fmt.Sprintf("received batch wire size %d exceeds bound (%d)", wireBytes, maxBatchWireLimit),
 					)
 					msgs = nil
 					break
@@ -1785,6 +1798,19 @@ func (q *GuardQueue) Receive(ctx context.Context, queue string, max, waitSeconds
 				if qQuote, qerr := g.meter.QuoteAttempt(AttemptPricingInput{Operation: "queue_receive", PayloadSize: wireBytes}); qerr == nil {
 					actualNano = qQuote.AttemptNanoUSD
 				}
+			}
+		}
+		if err != nil {
+			settledBytes = rawWireTotal
+			if settledBytes <= 0 {
+				settledBytes = maxWireBytes
+			}
+			units = 1
+			if settledBytes > 65536 {
+				units = (settledBytes + 65535) / 65536
+			}
+			if qQuote, qerr := g.meter.QuoteAttempt(AttemptPricingInput{Operation: "queue_receive", PayloadSize: settledBytes}); qerr == nil {
+				actualNano = qQuote.AttemptNanoUSD
 			}
 		}
 	}
