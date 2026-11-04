@@ -54,7 +54,7 @@ func TestConformanceOpenMode(t *testing.T) {
 	bin := lmscript(t)
 	ref := buildRef(t)
 	out := runConformance(t, ref, []string{"LMSCRIPT_BIN=" + bin, "LMCLOUD_REF_STATE=" + filepath.Join(t.TempDir(), "s.json")})
-	if !strings.Contains(out, "# pass 62 / 75, skip 18, fail 0") && !strings.Contains(out, "# pass 75 / 75, skip 18, fail 0") && !strings.Contains(out, "# pass 49 / 49, skip 3, fail 0") && !strings.Contains(out, "# pass 35 / 49, skip 16, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 2, fail 0") {
+	if !strings.Contains(out, "# pass 62 / 88, skip 31, fail 0") && !strings.Contains(out, "# pass 62 / 75, skip 18, fail 0") && !strings.Contains(out, "# pass 75 / 75, skip 18, fail 0") && !strings.Contains(out, "# pass 49 / 49, skip 3, fail 0") && !strings.Contains(out, "# pass 35 / 49, skip 16, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 2, fail 0") {
 		t.Fatalf("unexpected summary:\n%s", out)
 	}
 }
@@ -129,7 +129,7 @@ func TestConformanceEnforcedMode(t *testing.T) {
 		"LMGCP_SIM_TOKEN=allow-token",
 		"LMCLOUD_ENFORCE_DENIED_GCP_TOKEN=deny-token",
 	})
-	if !strings.Contains(out, "# pass 62 / 75, skip 14, fail 0") && !strings.Contains(out, "# pass 75 / 75, skip 14, fail 0") && !strings.Contains(out, "# pass 49 / 49, skip 0, fail 0") && !strings.Contains(out, "# pass 35 / 49, skip 14, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 0, fail 0") {
+	if !strings.Contains(out, "# pass 62 / 88, skip 27, fail 0") && !strings.Contains(out, "# pass 62 / 75, skip 14, fail 0") && !strings.Contains(out, "# pass 75 / 75, skip 14, fail 0") && !strings.Contains(out, "# pass 49 / 49, skip 0, fail 0") && !strings.Contains(out, "# pass 35 / 49, skip 14, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 0, fail 0") {
 		t.Fatalf("unexpected summary:\n%s", out)
 	}
 }
@@ -210,6 +210,25 @@ func TestSchemaAndSignatureParity(t *testing.T) {
 			if strings.HasPrefix(line, "method FunctionConfig.") ||
 				strings.HasPrefix(line, "method FunctionInvokeResult.") ||
 				strings.HasPrefix(line, "method Cloud.function_") {
+				continue
+			}
+			filtered = append(filtered, line)
+		}
+		want = strings.Join(filtered, "\n")
+	}
+	if strings.Contains(string(capsRaw), "lmcloud-ref:userpool=pending(") {
+		var filtered []string
+		for _, line := range strings.Split(want, "\n") {
+			if strings.HasPrefix(line, "method UserPoolConfig.") ||
+				strings.HasPrefix(line, "method UserRecord.") ||
+				strings.HasPrefix(line, "method User.") ||
+				strings.HasPrefix(line, "method UserPage.") ||
+				strings.HasPrefix(line, "method AuthSession.") ||
+				strings.HasPrefix(line, "method Session.") ||
+				strings.HasPrefix(line, "method TokenClaims.") ||
+				strings.HasPrefix(line, "method Cloud.userpool_") ||
+				strings.HasPrefix(line, "method Cloud.user_") ||
+				strings.HasPrefix(line, "method Cloud.group_") {
 				continue
 			}
 			filtered = append(filtered, line)

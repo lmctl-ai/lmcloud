@@ -96,11 +96,26 @@ func New(cfg Config) *Host {
 	if cfg.Permissions != nil {
 		cfg.Permissions = guardPermissions{cfg.Permissions}
 	}
+	errs := hostkit.NewErrorState()
+	ct := newCostTracker(cfg)
+	ct.mu.Lock()
+	ct.onToken = errs.AddRedaction
+	for _, pa := range ct.activePolicies {
+		if pa.OwnerToken != "" {
+			errs.AddRedaction(pa.OwnerToken)
+		}
+	}
+	for _, pa := range ct.ambiguousPolicies {
+		if pa.OwnerToken != "" {
+			errs.AddRedaction(pa.OwnerToken)
+		}
+	}
+	ct.mu.Unlock()
 	return &Host{
 		cfg:     cfg,
-		errs:    hostkit.NewErrorState(),
+		errs:    errs,
 		dry:     &dryScopes{m: map[string]*overlay{}},
-		cost:    newCostTracker(cfg),
+		cost:    ct,
 		metrics: newMetricsTracker(cfg.Now),
 	}
 }
@@ -427,11 +442,13 @@ func (h *Host) BucketCreate(dry bool, b string) (bool, error) {
 		// Design 02 §6.1: 409 is idempotent success only if the bucket is accessible in our scope.
 		exists, perr := h.meteredBucketExists(ctx, b, false)
 		if perr == nil && exists {
-			h.cost.lockResourceCleanupIfNeeded(op, safety.KindBucket, b)
 			proven, terr := h.meteredBucketCreateToken(ctx, b, token)
 			if terr != nil {
 				failed = true
 				return false, h.fail(op, b, terr)
+			}
+			if proven {
+				h.cost.lockResourceCleanupIfNeeded(hostkit.EndpointFrom(ctx), op, safety.KindBucket, b)
 			}
 			h.ok()
 			return proven, nil
@@ -1294,11 +1311,13 @@ func (h *Host) QueueCreate(dry bool, q string) (bool, error) {
 			}
 			exists, perr := h.meteredQueueExists(ctx, q)
 			if perr == nil && exists {
-				h.cost.lockResourceCleanupIfNeeded(op, safety.KindQueue, q)
 				proven, terr := h.meteredQueueCreateToken(ctx, q, token)
 				if terr != nil {
 					failed = true
 					return false, h.fail(op, q, terr)
+				}
+				if proven {
+					h.cost.lockResourceCleanupIfNeeded(hostkit.EndpointFrom(ctx), op, safety.KindQueue, q)
 				}
 				h.ok()
 				return proven, nil

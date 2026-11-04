@@ -153,17 +153,21 @@ type state struct {
 	Tables   map[string]*tableState            `json:",omitempty"`
 	Policies map[string]hostkit.PolicyAttachment `json:",omitempty"`
 	// Create tokens stored atomically with each create (hostkit.CreateToken).
-	BucketTokens map[string]string `json:",omitempty"`
-	QueueTokens  map[string]string `json:",omitempty"`
-	TableTokens  map[string]string `json:",omitempty"`
+	BucketTokens      map[string]string `json:",omitempty"`
+	QueueTokens       map[string]string `json:",omitempty"`
+	TableTokens       map[string]string `json:",omitempty"`
+	PolicyGenerations map[string]uint64 `json:",omitempty"`
+	PolicyOwners      map[string]string `json:",omitempty"`
 }
 
 func newState() *state {
 	return &state{
-		Buckets:  map[string]map[string]*object{},
-		Queues:   map[string][]*message{},
-		Tables:   map[string]*tableState{},
-		Policies: map[string]hostkit.PolicyAttachment{},
+		Buckets:           map[string]map[string]*object{},
+		Queues:            map[string][]*message{},
+		Tables:            map[string]*tableState{},
+		Policies:          map[string]hostkit.PolicyAttachment{},
+		PolicyGenerations: map[string]uint64{},
+		PolicyOwners:      map[string]string{},
 	}
 }
 
@@ -228,7 +232,13 @@ func (f *Fake) doTarget(name, target string, fn func(s *state) error) error {
 	}
 	defer lock.unlock()
 	s := newState()
+	if info, statErr := os.Stat(f.opts.StatePath); statErr == nil && info.Size() > 64<<20 {
+		return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state exceeds 64 MiB limit")
+	}
 	if raw, err := os.ReadFile(f.opts.StatePath); err == nil && len(raw) > 0 {
+		if len(raw) > 64<<20 {
+			return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state exceeds 64 MiB limit")
+		}
 		if err := json.Unmarshal(raw, s); err != nil {
 			return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state is corrupt: "+err.Error())
 		}
@@ -243,6 +253,12 @@ func (f *Fake) doTarget(name, target string, fn func(s *state) error) error {
 		}
 		if s.Policies == nil {
 			s.Policies = map[string]hostkit.PolicyAttachment{}
+		}
+		if s.PolicyGenerations == nil {
+			s.PolicyGenerations = map[string]uint64{}
+		}
+		if s.PolicyOwners == nil {
+			s.PolicyOwners = map[string]string{}
 		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state read: "+err.Error())
@@ -1065,18 +1081,76 @@ func (f *Fake) AttachPolicy(ctx context.Context, att hostkit.PolicyAttachment) e
 		if s.Policies == nil {
 			s.Policies = map[string]hostkit.PolicyAttachment{}
 		}
+		if s.PolicyGenerations == nil {
+			s.PolicyGenerations = map[string]uint64{}
+		}
+		if s.PolicyOwners == nil {
+			s.PolicyOwners = map[string]string{}
+		}
 		key := hostkit.AttachmentKey(att.Kind, att.Target, att.Principal)
+		attGen, _ := strconv.ParseUint(att.Generation, 10, 64)
+		if att.OwnerToken != "" && s.PolicyOwners[key] == att.OwnerToken {
+			if attGen > 0 && attGen < s.PolicyGenerations[key] {
+				return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "StaleGeneration", "stale policy attachment generation")
+			}
+		}
+		if cur, exists := s.Policies[key]; exists {
+			if curGen, err := strconv.ParseUint(cur.Generation, 10, 64); err == nil && attGen > 0 && attGen < curGen && (cur.OwnerToken == "" || cur.OwnerToken == att.OwnerToken) {
+				return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "StaleGeneration", "stale policy attachment generation")
+			}
+		}
+		if att.OwnerToken != "" {
+			s.PolicyOwners[key] = att.OwnerToken
+		}
+		if attGen > 0 {
+			s.PolicyGenerations[key] = attGen
+		}
 		s.Policies[key] = att.Clone()
 		return nil
 	})
 }
 
-func (f *Fake) DetachPolicy(_ context.Context, kind hostkit.AttachmentKind, target, principal string) error {
+func (f *Fake) DetachPolicy(ctx context.Context, kind hostkit.AttachmentKind, target, principal string) error {
 	return f.do("DetachPolicy", func(s *state) error {
-		if s.Policies != nil {
-			key := hostkit.AttachmentKey(kind, target, principal)
-			delete(s.Policies, key)
+		if s.Policies == nil {
+			return nil
 		}
+		if s.PolicyGenerations == nil {
+			s.PolicyGenerations = map[string]uint64{}
+		}
+		if s.PolicyOwners == nil {
+			s.PolicyOwners = map[string]string{}
+		}
+		key := hostkit.AttachmentKey(kind, target, principal)
+		cur, exists := s.Policies[key]
+		if exp, hasExp := hostkit.ExpectedAttachmentFrom(ctx); hasExp {
+			if exists {
+				if exp.ExpectedOwnerToken != "" && cur.OwnerToken != exp.ExpectedOwnerToken {
+					return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "OwnershipMismatch", "policy attachment owner token mismatch")
+				}
+				if exp.ExpectedGeneration != "" {
+					curGen, _ := strconv.ParseUint(cur.Generation, 10, 64)
+					expGen, _ := strconv.ParseUint(exp.ExpectedGeneration, 10, 64)
+					if curGen > 0 && expGen > 0 && curGen > expGen {
+						return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "GenerationMismatch", "policy attachment generation mismatch")
+					}
+				}
+			}
+			if genNum, err := strconv.ParseUint(exp.Generation, 10, 64); err == nil && genNum > 0 {
+				if genNum < s.PolicyGenerations[key] {
+					return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "StaleGeneration", "stale policy detach generation")
+				}
+				s.PolicyGenerations[key] = genNum
+			}
+			if exp.OwnerToken != "" {
+				s.PolicyOwners[key] = exp.OwnerToken
+			}
+		} else if exists {
+			if tok := hostkit.CreateToken(ctx); tok != "" && cur.OwnerToken != tok {
+				return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "OwnershipMismatch", "policy attachment owner token mismatch")
+			}
+		}
+		delete(s.Policies, key)
 		return nil
 	})
 }

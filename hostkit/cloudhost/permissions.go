@@ -147,6 +147,29 @@ func (h *Host) PolicyLint(p *Policy) (*LintReport, error) {
 	return &LintReport{r: rep}, nil
 }
 
+func isDefinitivePolicyRefusal(ce *hostkit.CloudError) bool {
+	if ce == nil {
+		return false
+	}
+	switch ce.Code {
+	case hostkit.Unauthenticated, hostkit.PermissionDenied, hostkit.InvalidArgument, hostkit.NotFound, hostkit.PreconditionFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Host) permissionsScope() (string, *hostkit.CloudError) {
+	permEP, _, e := h.cfg.Endpoints.Resolve("permissions")
+	if e != nil {
+		return "", e
+	}
+	stEP, _, _ := h.cfg.Endpoints.Resolve("storage")
+	qEP, _, _ := h.cfg.Endpoints.Resolve("queue")
+	tblEP, _, _ := h.cfg.Endpoints.Resolve("tables")
+	return "perm=" + permEP + "|storage=" + stEP + "|queue=" + qEP + "|tables=" + tblEP, nil
+}
+
 // PrincipalCurrent resolves the caller's active principal identifier.
 func (h *Host) PrincipalCurrent(dry bool) (string, error) {
 	const op = "principal_current"
@@ -167,6 +190,10 @@ func (h *Host) PrincipalCurrent(dry bool) (string, error) {
 	if h.cfg.Permissions == nil {
 		failed = true
 		return "", h.fail(op, "", missingPermissions())
+	}
+	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+		failed = true
+		return "", h.fail(op, "", ce)
 	}
 	if dry {
 		pr, err := h.cfg.Permissions.CurrentPrincipal(ctx)
@@ -224,6 +251,7 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 			return e
 		}
 		defer cancel()
+		ep := hostkit.EndpointFrom(sctx)
 		if dry {
 			exists, e := h.bucketExists(sctx, true, target.Name)
 			if e != nil {
@@ -233,7 +261,7 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 				return notFound(hostkit.AbsentBucket, fmt.Sprintf("bucket %q does not exist (dry-run preview)", target.Name))
 			}
 			if requireOwned && !h.ov(sctx).bucketCreatedInDry(target.Name) {
-				owned, cerr := h.cost.isOwnedResource(safety.KindBucket, target.Name)
+				owned, cerr := h.cost.isOwnedResourceAt(safety.KindBucket, ep, target.Name)
 				if cerr != nil {
 					return cerr
 				}
@@ -252,7 +280,7 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 			return notFound(hostkit.AbsentBucket, fmt.Sprintf("bucket %q does not exist", target.Name))
 		}
 		if requireOwned {
-			owned, cerr := h.cost.isOwnedResource(safety.KindBucket, target.Name)
+			owned, cerr := h.cost.isOwnedResourceAt(safety.KindBucket, ep, target.Name)
 			if cerr != nil {
 				return cerr
 			}
@@ -269,13 +297,14 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 			return e
 		}
 		defer cancel()
+		ep := hostkit.EndpointFrom(qctx)
 		if dry {
 			if e := h.requireQueue(qctx, true, target.Name); e != nil {
 				return e
 			}
 			if requireOwned {
 				if createdInDry, ok := h.ov(qctx).queue(target.Name); !ok || !createdInDry {
-					owned, cerr := h.cost.isOwnedResource(safety.KindQueue, target.Name)
+					owned, cerr := h.cost.isOwnedResourceAt(safety.KindQueue, ep, target.Name)
 					if cerr != nil {
 						return cerr
 					}
@@ -295,7 +324,7 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 			return notFound(hostkit.AbsentQueue, fmt.Sprintf("queue %q does not exist", target.Name))
 		}
 		if requireOwned {
-			owned, cerr := h.cost.isOwnedResource(safety.KindQueue, target.Name)
+			owned, cerr := h.cost.isOwnedResourceAt(safety.KindQueue, ep, target.Name)
 			if cerr != nil {
 				return cerr
 			}
@@ -312,13 +341,14 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 			return e
 		}
 		defer cancel()
+		ep := hostkit.EndpointFrom(tctx)
 		if dry {
 			if e := h.requireTable(tctx, true, target.Name); e != nil {
 				return e
 			}
 			if requireOwned {
 				if dt, ok := h.ov(tctx).table(target.Name); !ok || !dt.createdNow {
-					owned, cerr := h.cost.isOwnedResource(safety.KindTable, target.Name)
+					owned, cerr := h.cost.isOwnedResourceAt(safety.KindTable, ep, target.Name)
 					if cerr != nil {
 						return cerr
 					}
@@ -338,7 +368,7 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 			return notFound(hostkit.AbsentTable, fmt.Sprintf("table %q does not exist", target.Name))
 		}
 		if requireOwned {
-			owned, cerr := h.cost.isOwnedResource(safety.KindTable, target.Name)
+			owned, cerr := h.cost.isOwnedResourceAt(safety.KindTable, ep, target.Name)
 			if cerr != nil {
 				return cerr
 			}
@@ -372,12 +402,12 @@ func (h *Host) validateExecutablePolicy(p *Policy) (string, *hostkit.CloudError)
 	return hostkit.SerializeCanonicalPolicy(p.stmts)
 }
 
-func (h *Host) checkDryAttachHeadroom(ctx context.Context, kind hostkit.AttachmentKind, target, principal string) *hostkit.CloudError {
-	committed, cerr := h.cost.listPolicyAttachments()
+func (h *Host) checkDryAttachHeadroom(ovCtx context.Context, scope string, kind hostkit.AttachmentKind, target, principal string) *hostkit.CloudError {
+	committed, cerr := h.cost.listPolicyAttachmentsForScope(scope, "")
 	if cerr != nil {
 		return cerr
 	}
-	merged := h.ov(ctx).mergePolicies(committed)
+	merged := h.ov(ovCtx).mergePolicies(committed)
 	wantKey := hostkit.AttachmentKey(kind, target, principal)
 	for _, att := range merged {
 		if hostkit.AttachmentKey(att.Kind, att.Target, att.Principal) == wantKey {
@@ -429,9 +459,20 @@ func (h *Host) PolicyAttach(dry bool, target, principal string, policy *Policy) 
 		return h.fail(op, target, e)
 	}
 	defer cancel()
+	scopeKey, e := h.permissionsScope()
+	if e != nil {
+		failed = true
+		return h.fail(op, target, e)
+	}
+	ovCtx := hostkit.WithEndpoint(ctx, scopeKey)
+
+	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+		failed = true
+		return h.fail(op, target, ce)
+	}
 
 	if dry {
-		if ce := h.checkDryAttachHeadroom(ctx, hostkit.AttachmentResource, target, principal); ce != nil {
+		if ce := h.checkDryAttachHeadroom(ovCtx, scopeKey, hostkit.AttachmentResource, target, principal); ce != nil {
 			failed = true
 			return h.fail(op, target, ce)
 		}
@@ -439,8 +480,9 @@ func (h *Host) PolicyAttach(dry bool, target, principal string, policy *Policy) 
 			failed = true
 			return h.fail(op, target, ce)
 		}
-		h.ov(ctx).attachPolicy(hostkit.PolicyAttachment{
-			Key:        hostkit.AttachmentKey(hostkit.AttachmentResource, target, principal),
+		h.ov(ovCtx).attachPolicy(hostkit.PolicyAttachment{
+			Key:        hostkit.ScopedAttachmentKey(scopeKey, hostkit.AttachmentResource, target, principal),
+			Scope:      scopeKey,
 			Kind:       hostkit.AttachmentResource,
 			Target:     target,
 			Principal:  principal,
@@ -456,7 +498,7 @@ func (h *Host) PolicyAttach(dry bool, target, principal string, policy *Policy) 
 		return h.fail(op, target, missingPermissions())
 	}
 
-	if ce := h.cost.checkPolicyAttachHeadroom(hostkit.AttachmentResource, target, principal); ce != nil {
+	if ce := h.cost.checkPolicyAttachHeadroom(scopeKey, hostkit.AttachmentResource, target, principal); ce != nil {
 		failed = true
 		return h.fail(op, target, ce)
 	}
@@ -465,21 +507,23 @@ func (h *Host) PolicyAttach(dry bool, target, principal string, policy *Policy) 
 		return h.fail(op, target, ce)
 	}
 
-	att, cerr := h.cost.preparePolicyAttachment(hostkit.AttachmentResource, target, principal, policy.stmts, rawDoc)
+	attKey := hostkit.ScopedAttachmentKey(scopeKey, hostkit.AttachmentResource, target, principal)
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{
+		Operation:   op,
+		PayloadSize: bytesIn,
+	}, safety.KindPolicyAttachment, attKey)
 	if cerr != nil {
+		failed = true
+		return h.fail(op, target, cerr)
+	}
+
+	att, cerr := h.cost.beginPolicyAttachIntent(scopeKey, hostkit.AttachmentResource, target, principal, policy.stmts, rawDoc)
+	if cerr != nil {
+		_ = scope.releaseNotSent()
 		failed = true
 		return h.fail(op, target, cerr)
 	}
 	h.errs.AddRedaction(att.OwnerToken)
-
-	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{
-		Operation:   op,
-		PayloadSize: bytesIn,
-	}, safety.KindPolicyAttachment, att.Key)
-	if cerr != nil {
-		failed = true
-		return h.fail(op, target, cerr)
-	}
 
 	err := h.cfg.Permissions.AttachPolicy(hostkit.WithCreateToken(mctx, att.OwnerToken), att)
 	var abortErr *hostkit.CloudError
@@ -490,9 +534,13 @@ func (h *Host) PolicyAttach(dry bool, target, principal string, policy *Policy) 
 	}
 	if err != nil {
 		failed = true
-		return h.fail(op, target, hostkit.AsCloudError(err))
+		ce := hostkit.AsCloudError(err)
+		if isDefinitivePolicyRefusal(ce) {
+			_ = h.cost.abortPolicyIntent(att)
+		}
+		return h.fail(op, target, ce)
 	}
-	if cerr := h.cost.recordPolicyAttach(att); cerr != nil {
+	if cerr := h.cost.confirmPolicyAttach(att); cerr != nil {
 		failed = true
 		return h.fail(op, target, cerr)
 	}
@@ -534,9 +582,20 @@ func (h *Host) PolicyAttachPrincipal(dry bool, principal string, policy *Policy)
 		return h.fail(op, principal, e)
 	}
 	defer cancel()
+	scopeKey, e := h.permissionsScope()
+	if e != nil {
+		failed = true
+		return h.fail(op, principal, e)
+	}
+	ovCtx := hostkit.WithEndpoint(ctx, scopeKey)
+
+	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+		failed = true
+		return h.fail(op, principal, ce)
+	}
 
 	if dry {
-		if ce := h.checkDryAttachHeadroom(ctx, hostkit.AttachmentPrincipal, "", principal); ce != nil {
+		if ce := h.checkDryAttachHeadroom(ovCtx, scopeKey, hostkit.AttachmentPrincipal, "", principal); ce != nil {
 			failed = true
 			return h.fail(op, principal, ce)
 		}
@@ -546,8 +605,9 @@ func (h *Host) PolicyAttachPrincipal(dry bool, principal string, policy *Policy)
 				return h.fail(op, principal, ce)
 			}
 		}
-		h.ov(ctx).attachPolicy(hostkit.PolicyAttachment{
-			Key:        hostkit.AttachmentKey(hostkit.AttachmentPrincipal, "", principal),
+		h.ov(ovCtx).attachPolicy(hostkit.PolicyAttachment{
+			Key:        hostkit.ScopedAttachmentKey(scopeKey, hostkit.AttachmentPrincipal, "", principal),
+			Scope:      scopeKey,
 			Kind:       hostkit.AttachmentPrincipal,
 			Target:     "",
 			Principal:  principal,
@@ -563,7 +623,7 @@ func (h *Host) PolicyAttachPrincipal(dry bool, principal string, policy *Policy)
 		return h.fail(op, principal, missingPermissions())
 	}
 
-	if ce := h.cost.checkPolicyAttachHeadroom(hostkit.AttachmentPrincipal, "", principal); ce != nil {
+	if ce := h.cost.checkPolicyAttachHeadroom(scopeKey, hostkit.AttachmentPrincipal, "", principal); ce != nil {
 		failed = true
 		return h.fail(op, principal, ce)
 	}
@@ -574,21 +634,23 @@ func (h *Host) PolicyAttachPrincipal(dry bool, principal string, policy *Policy)
 		}
 	}
 
-	att, cerr := h.cost.preparePolicyAttachment(hostkit.AttachmentPrincipal, "", principal, policy.stmts, rawDoc)
+	attKey := hostkit.ScopedAttachmentKey(scopeKey, hostkit.AttachmentPrincipal, "", principal)
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{
+		Operation:   op,
+		PayloadSize: bytesIn,
+	}, safety.KindPolicyAttachment, attKey)
 	if cerr != nil {
+		failed = true
+		return h.fail(op, principal, cerr)
+	}
+
+	att, cerr := h.cost.beginPolicyAttachIntent(scopeKey, hostkit.AttachmentPrincipal, "", principal, policy.stmts, rawDoc)
+	if cerr != nil {
+		_ = scope.releaseNotSent()
 		failed = true
 		return h.fail(op, principal, cerr)
 	}
 	h.errs.AddRedaction(att.OwnerToken)
-
-	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{
-		Operation:   op,
-		PayloadSize: bytesIn,
-	}, safety.KindPolicyAttachment, att.Key)
-	if cerr != nil {
-		failed = true
-		return h.fail(op, principal, cerr)
-	}
 
 	err := h.cfg.Permissions.AttachPolicy(hostkit.WithCreateToken(mctx, att.OwnerToken), att)
 	var abortErr *hostkit.CloudError
@@ -599,9 +661,13 @@ func (h *Host) PolicyAttachPrincipal(dry bool, principal string, policy *Policy)
 	}
 	if err != nil {
 		failed = true
-		return h.fail(op, principal, hostkit.AsCloudError(err))
+		ce := hostkit.AsCloudError(err)
+		if isDefinitivePolicyRefusal(ce) {
+			_ = h.cost.abortPolicyIntent(att)
+		}
+		return h.fail(op, principal, ce)
 	}
-	if cerr := h.cost.recordPolicyAttach(att); cerr != nil {
+	if cerr := h.cost.confirmPolicyAttach(att); cerr != nil {
 		failed = true
 		return h.fail(op, principal, cerr)
 	}
@@ -637,13 +703,24 @@ func (h *Host) PolicyDetach(dry bool, target, principal string) error {
 		return h.fail(op, target, e)
 	}
 	defer cancel()
+	scopeKey, e := h.permissionsScope()
+	if e != nil {
+		failed = true
+		return h.fail(op, target, e)
+	}
+	ovCtx := hostkit.WithEndpoint(ctx, scopeKey)
+
+	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+		failed = true
+		return h.fail(op, target, ce)
+	}
 
 	if dry {
 		if ce := h.verifyTargetExistsAndOwned(true, anchored, true); ce != nil {
 			failed = true
 			return h.fail(op, target, ce)
 		}
-		h.ov(ctx).detachPolicy(hostkit.AttachmentResource, target, principal)
+		h.ov(ovCtx).detachPolicy(hostkit.AttachmentResource, target, principal)
 		h.ok()
 		return nil
 	}
@@ -658,14 +735,41 @@ func (h *Host) PolicyDetach(dry bool, target, principal string) error {
 		return h.fail(op, target, ce)
 	}
 
-	attKey := hostkit.AttachmentKey(hostkit.AttachmentResource, target, principal)
+	ownedAtt, cerr := h.cost.hasOwnedPolicyAttachment(scopeKey, hostkit.AttachmentResource, target, principal)
+	if cerr != nil {
+		failed = true
+		return h.fail(op, target, cerr)
+	}
+	if !ownedAtt {
+		h.ok()
+		return nil
+	}
+
+	attKey := hostkit.ScopedAttachmentKey(scopeKey, hostkit.AttachmentResource, target, principal)
 	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindPolicyAttachment, attKey)
 	if cerr != nil {
 		failed = true
 		return h.fail(op, target, cerr)
 	}
 
-	err := h.cfg.Permissions.DetachPolicy(mctx, hostkit.AttachmentResource, target, principal)
+	existing, foundNow, cerr := h.cost.beginPolicyDetachIntent(scopeKey, hostkit.AttachmentResource, target, principal)
+	if cerr != nil {
+		_ = scope.releaseNotSent()
+		failed = true
+		return h.fail(op, target, cerr)
+	}
+	if !foundNow {
+		if rerr := scope.releaseNotSent(); rerr != nil {
+			failed = true
+			return h.fail(op, target, rerr)
+		}
+		h.ok()
+		return nil
+	}
+	h.errs.AddRedaction(existing.OwnerToken)
+
+	dctx := hostkit.WithExpectedAttachment(hostkit.WithCreateToken(mctx, existing.OwnerToken), existing)
+	err := h.cfg.Permissions.DetachPolicy(dctx, hostkit.AttachmentResource, target, principal)
 	var abortErr *hostkit.CloudError
 	retries, throttles, abortErr = scope.finish(0, 0, true, err == nil)
 	if abortErr != nil {
@@ -674,9 +778,13 @@ func (h *Host) PolicyDetach(dry bool, target, principal string) error {
 	}
 	if err != nil {
 		failed = true
-		return h.fail(op, target, hostkit.AsCloudError(err))
+		ce := hostkit.AsCloudError(err)
+		if isDefinitivePolicyRefusal(ce) {
+			_ = h.cost.abortPolicyIntent(existing)
+		}
+		return h.fail(op, target, ce)
 	}
-	if cerr := h.cost.recordPolicyDetach(hostkit.AttachmentResource, target, principal); cerr != nil {
+	if cerr := h.cost.confirmPolicyDetach(existing); cerr != nil {
 		failed = true
 		return h.fail(op, target, cerr)
 	}
@@ -707,9 +815,20 @@ func (h *Host) PolicyDetachPrincipal(dry bool, principal string) error {
 		return h.fail(op, principal, e)
 	}
 	defer cancel()
+	scopeKey, e := h.permissionsScope()
+	if e != nil {
+		failed = true
+		return h.fail(op, principal, e)
+	}
+	ovCtx := hostkit.WithEndpoint(ctx, scopeKey)
+
+	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+		failed = true
+		return h.fail(op, principal, ce)
+	}
 
 	if dry {
-		h.ov(ctx).detachPolicy(hostkit.AttachmentPrincipal, "", principal)
+		h.ov(ovCtx).detachPolicy(hostkit.AttachmentPrincipal, "", principal)
 		h.ok()
 		return nil
 	}
@@ -719,14 +838,41 @@ func (h *Host) PolicyDetachPrincipal(dry bool, principal string) error {
 		return h.fail(op, principal, missingPermissions())
 	}
 
-	attKey := hostkit.AttachmentKey(hostkit.AttachmentPrincipal, "", principal)
+	ownedAtt, cerr := h.cost.hasOwnedPolicyAttachment(scopeKey, hostkit.AttachmentPrincipal, "", principal)
+	if cerr != nil {
+		failed = true
+		return h.fail(op, principal, cerr)
+	}
+	if !ownedAtt {
+		h.ok()
+		return nil
+	}
+
+	attKey := hostkit.ScopedAttachmentKey(scopeKey, hostkit.AttachmentPrincipal, "", principal)
 	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindPolicyAttachment, attKey)
 	if cerr != nil {
 		failed = true
 		return h.fail(op, principal, cerr)
 	}
 
-	err := h.cfg.Permissions.DetachPolicy(mctx, hostkit.AttachmentPrincipal, "", principal)
+	existing, foundNow, cerr := h.cost.beginPolicyDetachIntent(scopeKey, hostkit.AttachmentPrincipal, "", principal)
+	if cerr != nil {
+		_ = scope.releaseNotSent()
+		failed = true
+		return h.fail(op, principal, cerr)
+	}
+	if !foundNow {
+		if rerr := scope.releaseNotSent(); rerr != nil {
+			failed = true
+			return h.fail(op, principal, rerr)
+		}
+		h.ok()
+		return nil
+	}
+	h.errs.AddRedaction(existing.OwnerToken)
+
+	dctx := hostkit.WithExpectedAttachment(hostkit.WithCreateToken(mctx, existing.OwnerToken), existing)
+	err := h.cfg.Permissions.DetachPolicy(dctx, hostkit.AttachmentPrincipal, "", principal)
 	var abortErr *hostkit.CloudError
 	retries, throttles, abortErr = scope.finish(0, 0, true, err == nil)
 	if abortErr != nil {
@@ -735,9 +881,13 @@ func (h *Host) PolicyDetachPrincipal(dry bool, principal string) error {
 	}
 	if err != nil {
 		failed = true
-		return h.fail(op, principal, hostkit.AsCloudError(err))
+		ce := hostkit.AsCloudError(err)
+		if isDefinitivePolicyRefusal(ce) {
+			_ = h.cost.abortPolicyIntent(existing)
+		}
+		return h.fail(op, principal, ce)
 	}
-	if cerr := h.cost.recordPolicyDetach(hostkit.AttachmentPrincipal, "", principal); cerr != nil {
+	if cerr := h.cost.confirmPolicyDetach(existing); cerr != nil {
 		failed = true
 		return h.fail(op, principal, cerr)
 	}
@@ -770,18 +920,33 @@ func (h *Host) PolicyCheck(dry bool, principal, action, resource string) (bool, 
 		return false, h.fail(op, resource, e)
 	}
 	defer cancel()
+	scopeKey, e := h.permissionsScope()
+	if e != nil {
+		failed = true
+		return false, h.fail(op, resource, e)
+	}
+	ovCtx := hostkit.WithEndpoint(ctx, scopeKey)
+
+	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+		failed = true
+		return false, h.fail(op, resource, ce)
+	}
 
 	if dry {
 		if ce := h.verifyTargetExistsAndOwned(true, anchored, false); ce != nil {
 			failed = true
 			return false, h.fail(op, resource, ce)
 		}
-		committed, cerr := h.cost.listPolicyAttachments()
+		if ce := hostkit.ValidatePolicyCheckActionResourceType(action, resource, *h.cfg.Validator); ce != nil {
+			failed = true
+			return false, h.fail(op, resource, ce)
+		}
+		committed, cerr := h.cost.listPolicyAttachmentsForScope(scopeKey, principal)
 		if cerr != nil {
 			failed = true
 			return false, h.fail(op, resource, cerr)
 		}
-		merged := h.ov(ctx).mergePolicies(committed)
+		merged := h.ov(ovCtx).mergePolicies(committed)
 		allowed := hostkit.EvaluatePolicies(merged, principal, action, resource)
 		h.ok()
 		return allowed, nil
@@ -796,11 +961,9 @@ func (h *Host) PolicyCheck(dry bool, principal, action, resource string) (bool, 
 		failed = true
 		return false, h.fail(op, resource, ce)
 	}
-
-	attachments, cerr := h.cost.listPolicyAttachments()
-	if cerr != nil {
+	if ce := hostkit.ValidatePolicyCheckActionResourceType(action, resource, *h.cfg.Validator); ce != nil {
 		failed = true
-		return false, h.fail(op, resource, cerr)
+		return false, h.fail(op, resource, ce)
 	}
 
 	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, targetSafetyKind(anchored.Kind), anchored.Name)
@@ -819,6 +982,12 @@ func (h *Host) PolicyCheck(dry bool, principal, action, resource string) (bool, 
 	if err != nil {
 		failed = true
 		return false, h.fail(op, resource, hostkit.AsCloudError(err))
+	}
+
+	attachments, cerr := h.cost.listPolicyAttachmentsForScope(scopeKey, principal)
+	if cerr != nil {
+		failed = true
+		return false, h.fail(op, resource, cerr)
 	}
 	allowed := hostkit.EvaluatePolicies(attachments, principal, action, resource)
 	h.ok()

@@ -634,7 +634,7 @@ func (h *Host) TableCreate(dry bool, name string, sorted bool) (bool, error) {
 				return false, h.fail(op, name, terr)
 			}
 			if proven {
-				h.cost.lockResourceCleanupIfNeeded(op, safety.KindTable, name)
+				h.cost.lockResourceCleanupIfNeeded(hostkit.EndpointFrom(ctx), op, safety.KindTable, name)
 				h.ok()
 				return true, nil
 			}

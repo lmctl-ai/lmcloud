@@ -58,14 +58,18 @@ type PolicyDocument struct {
 // PolicyAttachment represents a single replace-per-key policy attachment in the
 // authoritative run journal and adapter state.
 type PolicyAttachment struct {
-	Key        string            `json:"key"`
-	Kind       AttachmentKind    `json:"kind"`
-	Target     string            `json:"target,omitempty"`
-	Principal  string            `json:"principal"`
-	Document   string            `json:"document"`
-	Statements []PolicyStatement `json:"statements"`
-	OwnerToken string            `json:"owner_token,omitempty"`
-	Generation string            `json:"generation,omitempty"`
+	Key                string            `json:"key"`
+	Scope              string            `json:"scope,omitempty"`
+	Kind               AttachmentKind    `json:"kind"`
+	Target             string            `json:"target,omitempty"`
+	Principal          string            `json:"principal"`
+	Document           string            `json:"document"`
+	Statements         []PolicyStatement `json:"statements"`
+	OwnerToken         string            `json:"owner_token,omitempty"`
+	Generation         string            `json:"generation,omitempty"`
+	IntentID           string            `json:"intent_id,omitempty"`
+	ExpectedOwnerToken string            `json:"expected_owner_token,omitempty"`
+	ExpectedGeneration string            `json:"expected_generation,omitempty"`
 }
 
 // Clone returns a deep copy of a.
@@ -75,14 +79,18 @@ func (a PolicyAttachment) Clone() PolicyAttachment {
 		stmts[i] = s.Clone()
 	}
 	return PolicyAttachment{
-		Key:        a.Key,
-		Kind:       a.Kind,
-		Target:     a.Target,
-		Principal:  a.Principal,
-		Document:   a.Document,
-		Statements: stmts,
-		OwnerToken: a.OwnerToken,
-		Generation: a.Generation,
+		Key:                a.Key,
+		Scope:              a.Scope,
+		Kind:               a.Kind,
+		Target:             a.Target,
+		Principal:          a.Principal,
+		Document:           a.Document,
+		Statements:         stmts,
+		OwnerToken:         a.OwnerToken,
+		Generation:         a.Generation,
+		IntentID:           a.IntentID,
+		ExpectedOwnerToken: a.ExpectedOwnerToken,
+		ExpectedGeneration: a.ExpectedGeneration,
 	}
 }
 
@@ -92,6 +100,37 @@ func AttachmentKey(kind AttachmentKind, target, principal string) string {
 		target = ""
 	}
 	return string(kind) + "\x00" + target + "\x00" + principal
+}
+
+// ScopedAttachmentKey returns the canonical attachment key scoped by endpoint/backend.
+func ScopedAttachmentKey(scope string, kind AttachmentKind, target, principal string) string {
+	if kind == AttachmentPrincipal {
+		target = ""
+	}
+	if scope == "" {
+		return AttachmentKey(kind, target, principal)
+	}
+	return scope + "\x00" + string(kind) + "\x00" + target + "\x00" + principal
+}
+
+type expectedAttachmentKey struct{}
+
+// WithExpectedAttachment attaches the expected authoritative PolicyAttachment
+// metadata (OwnerToken, Generation, IntentID) to ctx for DetachPolicy fencing.
+func WithExpectedAttachment(ctx context.Context, att PolicyAttachment) context.Context {
+	return context.WithValue(ctx, expectedAttachmentKey{}, att.Clone())
+}
+
+// ExpectedAttachmentFrom extracts the expected PolicyAttachment metadata from ctx, if present.
+func ExpectedAttachmentFrom(ctx context.Context) (PolicyAttachment, bool) {
+	if ctx == nil {
+		return PolicyAttachment{}, false
+	}
+	att, ok := ctx.Value(expectedAttachmentKey{}).(PolicyAttachment)
+	if !ok {
+		return PolicyAttachment{}, false
+	}
+	return att.Clone(), true
 }
 
 // LintFinding is a single semantic lint diagnostic produced by LintPolicy.
@@ -718,6 +757,7 @@ func LintPolicy(stmts []PolicyStatement, v Validator) LintReport {
 			hasWriteOrCreate bool
 			hasDelete        bool
 			actionSlices     = map[string]bool{}
+			actionTypes      = map[string]bool{}
 		)
 		for _, a := range stmt.Actions {
 			parts := strings.Split(a, ".")
@@ -733,11 +773,13 @@ func LintPolicy(stmts []PolicyStatement, v Validator) LintReport {
 				addFinding("error", "ESCALATION_NAMESPACE", fmt.Sprintf("statement %d action %q references forbidden escalation namespace %q", idx, a, slicePrefix))
 				continue
 			}
-			if !IsKnownPortableAction(a) {
+			wantType, ok := knownPortableActions[a]
+			if !ok {
 				addFinding("error", "UNKNOWN_ACTION", fmt.Sprintf("statement %d action %q is not in the portable action vocabulary", idx, a))
 				continue
 			}
 			actionSlices[slicePrefix] = true
+			actionTypes[wantType] = true
 			switch verb {
 			case "write", "create", "send":
 				hasWriteOrCreate = true
@@ -750,6 +792,8 @@ func LintPolicy(stmts []PolicyStatement, v Validator) LintReport {
 			hasWildcardScope   bool
 			hasValidKnownRes   bool
 			hasMatchedResSlice bool
+			resTypes           = map[string]bool{}
+			wildcardSlices     = map[string]bool{}
 		)
 		for _, r := range stmt.Resources {
 			pr, cerr := ParseResourceSyntax(r, v)
@@ -761,8 +805,9 @@ func LintPolicy(stmts []PolicyStatement, v Validator) LintReport {
 				addFinding("error", "ESCALATION_NAMESPACE", fmt.Sprintf("statement %d resource %q references forbidden escalation namespace %q", idx, r, pr.Slice))
 				continue
 			}
-			if !knownResourceTypes[pr.Slice+":"+pr.Type] {
-				addFinding("error", "UNKNOWN_RESOURCE", fmt.Sprintf("statement %d resource %q has unknown resource type \"%s:%s\"", idx, r, pr.Slice, pr.Type))
+			resType := pr.Slice + ":" + pr.Type
+			if !knownResourceTypes[resType] {
+				addFinding("error", "UNKNOWN_RESOURCE", fmt.Sprintf("statement %d resource %q has unknown resource type %q", idx, r, resType))
 				continue
 			}
 			hasValidKnownRes = true
@@ -771,12 +816,29 @@ func LintPolicy(stmts []PolicyStatement, v Validator) LintReport {
 			}
 			if pr.IsWildcard {
 				hasWildcardScope = true
+				wildcardSlices[pr.Slice] = true
+				if len(actionSlices) > 0 && !actionSlices[pr.Slice] {
+					addFinding("error", "UNKNOWN_RESOURCE", fmt.Sprintf("statement %d wildcard resource %q slice %q does not match statement actions", idx, r, pr.Slice))
+				}
 				addFinding("warning", "WILDCARD_SCOPE", fmt.Sprintf("statement %d resource %q uses a whole-class wildcard scope", idx, r))
+			} else {
+				resTypes[resType] = true
+				if len(actionTypes) > 0 && !actionTypes[resType] {
+					addFinding("error", "UNKNOWN_RESOURCE", fmt.Sprintf("statement %d resource %q type %q is incompatible with statement actions", idx, r, resType))
+				}
 			}
 		}
 
 		if len(actionSlices) > 0 && hasValidKnownRes && !hasMatchedResSlice {
 			addFinding("error", "UNKNOWN_RESOURCE", fmt.Sprintf("statement %d resources do not match action slice", idx))
+		}
+		if len(actionTypes) > 0 && hasValidKnownRes {
+			for wt := range actionTypes {
+				wtSlice := strings.SplitN(wt, ":", 2)[0]
+				if !resTypes[wt] && !wildcardSlices[wtSlice] {
+					addFinding("error", "UNKNOWN_RESOURCE", fmt.Sprintf("statement %d has no resource matching required action resource type %q", idx, wt))
+				}
+			}
 		}
 		if stmt.Effect == "Allow" && hasWildcardScope && hasWriteOrCreate && hasDelete {
 			addFinding("warning", "OVERBROAD_COMBINATION", fmt.Sprintf("statement %d combines write/create and delete actions on a wildcard resource scope", idx))
@@ -821,14 +883,17 @@ func ValidateTargetEntity(resource string, v Validator) (AnchoredTarget, *CloudE
 // ValidateResourceAttachScope enforces the resource-side scope fence (15 §4.3):
 // every statement resource in stmts must be target itself or (when target is
 // storage:bucket:<b>) an object scope storage:object:<b>/<key-or-prefix> inside
-// that same bucket, and every statement action must belong to the target's slice.
+// that same bucket, and every statement action must belong to the target's slice
+// and match the Appendix A resource type of the statement's resources.
 func ValidateResourceAttachScope(target AnchoredTarget, stmts []PolicyStatement, v Validator) *CloudError {
 	for i, stmt := range stmts {
+		actionTypes := map[string]bool{}
 		for _, a := range stmt.Actions {
 			wantType, ok := knownPortableActions[a]
 			if !ok {
 				return Preflightf("statement %d action %q is not a supported portable action", i, a)
 			}
+			actionTypes[wantType] = true
 			actionSlice := strings.SplitN(wantType, ":", 2)[0]
 			switch target.Kind {
 			case "bucket":
@@ -845,6 +910,7 @@ func ValidateResourceAttachScope(target AnchoredTarget, stmts []PolicyStatement,
 				}
 			}
 		}
+		resTypes := map[string]bool{}
 		for _, r := range stmt.Resources {
 			pr, cerr := ParseResourceSyntax(r, v)
 			if cerr != nil {
@@ -853,19 +919,29 @@ func ValidateResourceAttachScope(target AnchoredTarget, stmts []PolicyStatement,
 			if pr.IsWildcard {
 				return Preflightf("statement %d resource %q uses a whole-class wildcard not permitted on resource attach to %q", i, r, target.Resource)
 			}
+			resType := pr.Slice + ":" + pr.Type
 			switch target.Kind {
 			case "bucket":
-				if (pr.Slice+":"+pr.Type != "storage:bucket" && pr.Slice+":"+pr.Type != "storage:object") || pr.EntityName != target.Name {
+				if (resType != "storage:bucket" && resType != "storage:object") || pr.EntityName != target.Name {
 					return Preflightf("statement %d resource %q is outside target bucket %q", i, r, target.Resource)
 				}
 			case "queue":
-				if pr.Slice+":"+pr.Type != "queue:queue" || pr.EntityName != target.Name {
+				if resType != "queue:queue" || pr.EntityName != target.Name {
 					return Preflightf("statement %d resource %q is outside target queue %q", i, r, target.Resource)
 				}
 			case "table":
-				if pr.Slice+":"+pr.Type != "tables:table" || pr.EntityName != target.Name {
+				if resType != "tables:table" || pr.EntityName != target.Name {
 					return Preflightf("statement %d resource %q is outside target table %q", i, r, target.Resource)
 				}
+			}
+			if !actionTypes[resType] {
+				return Preflightf("statement %d resource %q type %q is incompatible with statement actions", i, r, resType)
+			}
+			resTypes[resType] = true
+		}
+		for wt := range actionTypes {
+			if !resTypes[wt] {
+				return Preflightf("statement %d action requires resource type %q not present in statement resources", i, wt)
 			}
 		}
 	}
@@ -874,19 +950,21 @@ func ValidateResourceAttachScope(target AnchoredTarget, stmts []PolicyStatement,
 
 // ValidatePrincipalAttachScope enforces the identity-side scope fence (15 §4.3):
 // whole-class wildcards (e.g. storage:bucket:*) are refused pre-flight with
-// INVALID_ARGUMENT, and every statement resource must anchor on a concrete
-// entity whose existence and run ownership will be verified before attach.
+// INVALID_ARGUMENT, every statement resource must match the Appendix A resource
+// type of the statement's actions, and every statement resource must anchor on a
+// concrete entity whose existence and run ownership will be verified before attach.
 func ValidatePrincipalAttachScope(stmts []PolicyStatement, v Validator) ([]AnchoredTarget, *CloudError) {
 	seen := map[string]AnchoredTarget{}
 	for i, stmt := range stmts {
-		actionSlices := map[string]bool{}
+		actionTypes := map[string]bool{}
 		for _, a := range stmt.Actions {
 			wantType, ok := knownPortableActions[a]
 			if !ok {
 				return nil, Preflightf("statement %d action %q is not a supported portable action", i, a)
 			}
-			actionSlices[strings.SplitN(wantType, ":", 2)[0]] = true
+			actionTypes[wantType] = true
 		}
+		resTypes := map[string]bool{}
 		for _, r := range stmt.Resources {
 			pr, cerr := ParseResourceSyntax(r, v)
 			if cerr != nil {
@@ -895,14 +973,21 @@ func ValidatePrincipalAttachScope(stmts []PolicyStatement, v Validator) ([]Ancho
 			if pr.IsWildcard {
 				return nil, Preflightf("statement %d resource %q uses a whole-class wildcard; policy_attach_principal requires concrete resource scopes", i, r)
 			}
-			if !actionSlices[pr.Slice] {
-				return nil, Preflightf("statement %d resource %q does not match statement action slice", i, r)
+			resType := pr.Slice + ":" + pr.Type
+			if !actionTypes[resType] {
+				return nil, Preflightf("statement %d resource %q type %q is incompatible with statement actions", i, r, resType)
 			}
+			resTypes[resType] = true
 			at, ok := pr.Anchored()
 			if !ok {
 				return nil, Preflightf("statement %d resource %q does not anchor on a concrete bucket, queue, or table", i, r)
 			}
 			seen[at.Resource] = at
+		}
+		for wt := range actionTypes {
+			if !resTypes[wt] {
+				return nil, Preflightf("statement %d action requires resource type %q not present in statement resources", i, wt)
+			}
 		}
 	}
 	keys := make([]string, 0, len(seen))
@@ -947,6 +1032,25 @@ func ValidatePolicyCheckInputs(principal, action, resource string, v Validator) 
 	return at, nil
 }
 
+// ValidatePolicyCheckActionResourceType enforces exact Appendix A action-to-resource
+// type compatibility (e.g. storage.object.* requires storage:object:<b>/<k>,
+// storage.bucket.* requires storage:bucket:<b>).
+func ValidatePolicyCheckActionResourceType(action, resource string, v Validator) *CloudError {
+	wantType, ok := knownPortableActions[action]
+	if !ok {
+		return Preflightf("unknown portable action %q in policy_check", action)
+	}
+	pr, cerr := ParseResourceSyntax(resource, v)
+	if cerr != nil {
+		return cerr
+	}
+	gotType := pr.Slice + ":" + pr.Type
+	if gotType != wantType {
+		return Preflightf("policy_check action %q requires resource type %q, got %q (%q)", action, wantType, gotType, resource)
+	}
+	return nil
+}
+
 // MatchPolicyResource reports whether a statement resource pattern (exact or
 // single trailing '*' prefix) matches a concrete resource string.
 func MatchPolicyResource(pattern, resource string) bool {
@@ -966,6 +1070,10 @@ func MatchPolicyResource(pattern, resource string) bool {
 //   - Otherwise, if at least one matching statement has Allow, returns true.
 //   - Otherwise returns false (default deny).
 func EvaluatePolicies(attachments []PolicyAttachment, principal, action, resource string) bool {
+	wantType, ok := knownPortableActions[action]
+	if !ok || !strings.HasPrefix(resource, wantType+":") {
+		return false
+	}
 	allowed := false
 	for _, att := range attachments {
 		if att.Principal != principal {
@@ -984,7 +1092,7 @@ func EvaluatePolicies(attachments []PolicyAttachment, principal, action, resourc
 			}
 			resMatched := false
 			for _, r := range stmt.Resources {
-				if MatchPolicyResource(r, resource) {
+				if strings.HasPrefix(r, wantType+":") && MatchPolicyResource(r, resource) {
 					resMatched = true
 					break
 				}
