@@ -3,8 +3,9 @@
 # <provider>sim --auth enforce (emits TAP SKIP in open mode unless LMCLOUD_AUTH_MODE=="enforce").
 # Step 0 seeds an existing function (seed_fn) with the allowed caller credentials so Pass 1 and Pass 2
 # test against a real existing target rather than relying on catalog-absence ordering.
-# Credentials and seed_fn cleanup are unconditionally restored/executed BEFORE evaluating Pass 1 / Pass 2
-# assertions so a failed assertion never leaks seed_fn or leaves modified environment variables.
+# On all normal Pass 1 / Pass 2 execution paths, caller credentials and seed_fn cleanup are executed
+# BEFORE evaluating result assertions so a failed assertion does not leak seed_fn or modified env vars
+# (abrupt process death, malformed host envelopes, or seed-step failures rely on the durable hostkit/safety sweeper).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 seed_fn = "lmf13" + run_id + "s";
@@ -130,7 +131,7 @@ end _lmcode_
 
 r_denied = is_open ? r_unauth : run_lmcode(denied_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 
-# Step 3: Unconditionally restore original allowed credentials and delete seed_fn BEFORE any assertions
+# Step 3: Restore original allowed credentials and delete seed_fn BEFORE evaluating Pass 1 / Pass 2 result assertions
 set_env("LMAWS_SIM_ACCESS_KEY_ID", orig_aws_key);
 set_env("LMAWS_SIM_SECRET_ACCESS_KEY", orig_aws_sec);
 set_env("LMAZURE_SIM_TOKEN", orig_az_tok);

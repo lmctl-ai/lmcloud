@@ -390,17 +390,27 @@ type Functions interface {
   (`1..1048576` bytes valid JSON; handler response `1 MiB + 1` sentinel -> `"Unhandled"` on overflow,
   outer HTTP wire envelope `2 MiB + 1` -> `INTERNAL`, log tail `<= 4 KiB` UTF-8-safe from a `64 KiB`
   bounded drain).
-- **Catalog, incarnation fencing & bounded staging GC (`lmcloudfnmeta` + `hostkit.RunSubOperation`):**
+- **Catalog, incarnation/generation fencing, operation terminality & bounded staging GC (`lmcloudfnmeta` + `hostkit.RunSubOperation`):**
   all four providers coordinate lifecycle state (`"creating"`, `"active"`, `"mutating"`, `"deleting"`),
-  `incarnation_id` (`inc8` embedded in physical resource names `lmfn-{name}-{inc8}`), `op_gen`,
-  writer leases (`35 s` TTL >= `30 s` hard HTTP timeout + `5 s` margin), distributed concurrency
-  `slots[1..K]` (never released early on caller disconnect), and synchronous post-update GC of
-  displaced unreferenced bundles (`<= 3` unversioned + `<= 16` versioned bundles retained) in
-  `lmcloudfnmeta`. Every extra physical network attempt executes through `hostkit.RunSubOperation`.
-- **Execution isolation (fail-closed):** simulator/host handler execution runs inside an unprivileged
-  Linux namespace jail (`CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWIPC` /
-  `bwrap --unshare-all --die-with-parent`) hiding parent `/proc`, host filesystem, and host loopback;
-  if unavailable, `function_invoke` fails closed (`ErrorCode.INTERNAL`).
+  `incarnation_id` (`inc8` embedded in physical resource names `lmfn-{name}-{inc8}*`), `op_gen`,
+  immutable per-generation deployment targets (`lmfn-{name}-{inc8}-g{op_gen}` on GCP/Azure/OCI) and
+  `RevisionId` + `LastUpdateStatus` barriers (on AWS), durable `candidate.pending_op_id` tracking with
+  metered provider operation status polling to authoritative terminal state (never relying on client
+  socket deadlines or lease expiry as proof that an accepted asynchronous deployment has stopped),
+  distributed concurrency `slots[1..K]` (`concurrency > 0`) and `active_invocations` (`concurrency == 0`,
+  never released early on caller disconnect), and synchronous post-update GC of displaced unreferenced
+  bundles with deterministic `CONFLICT` backpressure when `2` displaced revisions are pinned in
+  `pending_gc` (`<= 3` unversioned + `<= 16` versioned = `<= 19` total artifacts retained) in
+  `lmcloudfnmeta`. Every extra physical network attempt (including status polls) executes through
+  `hostkit.RunSubOperation`.
+- **Execution isolation & runtime-compatible memory limits (fail-closed):** simulator/host handler
+  execution runs inside an unprivileged Linux namespace jail
+  (`CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWIPC` /
+  `bwrap --unshare-all --die-with-parent`) hiding parent `/proc`, host filesystem, and host loopback,
+  with physical resident memory (`VmRSS + VmSwap <= memory_mb MiB`) enforced via cgroup v2 `memory.max`
+  (`memory.swap.max = 0`) + `5 ms` RSS monitor (`RLIMIT_DATA` on `"python3.12"`,
+  `--max-old-space-size` on `"nodejs20.x"` without breaking V8 virtual cage startup); if unavailable,
+  `function_invoke` fails closed (`ErrorCode.INTERNAL`).
 - **Cost, cleanup reserves & dry-run (`service == "function"`):** control-plane calls consume `1`
   unit/attempt (`200` nanodollars = `$0.00000020`); `function_create` locks `$0.00015000`
   (`150,000` nanodollars) multi-service cleanup reserve, `function_publish_version` locks
