@@ -1,0 +1,59 @@
+# Requires: userpool
+# Scenario 03: User CRUD with portable attributes — create with attrs (incl. unicode), get round-trip
+# (username/enabled/status/attributes/created_at), get-on-missing probe, idempotent delete.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+pool = "lmu03" + run_id + "a";
+user = "user03_" + run_id + "_ada";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("userpool", ep);
+  }
+  let p = ${pool};
+  let u = ${user};
+  cloud.userpool_create(p);
+
+  let attrs = str_map().set("display_name", "雪 Ada 🚀").set("department", "eng").set("note", "");
+  let created = cloud.user_create(p, u, attrs);
+
+  let got = cloud.user_get(p, u);
+  let basic_ok = got.exists() && got.username() == u && got.enabled() == true;
+  let status_ok = got.status() == "FORCE_CHANGE_PASSWORD" || got.status() == "CONFIRMED";
+  let created_ok = got.created_at() > 0;
+  let gattrs = got.attributes();
+  let attr_ok = str_len(gattrs.get("display_name")) > 0
+    && gattrs.get("display_name") == "雪 Ada 🚀"
+    && gattrs.get("department") == "eng"
+    && gattrs.get("note") == "";
+  let one_ok = got.attribute("department") == "eng";
+
+  let miss = cloud.user_get(p, "user03_" + "zz" + "_ghost");
+  let miss_ok = !miss.exists() && cloud.last_error().code() == ErrorCode.OK;
+
+  cloud.user_delete(p, u);
+  let gone = cloud.user_get(p, u);
+  cloud.user_delete(p, u);   # idempotent
+  let del_ok = cloud.last_error().ok();
+
+  cloud.userpool_delete(p);
+
+  lmcode_return_put("exists_after_create", created.exists());
+  lmcode_return_put("basic_ok", basic_ok);
+  lmcode_return_put("status_ok", status_ok);
+  lmcode_return_put("created_ok", created_ok);
+  lmcode_return_put("attr_ok", attr_ok);
+  lmcode_return_put("one_ok", one_ok);
+  lmcode_return_put("miss_ok", miss_ok);
+  lmcode_return_put("gone", !gone.exists());
+  lmcode_return_put("del_ok", del_ok);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "03-user-crud-attributes host execution failed");
+assert(r.result.exists_after_create && r.result.basic_ok, "user_create returns existing enabled user");
+assert(r.result.status_ok && r.result.created_ok, "status in {CONFIRMED,FORCE_CHANGE_PASSWORD}, created_at epoch > 0");
+assert(r.result.attr_ok && r.result.one_ok, "attributes round-trip (unicode, empty string) via attributes() and attribute()");
+assert(r.result.miss_ok, "missing user -> exists()==false with OK");
+assert(r.result.gone && r.result.del_ok, "delete works, second delete idempotent OK");

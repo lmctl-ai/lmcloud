@@ -1,0 +1,38 @@
+# Requires: userpool
+# Scenario 02: Pool idempotency — repeated create returns false; delete of missing pool returns false
+# with ErrorCode.OK.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+pool = "lmu02" + run_id + "a";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("userpool", ep);
+  }
+  let n = ${pool};
+
+  let first = cloud.userpool_create(n);
+  let second = cloud.userpool_create(n);
+  let third = cloud.userpool_create(n);
+
+  cloud.set_abort_on_error(false);
+  let del_missing = cloud.userpool_delete("lmu02" + "zz" + "absent");
+  let e = cloud.last_error();
+  cloud.set_abort_on_error(true);
+
+  let del = cloud.userpool_delete(n);
+  let del2 = cloud.userpool_delete(n);
+
+  lmcode_return_put("first", first);
+  lmcode_return_put("repeats_false", !second && !third);
+  lmcode_return_put("del_missing_false_ok", !del_missing && e.code() == ErrorCode.OK);
+  lmcode_return_put("del", del);
+  lmcode_return_put("del2", del2);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "02-pool-idempotency host execution failed");
+assert(r.result.first && r.result.repeats_false, "first create true; repeats false");
+assert(r.result.del_missing_false_ok, "delete of missing pool -> false with OK");
+assert(r.result.del && !r.result.del2, "delete true first, false second");

@@ -1,0 +1,79 @@
+# Requires: userpool
+# Scenario 10: Groups & membership — group lifecycle + sorted listings; idempotent add/remove; missing
+# user/group membership ops -> NOT_FOUND; deleting a membered group removes membership.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+pool = "lmu10" + run_id + "a";
+user = "user10_" + run_id + "_gus";
+ga = "grp10_" + run_id + "_admins";
+gb = "grp10_" + run_id + "_beta";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("userpool", ep);
+  }
+  let p = ${pool};
+  let u = ${user};
+  let a = ${ga};
+  let b = ${gb};
+  cloud.userpool_create(p);
+  cloud.user_create(p, u);
+
+  let ca = cloud.group_create(p, a);
+  let ca2 = cloud.group_create(p, a);
+  let cb = cloud.group_create(p, b);
+
+  cloud.group_add_user(p, a, u);
+  cloud.group_add_user(p, a, u);      # idempotent
+  let add_ok = cloud.last_error().ok();
+  cloud.group_add_user(p, b, u);
+
+  let ug = cloud.user_groups(p, u);
+  let ug_ok = ug.len() == 2 && ug.at(0) == a && ug.at(1) == b;
+  let gl = cloud.group_list(p);
+  let gl_ok = gl.len() == 2 && gl.at(0) == a && gl.at(1) == b;
+
+  cloud.group_remove_user(p, b, u);
+  cloud.group_remove_user(p, b, u);   # idempotent
+  let rem_ok = cloud.last_error().ok();
+  let ug2 = cloud.user_groups(p, u);
+  let ug2_ok = ug2.len() == 1 && ug2.at(0) == a;
+
+  # missing user / missing group membership ops -> NOT_FOUND
+  cloud.set_abort_on_error(false);
+  cloud.group_add_user(p, a, "user10_zz_ghost");
+  let e_mu = cloud.last_error();
+  cloud.group_add_user(p, "grp10_zz_ghost", u);
+  let e_mg = cloud.last_error();
+  let nf_ok = e_mu.code() == ErrorCode.NOT_FOUND && e_mg.code() == ErrorCode.NOT_FOUND;
+  cloud.set_abort_on_error(true);
+
+  # delete membered group: allowed; membership disappears
+  let d = cloud.group_delete(p, a);
+  let d2 = cloud.group_delete(p, a);
+  let ug3 = cloud.user_groups(p, u);
+  let gone = ug3.len() == 0;
+
+  cloud.user_delete(p, u);
+  cloud.group_delete(p, b);
+  cloud.userpool_delete(p);
+
+  lmcode_return_put("create_ok", ca && !ca2 && cb);
+  lmcode_return_put("add_ok", add_ok);
+  lmcode_return_put("ug_ok", ug_ok);
+  lmcode_return_put("gl_ok", gl_ok);
+  lmcode_return_put("rem_ok", rem_ok);
+  lmcode_return_put("ug2_ok", ug2_ok);
+  lmcode_return_put("nf_ok", nf_ok);
+  lmcode_return_put("del", d && !d2);
+  lmcode_return_put("gone", gone);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "10 host execution failed");
+assert(r.result.create_ok, "group_create true once, false on duplicate");
+assert(r.result.add_ok && r.result.ug_ok && r.result.gl_ok, "idempotent add; sorted user_groups/group_list");
+assert(r.result.rem_ok && r.result.ug2_ok, "idempotent remove; membership updated");
+assert(r.result.nf_ok, "membership ops on missing user/group are NOT_FOUND");
+assert(r.result.del && r.result.gone, "group delete works while membered; membership disappears");

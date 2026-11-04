@@ -1,0 +1,66 @@
+# Requires: userpool
+# Scenario 12: NOT_FOUND semantics — every pool/user/group/session op against a missing pool fails
+# NOT_FOUND (abort mode shows [NOT_FOUND]); probes are non-throwing.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+missing = "lmu12" + run_id + "z";
+
+# 1. Abort mode: user_list on missing pool aborts with [NOT_FOUND]
+abort_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("userpool", ep);
+  }
+  cloud.user_list(${missing});
+end _lmcode_
+
+r_abort = run_lmcode(abort_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(!r_abort.ok, "user_list on missing pool must abort in default mode");
+assert(contains(r_abort.error, "[NOT_FOUND]"), "abort message must carry [NOT_FOUND]");
+
+# 2. Inspection mode: op-by-op
+inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("userpool", ep);
+  }
+  let m = ${missing};
+  let probes_ok = !cloud.userpool_exists(m) && cloud.last_error().code() == ErrorCode.OK;
+
+  cloud.set_abort_on_error(false);
+  cloud.user_create(m, "u_any");
+  let e1 = cloud.last_error();
+  cloud.user_get(m, "u_any");
+  let e2 = cloud.last_error();
+  cloud.user_delete(m, "u_any");
+  let e3 = cloud.last_error();
+  cloud.user_set_enabled(m, "u_any", false);
+  let e4 = cloud.last_error();
+  cloud.user_set_password(m, "u_any", "Aa1" + "zzzzzz");
+  let e5 = cloud.last_error();
+  cloud.user_list(m);
+  let e6 = cloud.last_error();
+  cloud.user_sign_in(m, "u_any", "Aa1" + "zzzzzz");
+  let e7 = cloud.last_error();
+  cloud.user_verify_token(m, "garbage.token.value");
+  let e8 = cloud.last_error();
+  cloud.group_create(m, "g_any");
+  let e9 = cloud.last_error();
+  cloud.group_list(m);
+  let e10 = cloud.last_error();
+  cloud.set_abort_on_error(true);
+
+  let all_nf = e1.code() == ErrorCode.NOT_FOUND && e2.code() == ErrorCode.NOT_FOUND
+    && e3.code() == ErrorCode.NOT_FOUND && e4.code() == ErrorCode.NOT_FOUND
+    && e5.code() == ErrorCode.NOT_FOUND && e6.code() == ErrorCode.NOT_FOUND
+    && e7.code() == ErrorCode.NOT_FOUND && e8.code() == ErrorCode.NOT_FOUND
+    && e9.code() == ErrorCode.NOT_FOUND && e10.code() == ErrorCode.NOT_FOUND;
+
+  lmcode_return_put("probes_ok", probes_ok);
+  lmcode_return_put("all_nf", all_nf);
+end _lmcode_
+
+r = run_lmcode(inspect_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "12 inspection host execution failed");
+assert(r.result.probes_ok, "userpool_exists on missing pool is false with OK");
+assert(r.result.all_nf, "all 10 ops against a missing pool must be NOT_FOUND");

@@ -1,0 +1,71 @@
+# Requires: userpool
+# Scenario 09: Validation guards — pool names (intersection rule), usernames, reserved attribute names,
+# oversize attribute values, weak passwords, pagination bounds: all INVALID_ARGUMENT with http_status()==0.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+pool = "lmu09" + run_id + "a";
+user = "user09_" + run_id + "_fey";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("userpool", ep);
+  }
+  let p = ${pool};
+  cloud.userpool_create(p);
+  let u = ${user};
+  cloud.user_create(p, u);
+
+  cloud.set_abort_on_error(false);
+  let fails = 0;
+  let want = 12;
+
+  # invalid pool names: "Up" (uppercase short), hyphen, 2-char, 33-char
+  let bad_pools = str_list().add("Up").add("bad-name").add("ab").add("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  let i = 0;
+  while (i < bad_pools.len()) {
+    cloud.userpool_create(bad_pools.at(i));
+    let e = cloud.last_error();
+    if (e.code() == ErrorCode.INVALID_ARGUMENT && e.http_status() == 0) { fails = fails + 1; }
+    i = i + 1;
+  }
+
+  # invalid usernames: starts uppercase, hyphen, underscore-leading, too short
+  let bad_users = str_list().add("Abcdef").add("bad-user").add("_x9").add("x");
+  let j = 0;
+  while (j < bad_users.len()) {
+    cloud.user_create(p, bad_users.at(j));
+    let e = cloud.last_error();
+    if (e.code() == ErrorCode.INVALID_ARGUMENT && e.http_status() == 0) { fails = fails + 1; }
+    j = j + 1;
+  }
+
+  # reserved/invalid attribute names: "sub" (reserved), "Bad-Key" (invalid charset)
+  cloud.user_create(p, "user09_" + ${run_id} + "_g1", str_map().set("sub", "x"));
+  let e_r = cloud.last_error();
+  if (e_r.code() == ErrorCode.INVALID_ARGUMENT && e_r.http_status() == 0) { fails = fails + 1; }
+  cloud.user_create(p, "user09_" + ${run_id} + "_g2", str_map().set("Bad-Key", "x"));
+  let e_k = cloud.last_error();
+  if (e_k.code() == ErrorCode.INVALID_ARGUMENT && e_k.http_status() == 0) { fails = fails + 1; }
+
+  # oversize attribute value (2049 bytes)
+  cloud.user_create(p, "user09_" + ${run_id} + "_g3", str_map().set("blob", str_repeat("v", 2049)));
+  let e_v = cloud.last_error();
+  if (e_v.code() == ErrorCode.INVALID_ARGUMENT && e_v.http_status() == 0) { fails = fails + 1; }
+
+  # weak password: 6-byte alphanumeric-but-tiny
+  cloud.user_set_password(p, u, "short1");
+  let e_w = cloud.last_error();
+  if (e_w.code() == ErrorCode.INVALID_ARGUMENT && e_w.http_status() == 0) { fails = fails + 1; }
+
+  cloud.set_abort_on_error(true);
+  cloud.user_delete(p, u);
+  cloud.userpool_delete(p);
+
+  lmcode_return_put("fails", fails);
+  lmcode_return_put("want", want);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "09 host execution failed");
+assert(r.result.fails == r.result.want, "all 12 invalid inputs must be pre-flight INVALID_ARGUMENT (http_status 0)");

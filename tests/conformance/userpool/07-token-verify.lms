@@ -1,0 +1,63 @@
+# Requires: userpool
+# Scenario 07: Token verification — fresh token verifies with matching claims; tampered signature and
+# cross-pool verification are UNAUTHENTICATED; error messages never echo the token (redaction asserted).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+pool_a = "lmu07" + run_id + "a";
+pool_b = "lmu07" + run_id + "b";
+user = "user07_" + run_id + "_eve";
+password = "Bb9" + "t4Xs" + run_id + "pw";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("userpool", ep);
+  }
+  let pa = ${pool_a};
+  let pb = ${pool_b};
+  let u = ${user};
+  cloud.userpool_create(pa);
+  cloud.userpool_create(pb);
+  cloud.user_create(pa, u);
+  cloud.user_set_password(pa, u, ${password});
+  let s = cloud.user_sign_in(pa, u, ${password});
+  let tok = s.access_token();
+
+  # happy path: claims present and correlated
+  let v = cloud.user_verify_token(pa, tok);
+  let claims = v.claims();
+  let claims_ok = claims.get("username") == u && str_len(claims.get("sub")) > 0;
+
+  # tamper: flip the final character (distinct replacement guaranteed legal)
+  let last = str_substr(tok, str_len(tok) - 1, 1);
+  let rep = "A";
+  if (last == "A") { rep = "B"; }
+  let bad_tok = str_substr(tok, 0, str_len(tok) - 1) + rep;
+
+  cloud.set_abort_on_error(false);
+  cloud.user_verify_token(pa, bad_tok);
+  let e_tam = cloud.last_error();
+  let tam_unauth = e_tam.code() == ErrorCode.UNAUTHENTICATED;
+  let no_tok_echo = !str_contains(e_tam.message(), tok);
+
+  cloud.user_verify_token(pb, tok);   # token from pool A under pool B
+  let e_cross = cloud.last_error();
+  let cross_unauth = e_cross.code() == ErrorCode.UNAUTHENTICATED;
+  cloud.set_abort_on_error(true);
+
+  cloud.user_delete(pa, u);
+  cloud.userpool_delete(pa);
+  cloud.userpool_delete(pb);
+
+  lmcode_return_put("claims_ok", claims_ok);
+  lmcode_return_put("tam_unauth", tam_unauth);
+  lmcode_return_put("no_tok_echo", no_tok_echo);
+  lmcode_return_put("cross_unauth", cross_unauth);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "07 host execution failed");
+assert(r.result.claims_ok, "valid token verifies with sub/username claims");
+assert(r.result.tam_unauth, "tampered token must be UNAUTHENTICATED");
+assert(r.result.no_tok_echo, "verify error must never echo the token");
+assert(r.result.cross_unauth, "cross-pool token must be rejected (audience isolation)");
