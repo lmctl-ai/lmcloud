@@ -100,6 +100,9 @@ type Options struct {
 	// mutator (CreateFunction, UpdateFunction, DeleteFunction) commits its state mutation;
 	// if it returns a non-nil error, the mutator returns that error (simulating a lost reply).
 	FaultMutatorAfterCommit func(op string) error
+	// FaultUserpoolMutatorAfterCommit, if non-nil, is called after a userpool mutator
+	// commits its state mutation; if it returns a non-nil error, the mutator returns that error.
+	FaultUserpoolMutatorAfterCommit func(op string) error
 	// BeforeInvokeLock is an optional test hook called at the start of InvokeFunction
 	// before acquiring the state lock (used to test concurrent updates/alias retargets at dispatch).
 	BeforeInvokeLock func()
@@ -171,6 +174,7 @@ type state struct {
 	Tables    map[string]*tableState              `json:",omitempty"`
 	Policies  map[string]hostkit.PolicyAttachment `json:",omitempty"`
 	Functions map[string]*functionState           `json:",omitempty"`
+	Userpools map[string]*userpoolState           `json:",omitempty"`
 	// Create tokens stored atomically with each create (hostkit.CreateToken).
 	BucketTokens      map[string]string `json:",omitempty"`
 	QueueTokens       map[string]string `json:",omitempty"`
@@ -186,6 +190,7 @@ func newState() *state {
 		Tables:            map[string]*tableState{},
 		Policies:          map[string]hostkit.PolicyAttachment{},
 		Functions:         map[string]*functionState{},
+		Userpools:         map[string]*userpoolState{},
 		PolicyGenerations: map[string]uint64{},
 		PolicyOwners:      map[string]string{},
 	}
@@ -210,6 +215,9 @@ var Mutators = []string{
 	"AttachPolicy", "DetachPolicy",
 	"CreateFunction", "UpdateFunction", "DeleteFunction",
 	"PublishFunctionVersion", "SetFunctionAlias", "DeleteFunctionAlias", "InvokeFunction",
+	"CreateUserPool", "DeleteUserPool",
+	"CreateUser", "DeleteUser", "SetUserEnabled", "SetUserPassword", "SignIn",
+	"CreateGroup", "DeleteGroup", "AddUserToGroup", "RemoveUserFromGroup",
 }
 
 // Calls returns a copy of the per-method call counters.
@@ -284,6 +292,9 @@ func (f *Fake) doTarget(name, target string, fn func(s *state) error) error {
 		}
 		if s.Functions == nil {
 			s.Functions = map[string]*functionState{}
+		}
+		if s.Userpools == nil {
+			s.Userpools = map[string]*userpoolState{}
 		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state read: "+err.Error())

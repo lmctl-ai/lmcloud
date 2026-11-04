@@ -184,6 +184,8 @@ func unwrapGuardAdapter(a any) any {
 			a = g.t
 		case guardFunctions:
 			a = g.f
+		case guardUserpools:
+			a = g.u
 		default:
 			return a
 		}

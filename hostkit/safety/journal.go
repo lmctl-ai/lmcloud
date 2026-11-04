@@ -40,26 +40,34 @@ const (
 	KindFunction         = "function"
 	KindFunctionVersion  = "function_version"
 	KindFunctionAlias    = "function_alias"
+	KindUserpool         = "userpool"
+	KindPoolUser         = "pool_user"
+	KindPoolGroup        = "pool_group"
+	KindPoolMembership   = "pool_membership"
 
 	// Journal event types.
-	EventMeta            = "meta"
-	EventIntent          = "intent"
-	EventConfirmed       = "confirmed"
-	EventFailed          = "failed"
-	EventRetained        = "retained"
-	EventDeleted         = "deleted"
-	EventCost            = "cost"
-	EventReserve         = "reserve"
-	EventSettle          = "settle"
-	EventWorkCap         = "work_cap"
-	EventCapExceeded     = "cap_exceeded"
-	EventPolicyIntent    = "policy_intent"
-	EventPolicyAttach    = "policy_attach"
-	EventPolicyDetach    = "policy_detach"
+	EventMeta                 = "meta"
+	EventIntent               = "intent"
+	EventConfirmed            = "confirmed"
+	EventFailed               = "failed"
+	EventRetained             = "retained"
+	EventDeleted              = "deleted"
+	EventCost                 = "cost"
+	EventReserve              = "reserve"
+	EventSettle               = "settle"
+	EventWorkCap              = "work_cap"
+	EventCapExceeded          = "cap_exceeded"
+	EventPolicyIntent         = "policy_intent"
+	EventPolicyAttach         = "policy_attach"
+	EventPolicyDetach         = "policy_detach"
 	EventFunctionIntent       = "function_intent"
 	EventFunctionConfirm      = "function_confirm"
 	EventFunctionPreviewState = "function_preview_state"
 	EventFunctionDelete       = "function_delete"
+	EventUserpoolIntent       = "userpool_intent"
+	EventUserpoolConfirm      = "userpool_confirm"
+	EventUserpoolState        = "userpool_state"
+	EventUserpoolDelete       = "userpool_delete"
 
 	// Resource lifecycle states after journal replay.
 	StatePending   = "pending"
@@ -238,6 +246,7 @@ type JournalRecord struct {
 	ExpectedOwnerToken    string                  `json:"expected_owner_token,omitempty"`
 	ExpectedGeneration    string                  `json:"expected_generation,omitempty"`
 	FunctionState         string                  `json:"function_state,omitempty"`
+	UserpoolState         string                  `json:"userpool_state,omitempty"`
 }
 
 func (r JournalRecord) meta() JournalMeta {
@@ -329,7 +338,29 @@ type JournalFunctionEntry struct {
 	StateJSON  string `json:"state_json,omitempty"`
 }
 
+// JournalUserpoolEntry is a durable userpool authority entry replayed from
+// EventUserpoolIntent / EventUserpoolConfirm / EventUserpoolState / EventUserpoolDelete records.
+type JournalUserpoolEntry struct {
+	Key         string `json:"key"`
+	Scope       string `json:"scope,omitempty"`
+	Name        string `json:"name"`
+	Incarnation string `json:"incarnation,omitempty"`
+	OwnerToken  string `json:"owner_token,omitempty"`
+	Generation  string `json:"generation,omitempty"`
+	IntentID    string `json:"intent_id,omitempty"`
+	Ambiguous   bool   `json:"ambiguous,omitempty"`
+	IntentOp    string `json:"intent_op,omitempty"`
+	StateJSON   string `json:"state_json,omitempty"`
+}
+
 func scopedFunctionKey(scope, name string) string {
+	if scope == "" {
+		return name
+	}
+	return scope + "\x00" + name
+}
+
+func scopedUserpoolKey(scope, name string) string {
 	if scope == "" {
 		return name
 	}
@@ -375,6 +406,12 @@ type LedgerState struct {
 	FunctionTombstones     map[string]JournalFunctionEntry
 	MaxFunctionGen         map[string]uint64
 	LatestFunctionIntent   map[string]string
+	ActiveUserpools        map[string]JournalUserpoolEntry
+	AmbiguousUserpools     map[string]JournalUserpoolEntry
+	AmbiguousUserpoolStack map[string][]JournalUserpoolEntry
+	UserpoolTombstones     map[string]JournalUserpoolEntry
+	MaxUserpoolGen         map[string]uint64
+	LatestUserpoolIntent   map[string]string
 	BucketsCreated         int
 	QueuesCreated          int
 	ObjectsCreated         int
@@ -629,6 +666,12 @@ func OpenJournal(dir string, meta JournalMeta) (*Journal, error) {
 			FunctionTombstones:     make(map[string]JournalFunctionEntry),
 			MaxFunctionGen:         make(map[string]uint64),
 			LatestFunctionIntent:   make(map[string]string),
+			ActiveUserpools:        make(map[string]JournalUserpoolEntry),
+			AmbiguousUserpools:     make(map[string]JournalUserpoolEntry),
+			AmbiguousUserpoolStack: make(map[string][]JournalUserpoolEntry),
+			UserpoolTombstones:     make(map[string]JournalUserpoolEntry),
+			MaxUserpoolGen:         make(map[string]uint64),
+			LatestUserpoolIntent:   make(map[string]string),
 			byKey:                  make(map[string]int),
 			byAttemptID:            make(map[string]int),
 		}
@@ -782,6 +825,30 @@ func (j *Journal) State() LedgerState {
 	cp.LatestFunctionIntent = make(map[string]string, len(j.state.LatestFunctionIntent))
 	for k, v := range j.state.LatestFunctionIntent {
 		cp.LatestFunctionIntent[k] = v
+	}
+	cp.ActiveUserpools = make(map[string]JournalUserpoolEntry, len(j.state.ActiveUserpools))
+	for k, v := range j.state.ActiveUserpools {
+		cp.ActiveUserpools[k] = v
+	}
+	cp.AmbiguousUserpools = make(map[string]JournalUserpoolEntry, len(j.state.AmbiguousUserpools))
+	for k, v := range j.state.AmbiguousUserpools {
+		cp.AmbiguousUserpools[k] = v
+	}
+	cp.AmbiguousUserpoolStack = make(map[string][]JournalUserpoolEntry, len(j.state.AmbiguousUserpoolStack))
+	for k, v := range j.state.AmbiguousUserpoolStack {
+		cp.AmbiguousUserpoolStack[k] = append([]JournalUserpoolEntry(nil), v...)
+	}
+	cp.UserpoolTombstones = make(map[string]JournalUserpoolEntry, len(j.state.UserpoolTombstones))
+	for k, v := range j.state.UserpoolTombstones {
+		cp.UserpoolTombstones[k] = v
+	}
+	cp.MaxUserpoolGen = make(map[string]uint64, len(j.state.MaxUserpoolGen))
+	for k, v := range j.state.MaxUserpoolGen {
+		cp.MaxUserpoolGen[k] = v
+	}
+	cp.LatestUserpoolIntent = make(map[string]string, len(j.state.LatestUserpoolIntent))
+	for k, v := range j.state.LatestUserpoolIntent {
+		cp.LatestUserpoolIntent[k] = v
 	}
 	cp.byKey = make(map[string]int, len(j.state.byKey))
 	for k, v := range j.state.byKey {
@@ -1391,6 +1458,96 @@ func (j *Journal) RecordFunctionDelete(scope, name, ownerToken, generation, inte
 	return j.appendLocked(JournalRecord{
 		Event:       EventFunctionDelete,
 		Kind:        KindFunction,
+		PolicyScope: scope,
+		Name:        name,
+		CreateToken: ownerToken,
+		Generation:  generation,
+		AttemptID:   intentID,
+	})
+}
+
+// RecordUserpoolIntent durably appends an EventUserpoolIntent record (with ownerToken,
+// generation, incarnation, intentID, and optional cleanup reserve) BEFORE dispatching
+// a userpool create or delete operation.
+func (j *Journal) RecordUserpoolIntent(scope, name, intentOp, incarnation, ownerToken, generation, intentID, expOwner, expGen string, cleanupReserveNanoUSD int64) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	return j.appendLocked(JournalRecord{
+		Event:                 EventUserpoolIntent,
+		Kind:                  KindUserpool,
+		PolicyScope:           scope,
+		Name:                  name,
+		PolicyIntentOp:        intentOp,
+		ETag:                  incarnation,
+		CreateToken:           ownerToken,
+		Generation:            generation,
+		AttemptID:             intentID,
+		ExpectedOwnerToken:    expOwner,
+		ExpectedGeneration:    expGen,
+		CleanupReserveNanoUSD: cleanupReserveNanoUSD,
+	})
+}
+
+// RecordUserpoolConfirm durably appends an EventUserpoolConfirm record confirming a userpool create.
+func (j *Journal) RecordUserpoolConfirm(scope, name, incarnation, ownerToken, generation, intentID string, cleanupReserveNanoUSD int64) error {
+	return j.RecordUserpoolConfirmWithState(scope, name, incarnation, ownerToken, generation, intentID, "", cleanupReserveNanoUSD)
+}
+
+// RecordUserpoolConfirmWithState durably appends an EventUserpoolConfirm record with optional serialized catalog state.
+func (j *Journal) RecordUserpoolConfirmWithState(scope, name, incarnation, ownerToken, generation, intentID, stateJSON string, cleanupReserveNanoUSD int64) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	return j.appendLocked(JournalRecord{
+		Event:                 EventUserpoolConfirm,
+		Kind:                  KindUserpool,
+		PolicyScope:           scope,
+		Name:                  name,
+		ETag:                  incarnation,
+		CreateToken:           ownerToken,
+		Generation:            generation,
+		AttemptID:             intentID,
+		UserpoolState:         stateJSON,
+		CleanupReserveNanoUSD: cleanupReserveNanoUSD,
+	})
+}
+
+// RecordUserpoolState durably appends a non-authoritative EventUserpoolState record
+// updating the cached catalog/token-binding state for a userpool only when the active
+// committed entry still matches (expOwnerToken, expIncarnation, expGeneration) and has no pending ambiguity.
+func (j *Journal) RecordUserpoolState(scope, name, expOwnerToken, expIncarnation, expGeneration, stateJSON string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	return j.appendLocked(JournalRecord{
+		Event:         EventUserpoolState,
+		Kind:          KindUserpool,
+		PolicyScope:   scope,
+		Name:          name,
+		ETag:          expIncarnation,
+		CreateToken:   expOwnerToken,
+		Generation:    expGeneration,
+		UserpoolState: stateJSON,
+	})
+}
+
+// RecordUserpoolDelete durably appends an EventUserpoolDelete record confirming userpool removal.
+func (j *Journal) RecordUserpoolDelete(scope, name, ownerToken, generation, intentID string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	return j.appendLocked(JournalRecord{
+		Event:       EventUserpoolDelete,
+		Kind:        KindUserpool,
 		PolicyScope: scope,
 		Name:        name,
 		CreateToken: ownerToken,
@@ -2014,6 +2171,187 @@ func (j *Journal) Compact() error {
 		}
 	}
 
+	if len(j.state.ActiveUserpools) > 0 {
+		upKeys := make([]string, 0, len(j.state.ActiveUserpools))
+		for k := range j.state.ActiveUserpools {
+			upKeys = append(upKeys, k)
+		}
+		sort.Strings(upKeys)
+		for _, k := range upKeys {
+			ue := j.state.ActiveUserpools[k]
+			seq++
+			compacted = append(compacted, JournalRecord{
+				Version:       JournalVersion,
+				Seq:           seq,
+				Time:          nowStr,
+				Event:         EventUserpoolConfirm,
+				RunID:         j.meta.RunID,
+				SessionID:     j.meta.SessionID,
+				PolicyHash:    j.meta.PolicyHash,
+				Provider:      j.meta.Provider,
+				Account:       j.meta.Account,
+				Tenant:        j.meta.Tenant,
+				Scope:         j.meta.Scope,
+				Region:        j.meta.Region,
+				Endpoint:      j.meta.Endpoint,
+				Kind:          KindUserpool,
+				PolicyScope:   ue.Scope,
+				Name:          ue.Name,
+				ETag:          ue.Incarnation,
+				CreateToken:   ue.OwnerToken,
+				Generation:    ue.Generation,
+				AttemptID:     ue.IntentID,
+				UserpoolState: ue.StateJSON,
+			})
+		}
+	}
+	if len(j.state.AmbiguousUserpoolStack) > 0 {
+		ambKeys := make([]string, 0, len(j.state.AmbiguousUserpoolStack))
+		for k, stack := range j.state.AmbiguousUserpoolStack {
+			if len(stack) > 0 {
+				ambKeys = append(ambKeys, k)
+			}
+		}
+		sort.Strings(ambKeys)
+		for _, k := range ambKeys {
+			for _, ue := range j.state.AmbiguousUserpoolStack[k] {
+				seq++
+				intentID := ue.IntentID
+				if intentID == "" {
+					intentID = ue.OwnerToken
+				}
+				compacted = append(compacted, JournalRecord{
+					Version:        JournalVersion,
+					Seq:            seq,
+					Time:           nowStr,
+					Event:          EventUserpoolIntent,
+					RunID:          j.meta.RunID,
+					SessionID:      j.meta.SessionID,
+					PolicyHash:     j.meta.PolicyHash,
+					Provider:       j.meta.Provider,
+					Account:        j.meta.Account,
+					Tenant:         j.meta.Tenant,
+					Scope:          j.meta.Scope,
+					Region:         j.meta.Region,
+					Endpoint:       j.meta.Endpoint,
+					Kind:           KindUserpool,
+					PolicyScope:    ue.Scope,
+					Name:           ue.Name,
+					PolicyIntentOp: ue.IntentOp,
+					ETag:           ue.Incarnation,
+					CreateToken:    ue.OwnerToken,
+					Generation:     ue.Generation,
+					AttemptID:      intentID,
+				})
+			}
+		}
+	}
+	if len(j.state.UserpoolTombstones) > 0 {
+		tbKeys := make([]string, 0, len(j.state.UserpoolTombstones))
+		for k := range j.state.UserpoolTombstones {
+			tbKeys = append(tbKeys, k)
+		}
+		sort.Strings(tbKeys)
+		for _, k := range tbKeys {
+			tb := j.state.UserpoolTombstones[k]
+			maxGen := j.state.MaxUserpoolGen[k]
+			if maxGen == 0 {
+				continue
+			}
+			latestIntent := j.state.LatestUserpoolIntent[k]
+			if latestIntent == "" {
+				latestIntent = tb.IntentID
+			}
+			_, inActive := j.state.ActiveUserpools[k]
+			_, inAmb := j.state.AmbiguousUserpools[k]
+			if !inActive && !inAmb {
+				seq++
+				compacted = append(compacted, JournalRecord{
+					Version:     JournalVersion,
+					Seq:         seq,
+					Time:        nowStr,
+					Event:       EventUserpoolDelete,
+					RunID:       j.meta.RunID,
+					SessionID:   j.meta.SessionID,
+					PolicyHash:  j.meta.PolicyHash,
+					Provider:    j.meta.Provider,
+					Account:     j.meta.Account,
+					Tenant:      j.meta.Tenant,
+					Scope:       j.meta.Scope,
+					Region:      j.meta.Region,
+					Endpoint:    j.meta.Endpoint,
+					Kind:        KindUserpool,
+					PolicyScope: tb.Scope,
+					Name:        tb.Name,
+					CreateToken: tb.OwnerToken,
+					Generation:  strconv.FormatUint(maxGen, 10),
+					AttemptID:   latestIntent,
+				})
+				continue
+			}
+			var emittedGen uint64
+			if ue, ok := j.state.ActiveUserpools[k]; ok {
+				if g, err := strconv.ParseUint(ue.Generation, 10, 64); err == nil && g > emittedGen {
+					emittedGen = g
+				}
+			}
+			if ue, ok := j.state.AmbiguousUserpools[k]; ok {
+				if g, err := strconv.ParseUint(ue.Generation, 10, 64); err == nil && g > emittedGen {
+					emittedGen = g
+				}
+			}
+			if maxGen > emittedGen && tb.OwnerToken != "" && latestIntent != "" {
+				genStr := strconv.FormatUint(maxGen, 10)
+				seq++
+				compacted = append(compacted, JournalRecord{
+					Version:        JournalVersion,
+					Seq:            seq,
+					Time:           nowStr,
+					Event:          EventUserpoolIntent,
+					RunID:          j.meta.RunID,
+					SessionID:      j.meta.SessionID,
+					PolicyHash:     j.meta.PolicyHash,
+					Provider:       j.meta.Provider,
+					Account:        j.meta.Account,
+					Tenant:         j.meta.Tenant,
+					Scope:          j.meta.Scope,
+					Region:         j.meta.Region,
+					Endpoint:       j.meta.Endpoint,
+					Kind:           KindUserpool,
+					PolicyScope:    tb.Scope,
+					Name:           tb.Name,
+					PolicyIntentOp: "delete",
+					CreateToken:    tb.OwnerToken,
+					Generation:     genStr,
+					AttemptID:      latestIntent,
+				})
+				seq++
+				compacted = append(compacted, JournalRecord{
+					Version:        JournalVersion,
+					Seq:            seq,
+					Time:           nowStr,
+					Event:          EventUserpoolIntent,
+					RunID:          j.meta.RunID,
+					SessionID:      j.meta.SessionID,
+					PolicyHash:     j.meta.PolicyHash,
+					Provider:       j.meta.Provider,
+					Account:        j.meta.Account,
+					Tenant:         j.meta.Tenant,
+					Scope:          j.meta.Scope,
+					Region:         j.meta.Region,
+					Endpoint:       j.meta.Endpoint,
+					Kind:           KindUserpool,
+					PolicyScope:    tb.Scope,
+					Name:           tb.Name,
+					PolicyIntentOp: "abort",
+					CreateToken:    tb.OwnerToken,
+					Generation:     genStr,
+					AttemptID:      latestIntent,
+				})
+			}
+		}
+	}
+
 	newState, err := ReplayJournal(compacted)
 	if err != nil {
 		return fmt.Errorf("validate compacted journal: %w", err)
@@ -2213,6 +2551,12 @@ func ReplayJournal(records []JournalRecord) (*LedgerState, error) {
 		FunctionTombstones:     make(map[string]JournalFunctionEntry),
 		MaxFunctionGen:         make(map[string]uint64),
 		LatestFunctionIntent:   make(map[string]string),
+		ActiveUserpools:        make(map[string]JournalUserpoolEntry),
+		AmbiguousUserpools:     make(map[string]JournalUserpoolEntry),
+		AmbiguousUserpoolStack: make(map[string][]JournalUserpoolEntry),
+		UserpoolTombstones:     make(map[string]JournalUserpoolEntry),
+		MaxUserpoolGen:         make(map[string]uint64),
+		LatestUserpoolIntent:   make(map[string]string),
 		byKey:                  make(map[string]int),
 		byAttemptID:            make(map[string]int),
 	}
@@ -2490,9 +2834,118 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 			}
 		}
 		return nil
+	case EventUserpoolIntent:
+		if rec.Kind != KindUserpool {
+			return fmt.Errorf("userpool_intent record must have kind %q (got %q)", KindUserpool, rec.Kind)
+		}
+		if hasControlChars(rec.PolicyScope) || rec.Name == "" || len(rec.Name) > 32 || hasControlChars(rec.Name) {
+			return fmt.Errorf("invalid userpool_intent scope/name %q/%q", rec.PolicyScope, rec.Name)
+		}
+		if rec.PolicyIntentOp != "create" && rec.PolicyIntentOp != "mutate" && rec.PolicyIntentOp != "update" && rec.PolicyIntentOp != "delete" && rec.PolicyIntentOp != "abort" {
+			return fmt.Errorf("invalid userpool_intent_op %q", rec.PolicyIntentOp)
+		}
+		if err := ValidateToken128(rec.CreateToken); err != nil {
+			return fmt.Errorf("userpool_intent owner_token (create_token): %w", err)
+		}
+		if err := ValidateToken128(rec.AttemptID); err != nil {
+			return fmt.Errorf("userpool_intent intent_id (attempt_id): %w", err)
+		}
+		genNum, err := strconv.ParseUint(rec.Generation, 10, 64)
+		if err != nil || genNum == 0 {
+			return fmt.Errorf("userpool_intent requires positive uint64 generation (got %q)", rec.Generation)
+		}
+		if hasControlChars(rec.ETag) || len(rec.ETag) > 512 {
+			return fmt.Errorf("invalid userpool_intent incarnation %q", rec.ETag)
+		}
+		return nil
+	case EventUserpoolConfirm:
+		if rec.Kind != KindUserpool {
+			return fmt.Errorf("userpool_confirm record must have kind %q (got %q)", KindUserpool, rec.Kind)
+		}
+		if hasControlChars(rec.PolicyScope) || rec.Name == "" || len(rec.Name) > 32 || hasControlChars(rec.Name) {
+			return fmt.Errorf("invalid userpool_confirm scope/name %q/%q", rec.PolicyScope, rec.Name)
+		}
+		if err := ValidateToken128(rec.CreateToken); err != nil {
+			return fmt.Errorf("userpool_confirm owner_token (create_token): %w", err)
+		}
+		genNum, err := strconv.ParseUint(rec.Generation, 10, 64)
+		if err != nil || genNum == 0 {
+			return fmt.Errorf("userpool_confirm requires positive uint64 generation (got %q)", rec.Generation)
+		}
+		if rec.AttemptID != "" {
+			if err := ValidateToken128(rec.AttemptID); err != nil {
+				return fmt.Errorf("userpool_confirm attempt_id: %w", err)
+			}
+		}
+		if hasControlChars(rec.ETag) || len(rec.ETag) > 512 {
+			return fmt.Errorf("invalid userpool_confirm incarnation %q", rec.ETag)
+		}
+		if err := validateJournalUserpoolState(rec.UserpoolState); err != nil {
+			return err
+		}
+		return nil
+	case EventUserpoolState:
+		if rec.Kind != KindUserpool {
+			return fmt.Errorf("userpool_state record must have kind %q (got %q)", KindUserpool, rec.Kind)
+		}
+		if hasControlChars(rec.PolicyScope) || rec.Name == "" || len(rec.Name) > 32 || hasControlChars(rec.Name) {
+			return fmt.Errorf("invalid userpool_state scope/name %q/%q", rec.PolicyScope, rec.Name)
+		}
+		if err := ValidateToken128(rec.CreateToken); err != nil {
+			return fmt.Errorf("userpool_state owner_token (create_token): %w", err)
+		}
+		genNum, err := strconv.ParseUint(rec.Generation, 10, 64)
+		if err != nil || genNum == 0 {
+			return fmt.Errorf("userpool_state requires positive uint64 generation (got %q)", rec.Generation)
+		}
+		if hasControlChars(rec.ETag) || len(rec.ETag) > 512 {
+			return fmt.Errorf("invalid userpool_state incarnation %q", rec.ETag)
+		}
+		if err := validateJournalUserpoolState(rec.UserpoolState); err != nil {
+			return err
+		}
+		return nil
+	case EventUserpoolDelete:
+		if rec.Kind != KindUserpool {
+			return fmt.Errorf("userpool_delete record must have kind %q (got %q)", KindUserpool, rec.Kind)
+		}
+		if hasControlChars(rec.PolicyScope) || rec.Name == "" || len(rec.Name) > 32 || hasControlChars(rec.Name) {
+			return fmt.Errorf("invalid userpool_delete scope/name %q/%q", rec.PolicyScope, rec.Name)
+		}
+		if rec.CreateToken != "" {
+			if err := ValidateToken128(rec.CreateToken); err != nil {
+				return fmt.Errorf("userpool_delete owner_token (create_token): %w", err)
+			}
+		}
+		if rec.Generation != "" {
+			if genNum, err := strconv.ParseUint(rec.Generation, 10, 64); err != nil || genNum == 0 {
+				return fmt.Errorf("userpool_delete invalid generation %q", rec.Generation)
+			}
+		}
+		if rec.AttemptID != "" {
+			if err := ValidateToken128(rec.AttemptID); err != nil {
+				return fmt.Errorf("userpool_delete attempt_id: %w", err)
+			}
+		}
+		return nil
 	default:
 		return fmt.Errorf("unknown journal event %q", rec.Event)
 	}
+}
+
+func validateJournalUserpoolState(raw string) error {
+	if len(raw) > 8*1024*1024 {
+		return errors.New("userpool_state exceeds maximum size")
+	}
+	if hasControlChars(raw) {
+		return errors.New("userpool_state contains control characters")
+	}
+	if strings.Contains(raw, `"password"`) || strings.Contains(raw, `"password_hash"`) ||
+		strings.Contains(raw, `"password_salt"`) || strings.Contains(raw, `"private_key"`) ||
+		strings.Contains(raw, `"access_token"`) || strings.Contains(raw, `"eyJ`) {
+		return errors.New("userpool_state contains forbidden secret or credential material")
+	}
+	return nil
 }
 
 func validateResourceIdentity(runID, kind, parent, name string) error {
@@ -2500,7 +2953,7 @@ func validateResourceIdentity(runID, kind, parent, name string) error {
 		return errors.New("resource parent/name contains control characters")
 	}
 	switch kind {
-	case KindBucket, KindQueue, KindTable, KindFunction:
+	case KindBucket, KindQueue, KindTable, KindFunction, KindUserpool:
 		if parent != "" {
 			return fmt.Errorf("%s record must have empty parent (got %q)", kind, parent)
 		}
@@ -2508,7 +2961,7 @@ func validateResourceIdentity(runID, kind, parent, name string) error {
 			return fmt.Errorf("forged or unprefixed %s name in journal: %w", kind, err)
 		}
 		return nil
-	case KindObject, KindQueueMessage, KindTableItem, KindFunctionVersion, KindFunctionAlias:
+	case KindObject, KindQueueMessage, KindTableItem, KindFunctionVersion, KindFunctionAlias, KindPoolUser, KindPoolGroup, KindPoolMembership:
 		if err := ValidateLiveResourceName(runID, parent); err != nil {
 			return fmt.Errorf("forged or unprefixed parent %q for %s in journal: %w", parent, kind, err)
 		}
@@ -2720,6 +3173,44 @@ func inferJournalOp(rec JournalRecord, att AttemptLedgerEntry) string {
 		return "function_read_ownership"
 	case "function_invoke":
 		return "function_invoke"
+	case "userpool_create", "userpool_overwrite":
+		return "userpool_create"
+	case "userpool_delete":
+		return "userpool_delete"
+	case "userpool_exists":
+		return "userpool_exists"
+	case "userpool_list":
+		return "userpool_list"
+	case "userpool_read_ownership", "userpool_create_token":
+		return "userpool_read_ownership"
+	case "user_create":
+		return "user_create"
+	case "user_get":
+		return "user_get"
+	case "user_delete":
+		return "user_delete"
+	case "user_set_enabled":
+		return "user_set_enabled"
+	case "user_set_password":
+		return "user_set_password"
+	case "user_list":
+		return "user_list"
+	case "user_sign_in":
+		return "user_sign_in"
+	case "user_verify_token":
+		return "user_verify_token"
+	case "group_create":
+		return "group_create"
+	case "group_delete":
+		return "group_delete"
+	case "group_list":
+		return "group_list"
+	case "group_add_user":
+		return "group_add_user"
+	case "group_remove_user":
+		return "group_remove_user"
+	case "user_groups":
+		return "user_groups"
 	case "verify_parent_ownership":
 		if rec.Kind == KindQueue || att.Kind == KindQueue {
 			return "queue_read_ownership"
@@ -2729,6 +3220,9 @@ func inferJournalOp(rec JournalRecord, att AttemptLedgerEntry) string {
 		}
 		if rec.Kind == KindFunction || att.Kind == KindFunction {
 			return "function_read_ownership"
+		}
+		if rec.Kind == KindUserpool || att.Kind == KindUserpool {
+			return "userpool_read_ownership"
 		}
 		return "bucket_read_ownership"
 	}
@@ -2751,6 +3245,14 @@ func inferJournalOp(rec JournalRecord, att AttemptLedgerEntry) string {
 			return "function_publish_version"
 		case KindFunctionAlias:
 			return "function_alias_set"
+		case KindUserpool:
+			return "userpool_create"
+		case KindPoolUser:
+			return "user_create"
+		case KindPoolGroup:
+			return "group_create"
+		case KindPoolMembership:
+			return "group_add_user"
 		}
 	}
 	return ""
@@ -2834,6 +3336,24 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 	}
 	if state.LatestFunctionIntent == nil {
 		state.LatestFunctionIntent = make(map[string]string)
+	}
+	if state.ActiveUserpools == nil {
+		state.ActiveUserpools = make(map[string]JournalUserpoolEntry)
+	}
+	if state.AmbiguousUserpools == nil {
+		state.AmbiguousUserpools = make(map[string]JournalUserpoolEntry)
+	}
+	if state.AmbiguousUserpoolStack == nil {
+		state.AmbiguousUserpoolStack = make(map[string][]JournalUserpoolEntry)
+	}
+	if state.UserpoolTombstones == nil {
+		state.UserpoolTombstones = make(map[string]JournalUserpoolEntry)
+	}
+	if state.MaxUserpoolGen == nil {
+		state.MaxUserpoolGen = make(map[string]uint64)
+	}
+	if state.LatestUserpoolIntent == nil {
+		state.LatestUserpoolIntent = make(map[string]string)
 	}
 	state.LastSeq = rec.Seq
 	if rec.Event != EventSettle {
@@ -3184,6 +3704,163 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		removeResourcePolicyAttachments(state, KindFunction, rec.PolicyScope, rec.Name)
 		return nil
 	}
+	if rec.Event == EventUserpoolIntent {
+		uKey := scopedUserpoolKey(rec.PolicyScope, rec.Name)
+		genNum, _ := strconv.ParseUint(rec.Generation, 10, 64)
+		if rec.PolicyIntentOp == "abort" {
+			stack := state.AmbiguousUserpoolStack[uKey]
+			if len(stack) > 0 {
+				filtered := stack[:0]
+				for _, item := range stack {
+					if item.IntentID != rec.AttemptID {
+						filtered = append(filtered, item)
+					}
+				}
+				if len(filtered) > 0 {
+					state.AmbiguousUserpoolStack[uKey] = filtered
+					state.AmbiguousUserpools[uKey] = filtered[len(filtered)-1]
+				} else {
+					delete(state.AmbiguousUserpoolStack, uKey)
+					delete(state.AmbiguousUserpools, uKey)
+					if _, inActive := state.ActiveUserpools[uKey]; !inActive {
+						deleteUserpoolActiveCleanup(state, rec.PolicyScope, rec.Name, uKey)
+					}
+				}
+			} else if state.LatestUserpoolIntent[uKey] == "" || state.LatestUserpoolIntent[uKey] == rec.AttemptID {
+				delete(state.AmbiguousUserpools, uKey)
+				if _, inActive := state.ActiveUserpools[uKey]; !inActive {
+					deleteUserpoolActiveCleanup(state, rec.PolicyScope, rec.Name, uKey)
+				}
+			}
+			return nil
+		}
+		if genNum <= state.MaxUserpoolGen[uKey] {
+			return fmt.Errorf("non-monotonic userpool_intent generation %d for key %q (max=%d)", genNum, uKey, state.MaxUserpoolGen[uKey])
+		}
+		if rec.PolicyIntentOp == "create" {
+			if _, inActive := state.ActiveUserpools[uKey]; !inActive {
+				if _, inAmb := state.AmbiguousUserpools[uKey]; !inAmb {
+					if countUserpoolKeys(state) >= 128 {
+						return errors.New("userpool count in journal exceeds maximum of 128 per run")
+					}
+				}
+			}
+		}
+		state.MaxUserpoolGen[uKey] = genNum
+		state.LatestUserpoolIntent[uKey] = rec.AttemptID
+		jue := JournalUserpoolEntry{
+			Key:         uKey,
+			Scope:       rec.PolicyScope,
+			Name:        rec.Name,
+			Incarnation: rec.ETag,
+			OwnerToken:  rec.CreateToken,
+			Generation:  rec.Generation,
+			IntentID:    rec.AttemptID,
+			Ambiguous:   true,
+			IntentOp:    rec.PolicyIntentOp,
+		}
+		state.AmbiguousUserpoolStack[uKey] = append(state.AmbiguousUserpoolStack[uKey], jue)
+		state.AmbiguousUserpools[uKey] = jue
+		state.UserpoolTombstones[uKey] = jue
+		if rec.CleanupReserveNanoUSD > 0 {
+			state.ActiveCleanup[resourceKey(KindUserpool, rec.PolicyScope, rec.Name)] = rec.CleanupReserveNanoUSD
+		}
+		return nil
+	}
+	if rec.Event == EventUserpoolConfirm {
+		uKey := scopedUserpoolKey(rec.PolicyScope, rec.Name)
+		genNum, _ := strconv.ParseUint(rec.Generation, 10, 64)
+		if genNum < state.MaxUserpoolGen[uKey] {
+			return fmt.Errorf("stale userpool_confirm generation %d for key %q (max=%d)", genNum, uKey, state.MaxUserpoolGen[uKey])
+		}
+		if rec.AttemptID != "" && state.LatestUserpoolIntent[uKey] != "" && rec.AttemptID != state.LatestUserpoolIntent[uKey] {
+			return fmt.Errorf("stale userpool_confirm intent_id %q for key %q (latest=%q)", rec.AttemptID, uKey, state.LatestUserpoolIntent[uKey])
+		}
+		if _, inActive := state.ActiveUserpools[uKey]; !inActive {
+			if _, inAmb := state.AmbiguousUserpools[uKey]; !inAmb {
+				if countUserpoolKeys(state) >= 128 {
+					return errors.New("userpool count in journal exceeds maximum of 128 per run")
+				}
+			}
+		}
+		state.MaxUserpoolGen[uKey] = genNum
+		if rec.AttemptID != "" {
+			state.LatestUserpoolIntent[uKey] = rec.AttemptID
+		}
+		delete(state.AmbiguousUserpoolStack, uKey)
+		delete(state.AmbiguousUserpools, uKey)
+		stateJSON := rec.UserpoolState
+		if stateJSON == "" {
+			stateJSON = state.ActiveUserpools[uKey].StateJSON
+		}
+		jue := JournalUserpoolEntry{
+			Key:         uKey,
+			Scope:       rec.PolicyScope,
+			Name:        rec.Name,
+			Incarnation: rec.ETag,
+			OwnerToken:  rec.CreateToken,
+			Generation:  rec.Generation,
+			IntentID:    rec.AttemptID,
+			StateJSON:   stateJSON,
+		}
+		state.ActiveUserpools[uKey] = jue
+		state.UserpoolTombstones[uKey] = jue
+		if rec.CleanupReserveNanoUSD > 0 {
+			state.ActiveCleanup[resourceKey(KindUserpool, rec.PolicyScope, rec.Name)] = rec.CleanupReserveNanoUSD
+		}
+		return nil
+	}
+	if rec.Event == EventUserpoolState {
+		uKey := scopedUserpoolKey(rec.PolicyScope, rec.Name)
+		act, hasAct := state.ActiveUserpools[uKey]
+		_, hasAmb := state.AmbiguousUserpools[uKey]
+		if !hasAct || hasAmb || len(state.AmbiguousUserpoolStack[uKey]) > 0 {
+			return nil
+		}
+		if act.OwnerToken != rec.CreateToken || act.Incarnation != rec.ETag || act.Generation != rec.Generation {
+			return nil
+		}
+		act.StateJSON = rec.UserpoolState
+		state.ActiveUserpools[uKey] = act
+		if tb, hasTb := state.UserpoolTombstones[uKey]; hasTb && tb.OwnerToken == act.OwnerToken && tb.Generation == act.Generation {
+			tb.StateJSON = rec.UserpoolState
+			state.UserpoolTombstones[uKey] = tb
+		}
+		return nil
+	}
+	if rec.Event == EventUserpoolDelete {
+		uKey := scopedUserpoolKey(rec.PolicyScope, rec.Name)
+		if rec.Generation != "" {
+			genNum, _ := strconv.ParseUint(rec.Generation, 10, 64)
+			if genNum < state.MaxUserpoolGen[uKey] {
+				return fmt.Errorf("stale userpool_delete generation %d for key %q (max=%d)", genNum, uKey, state.MaxUserpoolGen[uKey])
+			}
+			state.MaxUserpoolGen[uKey] = genNum
+		}
+		if rec.AttemptID != "" && state.LatestUserpoolIntent[uKey] != "" && rec.AttemptID != state.LatestUserpoolIntent[uKey] {
+			return fmt.Errorf("stale userpool_delete intent_id %q for key %q (latest=%q)", rec.AttemptID, uKey, state.LatestUserpoolIntent[uKey])
+		}
+		if rec.AttemptID != "" {
+			state.LatestUserpoolIntent[uKey] = rec.AttemptID
+		}
+		ownerTok := rec.CreateToken
+		if ownerTok == "" {
+			ownerTok = state.UserpoolTombstones[uKey].OwnerToken
+		}
+		state.UserpoolTombstones[uKey] = JournalUserpoolEntry{
+			Key:        uKey,
+			Scope:      rec.PolicyScope,
+			Name:       rec.Name,
+			OwnerToken: ownerTok,
+			Generation: rec.Generation,
+			IntentID:   state.LatestUserpoolIntent[uKey],
+		}
+		delete(state.AmbiguousUserpoolStack, uKey)
+		delete(state.AmbiguousUserpools, uKey)
+		delete(state.ActiveUserpools, uKey)
+		deleteUserpoolActiveCleanup(state, rec.PolicyScope, rec.Name, uKey)
+		return nil
+	}
 	if rec.Event == EventCost {
 		if rec.Kind == KindQueueMessage && rec.Reason == "queue_send" {
 			state.MessagesSent++
@@ -3259,6 +3936,30 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			}
 			if att.Kind == KindFunction {
 				deleteFunctionActiveCleanup(state, att.Parent, att.Name, scopedFunctionKey(att.Parent, att.Name))
+			}
+			if att.Kind == KindUserpool {
+				deleteUserpoolActiveCleanup(state, att.Parent, att.Name, scopedUserpoolKey(att.Parent, att.Name))
+			}
+			if att.Kind == KindPoolUser {
+				if slash := strings.IndexByte(att.Name, '/'); slash > 0 && slash < len(att.Name)-1 {
+					poolName := att.Name[:slash]
+					userName := att.Name[slash+1:]
+					memPrefix := resourceKey(KindPoolMembership, att.Parent, poolName+"/")
+					memSuffix := "/" + userName
+					for ck := range state.ActiveCleanup {
+						if strings.HasPrefix(ck, memPrefix) && strings.HasSuffix(ck, memSuffix) {
+							delete(state.ActiveCleanup, ck)
+						}
+					}
+				}
+			}
+			if att.Kind == KindPoolGroup {
+				memPrefix := resourceKey(KindPoolMembership, att.Parent, att.Name+"/")
+				for ck := range state.ActiveCleanup {
+					if strings.HasPrefix(ck, memPrefix) {
+						delete(state.ActiveCleanup, ck)
+					}
+				}
 			}
 		}
 		if rec.BillingUnits == 0 && rec.ChargedNanoUSD == 0 && rec.CleanupReserveNanoUSD == 0 && !rec.ReleaseCleanup {
@@ -3680,6 +4381,36 @@ func deleteFunctionActiveCleanup(state *LedgerState, scope, name, fKey string) {
 	aliasPrefix := resourceKey(KindFunctionAlias, scope, name+"/")
 	for ck := range state.ActiveCleanup {
 		if strings.HasPrefix(ck, verPrefix) || strings.HasPrefix(ck, aliasPrefix) {
+			delete(state.ActiveCleanup, ck)
+		}
+	}
+}
+
+func countUserpoolKeys(state *LedgerState) int {
+	if state == nil {
+		return 0
+	}
+	seen := make(map[string]struct{}, len(state.ActiveUserpools)+len(state.AmbiguousUserpools))
+	for k := range state.ActiveUserpools {
+		seen[k] = struct{}{}
+	}
+	for k := range state.AmbiguousUserpools {
+		seen[k] = struct{}{}
+	}
+	return len(seen)
+}
+
+func deleteUserpoolActiveCleanup(state *LedgerState, scope, name, uKey string) {
+	if state == nil || name == "" {
+		return
+	}
+	delete(state.ActiveCleanup, "userpool\x00"+uKey)
+	delete(state.ActiveCleanup, resourceKey(KindUserpool, scope, name))
+	userPrefix := resourceKey(KindPoolUser, scope, name+"/")
+	grpPrefix := resourceKey(KindPoolGroup, scope, name+"/")
+	memPrefix := resourceKey(KindPoolMembership, scope, name+"/")
+	for ck := range state.ActiveCleanup {
+		if strings.HasPrefix(ck, userPrefix) || strings.HasPrefix(ck, grpPrefix) || strings.HasPrefix(ck, memPrefix) {
 			delete(state.ActiveCleanup, ck)
 		}
 	}

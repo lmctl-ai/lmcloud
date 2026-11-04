@@ -28,6 +28,7 @@ type (
 	opMetricsSnapshot     struct{ m OpMetrics }
 	metricsReportSnapshot struct{ r MetricsReport }
 	tablePageSnapshot     struct{ p TablePage }
+	userPageSnapshot      struct{ p UserPage }
 )
 
 type method = func(self any, args []lmcode.Value) (lmcode.Value, error)
@@ -569,6 +570,111 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 		return fnInvVal(h.FunctionInvoke(dry, a[0].Str, a[1].Str, a[2].Str, true))
 	})
 
+	// Userpools.
+	userVal := func(u *User, err error) (lmcode.Value, error) {
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return lmcode.Object("User", u), nil
+	}
+	userPageVal := func(p *UserPage, err error) (lmcode.Value, error) {
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		var snap UserPage
+		if p != nil {
+			snap = *p
+		}
+		return lmcode.Object("UserPage", &userPageSnapshot{p: snap}), nil
+	}
+	sessVal := func(s *Session, err error) (lmcode.Value, error) {
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return lmcode.Object("Session", s), nil
+	}
+	r.op("userpool_create", []string{"string"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.UserpoolCreate(dry, a[0].Str)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("userpool_delete", []string{"string"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.UserpoolDelete(dry, a[0].Str)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("userpool_exists", []string{"string"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.UserpoolExists(dry, a[0].Str)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("userpool_list", nil, "StrList", func(h *Host, dry bool, _ []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.UserpoolList(dry)
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return r.strList(v)
+	})
+	r.op("user_create", []string{"string", "string"}, "User", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return userVal(h.UserCreate(dry, a[0].Str, a[1].Str, nil))
+	})
+	r.op("user_create", []string{"string", "string", "StrMap"}, "User", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		attrs, err := strMapArg(a[2])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		return userVal(h.UserCreate(dry, a[0].Str, a[1].Str, attrs))
+	})
+	r.op("user_get", []string{"string", "string"}, "User", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return userVal(h.UserGet(dry, a[0].Str, a[1].Str))
+	})
+	r.op("user_delete", []string{"string", "string"}, "void", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.None(), hostErr(h.UserDelete(dry, a[0].Str, a[1].Str))
+	})
+	r.op("user_set_enabled", []string{"string", "string", "bool"}, "void", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.None(), hostErr(h.UserSetEnabled(dry, a[0].Str, a[1].Str, a[2].Bool))
+	})
+	r.op("user_set_password", []string{"string", "string", "string"}, "void", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.None(), hostErr(h.UserSetPassword(dry, a[0].Str, a[1].Str, a[2].Str))
+	})
+	r.op("user_list", []string{"string"}, "UserPage", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return userPageVal(h.UserList(dry, a[0].Str, 0, ""))
+	})
+	r.op("user_list", []string{"string", "int", "string"}, "UserPage", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return userPageVal(h.UserList(dry, a[0].Str, a[1].Int, a[2].Str))
+	})
+	r.op("user_sign_in", []string{"string", "string", "string"}, "Session", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return sessVal(h.UserSignIn(dry, a[0].Str, a[1].Str, a[2].Str))
+	})
+	r.op("user_verify_token", []string{"string", "string"}, "Session", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return sessVal(h.UserVerifyToken(dry, a[0].Str, a[1].Str))
+	})
+	r.op("group_create", []string{"string", "string"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.GroupCreate(dry, a[0].Str, a[1].Str)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("group_delete", []string{"string", "string"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.GroupDelete(dry, a[0].Str, a[1].Str)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("group_list", []string{"string"}, "StrList", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.GroupList(dry, a[0].Str)
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return r.strList(v)
+	})
+	r.op("group_add_user", []string{"string", "string", "string"}, "void", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.None(), hostErr(h.GroupAddUser(dry, a[0].Str, a[1].Str, a[2].Str))
+	})
+	r.op("group_remove_user", []string{"string", "string", "string"}, "void", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.None(), hostErr(h.GroupRemoveUser(dry, a[0].Str, a[1].Str, a[2].Str))
+	})
+	r.op("user_groups", []string{"string", "string"}, "StrList", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.UserGroups(dry, a[0].Str, a[1].Str)
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return r.strList(v)
+	})
+
 	// Cost & Performance.
 	r.pure("Cloud", "cost_cap_usd", nil, "float", func(self any, _ []lmcode.Value) (lmcode.Value, error) {
 		return lmcode.Float(self.(*Host).CostCapUSD()), nil
@@ -960,6 +1066,58 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 	})
 	r.pure("FunctionInvokeResult", "memory_mb", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
 		return lmcode.Int(fir(s).MemoryMB()), nil
+	})
+
+	usr := func(self any) *User { return self.(*User) }
+	r.pure("User", "exists", nil, "bool", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Bool(usr(s).Exists()), nil
+	})
+	r.pure("User", "username", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(usr(s).Username()), nil
+	})
+	r.pure("User", "enabled", nil, "bool", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Bool(usr(s).Enabled()), nil
+	})
+	r.pure("User", "status", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(usr(s).Status()), nil
+	})
+	r.pure("User", "attributes", nil, "StrMap", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return r.strMap(usr(s).Attributes())
+	})
+	r.pure("User", "attribute", []string{"string"}, "string", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(usr(s).Attribute(a[0].Str)), nil
+	})
+	r.pure("User", "created_at", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(usr(s).CreatedAt()), nil
+	})
+
+	up := func(self any) UserPage { return self.(*userPageSnapshot).p }
+	r.pure("UserPage", "len", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(int64(len(up(s).Items))), nil
+	})
+	r.pure("UserPage", "at", []string{"int"}, "User", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		p := up(s)
+		if a[0].Int < 0 || a[0].Int >= int64(len(p.Items)) {
+			return lmcode.None(), lmcode.NewHostError(fmt.Sprintf("UserPage.at(%d): %v (len %d)", a[0].Int, errIndex, len(p.Items)))
+		}
+		return lmcode.Object("User", p.Items[a[0].Int]), nil
+	})
+	r.pure("UserPage", "has_more", nil, "bool", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Bool(up(s).NextToken != ""), nil
+	})
+	r.pure("UserPage", "next_token", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(up(s).NextToken), nil
+	})
+
+	sess := func(self any) *Session { return self.(*Session) }
+	r.pure("Session", "access_token", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(sess(s).AccessToken()), nil
+	})
+	r.pure("Session", "expires_in", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(sess(s).ExpiresIn()), nil
+	})
+	r.pure("Session", "claims", nil, "StrMap", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return r.strMap(sess(s).Claims())
 	})
 
 	return r.first

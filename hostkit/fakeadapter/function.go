@@ -266,6 +266,9 @@ func (f *Fake) doSilent(write bool, fn func(s *state) error) error {
 		if s.Functions == nil {
 			s.Functions = map[string]*functionState{}
 		}
+		if s.Userpools == nil {
+			s.Userpools = map[string]*userpoolState{}
+		}
 		if s.PolicyGenerations == nil {
 			s.PolicyGenerations = map[string]uint64{}
 		}
@@ -350,6 +353,9 @@ func (f *Fake) InjectUnmarkedFunctionForTesting(name, ownerToken string, snap ho
 	return f.doSilent(true, func(s *state) error {
 		if s.Functions == nil {
 			s.Functions = map[string]*functionState{}
+		}
+		if s.Userpools == nil {
+			s.Userpools = map[string]*userpoolState{}
 		}
 		fn := &functionState{
 			State:         hostkit.FunctionStateActive,
@@ -582,6 +588,9 @@ func (f *Fake) CreateFunction(ctx context.Context, in hostkit.FunctionUpdateInpu
 	err := f.doTarget("CreateFunction", name, func(s *state) error {
 		if s.Functions == nil {
 			s.Functions = map[string]*functionState{}
+		}
+		if s.Userpools == nil {
+			s.Userpools = map[string]*userpoolState{}
 		}
 		ownerTok := in.OwnerToken
 		if ownerTok == "" {

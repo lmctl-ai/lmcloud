@@ -16,7 +16,7 @@ end _lmcode_
 
 r_abort = run_lmcode(abort_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(!r_abort.ok, "user_list on missing pool must abort in default mode");
-assert(contains(r_abort.error, "[NOT_FOUND]"), "abort message must carry [NOT_FOUND]");
+assert(contains(r_abort.message, "[NOT_FOUND]"), "abort message must carry [NOT_FOUND]");
 
 # 2. Inspection mode: op-by-op
 inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";

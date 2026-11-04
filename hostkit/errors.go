@@ -7,8 +7,10 @@
 package hostkit
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 )
@@ -47,13 +49,16 @@ func (c Code) Valid() bool {
 type Absence string
 
 const (
-	AbsentUnknown Absence = ""
-	AbsentBucket  Absence = "bucket"
-	AbsentObject  Absence = "object"
-	AbsentQueue   Absence = "queue"
-	AbsentMessage Absence = "message"
-	AbsentTable   Absence = "table"
-	AbsentItem    Absence = "item"
+	AbsentUnknown  Absence = ""
+	AbsentBucket   Absence = "bucket"
+	AbsentObject   Absence = "object"
+	AbsentQueue    Absence = "queue"
+	AbsentMessage  Absence = "message"
+	AbsentTable    Absence = "table"
+	AbsentItem     Absence = "item"
+	AbsentUserpool Absence = "userpool"
+	AbsentUser     Absence = "user"
+	AbsentGroup    Absence = "group"
 )
 
 // CloudError is the structured last_error value.
@@ -189,15 +194,41 @@ type ErrorState struct {
 	abort bool
 	// secrets are exact strings (this host's create tokens) replaced by
 	// CreateTokenMarker before last_error is stored or an abort is formatted.
-	secrets []string
+	secrets         []string
+	retainedSecrets []string
+	retainedSet     map[string]struct{}
 }
 
-// maxRedactions bounds the remembered exact strings (oldest dropped first).
+// maxRedactions bounds the primary secrets slice (oldest dropped first).
 const maxRedactions = 256
 
-// AddRedaction registers an exact string (a create token issued by this host)
-// that must never appear in last_error, its provider_code, the abort message
-// or its target. Strings shorter than 8 bytes are ignored. Added in v4.
+// maxRetainedRedactions bounds the session-wide retained secret set (including
+// JSON-escaped and URL-encoded forms) so >256 secret registrations across a
+// session never evict active passwords, session tokens, or create tokens.
+const maxRetainedRedactions = 32768
+
+func (s *ErrorState) addRetainedLocked(sec string) {
+	if len(sec) < 8 {
+		return
+	}
+	if s.retainedSet == nil {
+		s.retainedSet = make(map[string]struct{}, 64)
+	}
+	if _, exists := s.retainedSet[sec]; exists {
+		return
+	}
+	s.retainedSet[sec] = struct{}{}
+	s.retainedSecrets = append(s.retainedSecrets, sec)
+	if len(s.retainedSecrets) > maxRetainedRedactions {
+		dropped := s.retainedSecrets[0]
+		delete(s.retainedSet, dropped)
+		s.retainedSecrets = s.retainedSecrets[1:]
+	}
+}
+
+// AddRedaction registers an exact string (a create token, password, or session
+// token) that must never appear in last_error, its provider_code, the abort
+// message or its target. Strings shorter than 8 bytes are ignored. Added in v4.
 func (s *ErrorState) AddRedaction(secret string) {
 	if len(secret) < 8 {
 		return
@@ -208,11 +239,27 @@ func (s *ErrorState) AddRedaction(secret string) {
 	if len(s.secrets) > maxRedactions {
 		s.secrets = s.secrets[len(s.secrets)-maxRedactions:]
 	}
+	s.addRetainedLocked(secret)
+	if jb, err := json.Marshal(secret); err == nil && len(jb) >= 2 {
+		jEsc := string(jb[1 : len(jb)-1])
+		if jEsc != secret {
+			s.addRetainedLocked(jEsc)
+		}
+	}
+	if uEsc := url.QueryEscape(secret); uEsc != secret {
+		s.addRetainedLocked(uEsc)
+	}
+	if pEsc := url.PathEscape(secret); pEsc != secret {
+		s.addRetainedLocked(pEsc)
+	}
 }
 
 // scrubLocked replaces the registered exact strings, then applies RedactText.
 func (s *ErrorState) scrubLocked(text string) string {
 	for _, sec := range s.secrets {
+		text = strings.ReplaceAll(text, sec, CreateTokenMarker)
+	}
+	for _, sec := range s.retainedSecrets {
 		text = strings.ReplaceAll(text, sec, CreateTokenMarker)
 	}
 	return RedactText(text)

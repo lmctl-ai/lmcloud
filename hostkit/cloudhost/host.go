@@ -31,6 +31,7 @@ type Config struct {
 	Tables      hostkit.Tables
 	Permissions hostkit.Permissions
 	Functions   hostkit.Functions
+	Userpools   hostkit.Userpools
 	Endpoints   *hostkit.EndpointResolver
 	Validator   *hostkit.Validator
 	// OpTimeout bounds one operation (default 2m); ListTimeout bounds exhaustive lists (default 10m).
@@ -51,11 +52,12 @@ type Config struct {
 
 // Host is the state behind the `cloud` context object.
 type Host struct {
-	cfg     Config
-	errs    *hostkit.ErrorState
-	dry     *dryScopes
-	cost    *costTracker
-	metrics *metricsTracker
+	cfg          Config
+	errs         *hostkit.ErrorState
+	dry          *dryScopes
+	cost         *costTracker
+	metrics      *metricsTracker
+	pageTokenKey []byte
 }
 
 // New returns a host for cfg. Missing optional fields get defaults.
@@ -100,6 +102,9 @@ func New(cfg Config) *Host {
 	if cfg.Functions != nil {
 		cfg.Functions = guardFunctions{cfg.Functions}
 	}
+	if cfg.Userpools != nil {
+		cfg.Userpools = guardUserpools{cfg.Userpools}
+	}
 	errs := hostkit.NewErrorState()
 	ct := newCostTracker(cfg)
 	ct.mu.Lock()
@@ -124,13 +129,25 @@ func New(cfg Config) *Host {
 			errs.AddRedaction(fe.OwnerToken)
 		}
 	}
+	for _, ue := range ct.activeUserpoolEntries {
+		if ue.OwnerToken != "" {
+			errs.AddRedaction(ue.OwnerToken)
+		}
+	}
+	for _, ue := range ct.ambiguousUserpools {
+		if ue.OwnerToken != "" {
+			errs.AddRedaction(ue.OwnerToken)
+		}
+	}
 	ct.mu.Unlock()
+	ptKey := initAndRotatePageTokenKey(cfg, errs)
 	return &Host{
-		cfg:     cfg,
-		errs:    errs,
-		dry:     &dryScopes{m: map[string]*overlay{}},
-		cost:    ct,
-		metrics: newMetricsTracker(cfg.Now),
+		cfg:          cfg,
+		errs:         errs,
+		dry:          &dryScopes{m: map[string]*overlay{}},
+		cost:         ct,
+		metrics:      newMetricsTracker(cfg.Now),
+		pageTokenKey: ptKey,
 	}
 }
 
@@ -1973,6 +1990,15 @@ type dryFunction struct {
 	deletedAliases  map[string]bool
 }
 
+type dryUserpool struct {
+	exists      bool
+	createdNow  bool
+	users       map[string]hostkit.UserSnapshot
+	deletedUser map[string]bool
+	groups      map[string]bool
+	memberships map[string]map[string]bool
+}
+
 // overlay records what a dry run would have changed, so later reads in the
 // same dry run see the previewed state instead of aborting. It never reaches
 // the provider.
@@ -1986,6 +2012,7 @@ type overlay struct {
 	items     map[string]map[string]dryTableItem
 	policies  map[string]*hostkit.PolicyAttachment // nil = detached in this dry run
 	functions map[string]dryFunction
+	userpools map[string]dryUserpool
 	drySeq    int64
 }
 
@@ -1999,6 +2026,7 @@ func newOverlay() *overlay {
 		items:     map[string]map[string]dryTableItem{},
 		policies:  map[string]*hostkit.PolicyAttachment{},
 		functions: map[string]dryFunction{},
+		userpools: map[string]dryUserpool{},
 	}
 }
 
@@ -2355,6 +2383,70 @@ func (o *overlay) mergeFunctions(names []string) []string {
 	}
 	for n, df := range o.functions {
 		set[n] = df.exists
+	}
+	var out []string
+	for n, live := range set {
+		if live {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (o *overlay) userpool(name string) (dryUserpool, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	du, ok := o.userpools[name]
+	if !ok {
+		return dryUserpool{}, false
+	}
+	cp := dryUserpool{
+		exists:      du.exists,
+		createdNow:  du.createdNow,
+		users:       make(map[string]hostkit.UserSnapshot, len(du.users)),
+		deletedUser: copyBoolMap(du.deletedUser),
+		groups:      copyBoolMap(du.groups),
+		memberships: make(map[string]map[string]bool, len(du.memberships)),
+	}
+	for k, u := range du.users {
+		cp.users[k] = u.Clone()
+	}
+	for g, m := range du.memberships {
+		cp.memberships[g] = copyBoolMap(m)
+	}
+	return cp, true
+}
+
+func (o *overlay) setUserpool(name string, du dryUserpool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	cp := dryUserpool{
+		exists:      du.exists,
+		createdNow:  du.createdNow,
+		users:       make(map[string]hostkit.UserSnapshot, len(du.users)),
+		deletedUser: copyBoolMap(du.deletedUser),
+		groups:      copyBoolMap(du.groups),
+		memberships: make(map[string]map[string]bool, len(du.memberships)),
+	}
+	for k, u := range du.users {
+		cp.users[k] = u.Clone()
+	}
+	for g, m := range du.memberships {
+		cp.memberships[g] = copyBoolMap(m)
+	}
+	o.userpools[name] = cp
+}
+
+func (o *overlay) mergeUserpools(names []string) []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	set := map[string]bool{}
+	for _, n := range names {
+		set[n] = true
+	}
+	for n, du := range o.userpools {
+		set[n] = du.exists
 	}
 	var out []string
 	for n, live := range set {

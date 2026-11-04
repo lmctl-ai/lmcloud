@@ -366,6 +366,67 @@ func SyntheticSimPriceTable(provider string) *PriceTable {
 				RequestNanoUSD:   2,
 				EgressGiBNanoUSD: 90_000_000,
 			},
+			"userpool_create": {
+				RequestNanoUSD:        1000,
+				CleanupReserveNanoUSD: 50_000,
+			},
+			"userpool_delete": {
+				RequestNanoUSD: 400,
+			},
+			"userpool_exists": {
+				RequestNanoUSD: 400,
+			},
+			"userpool_list": {
+				RequestNanoUSD: 1000,
+			},
+			"userpool_read_ownership": {
+				RequestNanoUSD: 400,
+			},
+			"user_create": {
+				RequestNanoUSD:        1000,
+				CleanupReserveNanoUSD: 5000,
+			},
+			"user_get": {
+				RequestNanoUSD: 400,
+			},
+			"user_delete": {
+				RequestNanoUSD: 400,
+			},
+			"user_set_enabled": {
+				RequestNanoUSD: 400,
+			},
+			"user_set_password": {
+				RequestNanoUSD: 400,
+			},
+			"user_list": {
+				RequestNanoUSD: 1000,
+			},
+			"user_sign_in": {
+				RequestNanoUSD: 1000,
+			},
+			"user_verify_token": {
+				RequestNanoUSD: 400,
+			},
+			"group_create": {
+				RequestNanoUSD:        1000,
+				CleanupReserveNanoUSD: 5000,
+			},
+			"group_delete": {
+				RequestNanoUSD: 400,
+			},
+			"group_list": {
+				RequestNanoUSD: 1000,
+			},
+			"group_add_user": {
+				RequestNanoUSD:        400,
+				CleanupReserveNanoUSD: 1000,
+			},
+			"group_remove_user": {
+				RequestNanoUSD: 400,
+			},
+			"user_groups": {
+				RequestNanoUSD: 400,
+			},
 		},
 	}
 }
