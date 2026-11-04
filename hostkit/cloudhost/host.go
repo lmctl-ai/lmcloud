@@ -1963,13 +1963,14 @@ type dryTableItem struct {
 }
 
 type dryFunction struct {
-	exists         bool
-	createdNow     bool
-	snap           hostkit.FunctionSnapshot
-	versions       map[string]hostkit.FunctionSnapshot
-	versionOrder   []string
-	aliases        map[string]string
-	deletedAliases map[string]bool
+	exists          bool
+	createdNow      bool
+	completeAliases bool
+	snap            hostkit.FunctionSnapshot
+	versions        map[string]hostkit.FunctionSnapshot
+	versionOrder    []string
+	aliases         map[string]string
+	deletedAliases  map[string]bool
 }
 
 // overlay records what a dry run would have changed, so later reads in the
@@ -2311,13 +2312,14 @@ func (o *overlay) function(name string) (dryFunction, bool) {
 		return dryFunction{}, false
 	}
 	cp := dryFunction{
-		exists:         df.exists,
-		createdNow:     df.createdNow,
-		snap:           df.snap.Clone(),
-		versions:       make(map[string]hostkit.FunctionSnapshot, len(df.versions)),
-		versionOrder:   append([]string(nil), df.versionOrder...),
-		aliases:        copyMap(df.aliases),
-		deletedAliases: copyBoolMap(df.deletedAliases),
+		exists:          df.exists,
+		createdNow:      df.createdNow,
+		completeAliases: df.completeAliases,
+		snap:            df.snap.Clone(),
+		versions:        make(map[string]hostkit.FunctionSnapshot, len(df.versions)),
+		versionOrder:    append([]string(nil), df.versionOrder...),
+		aliases:         copyMap(df.aliases),
+		deletedAliases:  copyBoolMap(df.deletedAliases),
 	}
 	for k, v := range df.versions {
 		cp.versions[k] = v.Clone()
@@ -2329,13 +2331,14 @@ func (o *overlay) setFunction(name string, df dryFunction) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	cp := dryFunction{
-		exists:         df.exists,
-		createdNow:     df.createdNow,
-		snap:           df.snap.Clone(),
-		versions:       make(map[string]hostkit.FunctionSnapshot, len(df.versions)),
-		versionOrder:   append([]string(nil), df.versionOrder...),
-		aliases:        copyMap(df.aliases),
-		deletedAliases: copyBoolMap(df.deletedAliases),
+		exists:          df.exists,
+		createdNow:      df.createdNow,
+		completeAliases: df.completeAliases,
+		snap:            df.snap.Clone(),
+		versions:        make(map[string]hostkit.FunctionSnapshot, len(df.versions)),
+		versionOrder:    append([]string(nil), df.versionOrder...),
+		aliases:         copyMap(df.aliases),
+		deletedAliases:  copyBoolMap(df.deletedAliases),
 	}
 	for k, v := range df.versions {
 		cp.versions[k] = v.Clone()

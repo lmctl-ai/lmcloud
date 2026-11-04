@@ -720,7 +720,68 @@ func functionFenceCtx(ctx context.Context, ownerToken, generationStr string) con
 	return ctx
 }
 
+type persistedDryFunctionState struct {
+	Snap         hostkit.FunctionSnapshot            `json:"snap"`
+	Versions     map[string]hostkit.FunctionSnapshot `json:"versions,omitempty"`
+	VersionOrder []string                            `json:"version_order,omitempty"`
+	Aliases      map[string]string                   `json:"aliases,omitempty"`
+}
+
+func sanitizeSnapshotForJournal(s hostkit.FunctionSnapshot) hostkit.FunctionSnapshot {
+	cp := s.Clone()
+	cp.BundleZip = nil
+	cp.InlineCode = ""
+	cp.Env = nil
+	if cp.Version == "" {
+		cp.Version = "$LATEST"
+	}
+	return cp
+}
+
+func encodePersistedDryFunctionState(st persistedDryFunctionState) string {
+	st.Snap = sanitizeSnapshotForJournal(st.Snap)
+	if len(st.Versions) > 0 {
+		cleanVers := make(map[string]hostkit.FunctionSnapshot, len(st.Versions))
+		for k, v := range st.Versions {
+			vs := sanitizeSnapshotForJournal(v)
+			vs.Version = k
+			cleanVers[k] = vs
+		}
+		st.Versions = cleanVers
+	}
+	raw, err := json.Marshal(st)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+func decodePersistedDryFunctionState(raw string) (persistedDryFunctionState, bool) {
+	if raw == "" {
+		return persistedDryFunctionState{}, false
+	}
+	var st persistedDryFunctionState
+	if err := json.Unmarshal([]byte(raw), &st); err != nil || st.Snap.Name == "" {
+		return persistedDryFunctionState{}, false
+	}
+	if st.Versions == nil {
+		st.Versions = map[string]hostkit.FunctionSnapshot{}
+	}
+	if st.Aliases == nil {
+		st.Aliases = map[string]string{}
+	}
+	return st, true
+}
+
 func (h *Host) dryResolveFunction(ctx context.Context, name string) (dryFunction, *hostkit.CloudError) {
+	return h.dryResolveFunctionInternal(ctx, name, true)
+}
+
+func (h *Host) dryResolveFunctionZeroIO(ctx context.Context, name string) (dryFunction, *hostkit.CloudError) {
+	return h.dryResolveFunctionInternal(ctx, name, false)
+}
+
+func (h *Host) dryResolveFunctionInternal(ctx context.Context, name string, allowAdapterRead bool) (dryFunction, *hostkit.CloudError) {
 	if df, ok := h.ov(ctx).function(name); ok {
 		return df, nil
 	}
@@ -728,7 +789,7 @@ func (h *Host) dryResolveFunction(ctx context.Context, name string) (dryFunction
 		return dryFunction{}, missingFunctions()
 	}
 	ep := hostkit.EndpointFrom(ctx)
-	_, _, _, hasAmb, cerr := h.cost.lookupFunctionEntry(ep, name)
+	act, hasAct, _, hasAmb, cerr := h.cost.lookupFunctionEntry(ep, name)
 	if cerr != nil {
 		return dryFunction{}, cerr
 	}
@@ -739,19 +800,39 @@ func (h *Host) dryResolveFunction(ctx context.Context, name string) (dryFunction
 	if pinner := resolveAuthoritativeTargetPinner(ctx, h.cfg.Functions); pinner != nil {
 		snap, vers, order, aliases, found := pinner.PeekDryFunctionState(ctx, name)
 		if !found {
-			return dryFunction{exists: false}, nil
+			return dryFunction{exists: false, completeAliases: true}, nil
 		}
 		df := dryFunction{
-			exists:         true,
-			snap:           snap,
-			versions:       vers,
-			versionOrder:   order,
-			aliases:        aliases,
-			deletedAliases: map[string]bool{},
-			createdNow:     false,
+			exists:          true,
+			completeAliases: true,
+			snap:            snap,
+			versions:        vers,
+			versionOrder:    order,
+			aliases:         aliases,
+			deletedAliases:  map[string]bool{},
+			createdNow:      false,
 		}
 		h.ov(ctx).setFunction(name, df)
 		return df, nil
+	}
+	if hasAct && act.StateJSON != "" {
+		if st, ok := decodePersistedDryFunctionState(act.StateJSON); ok {
+			df := dryFunction{
+				exists:          true,
+				completeAliases: true,
+				snap:            st.Snap,
+				versions:        st.Versions,
+				versionOrder:    st.VersionOrder,
+				aliases:         st.Aliases,
+				deletedAliases:  map[string]bool{},
+				createdNow:      false,
+			}
+			h.ov(ctx).setFunction(name, df)
+			return df, nil
+		}
+	}
+	if !allowAdapterRead {
+		return dryFunction{exists: false, completeAliases: true}, nil
 	}
 	snap, err := h.cfg.Functions.GetFunction(ctx, name, "$LATEST")
 	if err != nil {
@@ -790,7 +871,7 @@ func (h *Host) dryResolveAlias(ctx context.Context, name, alias string, df *dryF
 			return targetVer, true, nil
 		}
 	}
-	if df.createdNow || h.cfg.Functions == nil {
+	if df.createdNow || df.completeAliases || h.cfg.Functions == nil {
 		return "", false, nil
 	}
 	ver, err := h.cfg.Functions.GetFunctionAlias(ctx, name, alias)
@@ -965,7 +1046,7 @@ func (h *Host) FunctionCreate(dry bool, name string, cfg *FunctionConfig) (bool,
 	}
 
 	mctx = hostkit.WithCreateToken(mctx, entry.OwnerToken)
-	created, _, err := h.cfg.Functions.CreateFunction(mctx, hostkit.FunctionUpdateInput{
+	created, createdSnap, err := h.cfg.Functions.CreateFunction(mctx, hostkit.FunctionUpdateInput{
 		Snapshot:           wantSnap,
 		OwnerToken:         entry.OwnerToken,
 		ExpectedOwnerToken: expectedOwner,
@@ -988,6 +1069,7 @@ func (h *Host) FunctionCreate(dry bool, name string, cfg *FunctionConfig) (bool,
 				return false, h.fail(op, name, terr)
 			}
 			if exists && tok != "" && tok == entry.OwnerToken && (!hasAmb || amb.Digest == "" || amb.Digest == digest) {
+				entry.StateJSON = encodePersistedDryFunctionState(persistedDryFunctionState{Snap: wantSnap})
 				if cerr := h.cost.confirmFunctionIntent(entry); cerr != nil {
 					failed = true
 					return false, h.fail(op, name, cerr)
@@ -1004,6 +1086,14 @@ func (h *Host) FunctionCreate(dry bool, name string, cfg *FunctionConfig) (bool,
 		return false, h.fail(op, name, ce)
 	}
 
+	if createdSnap.Name == "" {
+		createdSnap = wantSnap
+	}
+	if hasAct && act.StateJSON != "" {
+		entry.StateJSON = act.StateJSON
+	} else {
+		entry.StateJSON = encodePersistedDryFunctionState(persistedDryFunctionState{Snap: createdSnap})
+	}
 	if cerr := h.cost.confirmFunctionIntent(entry); cerr != nil {
 		failed = true
 		return false, h.fail(op, name, cerr)
@@ -1178,6 +1268,13 @@ func (h *Host) FunctionUpdate(dry bool, name string, cfg *FunctionConfig, expect
 		return h.missingFunctionConfig(name), h.fail(op, name, ce)
 	}
 
+	prevState, _ := decodePersistedDryFunctionState(act.StateJSON)
+	if updatedSnap.Name == "" {
+		prevState.Snap = wantSnap
+	} else {
+		prevState.Snap = updatedSnap
+	}
+	entry.StateJSON = encodePersistedDryFunctionState(prevState)
 	if cerr := h.cost.confirmFunctionIntent(entry); cerr != nil {
 		failed = true
 		return h.missingFunctionConfig(name), h.fail(op, name, cerr)
@@ -1693,6 +1790,29 @@ func (h *Host) FunctionPublishVersion(dry bool, name, expectRevision string, has
 		failed = true
 		return "", h.fail(op, name, ce)
 	}
+	if cerr := h.cost.updateFunctionDryState(ep, name, func(cur string) string {
+		st, ok := decodePersistedDryFunctionState(cur)
+		if !ok {
+			return cur
+		}
+		vsnap := st.Snap.Clone()
+		vsnap.Version = ver
+		st.Versions[ver] = vsnap
+		found := false
+		for _, existingVer := range st.VersionOrder {
+			if existingVer == ver {
+				found = true
+				break
+			}
+		}
+		if !found {
+			st.VersionOrder = append(st.VersionOrder, ver)
+		}
+		return encodePersistedDryFunctionState(st)
+	}); cerr != nil {
+		failed = true
+		return "", h.fail(op, name, cerr)
+	}
 	h.ok()
 	return ver, nil
 }
@@ -1923,6 +2043,17 @@ func (h *Host) FunctionAliasSet(dry bool, name, alias, version string) error {
 		failed = true
 		return h.fail(op, name, ce)
 	}
+	if cerr := h.cost.updateFunctionDryState(ep, name, func(cur string) string {
+		st, ok := decodePersistedDryFunctionState(cur)
+		if !ok {
+			return cur
+		}
+		st.Aliases[alias] = version
+		return encodePersistedDryFunctionState(st)
+	}); cerr != nil {
+		failed = true
+		return h.fail(op, name, cerr)
+	}
 	h.ok()
 	return nil
 }
@@ -2135,6 +2266,17 @@ func (h *Host) FunctionAliasDelete(dry bool, name, alias string) (bool, error) {
 		failed = true
 		return false, h.fail(op, name, ce)
 	}
+	if cerr := h.cost.updateFunctionDryState(ep, name, func(cur string) string {
+		st, ok := decodePersistedDryFunctionState(cur)
+		if !ok {
+			return cur
+		}
+		delete(st.Aliases, alias)
+		return encodePersistedDryFunctionState(st)
+	}); cerr != nil {
+		failed = true
+		return false, h.fail(op, name, cerr)
+	}
 	h.ok()
 	return existed, nil
 }
@@ -2187,7 +2329,7 @@ func (h *Host) FunctionInvoke(dry bool, name, qualifier, payloadJSON string, has
 	}
 
 	if dry {
-		df, e := h.dryResolveFunction(ctx, name)
+		df, e := h.dryResolveFunctionZeroIO(ctx, name)
 		if e != nil {
 			failed = true
 			return zeroRes, h.fail(op, name, e)

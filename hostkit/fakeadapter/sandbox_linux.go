@@ -159,9 +159,10 @@ func (f *Fake) ensureSandboxReady() *hostkit.CloudError {
 	cachedNodeRoot = nodeRoot
 	cachedCgroupParent = cgParent
 
-	// Self-test both python3.12 and nodejs20.x at 128 MiB in the namespace + cgroupv2 + Landlock jail,
-	// verifying PID 1, rlimits (NOFILE=64, NPROC=32, FSIZE=16MiB), and /etc isolation.
-	pyZip, _, cerr := hostkit.BuildDeterministicInlineZip(hostkit.RuntimePython312, "index.handler", `import os, resource
+	// Self-test both python3.12 and nodejs20.x at 128 MiB in the namespace + cgroupv2 + Landlock + seccomp jail,
+	// verifying PID 1, rlimits (NOFILE=64, NPROC=32, FSIZE=16MiB), /etc isolation, and synchronous aggregate
+	// 16-MiB scratch quota across open-unlinked files.
+	pyZip, _, cerr := hostkit.BuildDeterministicInlineZip(hostkit.RuntimePython312, "index.handler", `import errno, os, resource
 def handler(event, context):
     assert os.getpid() == 1, f"expected pid 1, got {os.getpid()}"
     assert resource.getrlimit(resource.RLIMIT_NOFILE) == (64, 64), f"nofile={resource.getrlimit(resource.RLIMIT_NOFILE)}"
@@ -173,6 +174,30 @@ def handler(event, context):
             raise AssertionError("/etc/machine-id should be blocked by Landlock")
         except PermissionError:
             pass
+    td = os.environ.get("TMPDIR", "/tmp")
+    chunk = b"x" * (1024 * 1024)
+    f1 = open(os.path.join(td, "unlinked_1.bin"), "wb+")
+    os.unlink(f1.name)
+    f2 = open(os.path.join(td, "unlinked_2.bin"), "wb+")
+    os.unlink(f2.name)
+    try:
+        for _ in range(10):
+            f1.write(chunk)
+            f1.flush()
+        blocked = False
+        try:
+            for _ in range(10):
+                f2.write(chunk)
+                f2.flush()
+        except OSError as e:
+            if e.errno in (errno.ENOSPC, errno.EFBIG, errno.EDQUOT, errno.EPERM):
+                blocked = True
+            else:
+                raise
+        assert blocked, "expected aggregate 16-MiB scratch quota to reject 20 MiB across open-unlinked files"
+    finally:
+        f1.close()
+        f2.close()
     return {"selftest": True}
 `)
 	if cerr != nil {
@@ -300,7 +325,7 @@ func (b *boundedLogBuffer) TailString() string {
 // scrubs os.environ to only the configured user env vars, enforces RLIMIT_NOFILE and memory
 // bounds, executes the handler, and writes the structured JSON outcome to fd 3.
 const sandboxLauncherPy = `
-import ctypes, json, os, resource, signal, subprocess, sys, traceback
+import ctypes, errno, json, os, resource, select, signal, socket, stat, struct, subprocess, sys, time, traceback
 
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 CLONE_NEWNS   = 0x00020000
@@ -318,6 +343,45 @@ O_PATH                      = 0o10000000
 O_CLOEXEC                   = 0o2000000
 LANDLOCK_RULE_PATH_BENEATH  = 1
 
+MAX_SCRATCH_BYTES                  = 16 * 1024 * 1024
+SECCOMP_SET_MODE_FILTER            = 1
+SECCOMP_FILTER_FLAG_NEW_LISTENER   = (1 << 3)
+SECCOMP_RET_USER_NOTIF             = 0x7fc00000
+SECCOMP_RET_ALLOW                  = 0x7fff0000
+SECCOMP_IOCTL_NOTIF_RECV           = 0xc0502100
+SECCOMP_IOCTL_NOTIF_SEND           = 0xc0182101
+SECCOMP_USER_NOTIF_FLAG_CONTINUE   = 1
+
+_ARCH = os.uname().machine
+if _ARCH in ("aarch64", "arm64"):
+    SYS_seccomp         = 277
+    SYS_truncate        = 45
+    SYS_ftruncate       = 46
+    SYS_fallocate       = 47
+    SYS_write           = 64
+    SYS_writev          = 66
+    SYS_pwrite64        = 68
+    SYS_pwritev         = 70
+    SYS_sendfile        = 71
+    SYS_splice          = 76
+    SYS_copy_file_range = 285
+    SYS_pwritev2        = 287
+elif _ARCH in ("x86_64", "amd64"):
+    SYS_seccomp         = 317
+    SYS_write           = 1
+    SYS_pwrite64        = 18
+    SYS_writev          = 20
+    SYS_sendfile        = 40
+    SYS_truncate        = 76
+    SYS_ftruncate       = 77
+    SYS_splice          = 275
+    SYS_fallocate       = 285
+    SYS_pwritev         = 296
+    SYS_copy_file_range = 326
+    SYS_pwritev2        = 328
+else:
+    SYS_seccomp = -1
+
 class RulesetAttr(ctypes.Structure):
     _fields_ = [("handled_access_fs", ctypes.c_uint64)]
 
@@ -326,6 +390,44 @@ class PathBeneathAttr(ctypes.Structure):
     _fields_ = [
         ("allowed_access", ctypes.c_uint64),
         ("parent_fd", ctypes.c_int32),
+    ]
+
+class SockFilter(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_uint16),
+        ("jt", ctypes.c_uint8),
+        ("jf", ctypes.c_uint8),
+        ("k", ctypes.c_uint32),
+    ]
+
+class SockFprog(ctypes.Structure):
+    _fields_ = [
+        ("len", ctypes.c_uint16),
+        ("filter", ctypes.POINTER(SockFilter)),
+    ]
+
+class SeccompData(ctypes.Structure):
+    _fields_ = [
+        ("nr", ctypes.c_int),
+        ("arch", ctypes.c_uint32),
+        ("instruction_pointer", ctypes.c_uint64),
+        ("args", ctypes.c_uint64 * 6),
+    ]
+
+class SeccompNotif(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint64),
+        ("pid", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("data", SeccompData),
+    ]
+
+class SeccompNotifResp(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint64),
+        ("val", ctypes.c_int64),
+        ("error", ctypes.c_int32),
+        ("flags", ctypes.c_uint32),
     ]
 
 def write_outcome(fd, obj):
@@ -375,12 +477,318 @@ def apply_landlock(bundle_dir, scratch_tmp, extra_ro):
         raise RuntimeError(f"landlock_restrict_self failed: errno={ctypes.get_errno()}")
     os.close(rfd)
 
+def install_seccomp_quota_listener(out_fd):
+    if SYS_seccomp < 0:
+        raise RuntimeError(f"unsupported architecture for seccomp listener: {_ARCH}")
+    BPF_LD_W_ABS  = 0x20
+    BPF_JMP_JEQ_K = 0x15
+    BPF_RET_K     = 0x06
+    spec = [
+        ("ENTRY",    BPF_LD_W_ABS,  0,  None,       None),
+        (None,       BPF_JMP_JEQ_K, SYS_write,           "CHECK_FD", None),
+        (None,       BPF_JMP_JEQ_K, SYS_writev,          "CHECK_FD", None),
+        (None,       BPF_JMP_JEQ_K, SYS_pwrite64,        "NOTIF",    None),
+        (None,       BPF_JMP_JEQ_K, SYS_pwritev,         "NOTIF",    None),
+        (None,       BPF_JMP_JEQ_K, SYS_pwritev2,        "NOTIF",    None),
+        (None,       BPF_JMP_JEQ_K, SYS_truncate,        "NOTIF",    None),
+        (None,       BPF_JMP_JEQ_K, SYS_ftruncate,       "NOTIF",    None),
+        (None,       BPF_JMP_JEQ_K, SYS_fallocate,       "NOTIF",    None),
+        (None,       BPF_JMP_JEQ_K, SYS_sendfile,        "NOTIF",    None),
+        (None,       BPF_JMP_JEQ_K, SYS_splice,          "NOTIF",    None),
+        (None,       BPF_JMP_JEQ_K, SYS_copy_file_range, "NOTIF",    "ALLOW"),
+        ("CHECK_FD", BPF_LD_W_ABS,  20, None,       None),
+        (None,       BPF_JMP_JEQ_K, 0,  None,       "NOTIF"),
+        (None,       BPF_LD_W_ABS,  16, None,       None),
+        (None,       BPF_JMP_JEQ_K, 1,  "ALLOW",    None),
+        (None,       BPF_JMP_JEQ_K, 2,  "ALLOW",    None),
+        (None,       BPF_JMP_JEQ_K, out_fd, "ALLOW", "NOTIF"),
+        ("ALLOW",    BPF_RET_K,     SECCOMP_RET_ALLOW,      None, None),
+        ("NOTIF",    BPF_RET_K,     SECCOMP_RET_USER_NOTIF, None, None),
+    ]
+    labels = {}
+    for idx, item in enumerate(spec):
+        if item[0] is not None:
+            labels[item[0]] = idx
+    arr = (SockFilter * len(spec))()
+    for idx, (_lbl, code, k, jt_lbl, jf_lbl) in enumerate(spec):
+        jt = (labels[jt_lbl] - (idx + 1)) if jt_lbl is not None else 0
+        jf = (labels[jf_lbl] - (idx + 1)) if jf_lbl is not None else 0
+        arr[idx] = SockFilter(code=code, jt=jt, jf=jf, k=int(k) & 0xffffffff)
+    prog = SockFprog(len=len(spec), filter=arr)
+    nfd = libc.syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, ctypes.byref(prog))
+    if nfd < 0:
+        raise RuntimeError(f"seccomp(SECCOMP_FILTER_FLAG_NEW_LISTENER) failed: errno={ctypes.get_errno()}")
+    return nfd
+
+def run_seccomp_supervisor(nfd, child_pid, scratch_tmp, cg_procs):
+    last_approved = {}
+    scratch_prefix = scratch_tmp.rstrip("/") + "/"
+
+    def is_scratch_link(link):
+        return link.startswith(scratch_prefix) or link == scratch_tmp or (
+            link.startswith("/memfd:") and not link.startswith("/memfd:lmcloud_payload")
+        )
+
+    def scan_live_inodes(req_pid):
+        live = {}
+        try:
+            for root, _dirs, files in os.walk(scratch_tmp):
+                for fn in files:
+                    p = os.path.join(root, fn)
+                    try:
+                        st = os.lstat(p)
+                        if stat.S_ISREG(st.st_mode):
+                            k = (st.st_dev, st.st_ino)
+                            if st.st_size > live.get(k, 0):
+                                live[k] = st.st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        pids = {child_pid}
+        if req_pid > 0:
+            pids.add(req_pid)
+        if cg_procs:
+            try:
+                with open(cg_procs, "r") as f:
+                    for line in f:
+                        s = line.strip()
+                        if s.isdigit():
+                            pids.add(int(s))
+            except OSError:
+                pass
+        for p in pids:
+            fd_dir = f"/proc/{p}/fd"
+            try:
+                fd_list = os.listdir(fd_dir)
+            except OSError:
+                continue
+            for fd_str in fd_list:
+                fd_path = f"{fd_dir}/{fd_str}"
+                try:
+                    link = os.readlink(fd_path)
+                except OSError:
+                    continue
+                if is_scratch_link(link):
+                    try:
+                        st = os.stat(fd_path)
+                        if stat.S_ISREG(st.st_mode):
+                            k = (st.st_dev, st.st_ino)
+                            if st.st_size > live.get(k, 0):
+                                live[k] = st.st_size
+                    except OSError:
+                        pass
+        now_ts = time.monotonic()
+        for k in list(last_approved.keys()):
+            if k not in live:
+                del last_approved[k]
+            else:
+                ap_sz, ap_ts = last_approved[k]
+                if now_ts - ap_ts < 0.05 and ap_sz > live[k]:
+                    live[k] = ap_sz
+        return live
+
+    def read_fdinfo(rpid, fd):
+        pos = 0
+        flags = 0
+        try:
+            with open(f"/proc/{rpid}/fdinfo/{fd}", "r") as f:
+                for line in f:
+                    if line.startswith("pos:"):
+                        pos = int(line.split(":", 1)[1].strip())
+                    elif line.startswith("flags:"):
+                        flags = int(line.split(":", 1)[1].strip(), 8)
+        except Exception:
+            pass
+        return pos, flags
+
+    def sum_iovec(rpid, iov_ptr, iovcnt):
+        if iovcnt == 0:
+            return 0
+        if iovcnt < 0 or iovcnt > 1024:
+            return MAX_SCRATCH_BYTES + 1
+        mfd = -1
+        try:
+            mfd = os.open(f"/proc/{rpid}/mem", os.O_RDONLY)
+            raw = os.pread(mfd, iovcnt * 16, iov_ptr)
+            if len(raw) != iovcnt * 16:
+                return MAX_SCRATCH_BYTES + 1
+            total = 0
+            for i in range(iovcnt):
+                _base, length = struct.unpack_from("<QQ", raw, i * 16)
+                total += length
+            return total
+        except Exception:
+            return MAX_SCRATCH_BYTES + 1
+        finally:
+            if mfd >= 0:
+                try:
+                    os.close(mfd)
+                except OSError:
+                    pass
+
+    def read_c_string(rpid, ptr, max_len=4096):
+        mfd = -1
+        try:
+            mfd = os.open(f"/proc/{rpid}/mem", os.O_RDONLY)
+            raw = os.pread(mfd, max_len, ptr)
+            idx = raw.find(b"\x00")
+            if idx >= 0:
+                raw = raw[:idx]
+            return raw.decode("utf-8", errors="surrogateescape")
+        except Exception:
+            return ""
+        finally:
+            if mfd >= 0:
+                try:
+                    os.close(mfd)
+                except OSError:
+                    pass
+
+    def evaluate_notif(req):
+        nr = req.data.nr
+        args = req.data.args
+        rpid = req.pid if req.pid > 0 else child_pid
+
+        if nr == SYS_truncate:
+            length = ctypes.c_int64(args[1]).value
+            if length < 0 or length > MAX_SCRATCH_BYTES:
+                return -errno.ENOSPC
+            path_str = read_c_string(rpid, args[0])
+            if not path_str:
+                return -errno.ENOSPC
+            if not os.path.isabs(path_str):
+                try:
+                    cwd = os.readlink(f"/proc/{rpid}/cwd")
+                    path_str = os.path.join(cwd, path_str)
+                except OSError:
+                    pass
+            live = scan_live_inodes(rpid)
+            key = None
+            try:
+                st = os.lstat(path_str)
+                key = (st.st_dev, st.st_ino)
+            except OSError:
+                pass
+            other_bytes = sum(sz for k, sz in live.items() if k != key)
+            if other_bytes + length > MAX_SCRATCH_BYTES:
+                return -errno.ENOSPC
+            if key is not None:
+                last_approved[key] = (length, time.monotonic())
+            return 0
+
+        if nr in (SYS_splice, SYS_copy_file_range):
+            fd = int(args[2]) & 0xffffffff
+        else:
+            fd = int(args[0]) & 0xffffffff
+
+        fd_path = f"/proc/{rpid}/fd/{fd}"
+        try:
+            link = os.readlink(fd_path)
+        except OSError:
+            return 0
+
+        if not is_scratch_link(link):
+            return 0
+
+        try:
+            st = os.stat(fd_path)
+        except OSError:
+            return 0
+        if not stat.S_ISREG(st.st_mode):
+            return 0
+
+        key = (st.st_dev, st.st_ino)
+        live = scan_live_inodes(rpid)
+        cur_size = live.get(key, st.st_size)
+        pos, flags = read_fdinfo(rpid, fd)
+        if st.st_size == 0 and pos == 0:
+            cur_size = 0
+
+        if nr == SYS_ftruncate:
+            length = ctypes.c_int64(args[1]).value
+            if length < 0:
+                return -errno.EINVAL
+            new_size = length
+        elif nr == SYS_fallocate:
+            offset = ctypes.c_int64(args[2]).value
+            length = ctypes.c_int64(args[3]).value
+            if offset < 0 or length < 0:
+                return -errno.EINVAL
+            new_size = max(cur_size, offset + length)
+        elif nr == SYS_write:
+            count = int(args[2])
+            base = cur_size if (flags & os.O_APPEND) else pos
+            new_size = max(cur_size, base + count)
+        elif nr == SYS_pwrite64:
+            count = int(args[2])
+            offset = ctypes.c_int64(args[3]).value
+            if offset < 0:
+                return -errno.EINVAL
+            new_size = max(cur_size, offset + count)
+        elif nr in (SYS_writev, SYS_pwritev, SYS_pwritev2):
+            count = sum_iovec(rpid, int(args[1]), ctypes.c_int32(args[2]).value)
+            if nr == SYS_writev:
+                base = cur_size if (flags & os.O_APPEND) else pos
+            else:
+                off = ctypes.c_int64(args[3]).value
+                base = cur_size if (off < 0 or (flags & os.O_APPEND)) else off
+            new_size = max(cur_size, base + count)
+        elif nr == SYS_sendfile:
+            count = int(args[3])
+            new_size = cur_size + count
+        elif nr in (SYS_splice, SYS_copy_file_range):
+            count = int(args[4])
+            new_size = cur_size + count
+        else:
+            new_size = cur_size
+
+        other_bytes = sum(sz for k, sz in live.items() if k != key)
+        if new_size > MAX_SCRATCH_BYTES or (other_bytes + new_size) > MAX_SCRATCH_BYTES:
+            return -errno.ENOSPC
+
+        last_approved[key] = (new_size, time.monotonic())
+        return 0
+
+    poller = select.poll()
+    poller.register(nfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    while True:
+        try:
+            wpid, _st = os.waitpid(child_pid, os.WNOHANG)
+            if wpid == child_pid:
+                break
+        except ChildProcessError:
+            break
+        except OSError:
+            pass
+        try:
+            events = poller.poll(10)
+        except InterruptedError:
+            continue
+        except OSError:
+            break
+        for _fd, ev in events:
+            if ev & select.POLLIN:
+                req = SeccompNotif()
+                rc = libc.ioctl(nfd, SECCOMP_IOCTL_NOTIF_RECV, ctypes.byref(req))
+                if rc != 0:
+                    continue
+                err_code = evaluate_notif(req)
+                if err_code < 0:
+                    resp = SeccompNotifResp(id=req.id, val=0, error=err_code, flags=0)
+                else:
+                    resp = SeccompNotifResp(id=req.id, val=0, error=0, flags=SECCOMP_USER_NOTIF_FLAG_CONTINUE)
+                libc.ioctl(nfd, SECCOMP_IOCTL_NOTIF_SEND, ctypes.byref(resp))
+
 def main():
     out_fd = os.dup(3)
     os.close(3)
     os.set_inheritable(out_fd, True)
     spec_raw = sys.stdin.buffer.read()
     spec = json.loads(spec_raw.decode("utf-8"))
+
+    notif_parent_sock, notif_child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    notif_parent_sock.settimeout(5.0)
 
     rc = libc.unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWIPC)
     if rc != 0:
@@ -389,7 +797,7 @@ def main():
 
     pid = os.fork()
     if pid > 0:
-        os.close(out_fd)
+        notif_child_sock.close()
         def forward_kill(signum, _frame):
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -397,10 +805,45 @@ def main():
                 pass
         signal.signal(signal.SIGTERM, forward_kill)
         signal.signal(signal.SIGINT, forward_kill)
-        _, status = os.waitpid(pid, 0)
+        nfd = -1
+        try:
+            _msg, fds, _flags, _addr = socket.recv_fds(notif_parent_sock, 1, 1)
+            if fds:
+                nfd = fds[0]
+        except Exception as e:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            write_outcome(out_fd, {"internalError": f"failed to receive seccomp listener fd: {e}"})
+            os.close(out_fd)
+            os._exit(2)
+        finally:
+            notif_parent_sock.close()
+        if nfd < 0:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            write_outcome(out_fd, {"internalError": "seccomp listener fd not established"})
+            os.close(out_fd)
+            os._exit(2)
+        os.close(out_fd)
+        try:
+            run_seccomp_supervisor(nfd, pid, spec["scratch_tmp"], spec.get("cgroup_procs_path", ""))
+        finally:
+            try:
+                os.close(nfd)
+            except OSError:
+                pass
+        try:
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
         os._exit(0)
 
     # Inside child: PID 1 of the isolated PID namespace!
+    notif_parent_sock.close()
     libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
     if os.getpid() != 1:
         write_outcome(out_fd, {"internalError": f"expected PID 1 in PID namespace, got {os.getpid()}"})
@@ -452,6 +895,15 @@ def main():
         resource.setrlimit(resource.RLIMIT_FSIZE, (16 * 1024 * 1024, 16 * 1024 * 1024))
     except Exception as e:
         write_outcome(out_fd, {"internalError": f"rlimit setup failed: {e}"})
+        os._exit(2)
+
+    try:
+        nfd = install_seccomp_quota_listener(out_fd)
+        socket.send_fds(notif_child_sock, [b"1"], [nfd])
+        os.close(nfd)
+        notif_child_sock.close()
+    except Exception as e:
+        write_outcome(out_fd, {"internalError": f"seccomp quota listener setup failed: {e}"})
         os._exit(2)
 
     clean_env = {
@@ -630,17 +1082,63 @@ type sandboxOutcome struct {
 	InternalError string `json:"internalError"`
 }
 
-func scratchDirBytes(dir string) int64 {
-	var total int64
+type inodeKey struct {
+	dev uint64
+	ino uint64
+}
+
+func scratchDirBytes(dir string, pids []int) int64 {
+	seen := map[inodeKey]int64{}
+	var fallbackTotal int64
+	prefix := strings.TrimSuffix(dir, "/") + "/"
+	recordInfo := func(info os.FileInfo) {
+		if info == nil || !info.Mode().IsRegular() {
+			return
+		}
+		if st, ok := info.Sys().(*syscall.Stat_t); ok && st != nil {
+			k := inodeKey{dev: uint64(st.Dev), ino: uint64(st.Ino)}
+			if info.Size() > seen[k] {
+				seen[k] = info.Size()
+			}
+			return
+		}
+		fallbackTotal += info.Size()
+	}
 	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
 		if err != nil || d == nil || d.IsDir() {
 			return nil
 		}
 		if info, ierr := d.Info(); ierr == nil {
-			total += info.Size()
+			recordInfo(info)
 		}
 		return nil
 	})
+	for _, pid := range pids {
+		if pid <= 0 {
+			continue
+		}
+		fdDir := fmt.Sprintf("/proc/%d/fd", pid)
+		entries, err := os.ReadDir(fdDir)
+		if err != nil {
+			continue
+		}
+		for _, ent := range entries {
+			fdPath := filepath.Join(fdDir, ent.Name())
+			link, lerr := os.Readlink(fdPath)
+			if lerr != nil {
+				continue
+			}
+			if strings.HasPrefix(link, prefix) || link == dir || (strings.HasPrefix(link, "/memfd:") && !strings.HasPrefix(link, "/memfd:lmcloud_payload")) {
+				if info, serr := os.Stat(fdPath); serr == nil {
+					recordInfo(info)
+				}
+			}
+		}
+	}
+	total := fallbackTotal
+	for _, sz := range seen {
+		total += sz
+	}
 	return total
 }
 
@@ -890,7 +1388,7 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 			done = true
 		case <-ticker.C:
 			pids, rss := collectProcessTreeAndRSS(rootPID)
-			diskBytes := scratchDirBytes(scratchTmp)
+			diskBytes := scratchDirBytes(scratchTmp, pids)
 			monMu.Lock()
 			for _, p := range pids {
 				observedPIDs[p] = true
@@ -931,7 +1429,7 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 	}
 	isTimeout := killedForTime
 	isOOM := killedForMemory || cgroupHadOOM(cgDir)
-	isDiskQuota := killedForDisk || scratchDirBytes(scratchTmp) > maxScratchTmpBytes
+	isDiskQuota := killedForDisk || scratchDirBytes(scratchTmp, allPIDs) > maxScratchTmpBytes
 	monMu.Unlock()
 
 	waitForPIDsGone(allPIDs, 500*time.Millisecond)

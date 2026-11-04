@@ -226,9 +226,6 @@ func verifyFunctionWriteFence(ctx context.Context, fn *functionState, name, expO
 		return hostkit.ProviderError(hostkit.Conflict, 409, "StaleGeneration",
 			fmt.Sprintf("stale generation %d < %d for function %q", gen, fn.MaxGeneration, name))
 	}
-	if gen > fn.MaxGeneration {
-		fn.MaxGeneration = gen
-	}
 	return nil
 }
 

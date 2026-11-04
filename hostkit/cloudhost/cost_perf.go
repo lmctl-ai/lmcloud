@@ -225,6 +225,7 @@ type campaignJournalRecord struct {
 	ExpectedOwnerToken       string `json:"expected_owner_token,omitempty"`
 	ExpectedGeneration       string `json:"expected_generation,omitempty"`
 	FunctionDigest           string `json:"function_digest,omitempty"`
+	FunctionState            string `json:"function_state,omitempty"`
 }
 
 type replayedCampaignState struct {
@@ -1486,6 +1487,10 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 			st.functionOwnerTokens[fKey] = rec.OwnerToken
 			delete(st.ambiguousFunctionStack, fKey)
 			delete(st.ambiguousFunctions, fKey)
+			stateJSON := rec.FunctionState
+			if stateJSON == "" {
+				stateJSON = st.activeFunctionEntries[fKey].StateJSON
+			}
 			st.activeFunctionEntries[fKey] = safety.JournalFunctionEntry{
 				Key:        fKey,
 				Scope:      rec.Endpoint,
@@ -1494,6 +1499,7 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 				OwnerToken: rec.OwnerToken,
 				Generation: rec.Generation,
 				IntentID:   rec.IntentID,
+				StateJSON:  stateJSON,
 			}
 			if rec.CleanupReserveNanoUSD > 0 {
 				st.activeFunctions[fKey] = rec.CleanupReserveNanoUSD
@@ -3774,7 +3780,7 @@ func (ct *costTracker) confirmFunctionIntent(entry safety.JournalFunctionEntry) 
 			ct.latestFunctionIntent[key] != entry.IntentID || entryGen < ct.maxFunctionGen[key] {
 			return nil
 		}
-		if err := ct.journal.RecordFunctionConfirm(entry.Scope, entry.Name, entry.Digest, entry.OwnerToken, entry.Generation, entry.IntentID, 0); err != nil {
+		if err := ct.journal.RecordFunctionConfirmWithState(entry.Scope, entry.Name, entry.Digest, entry.OwnerToken, entry.Generation, entry.IntentID, entry.StateJSON, 0); err != nil {
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
 			return ct.poisoned
 		}
@@ -3796,12 +3802,16 @@ func (ct *costTracker) confirmFunctionIntent(entry safety.JournalFunctionEntry) 
 				FunctionDigest: entry.Digest,
 				OwnerToken:     entry.OwnerToken,
 				Generation:     entry.Generation,
+				FunctionState:  entry.StateJSON,
 			}); err != nil {
 				return err
 			}
 			confirmed := entry
 			confirmed.Ambiguous = false
 			confirmed.IntentOp = ""
+			if confirmed.StateJSON == "" {
+				confirmed.StateJSON = st.activeFunctionEntries[key].StateJSON
+			}
 			st.activeFunctionEntries[key] = confirmed
 			st.functionOwnerTokens[key] = entry.OwnerToken
 			delete(st.ambiguousFunctionStack, key)
@@ -3822,10 +3832,109 @@ func (ct *costTracker) confirmFunctionIntent(entry safety.JournalFunctionEntry) 
 	confirmed := entry
 	confirmed.Ambiguous = false
 	confirmed.IntentOp = ""
+	if confirmed.StateJSON == "" {
+		confirmed.StateJSON = ct.activeFunctionEntries[key].StateJSON
+	}
 	ct.activeFunctionEntries[key] = confirmed
 	ct.functionOwnerTokens[key] = entry.OwnerToken
 	delete(ct.ambiguousFunctionStack, key)
 	delete(ct.ambiguousFunctions, key)
+	return nil
+}
+
+func (ct *costTracker) updateFunctionDryState(endpoint, name string, mutate func(curStateJSON string) string) *hostkit.CloudError {
+	if mutate == nil {
+		return nil
+	}
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	key := scopedResKey(endpoint, name)
+
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return ct.poisoned
+		}
+		act, ok := ct.activeFunctionEntries[key]
+		if !ok {
+			return nil
+		}
+		newState := mutate(act.StateJSON)
+		if newState == act.StateJSON {
+			return nil
+		}
+		genStr := act.Generation
+		if maxG := ct.maxFunctionGen[key]; maxG > 0 {
+			genStr = strconv.FormatUint(maxG, 10)
+		}
+		intentID := ct.latestFunctionIntent[key]
+		if intentID == "" {
+			intentID = act.IntentID
+		}
+		if err := ct.journal.RecordFunctionConfirmWithState(act.Scope, act.Name, act.Digest, act.OwnerToken, genStr, intentID, newState, 0); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		return ct.poisoned
+	}
+
+	if ct.statePath != "" {
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			act, ok := st.activeFunctionEntries[key]
+			if !ok {
+				return nil
+			}
+			newState := mutate(act.StateJSON)
+			if newState == act.StateJSON {
+				return nil
+			}
+			genStr := act.Generation
+			if maxG := st.maxFunctionGen[key]; maxG > 0 {
+				genStr = strconv.FormatUint(maxG, 10)
+			}
+			intentID := st.latestFunctionIntent[key]
+			if intentID == "" {
+				intentID = act.IntentID
+			}
+			if err := appendRec(campaignJournalRecord{
+				Event:          safety.EventFunctionConfirm,
+				IntentID:       intentID,
+				Endpoint:       act.Scope,
+				ResKey:         act.Name,
+				FunctionDigest: act.Digest,
+				OwnerToken:     act.OwnerToken,
+				Generation:     genStr,
+				FunctionState:  newState,
+			}); err != nil {
+				return err
+			}
+			act.Generation = genStr
+			act.IntentID = intentID
+			act.StateJSON = newState
+			st.activeFunctionEntries[key] = act
+			ct.applyReplayedStateLocked(st)
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		return nil
+	}
+
+	act, ok := ct.activeFunctionEntries[key]
+	if !ok {
+		return nil
+	}
+	act.StateJSON = mutate(act.StateJSON)
+	ct.activeFunctionEntries[key] = act
 	return nil
 }
 

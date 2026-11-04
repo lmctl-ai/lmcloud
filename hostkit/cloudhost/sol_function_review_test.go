@@ -583,3 +583,318 @@ func TestSolFnConcurrentPublishCrashReopenAndDelete(t *testing.T) {
 		})
 	}
 }
+
+func TestSolR2FnUnlinkedScratchQuota(t *testing.T) {
+	h, _, _, _ := newFuncHost(t)
+	cfg := solFnConfig(t, h, `import os
+def handler(e,c):
+ files=[]
+ try:
+  for i in range(2):
+   p=os.path.join(os.environ['TMPDIR'],'bounded'+str(i))
+   fd=os.open(p,os.O_RDWR|os.O_CREAT,0o600)
+   os.unlink(p)
+   files.append(fd)
+   for j in range(12): os.write(fd,b'x'*1048576)
+   os.fsync(fd)
+  return {'open_bytes':sum(os.fstat(fd).st_size for fd in files),'visible_names':os.listdir(os.environ['TMPDIR'])}
+ finally:
+  for fd in files: os.close(fd)
+`)
+	_, _ = h.FunctionCreate(false, "quotaunlinked", cfg)
+	out, _ := h.FunctionInvoke(false, "quotaunlinked", "", "{}", false)
+	t.Logf("last=%+v function_error=%s payload=%s", h.LastError(), out.FunctionError(), out.Payload())
+	if h.LastError().Code != hostkit.OK {
+		t.Fatal(h.LastError())
+	}
+	var v map[string]any
+	_ = json.Unmarshal([]byte(out.Payload()), &v)
+	if n, ok := v["open_bytes"].(float64); ok && n > 16*1024*1024 {
+		t.Fatal("unlinked open files bypass aggregate 16 MiB sandbox quota")
+	}
+	if out.FunctionError() == "" {
+		t.Fatalf("expected non-empty FunctionError when writing 24 MiB to unlinked open files, got payload=%s", out.Payload())
+	}
+}
+
+func TestSolR2FnUnlinkedScratchQuotaNodeJS(t *testing.T) {
+	h, _, _, _ := newFuncHost(t)
+	cfg, err := h.FunctionConfig("nodejs20.x", "index.handler")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsCode := `const fs = require("fs");
+const path = require("path");
+exports.handler = async () => {
+  const td = process.env.TMPDIR || "/tmp";
+  const chunk = Buffer.alloc(1024 * 1024, 0x78);
+  const fds = [];
+  try {
+    for (let idx = 0; idx < 2; idx++) {
+      const p = path.join(td, "unlinked-js-" + idx + ".bin");
+      const fd = fs.openSync(p, "w+");
+      fs.unlinkSync(p);
+      fds.push(fd);
+      for (let i = 0; i < 12; i++) {
+        fs.writeSync(fd, chunk);
+      }
+      fs.fsyncSync(fd);
+    }
+    return { open_bytes: 24 * 1024 * 1024 };
+  } finally {
+    for (const fd of fds) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
+  }
+};
+`
+	if _, err := cfg.SetInlineCode(jsCode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.SetTimeoutSeconds(5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.SetMemoryMB(128); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = h.FunctionCreate(false, "quotaunlinkedjs", cfg)
+	out, _ := h.FunctionInvoke(false, "quotaunlinkedjs", "", "{}", false)
+	t.Logf("last=%+v function_error=%s payload=%s", h.LastError(), out.FunctionError(), out.Payload())
+	if h.LastError().Code != hostkit.OK {
+		t.Fatal(h.LastError())
+	}
+	if out.FunctionError() == "" {
+		t.Fatalf("expected non-empty FunctionError for nodejs20.x writing 24 MiB to unlinked open files, got payload=%s", out.Payload())
+	}
+}
+
+func TestSolR2FnRefusedUpdatePoisonsChildren(t *testing.T) {
+	for _, journalMode := range []bool{false, true} {
+		mode := "campaign"
+		if journalMode {
+			mode = "journal"
+		}
+		t.Run(mode, func(t *testing.T) {
+			h, f, _, campaign := newFuncHost(t)
+			base := Config{Provider: "aws", Functions: f, CampaignStatePath: campaign}
+			if journalMode {
+				_, j, _ := solJournal(t)
+				base.Journal = j
+				base.CampaignStatePath = ""
+				h = New(base)
+				h.SetAbortOnError(false)
+			}
+			cfg := solFnConfig(t, h, "def handler(e,c): return {}\n")
+			_, _ = h.FunctionCreate(false, "refusedfn", cfg)
+			_, _ = h.FunctionPublishVersion(false, "refusedfn", "", false)
+			_ = h.FunctionAliasSet(false, "refusedfn", "prod", "1")
+			_, _ = h.FunctionUpdate(false, "refusedfn", cfg, strings.Repeat("0", 32), true)
+			if h.LastError().Code != hostkit.PreconditionFailed {
+				t.Fatal("wrong revision was not refused", h.LastError())
+			}
+			h = New(base)
+			h.SetAbortOnError(false)
+			for _, op := range []string{"publish", "alias", "delete-alias"} {
+				switch op {
+				case "publish":
+					_, _ = h.FunctionPublishVersion(false, "refusedfn", "", false)
+				case "alias":
+					_ = h.FunctionAliasSet(false, "refusedfn", "prod", "1")
+				case "delete-alias":
+					_, _ = h.FunctionAliasDelete(false, "refusedfn", "prod")
+				}
+				t.Logf("%s last=%+v", op, h.LastError())
+				if h.LastError().Code != hostkit.OK {
+					t.Errorf("refused update permanently fenced normal %s", op)
+				}
+			}
+		})
+	}
+}
+
+type solR2Foreign struct {
+	*fakeadapter.Fake
+	snap hostkit.FunctionSnapshot
+	op   string
+}
+
+func (a *solR2Foreign) swap(n string) error {
+	if e := a.InjectUnmarkedFunctionForTesting(n, strings.Repeat("f", 32), a.snap); e != nil {
+		return e
+	}
+	ctx := hostkit.WithCreateToken(context.Background(), strings.Repeat("f", 32))
+	if _, e := a.Fake.PublishFunctionVersion(ctx, n, ""); e != nil {
+		return e
+	}
+	_, e := a.Fake.SetFunctionAlias(ctx, n, "prod", "1")
+	return e
+}
+
+func (a *solR2Foreign) SetFunctionAlias(ctx context.Context, n, k, v string) (bool, error) {
+	if a.op == "alias" {
+		if e := a.swap(n); e != nil {
+			return false, e
+		}
+	}
+	return a.Fake.SetFunctionAlias(ctx, n, k, v)
+}
+
+func (a *solR2Foreign) DeleteFunctionAlias(ctx context.Context, n, k string) (bool, error) {
+	if a.op == "delete-alias" {
+		if e := a.swap(n); e != nil {
+			return false, e
+		}
+	}
+	return a.Fake.DeleteFunctionAlias(ctx, n, k)
+}
+
+func TestSolR2FnForeignWriteFixture(t *testing.T) {
+	for _, op := range []string{"alias", "delete-alias"} {
+		t.Run(op, func(t *testing.T) {
+			h, f, _, campaign := newFuncHost(t)
+			cfg := solFnConfig(t, h, "def handler(e,c): return {}\n")
+			_, _ = h.FunctionCreate(false, "foreignfn", cfg)
+			_, _ = h.FunctionPublishVersion(false, "foreignfn", "", false)
+			_ = h.FunctionAliasSet(false, "foreignfn", "prod", "1")
+			snap, _ := f.GetFunction(context.Background(), "foreignfn", "$LATEST")
+			h = New(Config{Provider: "aws", Functions: &solR2Foreign{Fake: f, snap: snap, op: op}, CampaignStatePath: campaign})
+			h.SetAbortOnError(false)
+			if op == "alias" {
+				_ = h.FunctionAliasSet(false, "foreignfn", "prod", "1")
+			} else {
+				_, _ = h.FunctionAliasDelete(false, "foreignfn", "prod")
+			}
+			if h.LastError().Code != hostkit.PermissionDenied {
+				t.Fatal("expected adapter lock owner refusal", h.LastError())
+			}
+			ctx := context.Background()
+			alias, e := f.GetFunctionAlias(ctx, "foreignfn", "prod")
+			if e != nil || alias != "1" {
+				t.Fatal("foreign alias changed", alias, e)
+			}
+		})
+	}
+}
+
+func TestSolR2FnPinnedSameShapeAndAppearance(t *testing.T) {
+	for _, mode := range []string{"alias-same-quota", "appearing-target"} {
+		t.Run(mode, func(t *testing.T) {
+			h, f, _, campaign := newFuncHost(t)
+			cfg := solFnConfig(t, h, "def handler(e,c): return {'v':1}\n")
+			peer := New(Config{Provider: "aws", Functions: f, CampaignStatePath: campaign})
+			peer.SetAbortOnError(false)
+			qualifier := ""
+			qualified := false
+			if mode == "alias-same-quota" {
+				_, _ = h.FunctionCreate(false, "pinnewfn", cfg)
+				_, _ = h.FunctionPublishVersion(false, "pinnewfn", "", false)
+				other := solFnConfig(t, h, "def handler(e,c): return {'v':2}\n")
+				_, _ = h.FunctionUpdate(false, "pinnewfn", other, "", false)
+				_, _ = h.FunctionPublishVersion(false, "pinnewfn", "", false)
+				_ = h.FunctionAliasSet(false, "pinnewfn", "prod", "1")
+				qualifier = "prod"
+				qualified = true
+			}
+			dispatched := false
+			f.SetFaultInvokeAfterDispatchForTesting(func() error {
+				dispatched = true
+				return nil
+			})
+			f.SetBeforeInvokeLockForTesting(func() {
+				if mode == "alias-same-quota" {
+					_ = peer.FunctionAliasSet(false, "pinnewfn", "prod", "2")
+				} else {
+					_, _ = peer.FunctionCreate(false, "pinnewfn", cfg)
+				}
+				if peer.LastError().Code != hostkit.OK {
+					t.Fatal(peer.LastError())
+				}
+			})
+			defer f.SetBeforeInvokeLockForTesting(nil)
+			_, _ = h.FunctionInvoke(false, "pinnewfn", qualifier, "{}", qualified)
+			t.Logf("mode=%s last=%+v dispatched=%v", mode, h.LastError(), dispatched)
+			if h.LastError().Code != hostkit.Conflict || h.LastError().ProviderCode != "ConcurrentTargetModification" || dispatched {
+				t.Fatal("pin race was not refused before execution", h.LastError())
+			}
+		})
+	}
+}
+
+type solR2FunctionsOnly struct {
+	hostkit.Functions
+}
+
+func TestSolR2FnDryNoPinnerIO(t *testing.T) {
+	h, f, _, campaign := newFuncHost(t)
+	c := solFnConfig(t, h, "def handler(e,c): return {}\n")
+	_, _ = h.FunctionCreate(false, "drynopin", c)
+	_, _ = h.FunctionPublishVersion(false, "drynopin", "", false)
+	_ = h.FunctionAliasSet(false, "drynopin", "prod", "1")
+	h = New(Config{Provider: "aws", Functions: solR2FunctionsOnly{Functions: f}, CampaignStatePath: campaign})
+	h.SetAbortOnError(false)
+	before := f.Calls()
+	out, _ := h.FunctionInvoke(true, "drynopin", "prod", "{}", true)
+	after := f.Calls()
+	reads := after["GetFunction"] - before["GetFunction"] + after["ListFunctionVersions"] - before["ListFunctionVersions"] + after["GetFunctionAlias"] - before["GetFunctionAlias"]
+	t.Logf("last=%+v adapter_reads=%d mutators=%d", h.LastError(), reads, f.MutatorCalls())
+	if h.LastError().Code != hostkit.OK || out.ExecutedVersion() != "1" {
+		t.Fatalf("dry invoke failed: last=%+v ver=%q", h.LastError(), out.ExecutedVersion())
+	}
+	if reads != 0 {
+		t.Fatal("dry invocation made adapter reads without optional pinner")
+	}
+}
+
+func TestSolR2FnDryNoPinnerIOSafetyJournal(t *testing.T) {
+	_, f, _, _ := newFuncHost(t)
+	journalDir := filepath.Join(t.TempDir(), "sj")
+	j, err := safety.OpenJournal(journalDir, safety.JournalMeta{
+		RunID:      "run-1700000000-abcdef012345",
+		Provider:   "aws",
+		Account:    "000000000000",
+		Scope:      "000000000000",
+		Region:     "us-east-1",
+		Endpoint:   "http://127.0.0.1:4566",
+		PolicyHash: strings.Repeat("a", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(Config{Provider: "aws", Functions: solR2FunctionsOnly{Functions: f}, Journal: j})
+	h.SetAbortOnError(false)
+	c := solFnConfig(t, h, "def handler(e,c): return {}\n")
+	_, _ = h.FunctionCreate(false, "drynopinsj", c)
+	_, _ = h.FunctionPublishVersion(false, "drynopinsj", "", false)
+	_ = h.FunctionAliasSet(false, "drynopinsj", "prod", "1")
+	if err := j.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	_ = j.Close()
+	j2, err := safety.OpenJournal(journalDir, safety.JournalMeta{
+		RunID:      "run-1700000000-abcdef012345",
+		Provider:   "aws",
+		Account:    "000000000000",
+		Scope:      "000000000000",
+		Region:     "us-east-1",
+		Endpoint:   "http://127.0.0.1:4566",
+		PolicyHash: strings.Repeat("a", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j2.Close()
+	h2 := New(Config{Provider: "aws", Functions: solR2FunctionsOnly{Functions: f}, Journal: j2})
+	h2.SetAbortOnError(false)
+	before := f.Calls()
+	out, _ := h2.FunctionInvoke(true, "drynopinsj", "prod", "{}", true)
+	after := f.Calls()
+	reads := after["GetFunction"] - before["GetFunction"] + after["ListFunctionVersions"] - before["ListFunctionVersions"] + after["GetFunctionAlias"] - before["GetFunctionAlias"]
+	if h2.LastError().Code != hostkit.OK || out.ExecutedVersion() != "1" {
+		t.Fatalf("dry invoke failed: last=%+v ver=%q", h2.LastError(), out.ExecutedVersion())
+	}
+	if reads != 0 {
+		t.Fatalf("dry invocation made %d adapter reads without optional pinner", reads)
+	}
+}
+
+

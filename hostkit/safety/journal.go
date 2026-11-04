@@ -236,6 +236,7 @@ type JournalRecord struct {
 	PolicyIntentOp        string                  `json:"policy_intent_op,omitempty"`
 	ExpectedOwnerToken    string                  `json:"expected_owner_token,omitempty"`
 	ExpectedGeneration    string                  `json:"expected_generation,omitempty"`
+	FunctionState         string                  `json:"function_state,omitempty"`
 }
 
 func (r JournalRecord) meta() JournalMeta {
@@ -324,6 +325,7 @@ type JournalFunctionEntry struct {
 	IntentID   string `json:"intent_id,omitempty"`
 	Ambiguous  bool   `json:"ambiguous,omitempty"`
 	IntentOp   string `json:"intent_op,omitempty"`
+	StateJSON  string `json:"state_json,omitempty"`
 }
 
 func scopedFunctionKey(scope, name string) string {
@@ -1333,6 +1335,11 @@ func (j *Journal) RecordFunctionIntent(scope, name, intentOp, digest, ownerToken
 
 // RecordFunctionConfirm durably appends an EventFunctionConfirm record confirming a function create or update.
 func (j *Journal) RecordFunctionConfirm(scope, name, digest, ownerToken, generation, intentID string, cleanupReserveNanoUSD int64) error {
+	return j.RecordFunctionConfirmWithState(scope, name, digest, ownerToken, generation, intentID, "", cleanupReserveNanoUSD)
+}
+
+// RecordFunctionConfirmWithState durably appends an EventFunctionConfirm record with optional serialized dry-preview state.
+func (j *Journal) RecordFunctionConfirmWithState(scope, name, digest, ownerToken, generation, intentID, stateJSON string, cleanupReserveNanoUSD int64) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.poisoned != nil {
@@ -1347,6 +1354,7 @@ func (j *Journal) RecordFunctionConfirm(scope, name, digest, ownerToken, generat
 		CreateToken:           ownerToken,
 		Generation:            generation,
 		AttemptID:             intentID,
+		FunctionState:         stateJSON,
 		CleanupReserveNanoUSD: cleanupReserveNanoUSD,
 	})
 }
@@ -1826,13 +1834,14 @@ func (j *Journal) Compact() error {
 				Scope:       j.meta.Scope,
 				Region:      j.meta.Region,
 				Endpoint:    j.meta.Endpoint,
-				Kind:        KindFunction,
-				PolicyScope: fe.Scope,
-				Name:        fe.Name,
-				ETag:        fe.Digest,
-				CreateToken: fe.OwnerToken,
-				Generation:  fe.Generation,
-				AttemptID:   fe.IntentID,
+				Kind:          KindFunction,
+				PolicyScope:   fe.Scope,
+				Name:          fe.Name,
+				ETag:          fe.Digest,
+				CreateToken:   fe.OwnerToken,
+				Generation:    fe.Generation,
+				AttemptID:     fe.IntentID,
+				FunctionState: fe.StateJSON,
 			})
 		}
 	}
@@ -2410,6 +2419,9 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 		}
 		if hasControlChars(rec.ETag) || len(rec.ETag) > 512 {
 			return fmt.Errorf("invalid function_confirm digest %q", rec.ETag)
+		}
+		if len(rec.FunctionState) > 256*1024 {
+			return errors.New("function_confirm function_state exceeds maximum size")
 		}
 		return nil
 	case EventFunctionDelete:
@@ -3056,6 +3068,10 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		}
 		delete(state.AmbiguousFunctionStack, fKey)
 		delete(state.AmbiguousFunctions, fKey)
+		stateJSON := rec.FunctionState
+		if stateJSON == "" {
+			stateJSON = state.ActiveFunctions[fKey].StateJSON
+		}
 		jfe := JournalFunctionEntry{
 			Key:        fKey,
 			Scope:      rec.PolicyScope,
@@ -3064,6 +3080,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			OwnerToken: rec.CreateToken,
 			Generation: rec.Generation,
 			IntentID:   rec.AttemptID,
+			StateJSON:  stateJSON,
 		}
 		state.ActiveFunctions[fKey] = jfe
 		state.FunctionTombstones[fKey] = jfe
