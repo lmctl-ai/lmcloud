@@ -12,15 +12,15 @@
     }
   },
   "azuresim": {
-    "version": "0.2.14",
-    "tag": "v0.2.14",
+    "version": "0.2.15",
+    "tag": "v0.2.15",
     "repository": "lmctl-ai/azuresim",
     "sha256": {
-      "azuresim-linux-arm64": "377176b1b80b423fdc364a2b1d546e923ddfac0278683e4c8afc5c4c60ebb79f",
-      "azuresim-linux-x64": "f224e00715a840fdd6fbbd71fea66b02cca2a22c96bb3a3406de446e4cdd4492",
-      "azuresim-macos-arm64": "69959018cfbc018ebf99cf817bb6a1c8a089e4b923f4a77ae4b2ebfc1858935e",
-      "azuresim-macos-x64": "d41c9fdd8772a23ea59c9b1f6e0ee3b2fdb549171422448bcb76d8c8ee21a8d4",
-      "azuresim-windows-x64.exe": "4eaf1b4c64c3437388b2413aadab53e7302b6ba83197cdf5c115c22cfdf1e90d"
+      "azuresim-linux-arm64": "6895c5ecc0df8e8be69c5351402ce24dfadbed51f8354b2478ca295fb869e8b7",
+      "azuresim-linux-x64": "d69cc1c45f91b24644b4e6b32079b23ba34c62a8c600ee84110b0aaeb187f329",
+      "azuresim-macos-arm64": "7f5a8d3f80d7b0e941faaae809388f307ab13af7e0fefa430b25a7386cb0fa5a",
+      "azuresim-macos-x64": "21a50ae48f54d026d63edb7ee53e7b73b56689d322403fab06034635443c5b1c",
+      "azuresim-windows-x64.exe": "53cbbe63f9b95e536351ccf072c242107862140e567a618c96ee0b09dd7fce89"
     }
   },
   "gcpsim": {
