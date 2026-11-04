@@ -1354,6 +1354,122 @@
             ],
             "returns": "FunctionInvokeResult"
           }
+        ],
+        "userpool_create": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "userpool_delete": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "userpool_exists": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "userpool_list": [
+          {
+            "params": [],
+            "returns": "StrList"
+          }
+        ],
+        "user_create": [
+          {
+            "params": ["string", "string"],
+            "returns": "User"
+          },
+          {
+            "params": ["string", "string", "StrMap"],
+            "returns": "User"
+          }
+        ],
+        "user_get": [
+          {
+            "params": ["string", "string"],
+            "returns": "User"
+          }
+        ],
+        "user_delete": [
+          {
+            "params": ["string", "string"],
+            "returns": "void"
+          }
+        ],
+        "user_set_enabled": [
+          {
+            "params": ["string", "string", "bool"],
+            "returns": "void"
+          }
+        ],
+        "user_set_password": [
+          {
+            "params": ["string", "string", "string"],
+            "returns": "void"
+          }
+        ],
+        "user_list": [
+          {
+            "params": ["string"],
+            "returns": "UserPage"
+          },
+          {
+            "params": ["string", "int", "string"],
+            "returns": "UserPage"
+          }
+        ],
+        "user_sign_in": [
+          {
+            "params": ["string", "string", "string"],
+            "returns": "Session"
+          }
+        ],
+        "user_verify_token": [
+          {
+            "params": ["string", "string"],
+            "returns": "Session"
+          }
+        ],
+        "group_create": [
+          {
+            "params": ["string", "string"],
+            "returns": "bool"
+          }
+        ],
+        "group_delete": [
+          {
+            "params": ["string", "string"],
+            "returns": "bool"
+          }
+        ],
+        "group_list": [
+          {
+            "params": ["string"],
+            "returns": "StrList"
+          }
+        ],
+        "group_add_user": [
+          {
+            "params": ["string", "string", "string"],
+            "returns": "void"
+          }
+        ],
+        "group_remove_user": [
+          {
+            "params": ["string", "string", "string"],
+            "returns": "void"
+          }
+        ],
+        "user_groups": [
+          {
+            "params": ["string", "string"],
+            "returns": "StrList"
+          }
         ]
       }
     },
@@ -1607,6 +1723,102 @@
           {
             "params": [],
             "returns": "int"
+          }
+        ]
+      }
+    },
+    "User": {
+      "methods": {
+        "exists": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ],
+        "username": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "enabled": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ],
+        "status": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "attributes": [
+          {
+            "params": [],
+            "returns": "StrMap"
+          }
+        ],
+        "attribute": [
+          {
+            "params": ["string"],
+            "returns": "string"
+          }
+        ],
+        "created_at": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ]
+      }
+    },
+    "UserPage": {
+      "methods": {
+        "len": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "at": [
+          {
+            "params": ["int"],
+            "returns": "User"
+          }
+        ],
+        "has_more": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ],
+        "next_token": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ]
+      }
+    },
+    "Session": {
+      "methods": {
+        "access_token": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "expires_in": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "claims": [
+          {
+            "params": [],
+            "returns": "StrMap"
           }
         ]
       }

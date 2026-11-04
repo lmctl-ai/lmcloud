@@ -1,0 +1,50 @@
+# Requires: userpool
+# Scenario 06: enable/disable gate — enabled user signs in; after user_set_enabled(false) sign-in
+# fails UNAUTHENTICATED; re-enable restores sign-in. Status/enabled accessor reflects the toggle.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+pool = "lmu06" + run_id + "a";
+user = "user06_" + run_id + "_dee";
+password = "Nn6" + "p2Qw" + run_id + "go";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("userpool", ep);
+  }
+  let p = ${pool};
+  let u = ${user};
+  cloud.userpool_create(p);
+  cloud.user_create(p, u);
+  cloud.user_set_password(p, u, ${password});
+
+  let s_on = cloud.user_sign_in(p, u, ${password});
+  let on_ok = str_len(s_on.access_token()) > 0;
+
+  cloud.user_set_enabled(p, u, false);
+  let disabled_flag = !cloud.user_get(p, u).enabled();
+  cloud.set_abort_on_error(false);
+  cloud.user_sign_in(p, u, ${password});
+  let e_off = cloud.last_error();
+  let off_denied = e_off.code() == ErrorCode.UNAUTHENTICATED;
+  cloud.set_abort_on_error(true);
+
+  cloud.user_set_enabled(p, u, true);
+  let enabled_flag = cloud.user_get(p, u).enabled();
+  let s_back = cloud.user_sign_in(p, u, ${password});
+  let back_ok = str_len(s_back.access_token()) > 0;
+
+  cloud.user_delete(p, u);
+  cloud.userpool_delete(p);
+
+  lmcode_return_put("on_ok", on_ok);
+  lmcode_return_put("disabled_flag", disabled_flag);
+  lmcode_return_put("off_denied", off_denied);
+  lmcode_return_put("enabled_flag", enabled_flag);
+  lmcode_return_put("back_ok", back_ok);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "06 host execution failed");
+assert(r.result.on_ok && r.result.disabled_flag && r.result.off_denied, "disabled user cannot sign in; enabled accessor reflects state");
+assert(r.result.enabled_flag && r.result.back_ok, "re-enabled user signs in again");

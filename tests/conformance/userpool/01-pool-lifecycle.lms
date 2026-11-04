@@ -1,0 +1,57 @@
+# Requires: userpool
+# Scenario 01: Pool lifecycle — create/exists/list (sorted, bounded poll)/delete/disappearance.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+p1 = "lmu01" + run_id + "a";
+p2 = "lmu01" + run_id + "b";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("userpool", ep);
+  }
+  let n1 = ${p1};
+  let n2 = ${p2};
+
+  let existed_before = cloud.userpool_exists(n1) || cloud.userpool_exists(n2);
+  let created2 = cloud.userpool_create(n2);
+  let created1 = cloud.userpool_create(n1);
+  let exists1 = cloud.userpool_exists(n1);
+  let exists2 = cloud.userpool_exists(n2);
+
+  let idx1 = -1;
+  let idx2 = -1;
+  let polls = 0;
+  while ((idx1 < 0 || idx2 < 0) && polls < 10) {
+    polls = polls + 1;
+    let pools = cloud.userpool_list();
+    idx1 = pools.index_of(n1);
+    idx2 = pools.index_of(n2);
+  }
+
+  let deleted1 = cloud.userpool_delete(n1);
+  let deleted2 = cloud.userpool_delete(n2);
+
+  let after1 = true;
+  let after2 = true;
+  let dp = 0;
+  while ((after1 || after2) && dp < 10) {
+    dp = dp + 1;
+    after1 = cloud.userpool_exists(n1);
+    after2 = cloud.userpool_exists(n2);
+  }
+
+  lmcode_return_put("existed_before", existed_before);
+  lmcode_return_put("created", created1 && created2);
+  lmcode_return_put("exists", exists1 && exists2);
+  lmcode_return_put("found_sorted", idx1 >= 0 && idx1 < idx2);
+  lmcode_return_put("deleted", deleted1 && deleted2);
+  lmcode_return_put("gone", !after1 && !after2);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "01-pool-lifecycle host execution failed");
+assert(!r.result.existed_before, "pools must not exist before create");
+assert(r.result.created && r.result.exists, "create returns true and exists() true");
+assert(r.result.found_sorted, "userpool_list contains both pools in ascending order");
+assert(r.result.deleted && r.result.gone, "delete true; exists false after bounded poll");
