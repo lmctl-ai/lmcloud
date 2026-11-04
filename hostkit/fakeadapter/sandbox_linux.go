@@ -1380,7 +1380,7 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 		return hostkit.FunctionInvokeOutput{}, nil, cerr
 	}
 
-	fuseFS, fuseErr := mountScratchFuseFS(scratchTmp, maxScratchTmpBytes, maxScratchTmpInodes)
+	fuseFS, fuseErr := mountScratchFuseHelper(scratchTmp, maxScratchTmpBytes, maxScratchTmpInodes, cachedCgroupParent)
 	if fuseFS != nil {
 		defer fuseFS.Close()
 	}

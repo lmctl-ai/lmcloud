@@ -9,14 +9,24 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 )
+
+func init() {
+	if os.Getenv("LMCLOUD_SCRATCH_FUSE_HELPER") == "1" {
+		runScratchFuseHelperMain()
+		os.Exit(0)
+	}
+}
 
 const (
 	maxScratchTmpInodes  = 4096
@@ -81,16 +91,18 @@ const (
 )
 
 type fuseInode struct {
-	ino       uint64
-	mode      uint32
-	nlink     uint32
-	uid       uint32
-	gid       uint32
-	openCount int32
-	data      []byte
-	children  map[string]uint64
-	parent    uint64
-	mtime     int64
+	ino             uint64
+	mode            uint32
+	nlink           uint32
+	uid             uint32
+	gid             uint32
+	openCount       int32
+	data            []byte
+	children        map[string]uint64
+	childrenPeak    int
+	childrenDeletes int
+	parent          uint64
+	mtime           int64
 }
 
 type scratchFuseFS struct {
@@ -106,6 +118,8 @@ type scratchFuseFS struct {
 	uid             uint32
 	gid             uint32
 	inodes          map[uint64]*fuseInode
+	inodesPeak      int
+	inodesDeletes   int
 	nextIno         uint64
 	pendingReleases int
 	lastFlushTime   time.Time
@@ -461,6 +475,64 @@ func validateFuseEntryName(name string) syscall.Errno {
 	return 0
 }
 
+func (fs *scratchFuseFS) setInodeLocked(ino uint64, n *fuseInode) {
+	fs.inodes[ino] = n
+	if len(fs.inodes) > fs.inodesPeak {
+		fs.inodesPeak = len(fs.inodes)
+	}
+}
+
+func (fs *scratchFuseFS) setDirChildLocked(dir *fuseInode, name string, ino uint64) {
+	if dir == nil {
+		return
+	}
+	if dir.children == nil {
+		dir.children = map[string]uint64{}
+	}
+	key := string([]byte(name))
+	dir.children[key] = ino
+	if len(dir.children) > dir.childrenPeak {
+		dir.childrenPeak = len(dir.children)
+	}
+}
+
+func (fs *scratchFuseFS) deleteDirChildLocked(dir *fuseInode, name string) {
+	if dir == nil || dir.children == nil {
+		return
+	}
+	delete(dir.children, name)
+	dir.childrenDeletes++
+	fs.compactDirChildrenLocked(dir)
+}
+
+func (fs *scratchFuseFS) compactDirChildrenLocked(dir *fuseInode) {
+	if dir == nil || dir.children == nil {
+		return
+	}
+	cur := len(dir.children)
+	if cur == 0 {
+		if dir.childrenPeak > 0 || dir.childrenDeletes > 0 {
+			dir.children = map[string]uint64{}
+			dir.childrenPeak = 0
+			dir.childrenDeletes = 0
+		}
+		return
+	}
+	delThreshold := cur
+	if delThreshold < 16 {
+		delThreshold = 16
+	}
+	if (dir.childrenPeak > 1 && (cur*2 <= dir.childrenPeak || dir.childrenPeak-cur >= 256)) || dir.childrenDeletes >= delThreshold {
+		compact := make(map[string]uint64, cur)
+		for k, v := range dir.children {
+			compact[k] = v
+		}
+		dir.children = compact
+		dir.childrenPeak = cur
+		dir.childrenDeletes = 0
+	}
+}
+
 func (fs *scratchFuseFS) reclaimInodeLocked(ino uint64, n *fuseInode) {
 	if ino == 1 || n == nil {
 		return
@@ -468,7 +540,24 @@ func (fs *scratchFuseFS) reclaimInodeLocked(ino uint64, n *fuseInode) {
 	if n.nlink == 0 && n.openCount <= 0 {
 		n.data = nil
 		n.children = nil
+		n.childrenPeak = 0
+		n.childrenDeletes = 0
 		delete(fs.inodes, ino)
+		fs.inodesDeletes++
+		cur := len(fs.inodes)
+		delThreshold := cur
+		if delThreshold < 16 {
+			delThreshold = 16
+		}
+		if (fs.inodesPeak > 2 && (cur*2 <= fs.inodesPeak || fs.inodesPeak-cur >= 256)) || fs.inodesDeletes >= delThreshold {
+			compact := make(map[uint64]*fuseInode, cur)
+			for k, v := range fs.inodes {
+				compact[k] = v
+			}
+			fs.inodes = compact
+			fs.inodesPeak = cur
+			fs.inodesDeletes = 0
+		}
 	}
 }
 
@@ -559,6 +648,10 @@ func (fs *scratchFuseFS) packEntry(b []byte, n *fuseInode) {
 	}
 	binary.LittleEndian.PutUint64(b[0:8], n.ino)
 	binary.LittleEndian.PutUint64(b[8:16], 1)
+	binary.LittleEndian.PutUint64(b[16:24], 60)
+	if n.mode&syscall.S_IFMT == syscall.S_IFDIR {
+		binary.LittleEndian.PutUint64(b[24:32], 60)
+	}
 	fs.packAttr(b[40:128], n)
 }
 
@@ -826,8 +919,8 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 				openCount: 1,
 				mtime:     time.Now().Unix(),
 			}
-			fs.inodes[cino] = cn
-			parent.children[name] = cino
+			fs.setInodeLocked(cino, cn)
+			fs.setDirChildLocked(parent, name, cino)
 		}
 		var out [144]byte
 		fs.packEntry(out[:128], cn)
@@ -874,8 +967,8 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 			gid:   fs.gid,
 			mtime: time.Now().Unix(),
 		}
-		fs.inodes[cino] = cn
-		parent.children[name] = cino
+		fs.setInodeLocked(cino, cn)
+		fs.setDirChildLocked(parent, name, cino)
 		var out [128]byte
 		fs.packEntry(out[:], cn)
 		fs.replyOK(fd, unique, out[:])
@@ -916,8 +1009,8 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 			parent:   nodeid,
 			mtime:    time.Now().Unix(),
 		}
-		fs.inodes[cino] = cn
-		parent.children[name] = cino
+		fs.setInodeLocked(cino, cn)
+		fs.setDirChildLocked(parent, name, cino)
 		parent.nlink++
 		var out [128]byte
 		fs.packEntry(out[:], cn)
@@ -940,7 +1033,7 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 			fs.replyErr(fd, unique, syscall.EISDIR)
 			return
 		}
-		delete(parent.children, name)
+		fs.deleteDirChildLocked(parent, name)
 		if cn != nil {
 			if cn.nlink > 0 {
 				cn.nlink--
@@ -970,7 +1063,7 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 			fs.replyErr(fd, unique, syscall.ENOTEMPTY)
 			return
 		}
-		delete(parent.children, name)
+		fs.deleteDirChildLocked(parent, name)
 		if parent.nlink > 2 {
 			parent.nlink--
 		}
@@ -1039,8 +1132,8 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 				}
 			}
 		}
-		delete(oldParent.children, oldName)
-		newParent.children[newName] = srcIno
+		fs.deleteDirChildLocked(oldParent, oldName)
+		fs.setDirChildLocked(newParent, newName, srcIno)
 		if src := fs.inodes[srcIno]; src != nil && src.mode&syscall.S_IFMT == syscall.S_IFDIR {
 			src.parent = newDirIno
 		}
@@ -1076,7 +1169,7 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 			return
 		}
 		target.nlink++
-		parent.children[name] = oldIno
+		fs.setDirChildLocked(parent, name, oldIno)
 		var out [128]byte
 		fs.packEntry(out[:], target)
 		fs.replyOK(fd, unique, out[:])
@@ -1121,8 +1214,8 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 			data:  symData,
 			mtime: time.Now().Unix(),
 		}
-		fs.inodes[cino] = cn
-		parent.children[name] = cino
+		fs.setInodeLocked(cino, cn)
+		fs.setDirChildLocked(parent, name, cino)
 		var out [128]byte
 		fs.packEntry(out[:], cn)
 		fs.replyOK(fd, unique, out[:])
@@ -1338,5 +1431,483 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 
 	default:
 		fs.replyErr(fd, unique, syscall.ENOSYS)
+	}
+}
+
+type scratchFuseHelper struct {
+	mu         sync.Mutex
+	ctrlFD     int
+	cmd        *exec.Cmd
+	watchCmd   *exec.Cmd
+	cgDir      string
+	mountDir   string
+	fusermount string
+	maxBytes   int64
+	lastUsed   int64
+	closed     bool
+}
+
+func waitBoundedCmd(cmd *exec.Cmd, timeout time.Duration) {
+	if cmd == nil {
+		return
+	}
+	waitCh := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(waitCh)
+	}()
+	select {
+	case <-waitCh:
+	case <-time.After(timeout):
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		<-waitCh
+	}
+}
+
+func isRaceEnabledProcess() bool {
+	if bi, ok := debug.ReadBuildInfo(); ok && bi != nil {
+		for _, s := range bi.Settings {
+			if s.Key == "-race" && s.Value == "true" {
+				return true
+			}
+		}
+	}
+	raw, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(string(raw))
+	if len(fields) == 0 {
+		return false
+	}
+	pages, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		return false
+	}
+	return pages > 200_000
+}
+
+func runScratchFuseHelperMain() {
+	_, _, _ = syscall.RawSyscall(syscall.SYS_PRCTL, syscall.PR_SET_PDEATHSIG, uintptr(syscall.SIGKILL), 0)
+	if ppidStr := os.Getenv("LMCLOUD_SCRATCH_FUSE_PPID"); ppidStr != "" {
+		if wantPPID, err := strconv.Atoi(ppidStr); err == nil && wantPPID > 0 {
+			if os.Getppid() != wantPPID {
+				os.Exit(1)
+			}
+		}
+	}
+	maxBytes := int64(16 * 1024 * 1024)
+	if s := os.Getenv("LMCLOUD_SCRATCH_FUSE_MAX_BYTES"); s != "" {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
+			maxBytes = v
+		}
+	}
+	maxInodes := maxScratchTmpInodes
+	if s := os.Getenv("LMCLOUD_SCRATCH_FUSE_MAX_INODES"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			maxInodes = v
+		}
+	}
+	mountDir := os.Getenv("LMCLOUD_SCRATCH_FUSE_MOUNT_DIR")
+
+	// Bound Go runtime memory to the 16 MiB data budget plus fixed runtime overhead.
+	if isRaceEnabledProcess() {
+		debug.SetMemoryLimit(maxBytes + 128*1024*1024)
+	} else {
+		debug.SetMemoryLimit(maxBytes + 16*1024*1024)
+		const asLimit = 2 * 1024 * 1024 * 1024
+		_ = syscall.Setrlimit(syscall.RLIMIT_AS, &syscall.Rlimit{Cur: asLimit, Max: asLimit})
+	}
+	debug.SetGCPercent(20)
+
+	const (
+		fuseFD   = 3
+		watchWFD = 4
+		ctrlFD   = 5
+	)
+	syscall.CloseOnExec(fuseFD)
+	syscall.CloseOnExec(watchWFD)
+	syscall.CloseOnExec(ctrlFD)
+
+	if _, err := syscall.Write(ctrlFD, []byte("READY")); err != nil {
+		os.Exit(1)
+	}
+	var startBuf [16]byte
+	n, err := syscall.Read(ctrlFD, startBuf[:])
+	if err != nil || string(startBuf[:n]) != "START" {
+		os.Exit(1)
+	}
+
+	uid := uint32(os.Getuid())
+	gid := uint32(os.Getgid())
+	now := time.Now().Unix()
+	fs := &scratchFuseFS{
+		fd:          fuseFD,
+		watchWFD:    watchWFD,
+		exitDelayFD: -1,
+		mountDir:    mountDir,
+		maxBytes:    maxBytes,
+		maxInodes:   maxInodes,
+		uid:         uid,
+		gid:         gid,
+		inodes: map[uint64]*fuseInode{
+			1: {
+				ino:      1,
+				mode:     syscall.S_IFDIR | 0o700,
+				nlink:    2,
+				uid:      uid,
+				gid:      gid,
+				children: map[string]uint64{},
+				parent:   1,
+				mtime:    now,
+			},
+		},
+		inodesPeak: 1,
+		nextIno:    2,
+		doneCh:     make(chan struct{}),
+	}
+	go fs.serve()
+
+	if _, err := syscall.Write(ctrlFD, []byte("OK")); err != nil {
+		fs.Close()
+		os.Exit(1)
+	}
+
+	go func() {
+		<-fs.doneCh
+		_ = syscall.Close(ctrlFD)
+	}()
+
+	var cmdBuf [16]byte
+	for {
+		n, err := syscall.Read(ctrlFD, cmdBuf[:])
+		if err != nil || n == 0 {
+			break
+		}
+		switch string(cmdBuf[:n]) {
+		case "USED":
+			used := fs.UsedBytes()
+			var reply [8]byte
+			binary.LittleEndian.PutUint64(reply[:], uint64(used))
+			_, _ = syscall.Write(ctrlFD, reply[:])
+		case "CLOSE":
+			fs.Close()
+			_, _ = syscall.Write(ctrlFD, []byte("BYE"))
+			os.Exit(0)
+		}
+	}
+	fs.Close()
+	os.Exit(0)
+}
+
+func mountScratchFuseHelper(mountDir string, maxBytes int64, maxInodes int, cgParent string) (*scratchFuseHelper, error) {
+	if cgParent == "" {
+		return nil, fmt.Errorf("missing cgroup v2 parent for scratch fuse helper")
+	}
+	fmBin, err := resolveFusermountBin()
+	if err != nil {
+		return nil, err
+	}
+	sweepDisconnectedScratchMounts(fmBin)
+
+	cgDir, err := os.MkdirTemp(cgParent, "lmcloud-fuse-*.scope")
+	if err != nil {
+		return nil, fmt.Errorf("create fuse helper cgroup: %w", err)
+	}
+	cleanupCg := func() {
+		_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o600)
+		_ = os.Remove(cgDir)
+	}
+	if err := os.WriteFile(filepath.Join(cgDir, "memory.swap.max"), []byte("0"), 0o600); err != nil {
+		cleanupCg()
+		return nil, fmt.Errorf("configure fuse helper cgroup swap: %w", err)
+	}
+	_ = os.WriteFile(filepath.Join(cgDir, "memory.oom.group"), []byte("1"), 0o600)
+	if err := os.WriteFile(filepath.Join(cgDir, "pids.max"), []byte("32"), 0o600); err != nil {
+		cleanupCg()
+		return nil, fmt.Errorf("configure fuse helper cgroup pids: %w", err)
+	}
+	initMemMax := "268435456"
+	if isRaceEnabledProcess() {
+		initMemMax = "536870912"
+	}
+	if err := os.WriteFile(filepath.Join(cgDir, "memory.max"), []byte(initMemMax), 0o600); err != nil {
+		cleanupCg()
+		return nil, fmt.Errorf("configure fuse helper cgroup initial memory.max: %w", err)
+	}
+
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
+	if err != nil {
+		cleanupCg()
+		return nil, fmt.Errorf("socketpair for fusermount3: %w", err)
+	}
+	parentSock := fds[0]
+	syscall.CloseOnExec(parentSock)
+	childFile := os.NewFile(uintptr(fds[1]), "fuse-commfd")
+
+	mountCtx, mountCancel := context.WithTimeout(context.Background(), fuseHelperTimeout)
+	defer mountCancel()
+	mcmd := exec.CommandContext(mountCtx, fmBin, "-o", "rw,nosuid,nodev,fsname=lmcloud_scratch,subtype=tmpfs", "--", mountDir)
+	mcmd.ExtraFiles = []*os.File{childFile}
+	mcmd.Env = []string{
+		"PATH=/usr/bin:/bin",
+		"_FUSE_COMMFD=3",
+	}
+	var stderrBuf [512]byte
+	rPipe, wPipe, pipeErr := os.Pipe()
+	if pipeErr == nil {
+		mcmd.Stderr = wPipe
+	}
+	if err := mcmd.Start(); err != nil {
+		_ = childFile.Close()
+		_ = syscall.Close(parentSock)
+		if pipeErr == nil {
+			_ = rPipe.Close()
+			_ = wPipe.Close()
+		}
+		cleanupCg()
+		return nil, fmt.Errorf("start fusermount3: %w", err)
+	}
+	_ = childFile.Close()
+	if pipeErr == nil {
+		_ = wPipe.Close()
+	}
+
+	_ = syscall.SetsockoptTimeval(parentSock, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &syscall.Timeval{Sec: 5})
+	msgBuf := make([]byte, 64)
+	oobBuf := make([]byte, syscall.CmsgSpace(4))
+	_, oobn, _, _, recvErr := syscall.Recvmsg(parentSock, msgBuf, oobBuf, 0)
+	_ = syscall.Close(parentSock)
+	waitErr := mcmd.Wait()
+	var errText string
+	if pipeErr == nil {
+		_ = rPipe.SetReadDeadline(time.Now().Add(fuseHelperTimeout))
+		n, _ := rPipe.Read(stderrBuf[:])
+		_ = rPipe.Close()
+		errText = string(stderrBuf[:n])
+	}
+	if recvErr != nil {
+		cleanupCg()
+		return nil, fmt.Errorf("receive /dev/fuse fd from fusermount3: %w (wait=%v stderr=%q)", recvErr, waitErr, errText)
+	}
+	cmsgs, err := syscall.ParseSocketControlMessage(oobBuf[:oobn])
+	if err != nil || len(cmsgs) == 0 {
+		cleanupCg()
+		return nil, fmt.Errorf("parse fusermount3 control message: %w (wait=%v stderr=%q)", err, waitErr, errText)
+	}
+	gotFDs, err := syscall.ParseUnixRights(&cmsgs[0])
+	if err != nil || len(gotFDs) == 0 {
+		cleanupCg()
+		return nil, fmt.Errorf("parse /dev/fuse unix rights: %w", err)
+	}
+	fuseFD := gotFDs[0]
+	syscall.CloseOnExec(fuseFD)
+
+	unmountDir := func() {
+		if syscall.Unmount(mountDir, syscall.MNT_DETACH) != nil {
+			uCtx, uCancel := context.WithTimeout(context.Background(), fuseHelperTimeout)
+			_ = exec.CommandContext(uCtx, fmBin, "-u", "-z", "-q", "--", mountDir).Run()
+			uCancel()
+		}
+	}
+
+	var wpipe [2]int
+	if err := syscall.Pipe2(wpipe[:], syscall.O_CLOEXEC); err != nil {
+		_ = syscall.Close(fuseFD)
+		unmountDir()
+		cleanupCg()
+		return nil, fmt.Errorf("create fuse watchdog pipe: %w", err)
+	}
+	watchR := os.NewFile(uintptr(wpipe[0]), "fuse-watch-r")
+	watchWFD := wpipe[1]
+
+	watchCmd, err := startFuseUnmountWatchdog(fmBin, mountDir, watchR)
+	_ = watchR.Close()
+	if err != nil {
+		_ = syscall.Close(fuseFD)
+		_ = syscall.Close(watchWFD)
+		unmountDir()
+		cleanupCg()
+		return nil, err
+	}
+
+	ctrlPair, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
+	if err != nil {
+		_ = syscall.Close(fuseFD)
+		_ = syscall.Close(watchWFD)
+		waitBoundedCmd(watchCmd, fuseHelperTimeout)
+		unmountDir()
+		cleanupCg()
+		return nil, fmt.Errorf("socketpair for fuse helper control: %w", err)
+	}
+	ctrlParent := ctrlPair[0]
+	syscall.CloseOnExec(ctrlParent)
+	_ = syscall.SetsockoptTimeval(ctrlParent, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &syscall.Timeval{Sec: 5})
+	_ = syscall.SetsockoptTimeval(ctrlParent, syscall.SOL_SOCKET, syscall.SO_SNDTIMEO, &syscall.Timeval{Sec: 5})
+
+	fuseFile := os.NewFile(uintptr(fuseFD), "dev-fuse")
+	watchWFile := os.NewFile(uintptr(watchWFD), "fuse-watch-w")
+	ctrlChildFile := os.NewFile(uintptr(ctrlPair[1]), "fuse-ctrl-child")
+
+	helperCmd := exec.Command(os.Args[0])
+	helperCmd.ExtraFiles = []*os.File{fuseFile, watchWFile, ctrlChildFile}
+	helperCmd.Env = []string{
+		"PATH=/usr/bin:/bin",
+		"LMCLOUD_SCRATCH_FUSE_HELPER=1",
+		"LMCLOUD_SCRATCH_FUSE_MAX_BYTES=" + strconv.FormatInt(maxBytes, 10),
+		"LMCLOUD_SCRATCH_FUSE_MAX_INODES=" + strconv.Itoa(maxInodes),
+		"LMCLOUD_SCRATCH_FUSE_PPID=" + strconv.Itoa(os.Getpid()),
+		"LMCLOUD_SCRATCH_FUSE_MOUNT_DIR=" + mountDir,
+	}
+	helperCmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid:   true,
+		Pdeathsig: syscall.SIGKILL,
+	}
+	startErr := helperCmd.Start()
+	_ = fuseFile.Close()
+	_ = watchWFile.Close()
+	_ = ctrlChildFile.Close()
+	if startErr != nil {
+		_ = syscall.Close(ctrlParent)
+		waitBoundedCmd(watchCmd, fuseHelperTimeout)
+		unmountDir()
+		cleanupCg()
+		return nil, fmt.Errorf("start scratch fuse helper process: %w", startErr)
+	}
+
+	abortHelper := func() {
+		_ = syscall.Close(ctrlParent)
+		if helperCmd.Process != nil {
+			_ = helperCmd.Process.Kill()
+		}
+		waitBoundedCmd(helperCmd, fuseHelperTimeout)
+		waitBoundedCmd(watchCmd, fuseHelperTimeout)
+		unmountDir()
+		cleanupCg()
+	}
+
+	var readyBuf [16]byte
+	rn, rerr := syscall.Read(ctrlParent, readyBuf[:])
+	if rerr != nil || string(readyBuf[:rn]) != "READY" {
+		abortHelper()
+		return nil, fmt.Errorf("scratch fuse helper failed readiness handshake: %w", rerr)
+	}
+
+	if err := os.WriteFile(filepath.Join(cgDir, "cgroup.procs"), []byte(strconv.Itoa(helperCmd.Process.Pid)), 0o600); err != nil {
+		abortHelper()
+		return nil, fmt.Errorf("move scratch fuse helper into cgroup: %w", err)
+	}
+
+	baseMem := int64(0)
+	if rawMem, merr := os.ReadFile(filepath.Join(cgDir, "memory.current")); merr == nil {
+		if v, perr := strconv.ParseInt(strings.TrimSpace(string(rawMem)), 10, 64); perr == nil && v > 0 {
+			baseMem = v
+		}
+	}
+	// Tighten cgroup memory.max to baseline RSS + 16 MiB data budget + fixed server overhead
+	// (accounting for ThreadSanitizer shadow memory when running under -race).
+	overhead := int64(24 * 1024 * 1024)
+	if isRaceEnabledProcess() {
+		overhead = 256 * 1024 * 1024
+	}
+	memCap := baseMem + maxBytes + overhead
+	if err := os.WriteFile(filepath.Join(cgDir, "memory.max"), []byte(strconv.FormatInt(memCap, 10)), 0o600); err != nil {
+		abortHelper()
+		return nil, fmt.Errorf("tighten scratch fuse helper cgroup memory.max: %w", err)
+	}
+
+	if _, werr := syscall.Write(ctrlParent, []byte("START")); werr != nil {
+		abortHelper()
+		return nil, fmt.Errorf("send START to scratch fuse helper: %w", werr)
+	}
+	var okBuf [16]byte
+	on, oerr := syscall.Read(ctrlParent, okBuf[:])
+	if oerr != nil || string(okBuf[:on]) != "OK" {
+		abortHelper()
+		return nil, fmt.Errorf("scratch fuse helper failed start confirmation: %w", oerr)
+	}
+
+	return &scratchFuseHelper{
+		ctrlFD:     ctrlParent,
+		cmd:        helperCmd,
+		watchCmd:   watchCmd,
+		cgDir:      cgDir,
+		mountDir:   mountDir,
+		fusermount: fmBin,
+		maxBytes:   maxBytes,
+	}, nil
+}
+
+func (h *scratchFuseHelper) UsedBytes() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return h.lastUsed
+	}
+	if h.cgDir != "" && cgroupHadOOM(h.cgDir) {
+		h.lastUsed = h.maxBytes + 1
+		return h.lastUsed
+	}
+	if h.ctrlFD < 0 {
+		return h.lastUsed
+	}
+	if _, err := syscall.Write(h.ctrlFD, []byte("USED")); err != nil {
+		if h.cgDir != "" && cgroupHadOOM(h.cgDir) {
+			h.lastUsed = h.maxBytes + 1
+		}
+		return h.lastUsed
+	}
+	var reply [8]byte
+	n, err := syscall.Read(h.ctrlFD, reply[:])
+	if err != nil || n != 8 {
+		if h.cgDir != "" && cgroupHadOOM(h.cgDir) {
+			h.lastUsed = h.maxBytes + 1
+		}
+		return h.lastUsed
+	}
+	used := int64(binary.LittleEndian.Uint64(reply[:]))
+	h.lastUsed = used
+	return used
+}
+
+func (h *scratchFuseHelper) Close() {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
+	}
+	h.closed = true
+	ctrlFD := h.ctrlFD
+	h.ctrlFD = -1
+	cmd := h.cmd
+	h.cmd = nil
+	watchCmd := h.watchCmd
+	h.watchCmd = nil
+	cgDir := h.cgDir
+	h.cgDir = ""
+	h.mu.Unlock()
+
+	if ctrlFD >= 0 {
+		_, _ = syscall.Write(ctrlFD, []byte("CLOSE"))
+		_ = syscall.Close(ctrlFD)
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	if cgDir != "" {
+		_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o600)
+	}
+	waitBoundedCmd(cmd, fuseHelperTimeout)
+	waitBoundedCmd(watchCmd, fuseHelperTimeout)
+	if syscall.Unmount(h.mountDir, syscall.MNT_DETACH) != nil && h.fusermount != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), fuseHelperTimeout)
+		_ = exec.CommandContext(ctx, h.fusermount, "-u", "-z", "-q", "--", h.mountDir).Run()
+		cancel()
+	}
+	if cgDir != "" {
+		_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o600)
+		_ = os.Remove(cgDir)
 	}
 }

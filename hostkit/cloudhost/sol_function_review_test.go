@@ -1407,3 +1407,174 @@ def handler(e,c):
 	}
 }
 
+func TestSolR5FnLateAliasAfterDeleteAndCompact(t *testing.T) {
+	for _, journalMode := range []bool{false, true} {
+		mode := "campaign"
+		if journalMode {
+			mode = "journal"
+		}
+		t.Run(mode, func(t *testing.T) {
+			h, f, _, campaign := newFuncHost(t)
+			base := Config{Provider: "aws", Functions: f, CampaignStatePath: campaign}
+			var j *safety.Journal
+			if journalMode {
+				_, j, _ = solJournal(t)
+				base.Journal = j
+				base.CampaignStatePath = ""
+				h = New(base)
+				h.SetAbortOnError(false)
+			}
+			c := solFnConfig(t, h, "def handler(e,c): return {'v':1}\n")
+			h.FunctionCreate(false, "aliasorder", c)
+			h.FunctionPublishVersion(false, "aliasorder", "", false)
+			c = solFnConfig(t, h, "def handler(e,c): return {'v':2}\n")
+			h.FunctionUpdate(false, "aliasorder", c, "", false)
+			h.FunctionPublishVersion(false, "aliasorder", "", false)
+
+			a := &solR4LateAlias{Fake: f, entered: make(chan struct{}), release: make(chan struct{})}
+			slowCfg := base
+			slowCfg.Functions = a
+			slow := New(slowCfg)
+			slow.SetAbortOnError(false)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				slow.FunctionAliasSet(false, "aliasorder", "prod", "1")
+			}()
+			<-a.entered
+
+			peer := New(base)
+			peer.SetAbortOnError(false)
+			if _, e := peer.FunctionAliasDelete(false, "aliasorder", "prod"); e != nil {
+				t.Fatal(e)
+			}
+			if peer.LastError().Code != hostkit.OK {
+				t.Fatal(peer.LastError())
+			}
+			if journalMode {
+				if e := j.Compact(); e != nil {
+					t.Fatal(e)
+				}
+			}
+			close(a.release)
+			<-done
+
+			if journalMode {
+				jDir := filepath.Dir(j.Path())
+				jMeta := j.State().Meta
+				if err := j.Compact(); err != nil {
+					t.Fatalf("Compact: %v", err)
+				}
+				if err := j.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+				reopened, err := safety.OpenJournal(jDir, jMeta)
+				if err != nil {
+					t.Fatalf("Reopen: %v", err)
+				}
+				t.Cleanup(func() { _ = reopened.Close() })
+				base.Journal = reopened
+			}
+
+			actual, e := f.GetFunctionAlias(context.Background(), "aliasorder", "prod")
+			if e != nil || actual != "" {
+				t.Fatal("fixture ordering", actual, e)
+			}
+			previewCfg := base
+			previewCfg.Functions = solR2FunctionsOnly{Functions: f}
+			preview := New(previewCfg)
+			preview.SetAbortOnError(false)
+			out, _ := preview.FunctionInvoke(true, "aliasorder", "prod", "{}", true)
+			t.Logf("actual=%s dry=%s last=%+v", actual, out.ExecutedVersion(), preview.LastError())
+			if preview.LastError().Code != hostkit.NotFound {
+				t.Fatal("older successful set reply resurrected deleted alias after compaction")
+			}
+		})
+	}
+}
+
+type solR5NoSequenceAlias struct {
+	hostkit.Functions
+	entered, release chan struct{}
+	reads            int
+	unmetered        bool
+}
+
+func (a *solR5NoSequenceAlias) SetFunctionAlias(ctx context.Context, n, k, v string) (bool, error) {
+	made, e := a.Functions.SetFunctionAlias(hostkit.WithFunctionChildMutationSeqOut(ctx, nil), n, k, v)
+	if e == nil {
+		close(a.entered)
+		<-a.release
+	}
+	return made, e
+}
+
+func (a *solR5NoSequenceAlias) DeleteFunctionAlias(ctx context.Context, n, k string) (bool, error) {
+	existed, e := a.Functions.DeleteFunctionAlias(hostkit.WithFunctionChildMutationSeqOut(ctx, nil), n, k)
+	if e == nil {
+		close(a.entered)
+		<-a.release
+	}
+	return existed, e
+}
+
+func (a *solR5NoSequenceAlias) GetFunctionAlias(ctx context.Context, n, k string) (string, error) {
+	a.reads++
+	a.unmetered = hostkit.RetryHooksFrom(ctx).BeforeAttempt == nil
+	return a.Functions.GetFunctionAlias(ctx, n, k)
+}
+
+func TestSolR5AliasFallbackReadAdmission(t *testing.T) {
+	h, f, _, campaign := newFuncHost(t)
+	c := solFnConfig(t, h, "def handler(e,c): return {}\n")
+	h.FunctionCreate(false, "fallbackalias", c)
+	h.FunctionPublishVersion(false, "fallbackalias", "", false)
+
+	a := &solR5NoSequenceAlias{Functions: f, entered: make(chan struct{}), release: make(chan struct{})}
+	cfg := Config{Provider: "aws", Functions: a, CampaignStatePath: campaign}
+	slow := New(cfg)
+	slow.SetAbortOnError(false)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		slow.FunctionAliasSet(false, "fallbackalias", "prod", "1")
+	}()
+	<-a.entered
+	peer := New(Config{Provider: "aws", Functions: f, CampaignStatePath: campaign})
+	peer.SetAbortOnError(false)
+	if e := peer.FunctionAliasSet(false, "fallbackalias", "newer", "1"); e != nil {
+		t.Fatal(e)
+	}
+	close(a.release)
+	<-done
+	t.Logf("fallback set adapter reads=%d no-admission-hook=%v last=%+v", a.reads, a.unmetered, slow.LastError())
+	if a.reads != 1 {
+		t.Fatal("fallback fixture not reached")
+	}
+	if a.unmetered {
+		t.Fatal("fallback alias reconciliation read bypassed physical-attempt admission")
+	}
+
+	// Also verify DeleteFunctionAlias fallback read admission.
+	aDel := &solR5NoSequenceAlias{Functions: f, entered: make(chan struct{}), release: make(chan struct{})}
+	slowDel := New(Config{Provider: "aws", Functions: aDel, CampaignStatePath: campaign})
+	slowDel.SetAbortOnError(false)
+	doneDel := make(chan struct{})
+	go func() {
+		defer close(doneDel)
+		slowDel.FunctionAliasDelete(false, "fallbackalias", "prod")
+	}()
+	<-aDel.entered
+	if e := peer.FunctionAliasSet(false, "fallbackalias", "newer2", "1"); e != nil {
+		t.Fatal(e)
+	}
+	close(aDel.release)
+	<-doneDel
+	t.Logf("fallback delete adapter reads=%d no-admission-hook=%v last=%+v", aDel.reads, aDel.unmetered, slowDel.LastError())
+	if aDel.reads != 1 {
+		t.Fatal("fallback delete fixture not reached")
+	}
+	if aDel.unmetered {
+		t.Fatal("fallback alias delete reconciliation read bypassed physical-attempt admission")
+	}
+}

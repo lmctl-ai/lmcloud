@@ -2070,10 +2070,7 @@ func (h *Host) FunctionAliasSet(dry bool, name, alias, version string) error {
 	hasReconciledAlias := false
 	if childSeq == 0 {
 		if curAct, hasCur, _, _, _ := h.cost.lookupFunctionEntry(ep, name); hasCur && curAct.StateJSON != act.StateJSON {
-			if actualVer, gerr := h.cfg.Functions.GetFunctionAlias(ctx, name, alias); gerr == nil {
-				reconciledAliasVer = actualVer
-				hasReconciledAlias = true
-			}
+			reconciledAliasVer, hasReconciledAlias = h.reconcileAliasForPreview(ctx, name, alias, false)
 		}
 	}
 	if cerr := h.cost.updateFunctionDryState(ep, name, act.OwnerToken, act.Digest, act.Generation, func(cur string) string {
@@ -2111,6 +2108,28 @@ func (h *Host) FunctionAliasSet(dry bool, name, alias, version string) error {
 	}
 	h.ok()
 	return nil
+}
+
+// reconcileAliasForPreview performs an admitted sub-operation read of the
+// current alias target when an adapter does not report a monotonic ChildSeq and
+// concurrent mutations modified the preview cache while the alias operation was
+// in flight.
+func (h *Host) reconcileAliasForPreview(ctx context.Context, name, alias string, isCleanup bool) (string, bool) {
+	const readOp = "function_alias_get"
+	readCtx, readScope, cerr := h.beginAttemptScope(ctx, readOp, safety.AttemptPricingInput{
+		Operation: readOp,
+		IsCleanup: isCleanup,
+	}, safety.KindFunction, name)
+	if cerr != nil {
+		return "", false
+	}
+	actualVer, gerr := h.cfg.Functions.GetFunctionAlias(readCtx, name, alias)
+	gce := hostkit.AsCloudError(gerr)
+	_, _, abortErr := readScope.finish(0, 0, gce == nil || isDefinitiveFunctionRefusal(gce), false)
+	if abortErr != nil || gerr != nil {
+		return "", false
+	}
+	return actualVer, true
 }
 
 // FunctionAliasGet implements function_alias_get(name, alias).
@@ -2327,10 +2346,7 @@ func (h *Host) FunctionAliasDelete(dry bool, name, alias string) (bool, error) {
 	hasReconciledAlias := false
 	if childSeq == 0 {
 		if curAct, hasCur, _, _, _ := h.cost.lookupFunctionEntry(ep, name); hasCur && curAct.StateJSON != act.StateJSON {
-			if actualVer, gerr := h.cfg.Functions.GetFunctionAlias(ctx, name, alias); gerr == nil {
-				reconciledAliasVer = actualVer
-				hasReconciledAlias = true
-			}
+			reconciledAliasVer, hasReconciledAlias = h.reconcileAliasForPreview(ctx, name, alias, true)
 		}
 	}
 	if cerr := h.cost.updateFunctionDryState(ep, name, act.OwnerToken, act.Digest, act.Generation, func(cur string) string {
