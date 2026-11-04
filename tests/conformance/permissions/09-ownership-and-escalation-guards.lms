@@ -1,11 +1,13 @@
 # Requires: permissions
-# Scenario 09: Ownership & escalation guards — attach to a missing (never-created) resource is NOT_FOUND;
-# attaching a lint-failing policy (management-namespace action) is refused pre-flight INVALID_ARGUMENT;
-# a Deny policy containing a management-namespace verb cannot even be built through lint-clean checks.
+# Scenario 09: Ownership & escalation guards — tier-2 management-namespace policy reaches lint and is
+# refused at attach (INVALID_ARGUMENT); attach against a never-created target is NOT_FOUND; when
+# LMCLOUD_FOREIGN_BUCKET names an operator-provisioned pre-existing bucket (out of this run's ownership
+# journal), attach is PERMISSION_DENIED. Foreign leg self-reports as skipped when the fixture is unset.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 ghost = "lmcloud-p09-" + run_id + "-ghost";
 pr = "arn:aws:iam::000000000000:role/attacker-" + run_id;
+foreign = env("LMCLOUD_FOREIGN_BUCKET", "");
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
@@ -14,30 +16,39 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
     cloud.set_endpoint("storage", ep);
   }
   let g = ${ghost};
+  let fb = ${foreign};
 
   let clean = cloud.policy_new().statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:object:" + g + "/*"));
   let bad = cloud.policy_new().statement("Allow", str_list().add("permissions.policy.write"), str_list().add("storage:bucket:" + g));
 
   cloud.set_abort_on_error(false);
 
-  # lint gates the escalation policy before any network work
+  # lint gates the escalation policy (semantic tier) before any network work
   let bad_rep = cloud.policy_lint(bad);
   let bad_lint_error = !bad_rep.ok();
 
-  # attach of lint-failing policy -> INVALID_ARGUMENT pre-flight
+  # attaching a lint-error policy -> INVALID_ARGUMENT pre-flight
   cloud.policy_attach("storage:bucket:" + g, ${pr}, bad);
   let e_esc = cloud.last_error();
   let esc_invalid = e_esc.code() == ErrorCode.INVALID_ARGUMENT && e_esc.http_status() == 0;
 
-  # attach of a clean policy onto a MISSING resource -> NOT_FOUND (existence checked)
+  # clean policy onto a MISSING target -> NOT_FOUND
   cloud.policy_attach("storage:bucket:" + g, ${pr}, clean);
   let e_missing = cloud.last_error();
   let missing_nf = e_missing.code() == ErrorCode.NOT_FOUND;
-
-  # same precedence for identity-side attach with a missing listed resource
   cloud.policy_attach_principal(${pr}, clean);
   let e_missing2 = cloud.last_error();
   let missing2_nf = e_missing2.code() == ErrorCode.NOT_FOUND;
+
+  # foreign (pre-existing, not run-owned) fixture leg — only when provided
+  let foreign_skipped = true;
+  let foreign_denied = true;
+  if (str_len(fb) > 0) {
+    foreign_skipped = false;
+    cloud.policy_attach("storage:bucket:" + fb, ${pr}, clean);
+    let e_for = cloud.last_error();
+    foreign_denied = e_for.code() == ErrorCode.PERMISSION_DENIED;
+  }
 
   cloud.set_abort_on_error(true);
 
@@ -45,10 +56,15 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   lmcode_return_put("esc_invalid", esc_invalid);
   lmcode_return_put("missing_nf", missing_nf);
   lmcode_return_put("missing2_nf", missing2_nf);
+  lmcode_return_put("foreign_skipped", foreign_skipped);
+  lmcode_return_put("foreign_denied", foreign_denied);
 end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "09-ownership-and-escalation-guards host execution failed");
 assert(r.result.bad_lint_error, "management-namespace action must produce a lint error");
 assert(r.result.esc_invalid, "lint-error policy must be refused pre-flight at attach (INVALID_ARGUMENT, http_status 0)");
-assert(r.result.missing_nf && r.result.missing2_nf, "attach against a missing resource must be NOT_FOUND (both attach forms)");
+assert(r.result.missing_nf && r.result.missing2_nf, "attach against a missing target must be NOT_FOUND (both attach forms)");
+if (!r.result.foreign_skipped) {
+  assert(r.result.foreign_denied, "attach against a foreign (not run-owned) existing bucket must be PERMISSION_DENIED");
+}

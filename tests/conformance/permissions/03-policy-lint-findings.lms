@@ -14,10 +14,10 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let e_rep = cloud.policy_lint(cloud.policy_new());
   let empty_err = !e_rep.ok() && e_rep.len() == 1 && e_rep.at(0).code() == "EMPTY_POLICY" && e_rep.at(0).severity() == "error";
 
-  # one policy collecting the other four findings
+  # one policy collecting the other four findings (valid name fixture: bucket names are 3..63 chars)
   let p = cloud.policy_new()
-    .statement("Allow", str_list().add("storage.object.bogusverb"), str_list().add("storage:object:b/k"))     # UNKNOWN_ACTION (error)
-    .statement("Allow", str_list().add("permissions.policy.write"), str_list().add("storage:bucket:admin"))      # ESCALATION_NAMESPACE (error)
+    .statement("Allow", str_list().add("storage.object.bogusverb"), str_list().add("storage:object:lmcloudp03a/k"))   # UNKNOWN_ACTION (error)
+    .statement("Allow", str_list().add("permissions.policy.write"), str_list().add("storage:bucket:lmcloudp03a"))     # ESCALATION_NAMESPACE (error)
     .statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:bucket:*"))               # WILDCARD_SCOPE (warning)
     .statement("Allow", str_list().add("storage.object.write").add("storage.object.delete"), str_list().add("storage:bucket:*"));  # +OVERBROAD_COMBINATION (warning)
 

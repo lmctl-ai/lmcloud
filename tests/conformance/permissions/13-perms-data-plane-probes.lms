@@ -1,0 +1,117 @@
+# Requires: permissions
+# Scenario 13: Real data-plane enforcement probes (design 15 §3.4) — a host-side evaluator passing
+# policy_check is not enough; the same attachments/journal must be visible to the simulator's real
+# authorization engine. Enforce mode only (SKIP in open). Per-leg SKIP when the sim's native attach
+# routes are not mapped yet (epics A-P1..A-P4), with explicit reason text.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+probe_bucket = "lmcloud-p13-" + run_id + "-probe";
+target = "lmcloud-p13-" + run_id + "-t";
+pr_ok = env("LMCLOUD_ENFORCE_GRANTED_AWS_ACCESS_KEY_ID", "");
+pr_ok_secret = env("LMCLOUD_ENFORCE_GRANTED_AWS_SECRET_ACCESS_KEY", "");
+pr = "arn:aws:iam::000000000000:role/grantee-" + run_id;
+
+orig_aws_key = env("LMAWS_SIM_ACCESS_KEY_ID", "");
+orig_aws_sec = env("LMAWS_SIM_SECRET_ACCESS_KEY", "");
+
+# ---- Mode probe (authenticated op with bogus creds) ----
+set_env("LMAWS_SIM_ACCESS_KEY_ID", "AKIAUNAUTH0000000000");
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", "wrong-secret-key-for-unauthenticated-pass");
+
+probe_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+    cloud.set_endpoint("storage", ep);
+  }
+  cloud.set_abort_on_error(false);
+  let created = cloud.bucket_create(${probe_bucket});
+  let open_mode = cloud.last_error().code() == ErrorCode.OK;
+  if (open_mode) {
+    if (created || cloud.bucket_exists(${probe_bucket})) { cloud.bucket_delete(${probe_bucket}); }
+  }
+  lmcode_return_put("open_mode", open_mode);
+end _lmcode_
+
+rp = run_lmcode(probe_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(rp.ok, "13 probe host execution failed");
+if (rp.result.open_mode) {
+  println("SKIP: simulator is in --auth open mode; scenario 13 requires --auth enforce");
+  exit(0);
+}
+
+# ---- Leg A: attach grants, then REAL object read as the granted restricted identity ----
+attach_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+    cloud.set_endpoint("storage", ep);
+  }
+  let t = ${target};
+  cloud.set_abort_on_error(false);
+  cloud.bucket_create(t);
+  let mk = cloud.last_error();
+  cloud.object_put(t, "readable.txt", "hello");
+  let put_err = cloud.last_error();
+
+  cloud.policy_attach("storage:bucket:" + t, ${pr},
+    cloud.policy_new().statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:object:" + t + "/*")));
+  let attach_err = cloud.last_error();
+
+  lmcode_return_put("mk_ok", mk.ok());
+  lmcode_return_put("put_ok", put_err.ok());
+  lmcode_return_put("attach_err_code", attach_err.code() == ErrorCode.OK);
+  lmcode_return_put("attach_denied_or_unmapped", attach_err.code() == ErrorCode.PERMISSION_DENIED || attach_err.code() == ErrorCode.INVALID_ARGUMENT || attach_err.code() == ErrorCode.INTERNAL);
+  lmcode_return_put("attach_msg", attach_err.message());
+end _lmcode_
+
+ra = run_lmcode(attach_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(ra.ok, "13 attach host execution failed");
+
+if (!ra.result.mk_ok || !ra.result.put_ok) {
+  println("SKIP: seed identity cannot create the target bucket/object in enforce mode (sim auth config lacks a seed credential)");
+  exit(0);
+}
+if (!ra.result.attach_err_code) {
+  println("SKIP: storage bucket-policy attach route unmapped on this sim (epic A-P1/A-P2/A-P3); " + ra.result.attach_msg);
+  exit(0);
+}
+
+# ---- Leg B: restricted read with granted identity (expected allow) ----
+set_env("LMAWS_SIM_ACCESS_KEY_ID", pr_ok);
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", pr_ok_secret);
+
+read_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("storage", ep);
+  }
+  cloud.set_abort_on_error(false);
+  let body = cloud.object_get(${target}, "readable.txt");
+  let e = cloud.last_error();
+  lmcode_return_put("read_ok", e.ok() && body == "hello");
+  lmcode_return_put("code", e.code() == ErrorCode.PERMISSION_DENIED);
+end _lmcode_
+
+rb = run_lmcode(read_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(rb.ok, "13 granted-read host execution failed");
+assert(rb.result.read_ok, "granted identity must READ the object through the real simulator auth engine (data-plane proof)");
+
+# ---- Leg C: unrelated identity (no grant) must be DENIED at the data plane ----
+set_env("LMAWS_SIM_ACCESS_KEY_ID", env("LMCLOUD_ENFORCE_DENIED_AWS_ACCESS_KEY_ID", orig_aws_key));
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", env("LMCLOUD_ENFORCE_DENIED_AWS_SECRET_ACCESS_KEY", orig_aws_sec));
+
+deny_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("storage", ep);
+  }
+  cloud.set_abort_on_error(false);
+  cloud.object_get(${target}, "readable.txt");
+  let e = cloud.last_error();
+  lmcode_return_put("denied", e.code() == ErrorCode.PERMISSION_DENIED || e.code() == ErrorCode.UNAUTHENTICATED);
+end _lmcode_
+
+rc = run_lmcode(deny_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(rc.ok, "13 denied-read host execution failed");
+assert(rc.result.denied, "unrelated identity must be DENIED (PERMISSION_DENIED/UNAUTHENTICATED) at the real data plane");

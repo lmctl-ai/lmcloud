@@ -1,10 +1,11 @@
 # Requires: permissions
-# Scenario 06: Deny precedence — Allow + Deny on the same action/resource evaluates to denied; a narrower
-# deny prefix only blocks its own sub-path.
+# Scenario 06: Deny precedence under the SINGLE attach contract (design 15 §4.1): one attachment key =
+# (target, principal); a re-attach with a different document REPLACES the old contribution; Deny wins
+# inside one document regardless of statement order.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
-bucket = "lmcloud-p06-" + run_id + "-x";
-pr = "arn:aws:iam::000000000000:role/reader-" + run_id;
+bucket = "lmcloud-p06-" + run_id + "-a";
+pr_read = len(ARGV) > 0 ? env("LMAWS_SIM_PRINCIPAL", env("LMCLOUD_TEST_PRINCIPAL", "arn:aws:iam::000000000000:role/lmcloud-test")) : "arn:aws:iam::000000000000:role/lmcloud-test";
 
 program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
@@ -13,33 +14,35 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
     cloud.set_endpoint("storage", ep);
   }
   let b = ${bucket};
+  let pr = ${pr_read};
   cloud.bucket_create(b);
 
-  # exact-overlap deny beats allow
-  cloud.policy_attach("storage:bucket:" + b, ${pr},
-    cloud.policy_new().statement("Allow", str_list().add("storage.object.delete"), str_list().add("storage:object:" + b + "/tmp/*")));
-  cloud.policy_attach("storage:bucket:" + b, ${pr},
-    cloud.policy_new().statement("Deny", str_list().add("storage.object.delete"), str_list().add("storage:object:" + b + "/tmp/*")));
-  let denied = cloud.policy_check(${pr}, "storage.object.delete", "storage:object:" + b + "/tmp/1");
+  # Case 1: ONE document, Allow-then-Deny order
+  let p1 = cloud.policy_new()
+    .statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/*"))
+    .statement("Deny", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/secret/*"));
+  cloud.policy_attach("storage:bucket:" + b, pr, p1);
 
-  # narrow deny: allow all objects, deny only secret/*
-  cloud.policy_attach("storage:bucket:" + b, ${pr},
-    cloud.policy_new().statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/*")));
-  cloud.policy_attach("storage:bucket:" + b, ${pr},
-    cloud.policy_new().statement("Deny", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/secret/*")));
-  let secret = cloud.policy_check(${pr}, "storage.object.read", "storage:object:" + b + "/secret/k");
-  let publick = cloud.policy_check(${pr}, "storage.object.read", "storage:object:" + b + "/public/k");
+  let secret1 = cloud.policy_check(pr, "storage.object.read", "storage:object:" + b + "/secret/k");
+  let public1 = cloud.policy_check(pr, "storage.object.read", "storage:object:" + b + "/public/k");
 
-  cloud.policy_detach("storage:bucket:" + b, ${pr});
+  # Case 2: same attachment key re-attached with REVERSED statement order -> replaces p1 entirely
+  let p2 = cloud.policy_new()
+    .statement("Deny", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/secret/*"))
+    .statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/*"));
+  cloud.policy_attach("storage:bucket:" + b, pr, p2);
+
+  let secret2 = cloud.policy_check(pr, "storage.object.read", "storage:object:" + b + "/secret/k");
+  let public2 = cloud.policy_check(pr, "storage.object.read", "storage:object:" + b + "/public/k");
+
+  cloud.policy_detach("storage:bucket:" + b, pr);
   cloud.bucket_delete(b);
 
-  lmcode_return_put("denied", denied);
-  lmcode_return_put("secret_denied", !secret);
-  lmcode_return_put("public_allowed", publick);
+  lmcode_return_put("deny_wins_1", !secret1 && public1);
+  lmcode_return_put("deny_wins_2", !secret2 && public2);
 end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "06-deny-overrides-allow host execution failed");
-assert(!r.result.denied, "explicit Deny must override Allow on the same action/resource");
-assert(r.result.secret_denied, "narrower deny must block its sub-path");
-assert(r.result.public_allowed, "keys outside the deny prefix must stay allowed");
+assert(r.result.deny_wins_1, "Allow-then-Deny in one document: secret denied, public allowed");
+assert(r.result.deny_wins_2, "Deny-then-Allow (replacement document): same outcome — statement order is irrelevant, Deny wins");
