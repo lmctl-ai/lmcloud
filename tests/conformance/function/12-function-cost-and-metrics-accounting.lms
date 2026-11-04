@@ -1,5 +1,5 @@
 # Requires: function
-# Scenario 12: Function cost & performance accounting — per-invocation GB-second + request billing units, memory-tier cost scaling, MetricsReport counters/bytes/latency invariants, pre-attempt COST_CAP_EXCEEDED refusal, and teardown immunity on function_delete.
+# Scenario 12: Function cost & performance accounting — integer-nanodollar per-invocation billing units (100 + billed_ms * (memory_mb / 128)), version/alias cleanup reserve coverage, MetricsReport counters/bytes/latency invariants, pre-attempt COST_CAP_EXCEEDED refusal, and teardown immunity on function_delete.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 f_low = "lmf12" + run_id + "lo";
@@ -29,6 +29,11 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.function_create(fn_hi, cfg_hi);
   let c1 = cloud.estimated_cost();
 
+  # Publish versions and aliases on fn_lo so teardown exercises incremental version/alias cleanup reserves
+  let v1 = cloud.function_publish_version(fn_lo);
+  cloud.function_alias_set(fn_lo, "prod", v1);
+  cloud.function_alias_set(fn_lo, "canary", v1);
+
   let req_json = "{\"data\":\"payload-for-cost-accounting\"}";
   let res_lo = cloud.function_invoke(fn_lo, req_json);
   let c2 = cloud.estimated_cost();
@@ -36,7 +41,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let c3 = cloud.estimated_cost();
 
   let expected_bytes = (str_len(req_json) * 2) + str_len(res_lo.payload()) + str_len(res_hi.payload());
-  let expected_units = (1 + res_lo.billed_ms() * 1) + (1 + res_hi.billed_ms() * 8);
+  let expected_units = (100 + res_lo.billed_ms() * 1) + (100 + res_hi.billed_ms() * 8);
 
   let rep1 = cloud.cost_report();
   let create_item = rep1.item("function_create");
@@ -64,7 +69,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
                    m.max_ms() >= m.p95_ms() &&
                    m.total_ms() >= m.max_ms();
 
-  # Narrow script work sub-cap to current settled cost so any further function_invoke is refused pre-flight
+  # Narrow script work sub-cap to current settled cost so any further function_invoke or version publish is refused pre-flight
   let settled = cloud.estimated_cost();
   cloud.set_cost_cap_usd(settled);
   cloud.set_abort_on_error(false);
@@ -76,7 +81,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
                        blocked_err.http_status() == 0 &&
                        cloud.cost_report().cap_exceeded_count() == 1;
 
-  # Teardown immunity: function_delete draws from reserved cleanup headroom inside the operator total ceiling and succeeds
+  # Teardown immunity: function_delete draws from locked per-function + per-version + per-alias cleanup reserves and succeeds
   let del_lo = cloud.function_delete(fn_lo);
   let del_lo_err = cloud.last_error();
   let del_hi = cloud.function_delete(fn_hi);
@@ -96,7 +101,7 @@ end _lmcode_
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "12-function-cost-and-metrics-accounting host execution failed");
 assert(r.result.monotonic_ok, "function_create and function_invoke must monotonically increase estimated_cost()");
-assert(r.result.line_items_ok, "CostReport function_create and function_invoke items must record exact requests, GB-s compute billing units, and payload bytes");
+assert(r.result.line_items_ok, "CostReport function_create and function_invoke items must record exact requests, integer-nanodollar billing units, and payload bytes");
 assert(r.result.metrics_ok, "MetricsReport op(function_invoke) must record calls, bytes_out, bytes_in, and monotonic latency quantiles");
 assert(r.result.cap_refused_ok, "function_invoke above work sub-cap must fail pre-flight with COST_CAP_EXCEEDED and http_status()==0");
-assert(r.result.teardown_ok, "function_delete must succeed under exhausted work sub-cap using reserved cleanup headroom and never refund cost");
+assert(r.result.teardown_ok, "function_delete must tear down function, versions, and aliases under exhausted work sub-cap using locked cleanup reserves");

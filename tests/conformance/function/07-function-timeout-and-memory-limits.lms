@@ -1,5 +1,5 @@
 # Requires: function
-# Scenario 07: Timeout (timeout_seconds) and memory (memory_mb) limits — discrete memory shapes {128, 256, 512, 1024, 2048} and timeout enforcement on slow execution.
+# Scenario 07: Timeout (timeout_seconds), all 5 discrete memory shapes {128, 256, 512, 1024, 2048}, timeout expiration (function_error()=="Timeout"), and >1 MiB oversize handler response rejection (function_error()=="Unhandled").
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 fname = "lmf07" + run_id + "lim";
@@ -11,53 +11,69 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   }
   let fn_name = ${fname};
 
-  let code = "import time\ndef handler(event, context):\n    sleep_s = event.get(\"sleep\", 0)\n    if sleep_s > 0:\n        time.sleep(sleep_s)\n    return {\"slept\": sleep_s}\n";
+  let code = "import time\ndef handler(event, context):\n    if event.get(\"oversize\", False):\n        return {\"big\": \"A\" * 1048580}\n    sleep_s = event.get(\"sleep\", 0)\n    if sleep_s > 0:\n        time.sleep(sleep_s)\n    return {\"slept\": sleep_s}\n";
 
   let cfg = cloud.function_config("python3.12", "index.handler")
     .set_inline_code(code)
     .set_timeout_seconds(1)
-    .set_memory_mb(512);
+    .set_memory_mb(128);
 
   cloud.function_create(fn_name, cfg);
   let got1 = cloud.function_get(fn_name);
-  let got1_ok = got1.timeout_seconds() == 1 && got1.memory_mb() == 512;
+  let got1_ok = got1.timeout_seconds() == 1 && got1.memory_mb() == 128;
 
-  # Fast invocation within 1s timeout succeeds and reports memory_mb == 512
+  # 1. Fast invocation within 1s timeout succeeds
   let fast = cloud.function_invoke(fn_name, "{\"sleep\":0}");
   let fast_ok = fast.status_code() == 200 &&
                 !fast.is_error() &&
-                fast.memory_mb() == 512 &&
+                fast.memory_mb() == 128 &&
                 fast.billed_ms() >= 1;
 
-  # Slow invocation exceeding 1s timeout surfaces as a function error ("Timeout" or "Unhandled") with ErrorCode.OK
+  # 2. Slow invocation exceeding 1s timeout surfaces as function_error() == "Timeout" with ErrorCode.OK and billed_ms == 1000
   let slow = cloud.function_invoke(fn_name, "{\"sleep\":2}");
   let slow_host_err = cloud.last_error();
-  let slow_ferr = slow.function_error();
   let slow_ok = slow_host_err.code() == ErrorCode.OK &&
                 slow.status_code() == 200 &&
                 slow.is_error() &&
-                (slow_ferr == "Timeout" || slow_ferr == "Unhandled") &&
-                slow.billed_ms() >= 1000 &&
-                slow.memory_mb() == 512;
+                slow.function_error() == "Timeout" &&
+                slow.billed_ms() == 1000 &&
+                slow.memory_mb() == 128;
 
-  # Update memory shape to 1024 MiB and timeout to 10s
-  let cfg2 = got1.set_memory_mb(1024).set_timeout_seconds(10);
-  let got2 = cloud.function_update(fn_name, cfg2);
-  let got2_ok = got2.memory_mb() == 1024 && got2.timeout_seconds() == 10;
+  # 3. Oversize handler return (> 1 MiB) surfaces deterministically as status_code()==200, is_error()==true, function_error()=="Unhandled", and ErrorCode.OK
+  let over = cloud.function_invoke(fn_name, "{\"oversize\":true}");
+  let over_host_err = cloud.last_error();
+  let over_ok = over_host_err.code() == ErrorCode.OK &&
+                over.status_code() == 200 &&
+                over.is_error() &&
+                over.function_error() == "Unhandled" &&
+                str_contains(over.payload(), "ResponseSizeExceeded");
+
+  # 4. Verify all remaining discrete memory shapes: 256, 512, 1024, 2048 MiB
+  let u256 = cloud.function_update(fn_name, got1.set_memory_mb(256).set_timeout_seconds(5));
+  let u512 = cloud.function_update(fn_name, u256.set_memory_mb(512));
+  let u1024 = cloud.function_update(fn_name, u512.set_memory_mb(1024));
+  let u2048 = cloud.function_update(fn_name, u1024.set_memory_mb(2048));
+  let shapes_ok = u256.memory_mb() == 256 &&
+                  u512.memory_mb() == 512 &&
+                  u1024.memory_mb() == 1024 &&
+                  u2048.memory_mb() == 2048 &&
+                  u2048.timeout_seconds() == 5;
 
   let deleted = cloud.function_delete(fn_name);
 
   lmcode_return_put("got1_ok", got1_ok);
   lmcode_return_put("fast_ok", fast_ok);
   lmcode_return_put("slow_ok", slow_ok);
-  lmcode_return_put("got2_ok", got2_ok);
+  lmcode_return_put("over_ok", over_ok);
+  lmcode_return_put("shapes_ok", shapes_ok);
   lmcode_return_put("deleted", deleted);
 end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "07-function-timeout-and-memory-limits host execution failed");
-assert(r.result.got1_ok, "function_get should report configured timeout_seconds=1 and memory_mb=512");
-assert(r.result.fast_ok, "invocation completing before timeout should succeed and report memory_mb=512");
-assert(r.result.slow_ok, "invocation exceeding timeout_seconds must return is_error()==true with function_error Timeout/Unhandled and billed_ms>=1000");
-assert(r.result.got2_ok, "function_update to 1024 MiB and 10s timeout should round-trip");
+assert(r.result.got1_ok, "function_get should report configured timeout_seconds=1 and memory_mb=128");
+assert(r.result.fast_ok, "invocation completing before timeout should succeed and report memory_mb=128");
+assert(r.result.slow_ok, "invocation exceeding timeout_seconds must return is_error()==true with function_error==\"Timeout\" and billed_ms==1000");
+assert(r.result.over_ok, "handler response exceeding 1 MiB must return status_code()==200, is_error()==true, function_error==\"Unhandled\", and ResponseSizeExceeded payload");
+assert(r.result.shapes_ok, "all discrete memory shapes {128, 256, 512, 1024, 2048} MiB should round-trip");
 assert(r.result.deleted, "function_delete should succeed");

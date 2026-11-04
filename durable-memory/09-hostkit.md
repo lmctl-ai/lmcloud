@@ -378,21 +378,30 @@ type Functions interface {
 - **Pre-flight validation (`cloudhost` / `hostkit`):** function name (`^[a-z][a-z0-9]{2,31}$`;
   reserved `lmcloudmeta`, `lmcloudfnmeta`, `tables`, `functions`, `default`, `system` rejected),
   runtime allowlist (`"python3.12"`, `"nodejs20.x"`), handler (`<module>.<export>`), exclusive code
-  source (`"inline"` 1..65536 UTF-8 bytes normalized into a deterministic ZIP with fixed timestamp
-  `1980-01-01T00:00:00Z` for reproducible `code_sha256()`, or `"object"` `(bucket, key)` bounded at
-  16 MiB via `RunSubOperation`), timeout (`1..230` s), memory (`{128, 256, 512, 1024, 2048}` MiB),
-  concurrency (`-1`, `0`, or `1..100`), user env vars (`<= 64` vars, `<= 4096` total user UTF-8 bytes,
-  reserved provider/host prefixes rejected), alias names (`^[a-z][a-z0-9_]{1,31}$`, reserved `latest`/
-  `default`/`system` rejected), and sync invoke payload (`1..1048576` bytes valid JSON; response
-  bounded at 1 MiB, log tail bounded at 4 KiB).
-- **Catalog & sub-operation accounting (`lmcloudfnmeta` + `hostkit.RunSubOperation`):** multi-step
-  deployments (reading Object Storage package, staging, updating code + config + concurrency,
-  publishing versions, managing aliases, and fenced `"deleting"` tombstone teardown) execute every
-  extra physical network attempt through `hostkit.RunSubOperation` so admission, journal recording,
-  and settlement stay exact.
-- **Cost & metrics (`service == "function"`):** control-plane calls consume 1 unit/attempt
-  (`$0.00000020`); `function_create` locks a per-function cleanup reserve released on
-  `function_delete` (`isCleanup = true`); `function_invoke` reserves worst-case compute units
-  (`1 + timeout_seconds * 1000 * (memory_mb / 128)`) + 1 MiB egress before dispatch and settles on
-  completion to `1 + billed_ms * (memory_mb / 128)` units (`$0.0000000021`/unit) + actual payload
-  bytes (`bytes_out + bytes_in`).
+  source (`"inline"` `1..65536` UTF-8 bytes packaged into a deterministic ZIP with fixed timestamp
+  `1980-01-01T00:00:00Z` + provider entrypoint shim `__lmcloud_<provider>_entry` for a reproducible
+  64-hex `code_sha256()`, or `"object"` `(bucket, key)` bounded by a `16 MiB + 1` byte reader,
+  `<= 64 MiB` uncompressed expansion, `<= 256` regular files, no symlinks/traversal, staged into
+  content-addressed `lmcloudfn-pkgs/{name}/{incarnation}/{code_sha256}.zip` via `RunSubOperation`),
+  timeout (`1..230` s), memory (`{128, 256, 512, 1024, 2048}` MiB), concurrency (`-1`, `0`, `1..100`),
+  user env vars (`<= 64` vars, `<= 4096` total user UTF-8 bytes, reserved prefixes rejected, values
+  registered in `ErrorState.AddRedaction`), versions/aliases (`<= 16` versions, `<= 16` aliases,
+  alias `^[a-z][a-z0-9_]{1,31}$` excluding `latest`/`default`/`system`), and sync invoke payload
+  (`1..1048576` bytes valid JSON; handler response `1 MiB + 1` sentinel -> `"Unhandled"` on overflow,
+  outer HTTP wire envelope `2 MiB + 1` -> `INTERNAL`, log tail `<= 4 KiB` UTF-8-safe from a `64 KiB`
+  bounded drain).
+- **Catalog & sub-operation accounting (`lmcloudfnmeta` + `hostkit.RunSubOperation`):** all four
+  providers coordinate lifecycle state (`"creating"`, `"active"`, `"mutating"`, `"deleting"`),
+  `incarnation_id`, `op_gen`, and writer leases in `lmcloudfnmeta` (and local `hostkit/safety`
+  journal). Every extra physical network attempt executes through `hostkit.RunSubOperation`.
+- **Cost, cleanup reserves & dry-run (`service == "function"`):** control-plane calls consume `1`
+  unit/attempt (`200` nanodollars = `$0.00000020`); `function_create` locks `25` units (`$0.00000500`)
+  cleanup reserve, `function_publish_version` locks `+6` units (`$0.00000120`), and `function_alias_set`
+  locks `+3` units (`$0.00000060`), released only after proven deletion (`isCleanup = true`).
+  `function_invoke` resolves and pins the target revision in `lmcloudfnmeta`, reserves worst-case
+  `100 + timeout_seconds * 1000 * (memory_mb / 128)` units (at `2` integer nanodollars =
+  `$0.000000002`/unit in the synthetic simulator table; verified regional price table required in
+  `--live` mode) + `1 MiB` egress before dispatch, never replays after wire dispatch, retains the
+  full reservation on lost replies/cancellation, and settles on completion to
+  `100 + settled_billed_ms * (memory_mb / 128)` units + actual payload bytes. In `--dry-run`,
+  `function_invoke` and all mutators run zero handler processes and zero mutator SDK calls.

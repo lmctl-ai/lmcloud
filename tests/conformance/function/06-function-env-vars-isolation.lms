@@ -1,5 +1,5 @@
 # Requires: function
-# Scenario 06: Environment variables — set_env, remove_env, sorted env_names(), readback via function_get, runtime visibility via function_invoke, and removal on function_update.
+# Scenario 06: Environment variables — set_env, remove_env, sorted env_names(), readback via function_get, runtime visibility via function_invoke, ambient-credential scrubbing check, and removal on function_update.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 fname = "lmf06" + run_id + "env";
@@ -11,7 +11,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   }
   let fn_name = ${fname};
 
-  let code = "import os\ndef handler(event, context):\n    return {\n        \"app_env\": os.environ.get(\"APP_ENV\", \"\"),\n        \"feature_x\": os.environ.get(\"FEATURE_X\", \"\"),\n        \"zeta_key\": os.environ.get(\"ZETA_KEY\", \"missing\")\n    }\n";
+  let code = "import os\ndef handler(event, context):\n    leaked = (\n        os.environ.get(\"LMAWS_SIM_SECRET_ACCESS_KEY\", \"\") +\n        os.environ.get(\"AWS_SECRET_ACCESS_KEY\", \"\") +\n        os.environ.get(\"LMAZURE_SIM_KEY\", \"\") +\n        os.environ.get(\"LMGCP_SIM_TOKEN\", \"\") +\n        os.environ.get(\"LMOCI_SIM_PRIVATE_KEY_PATH\", \"\")\n    )\n    return {\n        \"app_env\": os.environ.get(\"APP_ENV\", \"\"),\n        \"feature_x\": os.environ.get(\"FEATURE_X\", \"\"),\n        \"zeta_key\": os.environ.get(\"ZETA_KEY\", \"missing\"),\n        \"ambient_clean\": len(leaked) == 0\n    }\n";
 
   let cfg = cloud.function_config("python3.12", "index.handler")
     .set_inline_code(code)
@@ -45,9 +45,10 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let inv1_ok = !inv1.is_error() &&
                 str_contains(inv1.payload(), "\"staging\"") &&
                 str_contains(inv1.payload(), "\"enabled\"") &&
-                str_contains(inv1.payload(), "\"zval\"");
+                str_contains(inv1.payload(), "\"zval\"") &&
+                str_contains(inv1.payload(), "true");
 
-  # Remove ZETA_KEY and update APP_ENV to "production"
+  # Remove ZETA_KEY and update APP_ENV to "production" using readback builder got1
   let cfg2 = got1.remove_env("ZETA_KEY").set_env("APP_ENV", "production");
   let got2 = cloud.function_update(fn_name, cfg2);
   let remote2_ok = got2.env_len() == 2 &&
@@ -73,7 +74,7 @@ r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "06-function-env-vars-isolation host execution failed");
 assert(r.result.local_ok, "local FunctionConfig env builder should sort env_names() and honor remove_env()");
 assert(r.result.remote1_ok, "function_get should round-trip configured user env vars in sorted order");
-assert(r.result.inv1_ok, "function_invoke runtime environment should expose configured user env vars");
+assert(r.result.inv1_ok, "function_invoke runtime environment should expose configured user env vars and scrub ambient host/simulator credentials");
 assert(r.result.remote2_ok, "function_update after remove_env should remove the deleted env var on the provider");
 assert(r.result.inv2_ok, "function_invoke after remove_env should no longer see the removed env var");
 assert(r.result.deleted, "function_delete should succeed");
