@@ -127,7 +127,9 @@
         ],
         "at": [
           {
-            "params": ["int"],
+            "params": [
+              "int"
+            ],
             "returns": "ObjectSummary"
           }
         ],
@@ -183,7 +185,9 @@
         ],
         "at": [
           {
-            "params": ["int"],
+            "params": [
+              "int"
+            ],
             "returns": "QueueMessage"
           }
         ]
@@ -305,13 +309,17 @@
         ],
         "at": [
           {
-            "params": ["int"],
+            "params": [
+              "int"
+            ],
             "returns": "CostLineItem"
           }
         ],
         "item": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "CostLineItem"
           }
         ],
@@ -457,13 +465,17 @@
         ],
         "at": [
           {
-            "params": ["int"],
+            "params": [
+              "int"
+            ],
             "returns": "OpMetrics"
           }
         ],
         "op": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "OpMetrics"
           }
         ],
@@ -479,67 +491,93 @@
       "methods": {
         "set_string": [
           {
-            "params": ["string", "string"],
+            "params": [
+              "string",
+              "string"
+            ],
             "returns": "self"
           }
         ],
         "set_int": [
           {
-            "params": ["string", "int"],
+            "params": [
+              "string",
+              "int"
+            ],
             "returns": "self"
           }
         ],
         "set_number": [
           {
-            "params": ["string", "float"],
+            "params": [
+              "string",
+              "float"
+            ],
             "returns": "self"
           }
         ],
         "set_bool": [
           {
-            "params": ["string", "bool"],
+            "params": [
+              "string",
+              "bool"
+            ],
             "returns": "self"
           }
         ],
         "remove": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "self"
           }
         ],
         "has": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "bool"
           }
         ],
         "type_of": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "string"
           }
         ],
         "get_string": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "string"
           }
         ],
         "get_int": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "int"
           }
         ],
         "get_number": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "float"
           }
         ],
         "get_bool": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "bool"
           }
         ],
@@ -591,7 +629,9 @@
         ],
         "at": [
           {
-            "params": ["int"],
+            "params": [
+              "int"
+            ],
             "returns": "TableItem"
           }
         ],
@@ -605,6 +645,714 @@
           {
             "params": [],
             "returns": "string"
+          }
+        ]
+      }
+    },
+    "Policy": {
+      "methods": {
+        "statement": [
+          {
+            "params": [
+              "string",
+              "StrList",
+              "StrList"
+            ],
+            "returns": "self"
+          }
+        ],
+        "document": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "len": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ]
+      }
+    },
+    "LintReport": {
+      "methods": {
+        "len": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "at": [
+          {
+            "params": [
+              "int"
+            ],
+            "returns": "LintFinding"
+          }
+        ],
+        "ok": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ]
+      }
+    },
+    "LintFinding": {
+      "methods": {
+        "severity": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "code": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "message": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ]
+      }
+    },
+    "Cloud": {
+      "methods": {
+        "provider": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "endpoint": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "string"
+          }
+        ],
+        "set_endpoint": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "self"
+          }
+        ],
+        "abort_on_error": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ],
+        "set_abort_on_error": [
+          {
+            "params": [
+              "bool"
+            ],
+            "returns": "self"
+          }
+        ],
+        "last_error": [
+          {
+            "params": [],
+            "returns": "CloudError"
+          }
+        ],
+        "bucket_create": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "bucket_delete": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "bucket_exists": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "bucket_list": [
+          {
+            "params": [],
+            "returns": "StrList"
+          }
+        ],
+        "object_put": [
+          {
+            "params": [
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "ObjectMeta"
+          },
+          {
+            "params": [
+              "string",
+              "string",
+              "string",
+              "string",
+              "StrMap"
+            ],
+            "returns": "ObjectMeta"
+          }
+        ],
+        "object_get": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "string"
+          }
+        ],
+        "object_head": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "ObjectMeta"
+          }
+        ],
+        "object_delete": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "object_list": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "ObjectListPage"
+          },
+          {
+            "params": [
+              "string",
+              "string",
+              "int",
+              "string"
+            ],
+            "returns": "ObjectListPage"
+          }
+        ],
+        "object_list_all": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "StrList"
+          }
+        ],
+        "queue_create": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "queue_delete": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "queue_exists": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "queue_list": [
+          {
+            "params": [],
+            "returns": "StrList"
+          }
+        ],
+        "queue_send": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "string"
+          }
+        ],
+        "queue_receive": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "QueueMessageList"
+          },
+          {
+            "params": [
+              "string",
+              "int",
+              "int",
+              "int"
+            ],
+            "returns": "QueueMessageList"
+          }
+        ],
+        "queue_ack": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "queue_nack": [
+          {
+            "params": [
+              "string",
+              "string",
+              "int"
+            ],
+            "returns": "string"
+          }
+        ],
+        "cost_cap_usd": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "set_cost_cap_usd": [
+          {
+            "params": [
+              "float"
+            ],
+            "returns": "self"
+          }
+        ],
+        "estimated_cost": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "cost_report": [
+          {
+            "params": [],
+            "returns": "CostReport"
+          }
+        ],
+        "metrics_reset": [
+          {
+            "params": [],
+            "returns": "self"
+          }
+        ],
+        "metrics": [
+          {
+            "params": [],
+            "returns": "MetricsReport"
+          }
+        ],
+        "item_new": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "TableItem"
+          },
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "TableItem"
+          }
+        ],
+        "table_create": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          },
+          {
+            "params": [
+              "string",
+              "bool"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "table_delete": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "table_exists": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "table_list": [
+          {
+            "params": [],
+            "returns": "StrList"
+          }
+        ],
+        "item_put": [
+          {
+            "params": [
+              "string",
+              "TableItem"
+            ],
+            "returns": "TableItem"
+          },
+          {
+            "params": [
+              "string",
+              "TableItem",
+              "string"
+            ],
+            "returns": "TableItem"
+          }
+        ],
+        "item_get": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "TableItem"
+          },
+          {
+            "params": [
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "TableItem"
+          }
+        ],
+        "item_delete": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          },
+          {
+            "params": [
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "item_update": [
+          {
+            "params": [
+              "string",
+              "string",
+              "TableItem"
+            ],
+            "returns": "TableItem"
+          },
+          {
+            "params": [
+              "string",
+              "string",
+              "string",
+              "TableItem"
+            ],
+            "returns": "TableItem"
+          }
+        ],
+        "item_query": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "TablePage"
+          },
+          {
+            "params": [
+              "string",
+              "string",
+              "string",
+              "string",
+              "int",
+              "string"
+            ],
+            "returns": "TablePage"
+          }
+        ],
+        "item_scan": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "TablePage"
+          },
+          {
+            "params": [
+              "string",
+              "int",
+              "string"
+            ],
+            "returns": "TablePage"
+          }
+        ],
+        "principal_current": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "policy_new": [
+          {
+            "params": [],
+            "returns": "Policy"
+          }
+        ],
+        "policy_parse": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "Policy"
+          }
+        ],
+        "policy_lint": [
+          {
+            "params": [
+              "Policy"
+            ],
+            "returns": "LintReport"
+          }
+        ],
+        "policy_attach": [
+          {
+            "params": [
+              "string",
+              "string",
+              "Policy"
+            ],
+            "returns": "void"
+          }
+        ],
+        "policy_attach_principal": [
+          {
+            "params": [
+              "string",
+              "Policy"
+            ],
+            "returns": "void"
+          }
+        ],
+        "policy_detach": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "policy_detach_principal": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "policy_check": [
+          {
+            "params": [
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "function_config": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "FunctionConfig"
+          }
+        ],
+        "function_create": [
+          {
+            "params": [
+              "string",
+              "FunctionConfig"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "function_update": [
+          {
+            "params": [
+              "string",
+              "FunctionConfig"
+            ],
+            "returns": "FunctionConfig"
+          },
+          {
+            "params": [
+              "string",
+              "FunctionConfig",
+              "string"
+            ],
+            "returns": "FunctionConfig"
+          }
+        ],
+        "function_delete": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "function_exists": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "function_get": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "FunctionConfig"
+          },
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "FunctionConfig"
+          }
+        ],
+        "function_list": [
+          {
+            "params": [],
+            "returns": "StrList"
+          }
+        ],
+        "function_publish_version": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "string"
+          },
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "string"
+          }
+        ],
+        "function_versions": [
+          {
+            "params": [
+              "string"
+            ],
+            "returns": "StrList"
+          }
+        ],
+        "function_alias_set": [
+          {
+            "params": [
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "void"
+          }
+        ],
+        "function_alias_get": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "string"
+          }
+        ],
+        "function_alias_delete": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "bool"
+          }
+        ],
+        "function_invoke": [
+          {
+            "params": [
+              "string",
+              "string"
+            ],
+            "returns": "FunctionInvokeResult"
+          },
+          {
+            "params": [
+              "string",
+              "string",
+              "string"
+            ],
+            "returns": "FunctionInvokeResult"
           }
         ]
       }
@@ -637,7 +1385,9 @@
         ],
         "set_runtime": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "self"
           }
         ],
@@ -649,7 +1399,9 @@
         ],
         "set_handler": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "self"
           }
         ],
@@ -667,7 +1419,9 @@
         ],
         "set_inline_code": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "self"
           }
         ],
@@ -685,7 +1439,10 @@
         ],
         "set_package_object": [
           {
-            "params": ["string", "string"],
+            "params": [
+              "string",
+              "string"
+            ],
             "returns": "self"
           }
         ],
@@ -703,7 +1460,9 @@
         ],
         "set_timeout_seconds": [
           {
-            "params": ["int"],
+            "params": [
+              "int"
+            ],
             "returns": "self"
           }
         ],
@@ -715,7 +1474,9 @@
         ],
         "set_memory_mb": [
           {
-            "params": ["int"],
+            "params": [
+              "int"
+            ],
             "returns": "self"
           }
         ],
@@ -727,31 +1488,42 @@
         ],
         "set_concurrency": [
           {
-            "params": ["int"],
+            "params": [
+              "int"
+            ],
             "returns": "self"
           }
         ],
         "env": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "string"
           }
         ],
         "has_env": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "bool"
           }
         ],
         "set_env": [
           {
-            "params": ["string", "string"],
+            "params": [
+              "string",
+              "string"
+            ],
             "returns": "self"
           }
         ],
         "remove_env": [
           {
-            "params": ["string"],
+            "params": [
+              "string"
+            ],
             "returns": "self"
           }
         ],
@@ -838,406 +1610,42 @@
           }
         ]
       }
-    },
-    "Cloud": {
-      "methods": {
-        "provider": [
-          {
-            "params": [],
-            "returns": "string"
-          }
-        ],
-        "endpoint": [
-          {
-            "params": ["string"],
-            "returns": "string"
-          }
-        ],
-        "set_endpoint": [
-          {
-            "params": ["string", "string"],
-            "returns": "self"
-          }
-        ],
-        "abort_on_error": [
-          {
-            "params": [],
-            "returns": "bool"
-          }
-        ],
-        "set_abort_on_error": [
-          {
-            "params": ["bool"],
-            "returns": "self"
-          }
-        ],
-        "last_error": [
-          {
-            "params": [],
-            "returns": "CloudError"
-          }
-        ],
-        "bucket_create": [
-          {
-            "params": ["string"],
-            "returns": "bool"
-          }
-        ],
-        "bucket_delete": [
-          {
-            "params": ["string"],
-            "returns": "bool"
-          }
-        ],
-        "bucket_exists": [
-          {
-            "params": ["string"],
-            "returns": "bool"
-          }
-        ],
-        "bucket_list": [
-          {
-            "params": [],
-            "returns": "StrList"
-          }
-        ],
-        "object_put": [
-          {
-            "params": ["string", "string", "string"],
-            "returns": "ObjectMeta"
-          },
-          {
-            "params": ["string", "string", "string", "string", "StrMap"],
-            "returns": "ObjectMeta"
-          }
-        ],
-        "object_get": [
-          {
-            "params": ["string", "string"],
-            "returns": "string"
-          }
-        ],
-        "object_head": [
-          {
-            "params": ["string", "string"],
-            "returns": "ObjectMeta"
-          }
-        ],
-        "object_delete": [
-          {
-            "params": ["string", "string"],
-            "returns": "void"
-          }
-        ],
-        "object_list": [
-          {
-            "params": ["string", "string"],
-            "returns": "ObjectListPage"
-          },
-          {
-            "params": ["string", "string", "int", "string"],
-            "returns": "ObjectListPage"
-          }
-        ],
-        "object_list_all": [
-          {
-            "params": ["string", "string"],
-            "returns": "StrList"
-          }
-        ],
-        "queue_create": [
-          {
-            "params": ["string"],
-            "returns": "bool"
-          }
-        ],
-        "queue_delete": [
-          {
-            "params": ["string"],
-            "returns": "bool"
-          }
-        ],
-        "queue_exists": [
-          {
-            "params": ["string"],
-            "returns": "bool"
-          }
-        ],
-        "queue_list": [
-          {
-            "params": [],
-            "returns": "StrList"
-          }
-        ],
-        "queue_send": [
-          {
-            "params": ["string", "string"],
-            "returns": "string"
-          }
-        ],
-        "queue_receive": [
-          {
-            "params": ["string"],
-            "returns": "QueueMessageList"
-          },
-          {
-            "params": ["string", "int", "int", "int"],
-            "returns": "QueueMessageList"
-          }
-        ],
-        "queue_ack": [
-          {
-            "params": ["string", "string"],
-            "returns": "void"
-          }
-        ],
-        "queue_nack": [
-          {
-            "params": ["string", "string", "int"],
-            "returns": "string"
-          }
-        ],
-        "cost_cap_usd": [
-          {
-            "params": [],
-            "returns": "float"
-          }
-        ],
-        "set_cost_cap_usd": [
-          {
-            "params": ["float"],
-            "returns": "self"
-          }
-        ],
-        "estimated_cost": [
-          {
-            "params": [],
-            "returns": "float"
-          }
-        ],
-        "cost_report": [
-          {
-            "params": [],
-            "returns": "CostReport"
-          }
-        ],
-        "metrics_reset": [
-          {
-            "params": [],
-            "returns": "self"
-          }
-        ],
-        "metrics": [
-          {
-            "params": [],
-            "returns": "MetricsReport"
-          }
-        ],
-        "item_new": [
-          {
-            "params": ["string"],
-            "returns": "TableItem"
-          },
-          {
-            "params": ["string", "string"],
-            "returns": "TableItem"
-          }
-        ],
-        "table_create": [
-          {
-            "params": ["string"],
-            "returns": "bool"
-          },
-          {
-            "params": ["string", "bool"],
-            "returns": "bool"
-          }
-        ],
-        "table_delete": [
-          {
-            "params": ["string"],
-            "returns": "bool"
-          }
-        ],
-        "table_exists": [
-          {
-            "params": ["string"],
-            "returns": "bool"
-          }
-        ],
-        "table_list": [
-          {
-            "params": [],
-            "returns": "StrList"
-          }
-        ],
-        "item_put": [
-          {
-            "params": ["string", "TableItem"],
-            "returns": "TableItem"
-          },
-          {
-            "params": ["string", "TableItem", "string"],
-            "returns": "TableItem"
-          }
-        ],
-        "item_get": [
-          {
-            "params": ["string", "string"],
-            "returns": "TableItem"
-          },
-          {
-            "params": ["string", "string", "string"],
-            "returns": "TableItem"
-          }
-        ],
-        "item_delete": [
-          {
-            "params": ["string", "string"],
-            "returns": "void"
-          },
-          {
-            "params": ["string", "string", "string"],
-            "returns": "void"
-          }
-        ],
-        "item_update": [
-          {
-            "params": ["string", "string", "TableItem"],
-            "returns": "TableItem"
-          },
-          {
-            "params": ["string", "string", "string", "TableItem"],
-            "returns": "TableItem"
-          }
-        ],
-        "item_query": [
-          {
-            "params": ["string", "string"],
-            "returns": "TablePage"
-          },
-          {
-            "params": ["string", "string", "string", "string", "int", "string"],
-            "returns": "TablePage"
-          }
-        ],
-        "item_scan": [
-          {
-            "params": ["string"],
-            "returns": "TablePage"
-          },
-          {
-            "params": ["string", "int", "string"],
-            "returns": "TablePage"
-          }
-        ],
-        "function_config": [
-          {
-            "params": ["string", "string"],
-            "returns": "FunctionConfig"
-          }
-        ],
-        "function_create": [
-          {
-            "params": ["string", "FunctionConfig"],
-            "returns": "bool"
-          }
-        ],
-        "function_update": [
-          {
-            "params": ["string", "FunctionConfig"],
-            "returns": "FunctionConfig"
-          },
-          {
-            "params": ["string", "FunctionConfig", "string"],
-            "returns": "FunctionConfig"
-          }
-        ],
-        "function_delete": [
-          {
-            "params": ["string"],
-            "returns": "bool"
-          }
-        ],
-        "function_exists": [
-          {
-            "params": ["string"],
-            "returns": "bool"
-          }
-        ],
-        "function_get": [
-          {
-            "params": ["string"],
-            "returns": "FunctionConfig"
-          },
-          {
-            "params": ["string", "string"],
-            "returns": "FunctionConfig"
-          }
-        ],
-        "function_list": [
-          {
-            "params": [],
-            "returns": "StrList"
-          }
-        ],
-        "function_publish_version": [
-          {
-            "params": ["string"],
-            "returns": "string"
-          },
-          {
-            "params": ["string", "string"],
-            "returns": "string"
-          }
-        ],
-        "function_versions": [
-          {
-            "params": ["string"],
-            "returns": "StrList"
-          }
-        ],
-        "function_alias_set": [
-          {
-            "params": ["string", "string", "string"],
-            "returns": "void"
-          }
-        ],
-        "function_alias_get": [
-          {
-            "params": ["string", "string"],
-            "returns": "string"
-          }
-        ],
-        "function_alias_delete": [
-          {
-            "params": ["string", "string"],
-            "returns": "bool"
-          }
-        ],
-        "function_invoke": [
-          {
-            "params": ["string", "string"],
-            "returns": "FunctionInvokeResult"
-          },
-          {
-            "params": ["string", "string", "string"],
-            "returns": "FunctionInvokeResult"
-          }
-        ]
-      }
     }
   },
   "functions": {
     "print": [
-      { "params": ["string"], "returns": "void" },
-      { "params": ["int"], "returns": "void" },
-      { "params": ["float"], "returns": "void" },
-      { "params": ["bool"], "returns": "void" }
+      {
+        "params": [
+          "string"
+        ],
+        "returns": "void"
+      },
+      {
+        "params": [
+          "int"
+        ],
+        "returns": "void"
+      },
+      {
+        "params": [
+          "float"
+        ],
+        "returns": "void"
+      },
+      {
+        "params": [
+          "bool"
+        ],
+        "returns": "void"
+      }
     ],
     "assert_close": [
       {
-        "params": ["float", "float", "float"],
+        "params": [
+          "float",
+          "float",
+          "float"
+        ],
         "returns": "void"
       }
     ]

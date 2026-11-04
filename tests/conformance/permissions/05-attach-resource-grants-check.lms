@@ -1,0 +1,39 @@
+# Requires: permissions
+# Scenario 05: Attach an allow policy to a run-owned bucket for principal P; policy_check(P, read, object)
+# is true; an unrelated principal is false; detach cleans up.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-p05-" + run_id + "-x";
+pr = "arn:aws:iam::000000000000:role/reader-" + run_id;
+other = "arn:aws:iam::000000000000:role/other-" + run_id;
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+  }
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("storage", ep);
+  }
+  let b = ${bucket};
+  cloud.bucket_create(b);   # run-owned target
+
+  let pol = cloud.policy_new().statement("Allow",
+    str_list().add("storage.object.read"),
+    str_list().add("storage:object:" + b + "/*"));
+  cloud.policy_attach("storage:bucket:" + b, ${pr}, pol);
+
+  let grant = cloud.policy_check(${pr}, "storage.object.read", "storage:object:" + b + "/k1");
+  let nongrant = cloud.policy_check(${other}, "storage.object.read", "storage:object:" + b + "/k1");
+
+  cloud.policy_detach("storage:bucket:" + b, ${pr});
+  cloud.bucket_delete(b);
+
+  lmcode_return_put("grant", grant);
+  lmcode_return_put("nongrant", nongrant);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "05-attach-resource-grants-check host execution failed");
+assert(r.result.grant, "attached principal must be allowed on the bucket's objects");
+assert(!r.result.nongrant, "unrelated principal must remain denied (default deny)");

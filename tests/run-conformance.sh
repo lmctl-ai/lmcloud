@@ -15,8 +15,8 @@ CONF_DIR="$ROOT/tests/conformance"
 SCHEMA_FILE="$ROOT/schema/lmcloud.dsl.json"
 
 usage() {
-  echo "Usage: $0 [--live] [--name-prefix <prefix>] <host-binary> [endpoint] [object-storage|queue|cost-perf|tables|function|all] [run-id]" >&2
-  echo "       $0 [--live] --check [object-storage|queue|cost-perf|tables|function|all]" >&2
+  echo "Usage: $0 [--live] [--name-prefix <prefix>] <host-binary> [endpoint] [object-storage|queue|cost-perf|tables|permissions|function|all] [run-id]" >&2
+  echo "       $0 [--live] --check [object-storage|queue|cost-perf|tables|permissions|function|all]" >&2
   exit 2
 }
 
@@ -63,7 +63,9 @@ is_live_excluded_scenario() {
   base="$(basename "$1")"
   slice_dir="$(basename "$(dirname "$1")")"
   case "$slice_dir" in
-    cost-perf|tables|function)
+    # cost-perf, tables and permissions are excluded from the --live profile until their
+    # live naming/ownership profiles are designed (permissions: design 15 §4.4).
+    cost-perf|tables|permissions|function)
       return 0
       ;;
   esac
@@ -80,11 +82,11 @@ is_live_excluded_scenario() {
 validate_slice() {
   local slice="$1"
   case "$slice" in
-    object-storage|queue|cost-perf|tables|function|all|"")
+    object-storage|queue|cost-perf|tables|permissions|function|all|"")
       return 0
       ;;
     *)
-      echo "error: unknown slice '$slice' (expected: object-storage | queue | cost-perf | tables | function | all)" >&2
+      echo "error: unknown slice '$slice' (expected: object-storage | queue | cost-perf | tables | permissions | function | all)" >&2
       exit 2
       ;;
   esac
@@ -95,7 +97,7 @@ collect_scenarios() {
   local filter="${LMCLOUD_SCENARIO_FILTER:-}"
   local raw=()
   case "$slice" in
-    object-storage|queue|cost-perf|tables|function)
+    object-storage|queue|cost-perf|tables|permissions|function)
       mapfile -t raw < <(find "$CONF_DIR/$slice" -maxdepth 1 -name '*.lms' | sort)
       ;;
     all|"")
@@ -104,11 +106,12 @@ collect_scenarios() {
         find "$CONF_DIR/queue" -maxdepth 1 -name '*.lms' | sort
         find "$CONF_DIR/cost-perf" -maxdepth 1 -name '*.lms' | sort
         find "$CONF_DIR/tables" -maxdepth 1 -name '*.lms' | sort
+        find "$CONF_DIR/permissions" -maxdepth 1 -name '*.lms' | sort
         find "$CONF_DIR/function" -maxdepth 1 -name '*.lms' | sort
       )
       ;;
     *)
-      echo "error: unknown slice '$slice' (expected: object-storage | queue | cost-perf | tables | function | all)" >&2
+      echo "error: unknown slice '$slice' (expected: object-storage | queue | cost-perf | tables | permissions | function | all)" >&2
       exit 2
       ;;
   esac
@@ -267,7 +270,7 @@ else
   if [[ "$LIVE_PROFILE" == "1" ]]; then
     DEFAULT_RUN_ID="run-$(date -u +%s)-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
   fi
-  if [[ "$ARG2" == "object-storage" || "$ARG2" == "queue" || "$ARG2" == "cost-perf" || "$ARG2" == "tables" || "$ARG2" == "function" || "$ARG2" == "all" ]]; then
+  if [[ "$ARG2" == "object-storage" || "$ARG2" == "queue" || "$ARG2" == "cost-perf" || "$ARG2" == "tables" || "$ARG2" == "permissions" || "$ARG2" == "function" || "$ARG2" == "all" ]]; then
     ENDPOINT=""
     SLICE="$ARG2"
     RUN_ID="${3:-${LMCLOUD_RUN_ID:-${LMAWS_RUN_ID:-$DEFAULT_RUN_ID}}}"
@@ -298,6 +301,7 @@ else
     export LMCLOUD_STORAGE_ENDPOINT="$ENDPOINT"
     export LMCLOUD_QUEUE_ENDPOINT="$ENDPOINT"
     export LMCLOUD_TABLES_ENDPOINT="$ENDPOINT"
+    export LMCLOUD_PERMISSIONS_ENDPOINT="$ENDPOINT"
     export LMCLOUD_FUNCTION_ENDPOINT="$ENDPOINT"
     export LMCLOUD_ENDPOINT="$ENDPOINT"
   fi

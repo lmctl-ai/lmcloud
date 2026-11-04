@@ -390,18 +390,27 @@ type Functions interface {
   (`1..1048576` bytes valid JSON; handler response `1 MiB + 1` sentinel -> `"Unhandled"` on overflow,
   outer HTTP wire envelope `2 MiB + 1` -> `INTERNAL`, log tail `<= 4 KiB` UTF-8-safe from a `64 KiB`
   bounded drain).
-- **Catalog & sub-operation accounting (`lmcloudfnmeta` + `hostkit.RunSubOperation`):** all four
-  providers coordinate lifecycle state (`"creating"`, `"active"`, `"mutating"`, `"deleting"`),
-  `incarnation_id`, `op_gen`, and writer leases in `lmcloudfnmeta` (and local `hostkit/safety`
-  journal). Every extra physical network attempt executes through `hostkit.RunSubOperation`.
+- **Catalog, incarnation fencing & bounded staging GC (`lmcloudfnmeta` + `hostkit.RunSubOperation`):**
+  all four providers coordinate lifecycle state (`"creating"`, `"active"`, `"mutating"`, `"deleting"`),
+  `incarnation_id` (`inc8` embedded in physical resource names `lmfn-{name}-{inc8}`), `op_gen`,
+  writer leases (`35 s` TTL >= `30 s` hard HTTP timeout + `5 s` margin), distributed concurrency
+  `slots[1..K]` (never released early on caller disconnect), and synchronous post-update GC of
+  displaced unreferenced bundles (`<= 3` unversioned + `<= 16` versioned bundles retained) in
+  `lmcloudfnmeta`. Every extra physical network attempt executes through `hostkit.RunSubOperation`.
+- **Execution isolation (fail-closed):** simulator/host handler execution runs inside an unprivileged
+  Linux namespace jail (`CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWIPC` /
+  `bwrap --unshare-all --die-with-parent`) hiding parent `/proc`, host filesystem, and host loopback;
+  if unavailable, `function_invoke` fails closed (`ErrorCode.INTERNAL`).
 - **Cost, cleanup reserves & dry-run (`service == "function"`):** control-plane calls consume `1`
-  unit/attempt (`200` nanodollars = `$0.00000020`); `function_create` locks `25` units (`$0.00000500`)
-  cleanup reserve, `function_publish_version` locks `+6` units (`$0.00000120`), and `function_alias_set`
-  locks `+3` units (`$0.00000060`), released only after proven deletion (`isCleanup = true`).
-  `function_invoke` resolves and pins the target revision in `lmcloudfnmeta`, reserves worst-case
+  unit/attempt (`200` nanodollars = `$0.00000020`); `function_create` locks `$0.00015000`
+  (`150,000` nanodollars) multi-service cleanup reserve, `function_publish_version` locks
+  `+$0.00003000` per version (`<= 16`), and `function_alias_set` locks `+$0.00001000` per new alias
+  (`<= 16`), released only after proven terminal deletion (`isCleanup = true`). `function_invoke`
+  resolves and pins the target revision in `lmcloudfnmeta`, reserves worst-case
   `100 + timeout_seconds * 1000 * (memory_mb / 128)` units (at `2` integer nanodollars =
   `$0.000000002`/unit in the synthetic simulator table; verified regional price table required in
-  `--live` mode) + `1 MiB` egress before dispatch, never replays after wire dispatch, retains the
-  full reservation on lost replies/cancellation, and settles on completion to
-  `100 + settled_billed_ms * (memory_mb / 128)` units + actual payload bytes. In `--dry-run`,
-  `function_invoke` and all mutators run zero handler processes and zero mutator SDK calls.
+  `--live` mode) + `2 MiB` outer wire envelope before dispatch, never replays after wire dispatch,
+  retains the full reservation on lost replies/cancellation/malformed `provider_billed_ms`, and
+  settles on validated completion to `100 + settled_billed_ms * (memory_mb / 128)` units + payload
+  bytes. In `--dry-run`, `function_invoke` and all mutators spawn zero handler processes and make
+  zero network calls.

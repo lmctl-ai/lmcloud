@@ -3,9 +3,8 @@
 # <provider>sim --auth enforce (emits TAP SKIP in open mode unless LMCLOUD_AUTH_MODE=="enforce").
 # Step 0 seeds an existing function (seed_fn) with the allowed caller credentials so Pass 1 and Pass 2
 # test against a real existing target rather than relying on catalog-absence ordering.
-# Pass 1 = bogus credentials across all 4 clouds -> UNAUTHENTICATED on function_create and function_invoke.
-# Pass 2 = valid restricted principal denied by policy across all 4 clouds -> PERMISSION_DENIED on
-# function_exists(seed_fn) (never masked as false/OK), function_create(denied_fn), and function_invoke(seed_fn).
+# Credentials and seed_fn cleanup are unconditionally restored/executed BEFORE evaluating Pass 1 / Pass 2
+# assertions so a failed assertion never leaks seed_fn or leaves modified environment variables.
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 seed_fn = "lmf13" + run_id + "s";
@@ -86,37 +85,10 @@ unauth_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 end _lmcode_
 
 r_unauth = run_lmcode(unauth_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
-assert(r_unauth.ok, "13 unauthenticated pass host execution failed");
-
-if (r_unauth.result.open_mode) {
-  # Restore original credentials and clean up seed_fn before exiting or failing
-  set_env("LMAWS_SIM_ACCESS_KEY_ID", orig_aws_key);
-  set_env("LMAWS_SIM_SECRET_ACCESS_KEY", orig_aws_sec);
-  set_env("LMAZURE_SIM_TOKEN", orig_az_tok);
-  set_env("LMAZURE_SIM_KEY", orig_az_key);
-  set_env("LMGCP_SIM_TOKEN", orig_gcp_tok);
-  set_env("LMOCI_SIM_KEY_ID", orig_oci_kid);
-  set_env("LMOCI_SIM_PRIVATE_KEY_PATH", orig_oci_key);
-
-  cleanup_open = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
-    let ep = ${endpoint};
-    if (str_len(ep) > 0) {
-      cloud.set_endpoint("function", ep);
-    }
-    cloud.function_delete(${seed_fn});
-end _lmcode_
-  run_lmcode(cleanup_open, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
-
-  assert(!expect_enforce, "LMCLOUD_AUTH_MODE=enforce was requested, but simulator accepted bogus credentials (open mode)");
-  println("SKIP: simulator is in --auth open mode; 13-function-auth-enforced-denial requires --auth enforce");
-  exit(0);
-}
-
-assert(r_unauth.result.create_unauth, "Pass 1 (wrong creds): function_create must fail UNAUTHENTICATED");
-assert(r_unauth.result.invoke_unauth, "Pass 1 (wrong creds): function_invoke on seeded function must fail UNAUTHENTICATED");
-assert(r_unauth.result.exists_not_ok, "Pass 1 (wrong creds): function_exists on seeded function must fail UNAUTHENTICATED or PERMISSION_DENIED");
+is_open = r_unauth.ok && r_unauth.result.open_mode;
 
 # Pass 2: Valid restricted principal denied by policy across all 4 clouds -> PERMISSION_DENIED
+# (Executed only when Pass 1 did not detect open mode)
 set_env("LMAWS_SIM_ACCESS_KEY_ID", env("LMCLOUD_ENFORCE_DENIED_AWS_ACCESS_KEY_ID", orig_aws_key));
 set_env("LMAWS_SIM_SECRET_ACCESS_KEY", env("LMCLOUD_ENFORCE_DENIED_AWS_SECRET_ACCESS_KEY", orig_aws_sec));
 set_env("LMAZURE_SIM_TOKEN", env("LMCLOUD_ENFORCE_DENIED_AZURE_TOKEN", orig_az_tok));
@@ -145,6 +117,10 @@ denied_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   cloud.function_invoke(sfn, "{}");
   let inv_err = cloud.last_error();
 
+  if (created) {
+    cloud.function_delete(dfn);
+  }
+
   lmcode_return_put("created", created);
   lmcode_return_put("exists_val", exists_val);
   lmcode_return_put("exists_denied", exists_err.code() == ErrorCode.PERMISSION_DENIED);
@@ -152,9 +128,9 @@ denied_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   lmcode_return_put("invoke_denied", inv_err.code() == ErrorCode.PERMISSION_DENIED);
 end _lmcode_
 
-r_denied = run_lmcode(denied_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+r_denied = is_open ? r_unauth : run_lmcode(denied_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 
-# Step 3: Restore original allowed credentials and delete seed_fn
+# Step 3: Unconditionally restore original allowed credentials and delete seed_fn BEFORE any assertions
 set_env("LMAWS_SIM_ACCESS_KEY_ID", orig_aws_key);
 set_env("LMAWS_SIM_SECRET_ACCESS_KEY", orig_aws_sec);
 set_env("LMAZURE_SIM_TOKEN", orig_az_tok);
@@ -173,8 +149,20 @@ cleanup_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 end _lmcode_
 r_clean = run_lmcode(cleanup_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 
-assert(r_denied.ok, "13 policy-denied pass host execution failed");
 assert(r_clean.ok && r_clean.result.deleted, "13 cleanup of seeded function with allowed credentials failed");
+assert(r_unauth.ok, "13 unauthenticated pass host execution failed");
+
+if (is_open) {
+  assert(!expect_enforce, "LMCLOUD_AUTH_MODE=enforce was requested, but simulator accepted bogus credentials (open mode)");
+  println("SKIP: simulator is in --auth open mode; 13-function-auth-enforced-denial requires --auth enforce");
+  exit(0);
+}
+
+assert(r_unauth.result.create_unauth, "Pass 1 (wrong creds): function_create must fail UNAUTHENTICATED");
+assert(r_unauth.result.invoke_unauth, "Pass 1 (wrong creds): function_invoke on seeded function must fail UNAUTHENTICATED");
+assert(r_unauth.result.exists_not_ok, "Pass 1 (wrong creds): function_exists on seeded function must fail UNAUTHENTICATED or PERMISSION_DENIED");
+
+assert(r_denied.ok, "13 policy-denied pass host execution failed");
 assert(!r_denied.result.created && !r_denied.result.exists_val, "denied principal must not create or observe seeded function");
 assert(r_denied.result.exists_denied && r_denied.result.create_denied && r_denied.result.invoke_denied,
   "Pass 2 (policy denied): function_exists(seed_fn)/function_create(denied_fn)/function_invoke(seed_fn) must all fail PERMISSION_DENIED (probe never masked as false/OK)");

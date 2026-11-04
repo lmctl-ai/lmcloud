@@ -1,0 +1,36 @@
+# Requires: permissions
+# Scenario 07: Identity-side attach — policy_attach_principal with a statement resource list scopes
+# permissions to exactly the listed resources.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+b1 = "lmcloud-p07-" + run_id + "-a";
+b2 = "lmcloud-p07-" + run_id + "-b";
+pr = "arn:aws:iam::000000000000:role/lister-" + run_id;
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+    cloud.set_endpoint("storage", ep);
+  }
+  cloud.bucket_create(${b1});
+  cloud.bucket_create(${b2});
+
+  cloud.policy_attach_principal(${pr},
+    cloud.policy_new().statement("Allow", str_list().add("storage.bucket.list"), str_list().add("storage:bucket:" + ${b1})));
+
+  let listed = cloud.policy_check(${pr}, "storage.bucket.list", "storage:bucket:" + ${b1});
+  let other = cloud.policy_check(${pr}, "storage.bucket.list", "storage:bucket:" + ${b2});
+
+  cloud.policy_detach_principal(${pr});
+  cloud.bucket_delete(${b1});
+  cloud.bucket_delete(${b2});
+
+  lmcode_return_put("listed", listed);
+  lmcode_return_put("other", other);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "07-attach-principal-identity host execution failed");
+assert(r.result.listed, "identity-attach must allow the listed bucket");
+assert(!r.result.other, "identity-attach must not leak to unlisted buckets");

@@ -1,0 +1,120 @@
+# Requires: permissions
+# Scenario 01: Policy builder + canonical document format (design 15 §3.5) — two-tier contract:
+# Tier-1 (builder/parse) rejects only malformed syntax; canonical document bytes round-trip and match a
+# golden fixture string (cross-host byte equality).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-p01-" + run_id + "-a";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+  }
+  let b = ${bucket};
+
+  let p = cloud.policy_new();
+  p = p.statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/public/*"));
+  p = p.statement("Deny", str_list().add("storage.object.delete"), str_list().add("storage:object:" + b + "/secret/*"));
+
+  let doc = p.document();
+  let roundtrip = cloud.policy_parse(doc);
+  let rt_ok = roundtrip.document() == doc;
+  let len_ok = p.len() == 2;
+
+  # Golden canonical fixture (design 15 §3.5): byte-exact envelope, sorted arrays, insertion-ordered statements
+  let golden = "{\"v\":1,\"statements\":[{\"effect\":\"Allow\",\"actions\":[\"storage.object.read\"],\"resources\":[\"storage:object:" + b + "/public/*\"]},{\"effect\":\"Deny\",\"actions\":[\"storage.object.delete\"],\"resources\":[\"storage:object:" + b + "/secret/*\"]}]}";
+  let golden_ok = doc == golden;
+
+  # Sorting proof: multi-element arrays added out of order canonicalize sorted ascending (UTF-8 bytes)
+  let p2 = cloud.policy_new();
+  p2 = p2.statement("Allow",
+    str_list().add("storage.object.write").add("storage.object.read"),
+    str_list().add("storage:object:" + b + "/z/*").add("storage:object:" + b + "/a/*"));
+  let golden2 = "{\"v\":1,\"statements\":[{\"effect\":\"Allow\",\"actions\":[\"storage.object.read\",\"storage.object.write\"],\"resources\":[\"storage:object:" + b + "/a/*\",\"storage:object:" + b + "/z/*\"]}]}";
+  let sort_ok = p2.document() == golden2;
+
+  # Duplicate and unknown JSON fields rejected at policy_parse
+  cloud.set_abort_on_error(false);
+  cloud.policy_parse("{\"v\":1,\"v\":2,\"statements\":[]}");
+  let e_dup = cloud.last_error();
+  cloud.policy_parse("{\"v\":1,\"junk\":1,\"statements\":[]}");
+  let e_unk = cloud.last_error();
+  let dup_ok = e_dup.code() == ErrorCode.INVALID_ARGUMENT && e_dup.http_status() == 0;
+  let unk_field_ok = e_unk.code() == ErrorCode.INVALID_ARGUMENT && e_unk.http_status() == 0;
+  cloud.set_abort_on_error(true);
+
+  # Canonical document size boundary (8192 bytes) within all per-element limits:
+  # 16 identical 480-byte resources, then a measured tail resource sized to land the doc at exactly 8192.
+  let r480 = "storage:object:" + b + "/pad" + str_repeat("p", 439);
+  let res16 = str_list();
+  let i = 0;
+  while (i < 16) {
+    res16 = res16.add(r480);
+    i = i + 1;
+  }
+  let p3 = cloud.policy_new().statement("Allow", str_list().add("storage.object.read"), res16);
+  let m1 = str_len(p3.document());
+  # measure second-statement framing empirically with a minimal resource
+  let min_res = "storage:object:" + b + "/q";
+  let p3t = cloud.policy_parse(p3.document());
+  p3t = p3t.statement("Allow", str_list().add("storage.object.read"), str_list().add(min_res));
+  let fprime = str_len(p3t.document()) - m1 - (str_len(min_res) + 2);
+  # tail resource length that lands the canonical doc at exactly 8192
+  let tl = 8192 - m1 - fprime - 2;
+  let tail_res = "storage:object:" + b + "/pad" + str_repeat("p", tl - str_len("storage:object:" + b + "/pad"));
+  let fit_p = cloud.policy_parse(p3.document());
+  fit_p = fit_p.statement("Allow", str_list().add("storage.object.read"), str_list().add(tail_res));
+  let fit_doc = fit_p.document();
+  let fit_ok = str_len(fit_doc) == 8192 && cloud.policy_lint(fit_p).ok();
+  # +1 byte over the bound -> pre-flight INVALID_ARGUMENT
+  cloud.set_abort_on_error(false);
+  let over_p = cloud.policy_parse(p3.document());
+  over_p = over_p.statement("Allow", str_list().add("storage.object.read"), str_list().add(tail_res + "x"));
+  over_p.document();
+  let e_big = cloud.last_error();
+  let over_ok = e_big.code() == ErrorCode.INVALID_ARGUMENT && e_big.http_status() == 0;
+  cloud.set_abort_on_error(true);
+
+  cloud.set_abort_on_error(false);
+  # Tier-1 syntax failures (malformed): bad effect, dot-less action, colon-less resource, malofrmed JSON
+  cloud.policy_new().statement("Maybe", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/k"));
+  let e_effect = cloud.last_error();
+  cloud.policy_new().statement("Allow", str_list().add("bogus"), str_list().add("storage:object:" + b + "/k"));
+  let e_action = cloud.last_error();
+  cloud.policy_new().statement("Allow", str_list().add("storage.object.read"), str_list().add("not-a-resource"));
+  let e_res = cloud.last_error();
+  cloud.policy_parse("{not json");
+  let e_parse = cloud.last_error();
+  # Tier-1 accepts well-formed-but-unknown vocabulary (semantic lint handles it in 03/09)
+  let unk_ok = true;
+  let unk = cloud.policy_new().statement("Allow", str_list().add("storage.object.unknownverb"), str_list().add("storage:object:" + b + "/k"));
+  unk_ok = cloud.last_error().ok();
+  let guards_ok =
+    e_effect.code() == ErrorCode.INVALID_ARGUMENT && e_effect.http_status() == 0
+    && e_action.code() == ErrorCode.INVALID_ARGUMENT && e_action.http_status() == 0
+    && e_res.code() == ErrorCode.INVALID_ARGUMENT && e_res.http_status() == 0
+    && e_parse.code() == ErrorCode.INVALID_ARGUMENT && e_parse.http_status() == 0
+    && unk_ok;
+  cloud.set_abort_on_error(true);
+
+  lmcode_return_put("rt_ok", rt_ok);
+  lmcode_return_put("len_ok", len_ok);
+  lmcode_return_put("golden_ok", golden_ok);
+  lmcode_return_put("sort_ok", sort_ok);
+  lmcode_return_put("dup_ok", dup_ok);
+  lmcode_return_put("unk_field_ok", unk_field_ok);
+  lmcode_return_put("fit_ok", fit_ok);
+  lmcode_return_put("over_ok", over_ok);
+  lmcode_return_put("guards_ok", guards_ok);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "01-policy-build-and-document host execution failed");
+assert(r.result.rt_ok, "document must round-trip: parse(document()).document() == document()");
+assert(r.result.len_ok, "policy must contain exactly 2 statements");
+assert(r.result.golden_ok, "canonical document bytes must match the golden fixture (cross-host equality)");
+assert(r.result.sort_ok, "multi-element action/resource arrays canonicalize sorted ascending");
+assert(r.result.dup_ok && r.result.unk_field_ok, "duplicate/unknown JSON fields rejected at parse");
+assert(r.result.fit_ok && r.result.over_ok, "canonical document of exactly 8192 bytes is legal; 8193 fails pre-flight INVALID_ARGUMENT");
+assert(r.result.guards_ok, "Tier-1: malformed effect/action/resource/JSON fail pre-flight INVALID_ARGUMENT (http_status 0); well-formed unknown vocabulary is accepted to lint");

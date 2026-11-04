@@ -1,0 +1,36 @@
+# Requires: permissions
+# Scenario 10: policy_check validation — malformed action/resource fail pre-flight INVALID_ARGUMENT;
+# well-formed grammar on a missing resource is NOT_FOUND.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+ghost = "lmcloud-p10-" + run_id + "-g";
+pr = "arn:aws:iam::000000000000:role/any-" + run_id;
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+  }
+
+  cloud.set_abort_on_error(false);
+  cloud.policy_check(${pr}, "bogus", "storage:bucket:x");
+  let e_action = cloud.last_error();
+  cloud.policy_check(${pr}, "storage.object.read", "bogus");
+  let e_res = cloud.last_error();
+  cloud.policy_check(${pr}, "storage.object.read", "storage:bucket:" + ${ghost});
+  let e_nf = cloud.last_error();
+  cloud.set_abort_on_error(true);
+
+  let va = e_action.code() == ErrorCode.INVALID_ARGUMENT && e_action.http_status() == 0;
+  let vr = e_res.code() == ErrorCode.INVALID_ARGUMENT && e_res.http_status() == 0;
+  let nf = e_nf.code() == ErrorCode.NOT_FOUND;
+
+  lmcode_return_put("va", va);
+  lmcode_return_put("vr", vr);
+  lmcode_return_put("nf", nf);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "10-check-validation-notfound host execution failed");
+assert(r.result.va && r.result.vr, "malformed action/resource must fail pre-flight INVALID_ARGUMENT (http_status 0)");
+assert(r.result.nf, "policy_check on a missing resource must be NOT_FOUND");

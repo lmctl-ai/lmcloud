@@ -1,0 +1,40 @@
+# Requires: permissions
+# Scenario 08: Detach revokes — attach then detach flips policy_check from true to false;
+# detaching an already-detached pair is idempotent OK.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-p08-" + run_id + "-x";
+pr = "arn:aws:iam::000000000000:role/rw-" + run_id;
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+    cloud.set_endpoint("storage", ep);
+  }
+  let b = ${bucket};
+  cloud.bucket_create(b);
+
+  cloud.policy_attach("storage:bucket:" + b, ${pr},
+    cloud.policy_new().statement("Allow", str_list().add("storage.object.write"), str_list().add("storage:object:" + b + "/*")));
+  let after_attach = cloud.policy_check(${pr}, "storage.object.write", "storage:object:" + b + "/k");
+
+  cloud.policy_detach("storage:bucket:" + b, ${pr});
+  let after_detach = cloud.policy_check(${pr}, "storage.object.write", "storage:object:" + b + "/k");
+
+  # idempotent re-detach must not error
+  cloud.policy_detach("storage:bucket:" + b, ${pr});
+  let detach_ok = cloud.last_error().ok();
+
+  cloud.bucket_delete(b);
+
+  lmcode_return_put("after_attach", after_attach);
+  lmcode_return_put("after_detach", after_detach);
+  lmcode_return_put("detach_ok", detach_ok);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "08-detach-revokes host execution failed");
+assert(r.result.after_attach, "check true after attach");
+assert(!r.result.after_detach, "check false after detach (revocation)");
+assert(r.result.detach_ok, "repeat detach must be idempotent OK");

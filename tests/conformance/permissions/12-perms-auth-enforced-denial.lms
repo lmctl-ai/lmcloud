@@ -1,0 +1,116 @@
+# Requires: permissions
+# Scenario 12: Auth-enforced denial — runs ONLY under <provider>sim --auth enforce (TAP SKIP in open).
+# Mode detection is an authenticated DATA operation (bucket_create with bogus creds), never a local
+# identity accessor. Pass 1: bogus creds -> UNAUTHENTICATED. Pass 2: valid-but-restricted principal
+# with an explicitly seeded owned target -> PERMISSION_DENIED on policy_attach AND policy_check.
+# Azure leg self-SKIPs until epic A-P2; OCI is runner-level capability SKIP.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+probe_bucket = "lmcloud-p12-" + run_id + "-probe";
+denied_bucket = "lmcloud-p12-" + run_id + "-targetok";
+pr = "arn:aws:iam::000000000000:role/restricted-" + run_id;
+host = ARGV[0];
+is_azure = contains(host, "lmazure");
+
+orig_aws_key = env("LMAWS_SIM_ACCESS_KEY_ID", "");
+orig_aws_sec = env("LMAWS_SIM_SECRET_ACCESS_KEY", "");
+orig_az_tok = env("LMAZURE_SIM_TOKEN", "");
+orig_az_key = env("LMAZURE_SIM_KEY", "");
+orig_gcp_tok = env("LMGCP_SIM_TOKEN", "");
+
+# Pass 1: bogus credentials; probe enforcement with bucket_create (an authenticated operation)
+set_env("LMAWS_SIM_ACCESS_KEY_ID", "AKIAUNAUTH0000000000");
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", "wrong-secret-key-for-unauthenticated-pass");
+set_env("LMAZURE_SIM_TOKEN", "invalid-bearer-token-unauthenticated");
+set_env("LMAZURE_SIM_KEY", "d3JvbmdrZXl1bmF1dGhlbnRpY2F0ZWQ=");
+set_env("LMGCP_SIM_TOKEN", "invalid-bearer-token-unauthenticated");
+
+unauth_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+    cloud.set_endpoint("storage", ep);
+  }
+  cloud.set_abort_on_error(false);
+
+  # Mode probe: authenticated storage op. Open mode -> bucket actually created (OK).
+  let created = cloud.bucket_create(${probe_bucket});
+  let create_err = cloud.last_error();
+  let open_mode = create_err.code() == ErrorCode.OK;
+  let create_unauth = create_err.code() == ErrorCode.UNAUTHENTICATED;
+
+  let check_unauth = false;
+  if (open_mode) {
+    if (created || cloud.bucket_exists(${probe_bucket})) {
+      cloud.bucket_delete(${probe_bucket});
+    }
+  } else {
+    # valid grammar, anchored target missing is fine: auth failure must precede everything
+    cloud.policy_check(${pr}, "storage.object.read", "storage:object:" + ${probe_bucket} + "/k");
+    let e = cloud.last_error();
+    check_unauth = e.code() == ErrorCode.UNAUTHENTICATED;
+  }
+
+  lmcode_return_put("open_mode", open_mode);
+  lmcode_return_put("create_unauth", create_unauth);
+  lmcode_return_put("check_unauth", check_unauth);
+end _lmcode_
+
+r_unauth = run_lmcode(unauth_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r_unauth.ok, "12 unauthenticated pass host execution failed");
+
+if (r_unauth.result.open_mode) {
+  println("SKIP: simulator is in --auth open mode; 12-perms-auth-enforced-denial requires --auth enforce");
+  exit(0);
+}
+
+assert(r_unauth.result.create_unauth, "Pass 1 (bogus creds): bucket_create must fail with ErrorCode.UNAUTHENTICATED (authenticated probe)");
+assert(r_unauth.result.check_unauth, "Pass 1 (bogus creds): policy_check must fail with ErrorCode.UNAUTHENTICATED");
+
+if (is_azure) {
+  println("SKIP: " + host + " permission enforce routes pending (azuresim RBAC-lite epic A-P2, 16-permissions-conformance.md §3)");
+  exit(0);
+}
+
+# Pass 2: valid-but-restricted principal; seed an OWNABLE target first (open perms for data-plane ops
+# per the sim auth fixture), then attach/check must be PERMISSION_DENIED.
+set_env("LMAWS_SIM_ACCESS_KEY_ID", env("LMCLOUD_ENFORCE_DENIED_AWS_ACCESS_KEY_ID", orig_aws_key));
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", env("LMCLOUD_ENFORCE_DENIED_AWS_SECRET_ACCESS_KEY", orig_aws_sec));
+set_env("LMAZURE_SIM_TOKEN", env("LMCLOUD_ENFORCE_DENIED_AZURE_TOKEN", orig_az_tok));
+set_env("LMAZURE_SIM_KEY", env("LMCLOUD_ENFORCE_DENIED_AZURE_KEY", orig_az_key));
+set_env("LMGCP_SIM_TOKEN", env("LMCLOUD_ENFORCE_DENIED_GCP_TOKEN", orig_gcp_tok));
+
+denied_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+    cloud.set_endpoint("storage", ep);
+  }
+  let b = ${denied_bucket};
+  cloud.set_abort_on_error(false);
+
+  # explicitly seeded owned target by the restricted identity itself (fixture must allow data-plane
+  # creates on non-denied names); asserts seed success so authorization denial is isolated
+  let seeded = cloud.bucket_create(b);
+  lmcode_return_put("seeded_ok", seeded);
+
+  cloud.policy_attach("storage:bucket:" + b, ${pr},
+    cloud.policy_new().statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/*")));
+  let attach_err = cloud.last_error();
+
+  cloud.policy_check(${pr}, "storage.object.read", "storage:object:" + b + "/k");
+  let check_err = cloud.last_error();
+
+  if (seeded || cloud.bucket_exists(b)) {
+    cloud.bucket_delete(b);
+  }
+
+  lmcode_return_put("attach_denied", attach_err.code() == ErrorCode.PERMISSION_DENIED);
+  lmcode_return_put("check_denied", check_err.code() == ErrorCode.PERMISSION_DENIED);
+end _lmcode_
+
+r_denied = run_lmcode(denied_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r_denied.ok, "12 policy-denied pass host execution failed");
+assert(r_denied.result.seeded_ok, "Pass 2: restricted identity must successfully seed its owned target (auth fixture allows data-plane creates on non-denied names)");
+assert(r_denied.result.attach_denied, "Pass 2 (restricted principal, owned target): policy_attach must be PERMISSION_DENIED");
+assert(r_denied.result.check_denied, "Pass 2 (restricted principal, owned target): policy_check must be PERMISSION_DENIED");
