@@ -335,6 +335,8 @@ type LedgerState struct {
 	ActiveCleanup      map[string]int64
 	PolicyAttachments  map[string]JournalPolicyAttachment
 	AmbiguousPolicies  map[string]JournalPolicyAttachment
+	AmbiguousStack     map[string][]JournalPolicyAttachment
+	PolicyTombstones   map[string]JournalPolicyAttachment
 	MaxPolicyGen       map[string]uint64
 	LatestPolicyIntent map[string]string
 	BucketsCreated     int
@@ -696,6 +698,14 @@ func (j *Journal) State() LedgerState {
 	cp.AmbiguousPolicies = make(map[string]JournalPolicyAttachment, len(j.state.AmbiguousPolicies))
 	for k, v := range j.state.AmbiguousPolicies {
 		cp.AmbiguousPolicies[k] = v
+	}
+	cp.AmbiguousStack = make(map[string][]JournalPolicyAttachment, len(j.state.AmbiguousStack))
+	for k, v := range j.state.AmbiguousStack {
+		cp.AmbiguousStack[k] = append([]JournalPolicyAttachment(nil), v...)
+	}
+	cp.PolicyTombstones = make(map[string]JournalPolicyAttachment, len(j.state.PolicyTombstones))
+	for k, v := range j.state.PolicyTombstones {
+		cp.PolicyTombstones[k] = v
 	}
 	cp.MaxPolicyGen = make(map[string]uint64, len(j.state.MaxPolicyGen))
 	for k, v := range j.state.MaxPolicyGen {
@@ -1510,44 +1520,158 @@ func (j *Journal) Compact() error {
 			})
 		}
 	}
-	if len(j.state.AmbiguousPolicies) > 0 {
-		ambKeys := make([]string, 0, len(j.state.AmbiguousPolicies))
-		for k := range j.state.AmbiguousPolicies {
-			ambKeys = append(ambKeys, k)
+	if len(j.state.AmbiguousStack) > 0 {
+		ambKeys := make([]string, 0, len(j.state.AmbiguousStack))
+		for k, stack := range j.state.AmbiguousStack {
+			if len(stack) > 0 {
+				ambKeys = append(ambKeys, k)
+			}
 		}
 		sort.Strings(ambKeys)
 		for _, k := range ambKeys {
-			pa := j.state.AmbiguousPolicies[k]
-			seq++
-			intentID := pa.IntentID
-			if intentID == "" {
-				intentID = pa.OwnerToken
+			for _, pa := range j.state.AmbiguousStack[k] {
+				seq++
+				intentID := pa.IntentID
+				if intentID == "" {
+					intentID = pa.OwnerToken
+				}
+				compacted = append(compacted, JournalRecord{
+					Version:         JournalVersion,
+					Seq:             seq,
+					Time:            nowStr,
+					Event:           EventPolicyIntent,
+					RunID:           j.meta.RunID,
+					SessionID:       j.meta.SessionID,
+					PolicyHash:      j.meta.PolicyHash,
+					Provider:        j.meta.Provider,
+					Account:         j.meta.Account,
+					Tenant:          j.meta.Tenant,
+					Scope:           j.meta.Scope,
+					Region:          j.meta.Region,
+					Endpoint:        j.meta.Endpoint,
+					Kind:            KindPolicyAttachment,
+					PolicyScope:     pa.Scope,
+					PolicyKind:      pa.Kind,
+					PolicyTarget:    pa.Target,
+					PolicyPrincipal: pa.Principal,
+					PolicyIntentOp:  pa.IntentOp,
+					PolicyDocument:  pa.Document,
+					CreateToken:     pa.OwnerToken,
+					Generation:      pa.Generation,
+					AttemptID:       intentID,
+				})
 			}
-			compacted = append(compacted, JournalRecord{
-				Version:         JournalVersion,
-				Seq:             seq,
-				Time:            nowStr,
-				Event:           EventPolicyIntent,
-				RunID:           j.meta.RunID,
-				SessionID:       j.meta.SessionID,
-				PolicyHash:      j.meta.PolicyHash,
-				Provider:        j.meta.Provider,
-				Account:         j.meta.Account,
-				Tenant:          j.meta.Tenant,
-				Scope:           j.meta.Scope,
-				Region:          j.meta.Region,
-				Endpoint:        j.meta.Endpoint,
-				Kind:            KindPolicyAttachment,
-				PolicyScope:     pa.Scope,
-				PolicyKind:      pa.Kind,
-				PolicyTarget:    pa.Target,
-				PolicyPrincipal: pa.Principal,
-				PolicyIntentOp:  pa.IntentOp,
-				PolicyDocument:  pa.Document,
-				CreateToken:     pa.OwnerToken,
-				Generation:      pa.Generation,
-				AttemptID:       intentID,
-			})
+		}
+	}
+	if len(j.state.PolicyTombstones) > 0 {
+		tbKeys := make([]string, 0, len(j.state.PolicyTombstones))
+		for k := range j.state.PolicyTombstones {
+			tbKeys = append(tbKeys, k)
+		}
+		sort.Strings(tbKeys)
+		for _, k := range tbKeys {
+			tb := j.state.PolicyTombstones[k]
+			maxGen := j.state.MaxPolicyGen[k]
+			if maxGen == 0 {
+				continue
+			}
+			latestIntent := j.state.LatestPolicyIntent[k]
+			if latestIntent == "" {
+				latestIntent = tb.IntentID
+			}
+			_, inActive := j.state.PolicyAttachments[k]
+			_, inAmb := j.state.AmbiguousPolicies[k]
+			if !inActive && !inAmb {
+				seq++
+				compacted = append(compacted, JournalRecord{
+					Version:         JournalVersion,
+					Seq:             seq,
+					Time:            nowStr,
+					Event:           EventPolicyDetach,
+					RunID:           j.meta.RunID,
+					SessionID:       j.meta.SessionID,
+					PolicyHash:      j.meta.PolicyHash,
+					Provider:        j.meta.Provider,
+					Account:         j.meta.Account,
+					Tenant:          j.meta.Tenant,
+					Scope:           j.meta.Scope,
+					Region:          j.meta.Region,
+					Endpoint:        j.meta.Endpoint,
+					Kind:            KindPolicyAttachment,
+					PolicyScope:     tb.Scope,
+					PolicyKind:      tb.Kind,
+					PolicyTarget:    tb.Target,
+					PolicyPrincipal: tb.Principal,
+					CreateToken:     tb.OwnerToken,
+					Generation:      strconv.FormatUint(maxGen, 10),
+					AttemptID:       latestIntent,
+				})
+				continue
+			}
+			var emittedGen uint64
+			if pa, ok := j.state.PolicyAttachments[k]; ok {
+				if g, err := strconv.ParseUint(pa.Generation, 10, 64); err == nil && g > emittedGen {
+					emittedGen = g
+				}
+			}
+			if pa, ok := j.state.AmbiguousPolicies[k]; ok {
+				if g, err := strconv.ParseUint(pa.Generation, 10, 64); err == nil && g > emittedGen {
+					emittedGen = g
+				}
+			}
+			if maxGen > emittedGen && tb.OwnerToken != "" && latestIntent != "" {
+				genStr := strconv.FormatUint(maxGen, 10)
+				seq++
+				compacted = append(compacted, JournalRecord{
+					Version:         JournalVersion,
+					Seq:             seq,
+					Time:            nowStr,
+					Event:           EventPolicyIntent,
+					RunID:           j.meta.RunID,
+					SessionID:       j.meta.SessionID,
+					PolicyHash:      j.meta.PolicyHash,
+					Provider:        j.meta.Provider,
+					Account:         j.meta.Account,
+					Tenant:          j.meta.Tenant,
+					Scope:           j.meta.Scope,
+					Region:          j.meta.Region,
+					Endpoint:        j.meta.Endpoint,
+					Kind:            KindPolicyAttachment,
+					PolicyScope:     tb.Scope,
+					PolicyKind:      tb.Kind,
+					PolicyTarget:    tb.Target,
+					PolicyPrincipal: tb.Principal,
+					PolicyIntentOp:  "detach",
+					CreateToken:     tb.OwnerToken,
+					Generation:      genStr,
+					AttemptID:       latestIntent,
+				})
+				seq++
+				compacted = append(compacted, JournalRecord{
+					Version:         JournalVersion,
+					Seq:             seq,
+					Time:            nowStr,
+					Event:           EventPolicyIntent,
+					RunID:           j.meta.RunID,
+					SessionID:       j.meta.SessionID,
+					PolicyHash:      j.meta.PolicyHash,
+					Provider:        j.meta.Provider,
+					Account:         j.meta.Account,
+					Tenant:          j.meta.Tenant,
+					Scope:           j.meta.Scope,
+					Region:          j.meta.Region,
+					Endpoint:        j.meta.Endpoint,
+					Kind:            KindPolicyAttachment,
+					PolicyScope:     tb.Scope,
+					PolicyKind:      tb.Kind,
+					PolicyTarget:    tb.Target,
+					PolicyPrincipal: tb.Principal,
+					PolicyIntentOp:  "abort",
+					CreateToken:     tb.OwnerToken,
+					Generation:      genStr,
+					AttemptID:       latestIntent,
+				})
+			}
 		}
 	}
 
@@ -1740,6 +1864,8 @@ func ReplayJournal(records []JournalRecord) (*LedgerState, error) {
 		ActiveCleanup:      make(map[string]int64),
 		PolicyAttachments:  make(map[string]JournalPolicyAttachment),
 		AmbiguousPolicies:  make(map[string]JournalPolicyAttachment),
+		AmbiguousStack:     make(map[string][]JournalPolicyAttachment),
+		PolicyTombstones:   make(map[string]JournalPolicyAttachment),
 		MaxPolicyGen:       make(map[string]uint64),
 		LatestPolicyIntent: make(map[string]string),
 		byKey:              make(map[string]int),
@@ -2205,6 +2331,12 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 	if state.AmbiguousPolicies == nil {
 		state.AmbiguousPolicies = make(map[string]JournalPolicyAttachment)
 	}
+	if state.AmbiguousStack == nil {
+		state.AmbiguousStack = make(map[string][]JournalPolicyAttachment)
+	}
+	if state.PolicyTombstones == nil {
+		state.PolicyTombstones = make(map[string]JournalPolicyAttachment)
+	}
 	if state.MaxPolicyGen == nil {
 		state.MaxPolicyGen = make(map[string]uint64)
 	}
@@ -2266,7 +2398,25 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		pKey := scopedPolicyKey(rec.PolicyScope, rec.PolicyKind, rec.PolicyTarget, rec.PolicyPrincipal)
 		genNum, _ := strconv.ParseUint(rec.Generation, 10, 64)
 		if rec.PolicyIntentOp == "abort" {
-			if state.LatestPolicyIntent[pKey] == "" || state.LatestPolicyIntent[pKey] == rec.AttemptID {
+			stack := state.AmbiguousStack[pKey]
+			if len(stack) > 0 {
+				filtered := stack[:0]
+				for _, item := range stack {
+					if item.IntentID != rec.AttemptID {
+						filtered = append(filtered, item)
+					}
+				}
+				if len(filtered) > 0 {
+					state.AmbiguousStack[pKey] = filtered
+					state.AmbiguousPolicies[pKey] = filtered[len(filtered)-1]
+				} else {
+					delete(state.AmbiguousStack, pKey)
+					delete(state.AmbiguousPolicies, pKey)
+					if _, inActive := state.PolicyAttachments[pKey]; !inActive {
+						delete(state.ActiveCleanup, "policy\x00"+pKey)
+					}
+				}
+			} else if state.LatestPolicyIntent[pKey] == "" || state.LatestPolicyIntent[pKey] == rec.AttemptID {
 				delete(state.AmbiguousPolicies, pKey)
 				if _, inActive := state.PolicyAttachments[pKey]; !inActive {
 					delete(state.ActiveCleanup, "policy\x00"+pKey)
@@ -2288,7 +2438,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		}
 		state.MaxPolicyGen[pKey] = genNum
 		state.LatestPolicyIntent[pKey] = rec.AttemptID
-		state.AmbiguousPolicies[pKey] = JournalPolicyAttachment{
+		jpa := JournalPolicyAttachment{
 			Key:        pKey,
 			Scope:      rec.PolicyScope,
 			Kind:       rec.PolicyKind,
@@ -2301,6 +2451,9 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			Ambiguous:  true,
 			IntentOp:   rec.PolicyIntentOp,
 		}
+		state.AmbiguousStack[pKey] = append(state.AmbiguousStack[pKey], jpa)
+		state.AmbiguousPolicies[pKey] = jpa
+		state.PolicyTombstones[pKey] = jpa
 		if rec.CleanupReserveNanoUSD > 0 {
 			state.ActiveCleanup["policy\x00"+pKey] = rec.CleanupReserveNanoUSD
 		}
@@ -2326,8 +2479,9 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		if rec.AttemptID != "" {
 			state.LatestPolicyIntent[pKey] = rec.AttemptID
 		}
+		delete(state.AmbiguousStack, pKey)
 		delete(state.AmbiguousPolicies, pKey)
-		state.PolicyAttachments[pKey] = JournalPolicyAttachment{
+		jpa := JournalPolicyAttachment{
 			Key:        pKey,
 			Scope:      rec.PolicyScope,
 			Kind:       rec.PolicyKind,
@@ -2338,6 +2492,8 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 			Generation: rec.Generation,
 			IntentID:   rec.AttemptID,
 		}
+		state.PolicyAttachments[pKey] = jpa
+		state.PolicyTombstones[pKey] = jpa
 		if rec.CleanupReserveNanoUSD > 0 {
 			state.ActiveCleanup["policy\x00"+pKey] = rec.CleanupReserveNanoUSD
 		}
@@ -2355,6 +2511,24 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		if rec.AttemptID != "" && state.LatestPolicyIntent[pKey] != "" && rec.AttemptID != state.LatestPolicyIntent[pKey] {
 			return fmt.Errorf("stale policy_detach intent_id %q for key %q (latest=%q)", rec.AttemptID, pKey, state.LatestPolicyIntent[pKey])
 		}
+		if rec.AttemptID != "" {
+			state.LatestPolicyIntent[pKey] = rec.AttemptID
+		}
+		ownerTok := rec.CreateToken
+		if ownerTok == "" {
+			ownerTok = state.PolicyTombstones[pKey].OwnerToken
+		}
+		state.PolicyTombstones[pKey] = JournalPolicyAttachment{
+			Key:        pKey,
+			Scope:      rec.PolicyScope,
+			Kind:       rec.PolicyKind,
+			Target:     rec.PolicyTarget,
+			Principal:  rec.PolicyPrincipal,
+			OwnerToken: ownerTok,
+			Generation: rec.Generation,
+			IntentID:   state.LatestPolicyIntent[pKey],
+		}
+		delete(state.AmbiguousStack, pKey)
 		delete(state.AmbiguousPolicies, pKey)
 		delete(state.PolicyAttachments, pKey)
 		delete(state.ActiveCleanup, "policy\x00"+pKey)
@@ -2828,12 +3002,25 @@ func removeResourcePolicyAttachments(state *LedgerState, kind, name string) {
 		if pa.Kind == "resource" && pa.Target == target {
 			delete(state.PolicyAttachments, k)
 			delete(state.ActiveCleanup, "policy\x00"+k)
+			suffix := "\x00" + strings.ReplaceAll(k, "\x00", "|")
+			for ck := range state.ActiveCleanup {
+				if strings.HasPrefix(ck, KindPolicyAttachment+"\x00") && strings.HasSuffix(ck, suffix) {
+					delete(state.ActiveCleanup, ck)
+				}
+			}
 		}
 	}
 	for k, pa := range state.AmbiguousPolicies {
 		if pa.Kind == "resource" && pa.Target == target {
 			delete(state.AmbiguousPolicies, k)
+			delete(state.AmbiguousStack, k)
 			delete(state.ActiveCleanup, "policy\x00"+k)
+			suffix := "\x00" + strings.ReplaceAll(k, "\x00", "|")
+			for ck := range state.ActiveCleanup {
+				if strings.HasPrefix(ck, KindPolicyAttachment+"\x00") && strings.HasSuffix(ck, suffix) {
+					delete(state.ActiveCleanup, ck)
+				}
+			}
 		}
 	}
 }

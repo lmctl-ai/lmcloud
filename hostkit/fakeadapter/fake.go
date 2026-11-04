@@ -1089,13 +1089,21 @@ func (f *Fake) AttachPolicy(ctx context.Context, att hostkit.PolicyAttachment) e
 		}
 		key := hostkit.AttachmentKey(att.Kind, att.Target, att.Principal)
 		attGen, _ := strconv.ParseUint(att.Generation, 10, 64)
-		if att.OwnerToken != "" && s.PolicyOwners[key] == att.OwnerToken {
-			if attGen > 0 && attGen < s.PolicyGenerations[key] {
+		if cur, exists := s.Policies[key]; exists {
+			if cur.OwnerToken != "" && cur.OwnerToken != att.OwnerToken {
+				return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "OwnershipMismatch", "foreign policy attachment already exists for target and principal")
+			}
+			if exp, hasExp := hostkit.ExpectedAttachmentFrom(ctx); hasExp {
+				if exp.ExpectedOwnerToken != "" && cur.OwnerToken != exp.ExpectedOwnerToken {
+					return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "OwnershipMismatch", "policy attachment owner token mismatch")
+				}
+			}
+			if curGen, err := strconv.ParseUint(cur.Generation, 10, 64); err == nil && attGen > 0 && attGen < curGen {
 				return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "StaleGeneration", "stale policy attachment generation")
 			}
 		}
-		if cur, exists := s.Policies[key]; exists {
-			if curGen, err := strconv.ParseUint(cur.Generation, 10, 64); err == nil && attGen > 0 && attGen < curGen && (cur.OwnerToken == "" || cur.OwnerToken == att.OwnerToken) {
+		if att.OwnerToken != "" && s.PolicyOwners[key] == att.OwnerToken {
+			if attGen > 0 && attGen < s.PolicyGenerations[key] {
 				return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "StaleGeneration", "stale policy attachment generation")
 			}
 		}

@@ -170,6 +170,24 @@ func (h *Host) permissionsScope() (string, *hostkit.CloudError) {
 	return "perm=" + permEP + "|storage=" + stEP + "|queue=" + qEP + "|tables=" + tblEP, nil
 }
 
+func (h *Host) checkPermissionsRouteAllowed(ctx context.Context) *hostkit.CloudError {
+	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+		return ce
+	}
+	if ep := hostkit.EndpointFrom(ctx); ep != "" && !hostkit.IsLoopbackEndpoint(ep) {
+		return hostkit.ProviderError(hostkit.PermissionDenied, 403, "LiveModeUnsupported",
+			"live mode refuses permissions operations: live permissions slice is not enabled")
+	}
+	if r, ok := h.cfg.Permissions.(hostkit.Router); ok && r.Pick != nil {
+		if _, err := r.Pick(hostkit.WithForbidLiveRoute(ctx)); err != nil {
+			if ce := hostkit.AsCloudError(err); ce != nil && ce.Code == hostkit.PermissionDenied {
+				return ce
+			}
+		}
+	}
+	return nil
+}
+
 // PrincipalCurrent resolves the caller's active principal identifier.
 func (h *Host) PrincipalCurrent(dry bool) (string, error) {
 	const op = "principal_current"
@@ -191,7 +209,7 @@ func (h *Host) PrincipalCurrent(dry bool) (string, error) {
 		failed = true
 		return "", h.fail(op, "", missingPermissions())
 	}
-	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+	if ce := h.checkPermissionsRouteAllowed(ctx); ce != nil {
 		failed = true
 		return "", h.fail(op, "", ce)
 	}
@@ -252,6 +270,10 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 		}
 		defer cancel()
 		ep := hostkit.EndpointFrom(sctx)
+		if ep != "" && !hostkit.IsLoopbackEndpoint(ep) {
+			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "LiveModeUnsupported",
+				"live mode refuses permissions operations: live permissions slice is not enabled")
+		}
 		if dry {
 			exists, e := h.bucketExists(sctx, true, target.Name)
 			if e != nil {
@@ -298,6 +320,10 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 		}
 		defer cancel()
 		ep := hostkit.EndpointFrom(qctx)
+		if ep != "" && !hostkit.IsLoopbackEndpoint(ep) {
+			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "LiveModeUnsupported",
+				"live mode refuses permissions operations: live permissions slice is not enabled")
+		}
 		if dry {
 			if e := h.requireQueue(qctx, true, target.Name); e != nil {
 				return e
@@ -342,6 +368,10 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 		}
 		defer cancel()
 		ep := hostkit.EndpointFrom(tctx)
+		if ep != "" && !hostkit.IsLoopbackEndpoint(ep) {
+			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "LiveModeUnsupported",
+				"live mode refuses permissions operations: live permissions slice is not enabled")
+		}
 		if dry {
 			if e := h.requireTable(tctx, true, target.Name); e != nil {
 				return e
@@ -466,7 +496,7 @@ func (h *Host) PolicyAttach(dry bool, target, principal string, policy *Policy) 
 	}
 	ovCtx := hostkit.WithEndpoint(ctx, scopeKey)
 
-	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+	if ce := h.checkPermissionsRouteAllowed(ctx); ce != nil {
 		failed = true
 		return h.fail(op, target, ce)
 	}
@@ -525,7 +555,8 @@ func (h *Host) PolicyAttach(dry bool, target, principal string, policy *Policy) 
 	}
 	h.errs.AddRedaction(att.OwnerToken)
 
-	err := h.cfg.Permissions.AttachPolicy(hostkit.WithCreateToken(mctx, att.OwnerToken), att)
+	actx := hostkit.WithExpectedAttachment(hostkit.WithCreateToken(mctx, att.OwnerToken), att)
+	err := h.cfg.Permissions.AttachPolicy(actx, att)
 	var abortErr *hostkit.CloudError
 	retries, throttles, abortErr = scope.finish(bytesIn, bytesIn, true, err == nil)
 	if abortErr != nil {
@@ -589,7 +620,7 @@ func (h *Host) PolicyAttachPrincipal(dry bool, principal string, policy *Policy)
 	}
 	ovCtx := hostkit.WithEndpoint(ctx, scopeKey)
 
-	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+	if ce := h.checkPermissionsRouteAllowed(ctx); ce != nil {
 		failed = true
 		return h.fail(op, principal, ce)
 	}
@@ -652,7 +683,8 @@ func (h *Host) PolicyAttachPrincipal(dry bool, principal string, policy *Policy)
 	}
 	h.errs.AddRedaction(att.OwnerToken)
 
-	err := h.cfg.Permissions.AttachPolicy(hostkit.WithCreateToken(mctx, att.OwnerToken), att)
+	actx := hostkit.WithExpectedAttachment(hostkit.WithCreateToken(mctx, att.OwnerToken), att)
+	err := h.cfg.Permissions.AttachPolicy(actx, att)
 	var abortErr *hostkit.CloudError
 	retries, throttles, abortErr = scope.finish(bytesIn, bytesIn, true, err == nil)
 	if abortErr != nil {
@@ -710,7 +742,7 @@ func (h *Host) PolicyDetach(dry bool, target, principal string) error {
 	}
 	ovCtx := hostkit.WithEndpoint(ctx, scopeKey)
 
-	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+	if ce := h.checkPermissionsRouteAllowed(ctx); ce != nil {
 		failed = true
 		return h.fail(op, target, ce)
 	}
@@ -730,23 +762,22 @@ func (h *Host) PolicyDetach(dry bool, target, principal string) error {
 		return h.fail(op, target, missingPermissions())
 	}
 
-	if ce := h.verifyTargetExistsAndOwned(false, anchored, true); ce != nil {
-		failed = true
-		return h.fail(op, target, ce)
-	}
-
 	ownedAtt, cerr := h.cost.hasOwnedPolicyAttachment(scopeKey, hostkit.AttachmentResource, target, principal)
 	if cerr != nil {
 		failed = true
 		return h.fail(op, target, cerr)
 	}
 	if !ownedAtt {
+		if ce := h.verifyTargetExistsAndOwned(false, anchored, true); ce != nil {
+			failed = true
+			return h.fail(op, target, ce)
+		}
 		h.ok()
 		return nil
 	}
 
 	attKey := hostkit.ScopedAttachmentKey(scopeKey, hostkit.AttachmentResource, target, principal)
-	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindPolicyAttachment, attKey)
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, IsCleanup: true}, safety.KindPolicyAttachment, attKey)
 	if cerr != nil {
 		failed = true
 		return h.fail(op, target, cerr)
@@ -822,7 +853,7 @@ func (h *Host) PolicyDetachPrincipal(dry bool, principal string) error {
 	}
 	ovCtx := hostkit.WithEndpoint(ctx, scopeKey)
 
-	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+	if ce := h.checkPermissionsRouteAllowed(ctx); ce != nil {
 		failed = true
 		return h.fail(op, principal, ce)
 	}
@@ -849,7 +880,7 @@ func (h *Host) PolicyDetachPrincipal(dry bool, principal string) error {
 	}
 
 	attKey := hostkit.ScopedAttachmentKey(scopeKey, hostkit.AttachmentPrincipal, "", principal)
-	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op}, safety.KindPolicyAttachment, attKey)
+	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{Operation: op, IsCleanup: true}, safety.KindPolicyAttachment, attKey)
 	if cerr != nil {
 		failed = true
 		return h.fail(op, principal, cerr)
@@ -927,7 +958,7 @@ func (h *Host) PolicyCheck(dry bool, principal, action, resource string) (bool, 
 	}
 	ovCtx := hostkit.WithEndpoint(ctx, scopeKey)
 
-	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+	if ce := h.checkPermissionsRouteAllowed(ctx); ce != nil {
 		failed = true
 		return false, h.fail(op, resource, ce)
 	}

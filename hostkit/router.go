@@ -40,6 +40,29 @@ type EndpointRoutes struct {
 	Unavailable func(route string) error
 }
 
+type forbidLiveRouteKey struct{}
+
+// WithForbidLiveRoute marks ctx so EndpointRoutes.Pick refuses any route that
+// resolves to the live cloud backend.
+func WithForbidLiveRoute(ctx context.Context) context.Context {
+	return context.WithValue(ctx, forbidLiveRouteKey{}, true)
+}
+
+// ForbidLiveRouteFrom reports whether ctx forbids routing to the live backend.
+func ForbidLiveRouteFrom(ctx context.Context) bool {
+	v, _ := ctx.Value(forbidLiveRouteKey{}).(bool)
+	return v
+}
+
+// IsLoopbackEndpoint reports whether ep is a valid URL with a loopback host.
+func IsLoopbackEndpoint(ep string) bool {
+	if ep == "" {
+		return false
+	}
+	u, err := url.Parse(ep)
+	return err == nil && IsLoopbackHost(u.Hostname())
+}
+
 // Pick implements the routing policy for Router.Pick.
 func (e EndpointRoutes) Pick(ctx context.Context) (Backend, error) {
 	ep := EndpointFrom(ctx)
@@ -57,6 +80,9 @@ func (e EndpointRoutes) Pick(ctx context.Context) (Backend, error) {
 		} else {
 			route, b = "live", e.Live
 		}
+	}
+	if route == "live" && ForbidLiveRouteFrom(ctx) {
+		return nil, ProviderError(PermissionDenied, 403, "LiveModeUnsupported", "operation is not enabled for live cloud routes")
 	}
 	if b != nil {
 		return b, nil
@@ -402,7 +428,7 @@ func (r Router) Scan(ctx context.Context, table string, max int, token string) (
 var errNoPermissions = ProviderError(Internal, 0, "", "backend does not support permissions")
 
 func (r Router) pickPermissions(ctx context.Context) (Permissions, error) {
-	be, err := r.pick(ctx)
+	be, err := r.pick(WithForbidLiveRoute(ctx))
 	if err != nil {
 		return nil, err
 	}

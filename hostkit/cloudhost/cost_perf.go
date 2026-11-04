@@ -239,6 +239,8 @@ type replayedCampaignState struct {
 	activeItems            map[string]int64
 	activePolicies         map[string]hostkit.PolicyAttachment
 	ambiguousPolicies      map[string]hostkit.PolicyAttachment
+	ambiguousStack         map[string][]hostkit.PolicyAttachment
+	policyOwnerTokens      map[string]string
 	maxPolicyGen           map[string]uint64
 	latestPolicyIntent     map[string]string
 	policyCleanup          map[string]int64
@@ -335,6 +337,8 @@ type costTracker struct {
 	activeItems        map[string]int64
 	activePolicies     map[string]hostkit.PolicyAttachment
 	ambiguousPolicies  map[string]hostkit.PolicyAttachment
+	ambiguousStack     map[string][]hostkit.PolicyAttachment
+	policyOwnerTokens  map[string]string
 	maxPolicyGen       map[string]uint64
 	latestPolicyIntent map[string]string
 	policyCleanup      map[string]int64
@@ -346,6 +350,13 @@ func scopedResKey(endpoint, resKey string) string {
 		return resKey
 	}
 	return endpoint + "\x00" + resKey
+}
+
+func journalAttemptName(resKey string) string {
+	if resKey == "" {
+		return ""
+	}
+	return strings.ReplaceAll(resKey, "\x00", "|")
 }
 
 func isKnownProvider(p string) bool {
@@ -518,6 +529,8 @@ func newCostTracker(cfg Config) *costTracker {
 		activeItems:        map[string]int64{},
 		activePolicies:     map[string]hostkit.PolicyAttachment{},
 		ambiguousPolicies:  map[string]hostkit.PolicyAttachment{},
+		ambiguousStack:     map[string][]hostkit.PolicyAttachment{},
+		policyOwnerTokens:  map[string]string{},
 		maxPolicyGen:       map[string]uint64{},
 		latestPolicyIntent: map[string]string{},
 		policyCleanup:      map[string]int64{},
@@ -776,9 +789,9 @@ func (ct *costTracker) defaultBillingUnits(op string, bytes int64) int64 {
 	return units
 }
 
-func deleteResourcePolicyAttachments(policies, ambiguous map[string]hostkit.PolicyAttachment, policyCleanup map[string]int64, resKind, resKey string) {
+func deleteResourcePolicyAttachments(policies, ambiguous map[string]hostkit.PolicyAttachment, ambiguousStack map[string][]hostkit.PolicyAttachment, policyCleanup map[string]int64, resKind, resKey string) int64 {
 	if (len(policies) == 0 && len(ambiguous) == 0) || resKey == "" {
-		return
+		return 0
 	}
 	var target string
 	switch resKind {
@@ -789,20 +802,31 @@ func deleteResourcePolicyAttachments(policies, ambiguous map[string]hostkit.Poli
 	case safety.KindTable:
 		target = "tables:table:" + resKey
 	default:
-		return
+		return 0
 	}
+	var released int64
 	for k, pa := range policies {
 		if pa.Kind == hostkit.AttachmentResource && pa.Target == target {
 			delete(policies, k)
-			delete(policyCleanup, k)
+			if v, ok := policyCleanup[k]; ok {
+				released += v
+				delete(policyCleanup, k)
+			}
 		}
 	}
 	for k, pa := range ambiguous {
 		if pa.Kind == hostkit.AttachmentResource && pa.Target == target {
 			delete(ambiguous, k)
-			delete(policyCleanup, k)
+			if ambiguousStack != nil {
+				delete(ambiguousStack, k)
+			}
+			if v, ok := policyCleanup[k]; ok {
+				released += v
+				delete(policyCleanup, k)
+			}
 		}
 	}
+	return released
 }
 
 func countCampaignAttachmentKeys(st *replayedCampaignState) int {
@@ -826,6 +850,8 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 		activeItems:        map[string]int64{},
 		activePolicies:     map[string]hostkit.PolicyAttachment{},
 		ambiguousPolicies:  map[string]hostkit.PolicyAttachment{},
+		ambiguousStack:     map[string][]hostkit.PolicyAttachment{},
+		policyOwnerTokens:  map[string]string{},
 		maxPolicyGen:       map[string]uint64{},
 		latestPolicyIntent: map[string]string{},
 		policyCleanup:      map[string]int64{},
@@ -962,10 +988,14 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 					if _, exists := st.activeItems[sKey]; !exists {
 						st.activeItems[sKey] = p.CleanupReserveNanoUSD
 					}
+				case safety.KindPolicyAttachment:
+					if _, exists := st.policyCleanup[p.ResKey]; !exists {
+						st.policyCleanup[p.ResKey] = p.CleanupReserveNanoUSD
+					}
 				}
 			}
 			if rec.ReleaseCleanup && p.ResKey != "" {
-				deleteResourcePolicyAttachments(st.activePolicies, st.ambiguousPolicies, st.policyCleanup, p.ResKind, p.ResKey)
+				deleteResourcePolicyAttachments(st.activePolicies, st.ambiguousPolicies, st.ambiguousStack, st.policyCleanup, p.ResKind, p.ResKey)
 				switch p.ResKind {
 				case safety.KindBucket:
 					delete(st.activeBuckets, sKey)
@@ -983,6 +1013,8 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 					}
 				case safety.KindTableItem:
 					delete(st.activeItems, sKey)
+				case safety.KindPolicyAttachment:
+					delete(st.policyCleanup, p.ResKey)
 				}
 			}
 		case safety.EventPolicyIntent:
@@ -1014,7 +1046,25 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 			}
 			pKey := hostkit.ScopedAttachmentKey(rec.PolicyScope, pKind, rec.PolicyTarget, rec.PolicyPrincipal)
 			if rec.PolicyIntentOp == "abort" {
-				if st.latestPolicyIntent[pKey] == "" || st.latestPolicyIntent[pKey] == rec.IntentID {
+				stack := st.ambiguousStack[pKey]
+				if len(stack) > 0 {
+					filtered := stack[:0]
+					for _, item := range stack {
+						if item.IntentID != rec.IntentID {
+							filtered = append(filtered, item)
+						}
+					}
+					if len(filtered) > 0 {
+						st.ambiguousStack[pKey] = filtered
+						st.ambiguousPolicies[pKey] = filtered[len(filtered)-1]
+					} else {
+						delete(st.ambiguousStack, pKey)
+						delete(st.ambiguousPolicies, pKey)
+						if _, inActive := st.activePolicies[pKey]; !inActive {
+							delete(st.policyCleanup, pKey)
+						}
+					}
+				} else if st.latestPolicyIntent[pKey] == "" || st.latestPolicyIntent[pKey] == rec.IntentID {
 					delete(st.ambiguousPolicies, pKey)
 					if _, inActive := st.activePolicies[pKey]; !inActive {
 						delete(st.policyCleanup, pKey)
@@ -1043,7 +1093,8 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 			}
 			st.maxPolicyGen[pKey] = genNum
 			st.latestPolicyIntent[pKey] = rec.IntentID
-			st.ambiguousPolicies[pKey] = hostkit.PolicyAttachment{
+			st.policyOwnerTokens[pKey] = rec.OwnerToken
+			pa := hostkit.PolicyAttachment{
 				Key:                pKey,
 				Scope:              rec.PolicyScope,
 				Kind:               pKind,
@@ -1057,6 +1108,8 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 				ExpectedOwnerToken: rec.ExpectedOwnerToken,
 				ExpectedGeneration: rec.ExpectedGeneration,
 			}
+			st.ambiguousStack[pKey] = append(st.ambiguousStack[pKey], pa)
+			st.ambiguousPolicies[pKey] = pa
 			if rec.CleanupReserveNanoUSD > 0 {
 				st.policyCleanup[pKey] = rec.CleanupReserveNanoUSD
 			}
@@ -1106,6 +1159,8 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 			if rec.IntentID != "" {
 				st.latestPolicyIntent[pKey] = rec.IntentID
 			}
+			st.policyOwnerTokens[pKey] = rec.OwnerToken
+			delete(st.ambiguousStack, pKey)
 			delete(st.ambiguousPolicies, pKey)
 			st.activePolicies[pKey] = hostkit.PolicyAttachment{
 				Key:        pKey,
@@ -1147,6 +1202,13 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 			if rec.IntentID != "" && st.latestPolicyIntent[pKey] != "" && rec.IntentID != st.latestPolicyIntent[pKey] {
 				return nil, fmt.Errorf("corrupt campaign journal stale policy_detach intent_id %q", rec.IntentID)
 			}
+			if rec.IntentID != "" {
+				st.latestPolicyIntent[pKey] = rec.IntentID
+			}
+			if rec.OwnerToken != "" {
+				st.policyOwnerTokens[pKey] = rec.OwnerToken
+			}
+			delete(st.ambiguousStack, pKey)
 			delete(st.ambiguousPolicies, pKey)
 			delete(st.activePolicies, pKey)
 			delete(st.policyCleanup, pKey)
@@ -1215,6 +1277,18 @@ func (ct *costTracker) applyReplayedStateLocked(st *replayedCampaignState) {
 		if ct.onToken != nil && v.OwnerToken != "" {
 			ct.onToken(v.OwnerToken)
 		}
+	}
+	ct.ambiguousStack = make(map[string][]hostkit.PolicyAttachment, len(st.ambiguousStack))
+	for k, stack := range st.ambiguousStack {
+		cp := make([]hostkit.PolicyAttachment, len(stack))
+		for i, v := range stack {
+			cp[i] = v.Clone()
+		}
+		ct.ambiguousStack[k] = cp
+	}
+	ct.policyOwnerTokens = make(map[string]string, len(st.policyOwnerTokens))
+	for k, v := range st.policyOwnerTokens {
+		ct.policyOwnerTokens[k] = v
 	}
 	ct.maxPolicyGen = make(map[string]uint64, len(st.maxPolicyGen))
 	for k, v := range st.maxPolicyGen {
@@ -1469,6 +1543,41 @@ func (ct *costTracker) syncFromSafetyJournalLocked() {
 			IntentID:   pa.IntentID,
 		}
 	}
+	ct.ambiguousStack = make(map[string][]hostkit.PolicyAttachment, len(st.AmbiguousStack))
+	for k, stack := range st.AmbiguousStack {
+		cp := make([]hostkit.PolicyAttachment, 0, len(stack))
+		for _, pa := range stack {
+			var stmts []hostkit.PolicyStatement
+			var canonical string
+			if pa.Document != "" {
+				var cerr *hostkit.CloudError
+				stmts, canonical, cerr = hostkit.ParsePolicyDocument(pa.Document, hostkit.Validator{})
+				if cerr != nil {
+					ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalCorrupt", cerr.Error())
+					return
+				}
+			}
+			cp = append(cp, hostkit.PolicyAttachment{
+				Key:        k,
+				Scope:      pa.Scope,
+				Kind:       hostkit.AttachmentKind(pa.Kind),
+				Target:     pa.Target,
+				Principal:  pa.Principal,
+				Document:   canonical,
+				Statements: stmts,
+				OwnerToken: pa.OwnerToken,
+				Generation: pa.Generation,
+				IntentID:   pa.IntentID,
+			})
+		}
+		ct.ambiguousStack[k] = cp
+	}
+	ct.policyOwnerTokens = make(map[string]string, len(st.PolicyTombstones))
+	for k, tb := range st.PolicyTombstones {
+		if tb.OwnerToken != "" {
+			ct.policyOwnerTokens[k] = tb.OwnerToken
+		}
+	}
 	ct.maxPolicyGen = make(map[string]uint64, len(st.MaxPolicyGen))
 	for k, v := range st.MaxPolicyGen {
 		ct.maxPolicyGen[k] = v
@@ -1528,7 +1637,7 @@ func (ct *costTracker) reserveForOp(recordOp, endpoint string, in safety.Attempt
 			reservedBytes = in.EgressBytes
 		}
 		reservedNano := res.Quote().AttemptNanoUSD + res.Quote().CleanupReserveNanoUSD
-		attID, jerr := ct.journal.BeginAttempt(resKind, endpoint, resKey, recordOp, reservedNano, reservedBytes)
+		attID, jerr := ct.journal.BeginAttempt(resKind, endpoint, journalAttemptName(resKey), recordOp, reservedNano, reservedBytes)
 		if jerr != nil {
 			res.Release()
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", jerr.Error())
@@ -1709,20 +1818,21 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 
 	if ct.journal != nil {
 		st := ct.journal.State()
-		rKey := resKind + "\x00" + endpoint + "\x00" + resKey
-		_, inEntries := st.Lookup(resKind, "", resKey)
+		attName := journalAttemptName(resKey)
+		rKey := resKind + "\x00" + endpoint + "\x00" + attName
+		_, inEntries := st.Lookup(resKind, "", attName)
 		_, inActiveCleanup := st.ActiveCleanup[rKey]
 		lockCleanup := false
 		releaseCleanup := false
 		var cleanupNano int64
 		if opSucceeded {
 			switch op {
-			case "bucket_create", "object_put", "queue_create", "table_create", "item_put":
+			case "bucket_create", "object_put", "queue_create", "table_create", "item_put", "policy_attach", "policy_attach_principal":
 				if !inEntries && !inActiveCleanup && res.Quote().CleanupReserveNanoUSD > 0 {
 					lockCleanup = true
 					cleanupNano = res.Quote().CleanupReserveNanoUSD
 				}
-			case "bucket_delete", "object_delete", "queue_delete", "item_delete":
+			case "bucket_delete", "object_delete", "queue_delete", "item_delete", "policy_detach", "policy_detach_principal":
 				if inActiveCleanup {
 					releaseCleanup = true
 				}
@@ -1772,6 +1882,10 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 					if _, exists := st.activeItems[sKey]; !exists {
 						lockCleanup = true
 					}
+				case "policy_attach", "policy_attach_principal":
+					if _, exists := st.policyCleanup[resKey]; !exists {
+						lockCleanup = true
+					}
 				case "bucket_delete":
 					if _, exists := st.activeBuckets[sKey]; exists {
 						releaseCleanup = true
@@ -1790,6 +1904,10 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 					}
 				case "item_delete":
 					if _, exists := st.activeItems[sKey]; exists {
+						releaseCleanup = true
+					}
+				case "policy_detach", "policy_detach_principal":
+					if _, exists := st.policyCleanup[resKey]; exists {
 						releaseCleanup = true
 					}
 				}
@@ -1828,11 +1946,14 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 					st.activeTables[sKey] = res.Quote().CleanupReserveNanoUSD
 				case safety.KindTableItem:
 					st.activeItems[sKey] = res.Quote().CleanupReserveNanoUSD
+				case safety.KindPolicyAttachment:
+					st.policyCleanup[resKey] = res.Quote().CleanupReserveNanoUSD
 				}
 				st.resourceCleanupNanoUSD += res.Quote().CleanupReserveNanoUSD
 			}
 			if releaseCleanup {
-				deleteResourcePolicyAttachments(st.activePolicies, st.ambiguousPolicies, st.policyCleanup, resKind, resKey)
+				releasedPol := deleteResourcePolicyAttachments(st.activePolicies, st.ambiguousPolicies, st.ambiguousStack, st.policyCleanup, resKind, resKey)
+				st.resourceCleanupNanoUSD -= releasedPol
 				switch resKind {
 				case safety.KindBucket:
 					if v, ok := st.activeBuckets[sKey]; ok {
@@ -1864,6 +1985,11 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 				case safety.KindTableItem:
 					if v, ok := st.activeItems[sKey]; ok {
 						delete(st.activeItems, sKey)
+						st.resourceCleanupNanoUSD -= v
+					}
+				case safety.KindPolicyAttachment:
+					if v, ok := st.policyCleanup[resKey]; ok {
+						delete(st.policyCleanup, resKey)
 						st.resourceCleanupNanoUSD -= v
 					}
 				}
@@ -1911,6 +2037,11 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 				ct.activeItems[sKey] = res.Quote().CleanupReserveNanoUSD
 				lockCleanup = true
 			}
+		case "policy_attach", "policy_attach_principal":
+			if _, exists := ct.policyCleanup[resKey]; !exists && res.Quote().CleanupReserveNanoUSD > 0 {
+				ct.policyCleanup[resKey] = res.Quote().CleanupReserveNanoUSD
+				lockCleanup = true
+			}
 		}
 	}
 
@@ -1919,7 +2050,9 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 	if opSucceeded {
 		switch op {
 		case "bucket_delete":
-			deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.policyCleanup, safety.KindBucket, resKey)
+			if released := deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.ambiguousStack, ct.policyCleanup, safety.KindBucket, resKey); released > 0 {
+				ct.meter.ReleaseResourceCleanup(released)
+			}
 			if v, exists := ct.activeBuckets[sKey]; exists {
 				delete(ct.activeBuckets, sKey)
 				ct.meter.ReleaseResourceCleanup(v)
@@ -1930,13 +2063,17 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 				ct.meter.ReleaseResourceCleanup(v)
 			}
 		case "queue_delete":
-			deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.policyCleanup, safety.KindQueue, resKey)
+			if released := deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.ambiguousStack, ct.policyCleanup, safety.KindQueue, resKey); released > 0 {
+				ct.meter.ReleaseResourceCleanup(released)
+			}
 			if v, exists := ct.activeQueues[sKey]; exists {
 				delete(ct.activeQueues, sKey)
 				ct.meter.ReleaseResourceCleanup(v)
 			}
 		case "table_delete":
-			deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.policyCleanup, safety.KindTable, resKey)
+			if released := deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.ambiguousStack, ct.policyCleanup, safety.KindTable, resKey); released > 0 {
+				ct.meter.ReleaseResourceCleanup(released)
+			}
 			if v, exists := ct.activeTables[sKey]; exists {
 				delete(ct.activeTables, sKey)
 				ct.meter.ReleaseResourceCleanup(v)
@@ -1951,6 +2088,11 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 		case "item_delete":
 			if v, exists := ct.activeItems[sKey]; exists {
 				delete(ct.activeItems, sKey)
+				ct.meter.ReleaseResourceCleanup(v)
+			}
+		case "policy_detach", "policy_detach_principal":
+			if v, exists := ct.policyCleanup[resKey]; exists {
+				delete(ct.policyCleanup, resKey)
 				ct.meter.ReleaseResourceCleanup(v)
 			}
 		}
@@ -2071,6 +2213,21 @@ func (ct *costTracker) checkPolicyAttachHeadroom(scope string, kind hostkit.Atta
 	return nil
 }
 
+func hasPendingPolicyIntent(stack []hostkit.PolicyAttachment, amb map[string]hostkit.PolicyAttachment, key, intentID string) bool {
+	if intentID == "" {
+		return false
+	}
+	for _, item := range stack {
+		if item.IntentID == intentID {
+			return true
+		}
+	}
+	if cur, ok := amb[key]; ok && cur.IntentID == intentID {
+		return true
+	}
+	return false
+}
+
 func (ct *costTracker) beginPolicyAttachIntent(scope string, kind hostkit.AttachmentKind, target, principal string, stmts []hostkit.PolicyStatement, rawDoc string) (hostkit.PolicyAttachment, *hostkit.CloudError) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
@@ -2101,17 +2258,26 @@ func (ct *costTracker) beginPolicyAttachIntent(scope string, kind hostkit.Attach
 				fmt.Sprintf("run attachment count exceeds maximum (%d)", hostkit.MaxAttachmentsPerRun))
 		}
 		ownerToken := ""
+		expectedOwner := ""
+		expectedGen := ""
 		if existing, ok := ct.activePolicies[key]; ok && existing.OwnerToken != "" {
 			ownerToken = existing.OwnerToken
+			expectedOwner = existing.OwnerToken
+			expectedGen = existing.Generation
 		} else if amb, ok := ct.ambiguousPolicies[key]; ok && amb.OwnerToken != "" {
 			ownerToken = amb.OwnerToken
+			expectedOwner = amb.OwnerToken
+			expectedGen = amb.Generation
+		} else if tok := ct.policyOwnerTokens[key]; tok != "" {
+			ownerToken = tok
+			expectedOwner = tok
 		} else {
 			ownerToken = safety.NewToken128()
 		}
 		nextGen := ct.maxPolicyGen[key] + 1
 		genStr := strconv.FormatUint(nextGen, 10)
 		intentID := safety.NewToken128()
-		if err := ct.journal.RecordPolicyIntent("attach", scope, string(kind), target, principal, rawDoc, ownerToken, genStr, intentID, "", "", 0); err != nil {
+		if err := ct.journal.RecordPolicyIntent(scope, string(kind), target, principal, "attach", rawDoc, ownerToken, genStr, intentID, expectedOwner, expectedGen, 0); err != nil {
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
 			return hostkit.PolicyAttachment{}, ct.poisoned
 		}
@@ -2123,16 +2289,18 @@ func (ct *costTracker) beginPolicyAttachIntent(scope string, kind hostkit.Attach
 			ct.onToken(ownerToken)
 		}
 		return hostkit.PolicyAttachment{
-			Key:        key,
-			Scope:      scope,
-			Kind:       kind,
-			Target:     target,
-			Principal:  principal,
-			Document:   rawDoc,
-			Statements: clonedStmts,
-			OwnerToken: ownerToken,
-			Generation: genStr,
-			IntentID:   intentID,
+			Key:                key,
+			Scope:              scope,
+			Kind:               kind,
+			Target:             target,
+			Principal:          principal,
+			Document:           rawDoc,
+			Statements:         clonedStmts,
+			OwnerToken:         ownerToken,
+			Generation:         genStr,
+			IntentID:           intentID,
+			ExpectedOwnerToken: expectedOwner,
+			ExpectedGeneration: expectedGen,
 		}, nil
 	}
 
@@ -2146,10 +2314,19 @@ func (ct *costTracker) beginPolicyAttachIntent(scope string, kind hostkit.Attach
 				return nil
 			}
 			ownerToken := ""
+			expectedOwner := ""
+			expectedGen := ""
 			if existing, ok := st.activePolicies[key]; ok && existing.OwnerToken != "" {
 				ownerToken = existing.OwnerToken
+				expectedOwner = existing.OwnerToken
+				expectedGen = existing.Generation
 			} else if amb, ok := st.ambiguousPolicies[key]; ok && amb.OwnerToken != "" {
 				ownerToken = amb.OwnerToken
+				expectedOwner = amb.OwnerToken
+				expectedGen = amb.Generation
+			} else if tok := st.policyOwnerTokens[key]; tok != "" {
+				ownerToken = tok
+				expectedOwner = tok
 			} else {
 				ownerToken = safety.NewToken128()
 			}
@@ -2157,32 +2334,38 @@ func (ct *costTracker) beginPolicyAttachIntent(scope string, kind hostkit.Attach
 			genStr := strconv.FormatUint(nextGen, 10)
 			intentID := safety.NewToken128()
 			if err := appendRec(campaignJournalRecord{
-				Event:           safety.EventPolicyIntent,
-				IntentID:        intentID,
-				PolicyScope:     scope,
-				PolicyKind:      string(kind),
-				PolicyTarget:    target,
-				PolicyPrincipal: principal,
-				PolicyDocument:  rawDoc,
-				PolicyIntentOp:  "attach",
-				OwnerToken:      ownerToken,
-				Generation:      genStr,
+				Event:              safety.EventPolicyIntent,
+				IntentID:           intentID,
+				PolicyScope:        scope,
+				PolicyKind:         string(kind),
+				PolicyTarget:       target,
+				PolicyPrincipal:    principal,
+				PolicyDocument:     rawDoc,
+				PolicyIntentOp:     "attach",
+				OwnerToken:         ownerToken,
+				Generation:         genStr,
+				ExpectedOwnerToken: expectedOwner,
+				ExpectedGeneration: expectedGen,
 			}); err != nil {
 				return err
 			}
 			outAtt = hostkit.PolicyAttachment{
-				Key:        key,
-				Scope:      scope,
-				Kind:       kind,
-				Target:     target,
-				Principal:  principal,
-				Document:   rawDoc,
-				Statements: clonedStmts,
-				OwnerToken: ownerToken,
-				Generation: genStr,
-				IntentID:   intentID,
+				Key:                key,
+				Scope:              scope,
+				Kind:               kind,
+				Target:             target,
+				Principal:          principal,
+				Document:           rawDoc,
+				Statements:         clonedStmts,
+				OwnerToken:         ownerToken,
+				Generation:         genStr,
+				IntentID:           intentID,
+				ExpectedOwnerToken: expectedOwner,
+				ExpectedGeneration: expectedGen,
 			}
+			st.ambiguousStack[key] = append(st.ambiguousStack[key], outAtt.Clone())
 			st.ambiguousPolicies[key] = outAtt.Clone()
+			st.policyOwnerTokens[key] = ownerToken
 			st.maxPolicyGen[key] = nextGen
 			st.latestPolicyIntent[key] = intentID
 			ct.applyReplayedStateLocked(st)
@@ -2201,10 +2384,19 @@ func (ct *costTracker) beginPolicyAttachIntent(scope string, kind hostkit.Attach
 	}
 
 	ownerToken := ""
+	expectedOwner := ""
+	expectedGen := ""
 	if existing, ok := ct.activePolicies[key]; ok && existing.OwnerToken != "" {
 		ownerToken = existing.OwnerToken
+		expectedOwner = existing.OwnerToken
+		expectedGen = existing.Generation
 	} else if amb, ok := ct.ambiguousPolicies[key]; ok && amb.OwnerToken != "" {
 		ownerToken = amb.OwnerToken
+		expectedOwner = amb.OwnerToken
+		expectedGen = amb.Generation
+	} else if tok := ct.policyOwnerTokens[key]; tok != "" {
+		ownerToken = tok
+		expectedOwner = tok
 	} else {
 		ownerToken = safety.NewToken128()
 	}
@@ -2212,18 +2404,22 @@ func (ct *costTracker) beginPolicyAttachIntent(scope string, kind hostkit.Attach
 	genStr := strconv.FormatUint(nextGen, 10)
 	intentID := safety.NewToken128()
 	att := hostkit.PolicyAttachment{
-		Key:        key,
-		Scope:      scope,
-		Kind:       kind,
-		Target:     target,
-		Principal:  principal,
-		Document:   rawDoc,
-		Statements: clonedStmts,
-		OwnerToken: ownerToken,
-		Generation: genStr,
-		IntentID:   intentID,
+		Key:                key,
+		Scope:              scope,
+		Kind:               kind,
+		Target:             target,
+		Principal:          principal,
+		Document:           rawDoc,
+		Statements:         clonedStmts,
+		OwnerToken:         ownerToken,
+		Generation:         genStr,
+		IntentID:           intentID,
+		ExpectedOwnerToken: expectedOwner,
+		ExpectedGeneration: expectedGen,
 	}
+	ct.ambiguousStack[key] = append(ct.ambiguousStack[key], att.Clone())
 	ct.ambiguousPolicies[key] = att.Clone()
+	ct.policyOwnerTokens[key] = ownerToken
 	ct.maxPolicyGen[key] = nextGen
 	ct.latestPolicyIntent[key] = intentID
 	if ct.onToken != nil {
@@ -2254,7 +2450,8 @@ func (ct *costTracker) confirmPolicyAttach(att hostkit.PolicyAttachment) *hostki
 		if ct.poisoned != nil {
 			return ct.poisoned
 		}
-		if (ct.latestPolicyIntent[key] != "" && ct.latestPolicyIntent[key] != att.IntentID) || attGen < ct.maxPolicyGen[key] {
+		if !hasPendingPolicyIntent(ct.ambiguousStack[key], ct.ambiguousPolicies, key, att.IntentID) ||
+			ct.latestPolicyIntent[key] != att.IntentID || attGen < ct.maxPolicyGen[key] {
 			return nil
 		}
 		if err := ct.journal.RecordPolicyAttachScoped(att.Scope, string(att.Kind), att.Target, att.Principal, att.Document, att.OwnerToken, att.Generation, att.IntentID, 0); err != nil {
@@ -2267,7 +2464,8 @@ func (ct *costTracker) confirmPolicyAttach(att hostkit.PolicyAttachment) *hostki
 
 	if ct.statePath != "" {
 		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
-			if (st.latestPolicyIntent[key] != "" && st.latestPolicyIntent[key] != att.IntentID) || attGen < st.maxPolicyGen[key] {
+			if !hasPendingPolicyIntent(st.ambiguousStack[key], st.ambiguousPolicies, key, att.IntentID) ||
+				st.latestPolicyIntent[key] != att.IntentID || attGen < st.maxPolicyGen[key] {
 				return nil
 			}
 			if err := appendRec(campaignJournalRecord{
@@ -2284,6 +2482,8 @@ func (ct *costTracker) confirmPolicyAttach(att hostkit.PolicyAttachment) *hostki
 				return err
 			}
 			st.activePolicies[key] = att.Clone()
+			st.policyOwnerTokens[key] = att.OwnerToken
+			delete(st.ambiguousStack, key)
 			delete(st.ambiguousPolicies, key)
 			ct.applyReplayedStateLocked(st)
 			return nil
@@ -2294,10 +2494,13 @@ func (ct *costTracker) confirmPolicyAttach(att hostkit.PolicyAttachment) *hostki
 		return nil
 	}
 
-	if (ct.latestPolicyIntent[key] != "" && ct.latestPolicyIntent[key] != att.IntentID) || attGen < ct.maxPolicyGen[key] {
+	if !hasPendingPolicyIntent(ct.ambiguousStack[key], ct.ambiguousPolicies, key, att.IntentID) ||
+		ct.latestPolicyIntent[key] != att.IntentID || attGen < ct.maxPolicyGen[key] {
 		return nil
 	}
 	ct.activePolicies[key] = att.Clone()
+	ct.policyOwnerTokens[key] = att.OwnerToken
+	delete(ct.ambiguousStack, key)
 	delete(ct.ambiguousPolicies, key)
 	return nil
 }
@@ -2346,7 +2549,7 @@ func (ct *costTracker) beginPolicyDetachIntent(scope string, kind hostkit.Attach
 		nextGen := ct.maxPolicyGen[key] + 1
 		genStr := strconv.FormatUint(nextGen, 10)
 		intentID := safety.NewToken128()
-		if err := ct.journal.RecordPolicyIntent("detach", scope, string(kind), target, principal, "", existing.OwnerToken, genStr, intentID, existing.OwnerToken, existing.Generation, 0); err != nil {
+		if err := ct.journal.RecordPolicyIntent(scope, string(kind), target, principal, "detach", "", existing.OwnerToken, genStr, intentID, existing.OwnerToken, existing.Generation, 0); err != nil {
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
 			return hostkit.PolicyAttachment{}, false, ct.poisoned
 		}
@@ -2402,7 +2605,9 @@ func (ct *costTracker) beginPolicyDetachIntent(scope string, kind hostkit.Attach
 			out.Generation = genStr
 			out.IntentID = intentID
 			found = true
+			st.ambiguousStack[key] = append(st.ambiguousStack[key], out.Clone())
 			st.ambiguousPolicies[key] = out.Clone()
+			st.policyOwnerTokens[key] = existing.OwnerToken
 			st.maxPolicyGen[key] = nextGen
 			st.latestPolicyIntent[key] = intentID
 			ct.applyReplayedStateLocked(st)
@@ -2432,7 +2637,9 @@ func (ct *costTracker) beginPolicyDetachIntent(scope string, kind hostkit.Attach
 	out.ExpectedGeneration = existing.Generation
 	out.Generation = genStr
 	out.IntentID = intentID
+	ct.ambiguousStack[key] = append(ct.ambiguousStack[key], out.Clone())
 	ct.ambiguousPolicies[key] = out.Clone()
+	ct.policyOwnerTokens[key] = existing.OwnerToken
 	ct.maxPolicyGen[key] = nextGen
 	ct.latestPolicyIntent[key] = intentID
 	return out, true, nil
@@ -2460,7 +2667,8 @@ func (ct *costTracker) confirmPolicyDetach(att hostkit.PolicyAttachment) *hostki
 		if ct.poisoned != nil {
 			return ct.poisoned
 		}
-		if (ct.latestPolicyIntent[key] != "" && ct.latestPolicyIntent[key] != att.IntentID) || attGen < ct.maxPolicyGen[key] {
+		if !hasPendingPolicyIntent(ct.ambiguousStack[key], ct.ambiguousPolicies, key, att.IntentID) ||
+			ct.latestPolicyIntent[key] != att.IntentID || attGen < ct.maxPolicyGen[key] {
 			return nil
 		}
 		if err := ct.journal.RecordPolicyDetachScoped(att.Scope, string(att.Kind), att.Target, att.Principal, att.OwnerToken, att.Generation, att.IntentID); err != nil {
@@ -2473,7 +2681,8 @@ func (ct *costTracker) confirmPolicyDetach(att hostkit.PolicyAttachment) *hostki
 
 	if ct.statePath != "" {
 		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
-			if (st.latestPolicyIntent[key] != "" && st.latestPolicyIntent[key] != att.IntentID) || attGen < st.maxPolicyGen[key] {
+			if !hasPendingPolicyIntent(st.ambiguousStack[key], st.ambiguousPolicies, key, att.IntentID) ||
+				st.latestPolicyIntent[key] != att.IntentID || attGen < st.maxPolicyGen[key] {
 				return nil
 			}
 			if err := appendRec(campaignJournalRecord{
@@ -2489,6 +2698,7 @@ func (ct *costTracker) confirmPolicyDetach(att hostkit.PolicyAttachment) *hostki
 				return err
 			}
 			delete(st.activePolicies, key)
+			delete(st.ambiguousStack, key)
 			delete(st.ambiguousPolicies, key)
 			delete(st.policyCleanup, key)
 			ct.applyReplayedStateLocked(st)
@@ -2500,10 +2710,12 @@ func (ct *costTracker) confirmPolicyDetach(att hostkit.PolicyAttachment) *hostki
 		return nil
 	}
 
-	if (ct.latestPolicyIntent[key] != "" && ct.latestPolicyIntent[key] != att.IntentID) || attGen < ct.maxPolicyGen[key] {
+	if !hasPendingPolicyIntent(ct.ambiguousStack[key], ct.ambiguousPolicies, key, att.IntentID) ||
+		ct.latestPolicyIntent[key] != att.IntentID || attGen < ct.maxPolicyGen[key] {
 		return nil
 	}
 	delete(ct.activePolicies, key)
+	delete(ct.ambiguousStack, key)
 	delete(ct.ambiguousPolicies, key)
 	if releaseNano, ok := ct.policyCleanup[key]; ok {
 		delete(ct.policyCleanup, key)
@@ -2535,10 +2747,10 @@ func (ct *costTracker) abortPolicyIntent(att hostkit.PolicyAttachment) *hostkit.
 		if ct.poisoned != nil {
 			return ct.poisoned
 		}
-		if ct.latestPolicyIntent[key] != "" && ct.latestPolicyIntent[key] != att.IntentID {
+		if !hasPendingPolicyIntent(ct.ambiguousStack[key], ct.ambiguousPolicies, key, att.IntentID) {
 			return nil
 		}
-		if err := ct.journal.RecordPolicyIntent("abort", att.Scope, string(att.Kind), att.Target, att.Principal, "", att.OwnerToken, att.Generation, att.IntentID, "", "", 0); err != nil {
+		if err := ct.journal.RecordPolicyIntent(att.Scope, string(att.Kind), att.Target, att.Principal, "abort", "", att.OwnerToken, att.Generation, att.IntentID, "", "", 0); err != nil {
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
 			return ct.poisoned
 		}
@@ -2548,7 +2760,7 @@ func (ct *costTracker) abortPolicyIntent(att hostkit.PolicyAttachment) *hostkit.
 
 	if ct.statePath != "" {
 		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
-			if st.latestPolicyIntent[key] != "" && st.latestPolicyIntent[key] != att.IntentID {
+			if !hasPendingPolicyIntent(st.ambiguousStack[key], st.ambiguousPolicies, key, att.IntentID) {
 				return nil
 			}
 			if err := appendRec(campaignJournalRecord{
@@ -2564,9 +2776,29 @@ func (ct *costTracker) abortPolicyIntent(att hostkit.PolicyAttachment) *hostkit.
 			}); err != nil {
 				return err
 			}
-			delete(st.ambiguousPolicies, key)
-			if _, inActive := st.activePolicies[key]; !inActive {
-				delete(st.policyCleanup, key)
+			stack := st.ambiguousStack[key]
+			if len(stack) > 0 {
+				filtered := stack[:0]
+				for _, item := range stack {
+					if item.IntentID != att.IntentID {
+						filtered = append(filtered, item)
+					}
+				}
+				if len(filtered) > 0 {
+					st.ambiguousStack[key] = filtered
+					st.ambiguousPolicies[key] = filtered[len(filtered)-1]
+				} else {
+					delete(st.ambiguousStack, key)
+					delete(st.ambiguousPolicies, key)
+					if _, inActive := st.activePolicies[key]; !inActive {
+						delete(st.policyCleanup, key)
+					}
+				}
+			} else {
+				delete(st.ambiguousPolicies, key)
+				if _, inActive := st.activePolicies[key]; !inActive {
+					delete(st.policyCleanup, key)
+				}
 			}
 			ct.applyReplayedStateLocked(st)
 			return nil
@@ -2577,8 +2809,23 @@ func (ct *costTracker) abortPolicyIntent(att hostkit.PolicyAttachment) *hostkit.
 		return nil
 	}
 
-	if ct.latestPolicyIntent[key] != "" && ct.latestPolicyIntent[key] != att.IntentID {
+	if !hasPendingPolicyIntent(ct.ambiguousStack[key], ct.ambiguousPolicies, key, att.IntentID) {
 		return nil
+	}
+	stack := ct.ambiguousStack[key]
+	if len(stack) > 0 {
+		filtered := stack[:0]
+		for _, item := range stack {
+			if item.IntentID != att.IntentID {
+				filtered = append(filtered, item)
+			}
+		}
+		if len(filtered) > 0 {
+			ct.ambiguousStack[key] = filtered
+			ct.ambiguousPolicies[key] = filtered[len(filtered)-1]
+			return nil
+		}
+		delete(ct.ambiguousStack, key)
 	}
 	delete(ct.ambiguousPolicies, key)
 	if _, inActive := ct.activePolicies[key]; !inActive {
@@ -2639,14 +2886,15 @@ func (ct *costTracker) lockResourceCleanupIfNeeded(endpoint, op, resKind, resKey
 	}
 	if ct.journal != nil {
 		st := ct.journal.State()
-		rKey := resKind + "\x00" + endpoint + "\x00" + resKey
-		if _, inEntries := st.Lookup(resKind, endpoint, resKey); inEntries {
+		attName := journalAttemptName(resKey)
+		rKey := resKind + "\x00" + endpoint + "\x00" + attName
+		if _, inEntries := st.Lookup(resKind, endpoint, attName); inEntries {
 			return
 		}
 		if _, inActive := st.ActiveCleanup[rKey]; inActive {
 			return
 		}
-		if attID, err := ct.journal.BeginAttempt(resKind, endpoint, resKey, op, resNano, 0); err == nil {
+		if attID, err := ct.journal.BeginAttempt(resKind, endpoint, attName, op, resNano, 0); err == nil {
 			_ = ct.journal.SettleAttemptWithCleanup(attID, 0, 0, 0, resNano, false, false)
 			ct.syncFromSafetyJournalLocked()
 		}

@@ -392,3 +392,279 @@ func TestSolPermForeignBucketCreateConflictDoesNotAdoptOwnership(t *testing.T) {
 		t.Fatalf("expected PolicyAttach on unowned 409 bucket to fail PERMISSION_DENIED, got %+v", h.LastError())
 	}
 }
+
+type solR2AmbThenDeny struct {
+	*fakeadapter.Fake
+	calls int
+}
+
+func (a *solR2AmbThenDeny) AttachPolicy(ctx context.Context, att hostkit.PolicyAttachment) error {
+	a.calls++
+	if a.calls == 1 {
+		if err := a.Fake.AttachPolicy(ctx, att); err != nil {
+			return err
+		}
+		return hostkit.ProviderError(hostkit.Internal, 0, "LostReply", "synthetic lost reply after apply")
+	}
+	return hostkit.ProviderError(hostkit.PermissionDenied, 403, "AccessDenied", "synthetic refusal before apply")
+}
+
+func TestSolR2PriorAmbiguitySurvivesNewRefusal(t *testing.T) {
+	d := t.TempDir()
+	path := filepath.Join(d, "campaign.jsonl")
+	state := filepath.Join(d, "fake.json")
+	f := fakeadapter.New(fakeadapter.Options{StatePath: state})
+	a := &solR2AmbThenDeny{Fake: f}
+	seed := New(Config{Provider: "ref", Store: f, Permissions: f, CampaignStatePath: path})
+	seed.SetAbortOnError(false)
+	seed.BucketCreate(false, "sol-bucket")
+	initial, _ := seed.PolicyNew().Statement("Allow", []string{"storage.object.read"}, []string{"storage:object:sol-bucket/*"})
+	seed.PolicyAttach(false, "storage:bucket:sol-bucket", "principal:alice", initial)
+	h := New(Config{Provider: "ref", Store: f, Permissions: a, CampaignStatePath: path})
+	h.SetAbortOnError(false)
+	p, _ := h.PolicyNew().Statement("Allow", []string{"storage.object.read"}, []string{"storage:object:sol-bucket/*"})
+	deny, _ := h.PolicyNew().Statement("Deny", []string{"storage.object.read"}, []string{"storage:object:sol-bucket/*"})
+	h.PolicyAttach(false, "storage:bucket:sol-bucket", "principal:alice", deny)
+	h.PolicyCheck(false, "principal:alice", "storage.object.read", "storage:object:sol-bucket/k")
+	if h.LastError().Code != hostkit.Conflict {
+		t.Fatal("setup did not retain first lost reply")
+	}
+	h.PolicyAttach(false, "storage:bucket:sol-bucket", "principal:alice", p)
+	h2 := New(Config{Provider: "ref", Store: f, Permissions: f, CampaignStatePath: path})
+	h2.SetAbortOnError(false)
+	allowed, _ := h2.PolicyCheck(false, "principal:alice", "storage.object.read", "storage:object:sol-bucket/k")
+	raw, _ := os.ReadFile(state)
+	var st struct {
+		Policies map[string]hostkit.PolicyAttachment
+	}
+	json.Unmarshal(raw, &st)
+	var native []hostkit.PolicyAttachment
+	for _, v := range st.Policies {
+		native = append(native, v)
+	}
+	nativeAllowed := hostkit.EvaluatePolicies(native, "principal:alice", "storage.object.read", "storage:object:sol-bucket/k")
+	t.Logf("lost Deny reply, then new refusal, then reopen: native allowed=%v portable allowed=%v last=%s", nativeAllowed, allowed, h2.LastError().Code)
+	if h2.LastError().Code != hostkit.Conflict {
+		t.Error("new definitive refusal erased earlier unresolved applied intent")
+	}
+}
+
+func TestSolR2PriorAmbiguitySurvivesNewRefusalSafetyJournal(t *testing.T) {
+	_, j, _ := solJournal(t)
+	state := filepath.Join(t.TempDir(), "fake.json")
+	f := fakeadapter.New(fakeadapter.Options{StatePath: state})
+	a := &solR2AmbThenDeny{Fake: f}
+	seed := New(Config{Provider: "aws", Store: f, Permissions: f, Journal: j})
+	seed.SetAbortOnError(false)
+	seed.BucketCreate(false, "sol-bucket")
+	initial, _ := seed.PolicyNew().Statement("Allow", []string{"storage.object.read"}, []string{"storage:object:sol-bucket/*"})
+	seed.PolicyAttach(false, "storage:bucket:sol-bucket", "principal:alice", initial)
+
+	h := New(Config{Provider: "aws", Store: f, Permissions: a, Journal: j})
+	h.SetAbortOnError(false)
+	p, _ := h.PolicyNew().Statement("Allow", []string{"storage.object.read"}, []string{"storage:object:sol-bucket/*"})
+	deny, _ := h.PolicyNew().Statement("Deny", []string{"storage.object.read"}, []string{"storage:object:sol-bucket/*"})
+	h.PolicyAttach(false, "storage:bucket:sol-bucket", "principal:alice", deny)
+	h.PolicyCheck(false, "principal:alice", "storage.object.read", "storage:object:sol-bucket/k")
+	if h.LastError().Code != hostkit.Conflict {
+		t.Fatal("setup did not retain first lost reply")
+	}
+	h.PolicyAttach(false, "storage:bucket:sol-bucket", "principal:alice", p)
+	if err := j.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	journalDir := filepath.Dir(j.Path())
+	meta := j.State().Meta
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := safety.OpenJournal(journalDir, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	h2 := New(Config{Provider: "aws", Store: f, Permissions: f, Journal: reopened})
+	h2.SetAbortOnError(false)
+	_, _ = h2.PolicyCheck(false, "principal:alice", "storage.object.read", "storage:object:sol-bucket/k")
+	if h2.LastError().Code != hostkit.Conflict {
+		t.Errorf("new definitive refusal erased earlier unresolved applied intent in safety journal after compaction+reopen: got %s", h2.LastError().Code)
+	}
+}
+
+func TestSolR2SafetyJournalAttachWorkflow(t *testing.T) {
+	_, j, _ := solJournal(t)
+	f := fakeadapter.New(fakeadapter.Options{})
+	h := New(Config{Provider: "aws", Store: f, Permissions: f, Journal: j})
+	h.SetAbortOnError(false)
+	h.BucketCreate(false, "sol-bucket")
+	if h.LastError().Code != hostkit.OK {
+		t.Fatal("bucket setup failed", h.LastError())
+	}
+	p, _ := h.PolicyNew().Statement("Allow", []string{"storage.object.read"}, []string{"storage:object:sol-bucket/*"})
+	h.PolicyAttach(false, "storage:bucket:sol-bucket", "principal:alice", p)
+	t.Logf("Journal-backed attach: code=%s message=%s calls=%d", h.LastError().Code, h.LastError().Message, f.Calls()["AttachPolicy"])
+	if h.LastError().Code != hostkit.OK || f.Calls()["AttachPolicy"] != 1 {
+		t.Error("valid journal-backed policy attach failed")
+	}
+}
+
+func TestSolR2SafetyJournalDirectIntent(t *testing.T) {
+	_, j, _ := solJournal(t)
+	f := fakeadapter.New(fakeadapter.Options{})
+	h := New(Config{Provider: "aws", Store: f, Permissions: f, Journal: j})
+	h.SetAbortOnError(false)
+	scope, _ := h.permissionsScope()
+	stmts := []hostkit.PolicyStatement{{Effect: "Allow", Actions: []string{"storage.object.read"}, Resources: []string{"storage:object:sol-bucket/*"}}}
+	doc, _ := hostkit.SerializeCanonicalPolicy(stmts)
+	_, ce := h.cost.beginPolicyAttachIntent(scope, hostkit.AttachmentResource, "storage:bucket:sol-bucket", "principal:alice", stmts, doc)
+	if ce != nil {
+		t.Errorf("direct valid intent rejected after bypassing reservation key issue: %s", ce.Message)
+	}
+}
+
+func TestSolR2CompactionPreservesDetachFence(t *testing.T) {
+	_, j, _ := solJournal(t)
+	f := fakeadapter.New(fakeadapter.Options{})
+	f.CreateBucket(context.Background(), "sol-bucket")
+	h := New(Config{Provider: "aws", Store: f, Permissions: f, Journal: j})
+	h.SetAbortOnError(false)
+	scope, _ := h.permissionsScope()
+	target := "storage:bucket:sol-bucket"
+	principal := "principal:alice"
+	stmts := []hostkit.PolicyStatement{{Effect: "Allow", Actions: []string{"storage.object.read"}, Resources: []string{"storage:object:sol-bucket/*"}}}
+	doc, _ := hostkit.SerializeCanonicalPolicy(stmts)
+	owner := strings.Repeat("a", 32)
+	i1 := strings.Repeat("b", 32)
+	i2 := strings.Repeat("c", 32)
+	if e := j.RecordPolicyIntent(scope, "resource", target, principal, "attach", doc, owner, "1", i1, "", "", 0); e != nil {
+		t.Fatal(e)
+	}
+	if e := j.RecordPolicyAttachScoped(scope, "resource", target, principal, doc, owner, "1", i1, 0); e != nil {
+		t.Fatal(e)
+	}
+	if e := j.RecordPolicyIntent(scope, "resource", target, principal, "detach", "", owner, "2", i2, owner, "1", 0); e != nil {
+		t.Fatal(e)
+	}
+	if e := j.RecordPolicyDetachScoped(scope, "resource", target, principal, owner, "2", i2); e != nil {
+		t.Fatal(e)
+	}
+	key := hostkit.ScopedAttachmentKey(scope, hostkit.AttachmentResource, target, principal)
+	before := j.State().MaxPolicyGen[key]
+	if e := j.Compact(); e != nil {
+		t.Fatal(e)
+	}
+	journalDir := filepath.Dir(j.Path())
+	meta := j.State().Meta
+	if e := j.Close(); e != nil {
+		t.Fatal(e)
+	}
+	reopened, e := safety.OpenJournal(journalDir, meta)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer reopened.Close()
+	after := reopened.State().MaxPolicyGen[key]
+	h = New(Config{Provider: "aws", Store: f, Permissions: f, Journal: reopened})
+	h.SetAbortOnError(false)
+	stale := hostkit.PolicyAttachment{Key: key, Scope: scope, Kind: hostkit.AttachmentResource, Target: target, Principal: principal, Document: doc, Statements: stmts, OwnerToken: owner, Generation: "1", IntentID: i1}
+	ce := h.cost.confirmPolicyAttach(stale)
+	allowed, _ := h.PolicyCheck(false, principal, "storage.object.read", "storage:object:sol-bucket/k")
+	t.Logf("detach fence across compaction: max before=%d after=%d stale completion error=%v allowed=%v last=%s", before, after, ce, allowed, h.LastError().Code)
+	if after != before || allowed {
+		t.Error("compaction dropped tombstone/high-water mark and resurrected stale grant")
+	}
+}
+
+func TestSolR2ForeignAttachPreserved(t *testing.T) {
+	h, f, path := newPermsHost(t)
+	h.BucketCreate(false, "sol-bucket")
+	stmts := []hostkit.PolicyStatement{{Effect: "Deny", Actions: []string{"storage.object.read"}, Resources: []string{"storage:object:sol-bucket/*"}}}
+	doc, _ := hostkit.SerializeCanonicalPolicy(stmts)
+	foreign := hostkit.PolicyAttachment{Kind: hostkit.AttachmentResource, Target: "storage:bucket:sol-bucket", Principal: "principal:alice", Document: doc, Statements: stmts, OwnerToken: strings.Repeat("f", 32), Generation: "1"}
+	if err := f.AttachPolicy(context.Background(), foreign); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := h.PolicyNew().Statement("Allow", []string{"storage.object.read"}, []string{"storage:object:sol-bucket/*"})
+	h.PolicyAttach(false, "storage:bucket:sol-bucket", "principal:alice", p)
+	raw, _ := os.ReadFile(filepath.Join(filepath.Dir(path), "fake.json"))
+	var st struct {
+		Policies map[string]hostkit.PolicyAttachment
+	}
+	json.Unmarshal(raw, &st)
+	surviving := false
+	for _, v := range st.Policies {
+		if v.OwnerToken == foreign.OwnerToken && v.Document == doc {
+			surviving = true
+		}
+	}
+	t.Logf("foreign same-key Deny survives host attach=%v last=%s", surviving, h.LastError().Code)
+	if !surviving {
+		t.Error("host attach overwrote foreign native contribution/owner")
+	}
+}
+
+func TestSolR2PolicyCleanupHeadroom(t *testing.T) {
+	h, f, _ := newPermsHost(t)
+	h.BucketCreate(false, "sol-bucket")
+	before := h.cost.meter.Snapshot().ResourceCleanupNanoUSD
+	p, _ := h.PolicyNew().Statement("Allow", []string{"storage.object.read"}, []string{"storage:object:sol-bucket/*"})
+	h.PolicyAttach(false, "storage:bucket:sol-bucket", "principal:alice", p)
+	if h.LastError().Code != hostkit.OK {
+		t.Fatal(h.LastError())
+	}
+	after := h.cost.meter.Snapshot().ResourceCleanupNanoUSD
+	t.Logf("attachment cleanup lock delta=%d, quoted cleanup=%d", after-before, h.cost.meter.Table().Operations["policy_attach"].CleanupReserveNanoUSD)
+	if after-before < 1000 {
+		t.Error("successful attach released rather than durably locking its quoted cleanup headroom")
+	}
+	if err := h.SetCostCapUSD(h.EstimatedCost()); err != nil {
+		t.Fatal(err)
+	}
+	calls := f.Calls()["DetachPolicy"]
+	h.PolicyDetach(false, "storage:bucket:sol-bucket", "principal:alice")
+	t.Logf("owned detach with exhausted work budget: code=%s native detach calls=%d", h.LastError().Code, f.Calls()["DetachPolicy"]-calls)
+	if h.LastError().Code != hostkit.OK || f.Calls()["DetachPolicy"] == calls {
+		t.Error("owned cleanup cannot use reserved cleanup ceiling after work exhaustion")
+	}
+}
+
+func TestSolR2PolicyCleanupHeadroomCrashReopen(t *testing.T) {
+	h, f, path := newPermsHost(t)
+	h.BucketCreate(false, "sol-bucket")
+	p, _ := h.PolicyNew().Statement("Allow", []string{"storage.object.read"}, []string{"storage:object:sol-bucket/*"})
+	h.PolicyAttach(false, "storage:bucket:sol-bucket", "principal:alice", p)
+	if h.LastError().Code != hostkit.OK {
+		t.Fatal(h.LastError())
+	}
+	if err := h.SetCostCapUSD(h.EstimatedCost()); err != nil {
+		t.Fatal(err)
+	}
+	hReopen := New(Config{Provider: "aws", Store: f, Permissions: f, CampaignStatePath: path})
+	hReopen.SetAbortOnError(false)
+	callsBeforeReopenDetach := f.Calls()["DetachPolicy"]
+	hReopen.PolicyDetach(false, "storage:bucket:sol-bucket", "principal:alice")
+	if hReopen.LastError().Code != hostkit.OK || f.Calls()["DetachPolicy"] == callsBeforeReopenDetach {
+		t.Errorf("reopened host owned detach failed under exhausted work cap: %+v", hReopen.LastError())
+	}
+}
+
+func TestSolR2LiveRouteWithoutGlobalFlag(t *testing.T) {
+	offline := fakeadapter.New(fakeadapter.Options{})
+	live := fakeadapter.New(fakeadapter.Options{})
+	routes := hostkit.EndpointRoutes{Offline: offline, Live: live}
+	router := hostkit.Router{Pick: routes.Pick}
+	h := New(Config{Provider: "aws", Store: router, Permissions: router})
+	h.SetAbortOnError(false)
+	if err := h.SetEndpoint("all", "https://live.invalid"); err != nil {
+		t.Fatal(err)
+	}
+	// Native-route resource setup is synthetic; neither router backend uses networking.
+	h.BucketCreate(false, "sol-bucket")
+	p, _ := h.PolicyNew().Statement("Allow", []string{"storage.object.read"}, []string{"storage:object:sol-bucket/*"})
+	h.PolicyAttach(false, "storage:bucket:sol-bucket", "principal:alice", p)
+	t.Logf("EndpointRoutes.Live with no global LIVE flag: live policy writes=%d last=%s", live.Calls()["AttachPolicy"], h.LastError().Code)
+	if live.Calls()["AttachPolicy"] > 0 {
+		t.Error("uncertified live-routed permission mutation escaped flag-only refusal")
+	}
+}
