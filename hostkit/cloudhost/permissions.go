@@ -167,7 +167,8 @@ func (h *Host) permissionsScope() (string, *hostkit.CloudError) {
 	stEP, _, _ := h.cfg.Endpoints.Resolve("storage")
 	qEP, _, _ := h.cfg.Endpoints.Resolve("queue")
 	tblEP, _, _ := h.cfg.Endpoints.Resolve("tables")
-	return "perm=" + permEP + "|storage=" + stEP + "|queue=" + qEP + "|tables=" + tblEP, nil
+	fnEP, _, _ := h.cfg.Endpoints.Resolve("function")
+	return "perm=" + permEP + "|storage=" + stEP + "|queue=" + qEP + "|tables=" + tblEP + "|function=" + fnEP, nil
 }
 
 func unwrapGuardAdapter(a any) any {
@@ -181,6 +182,8 @@ func unwrapGuardAdapter(a any) any {
 			a = g.q
 		case guardTables:
 			a = g.t
+		case guardFunctions:
+			a = g.f
 		default:
 			return a
 		}
@@ -289,6 +292,8 @@ func targetSafetyKind(kind string) string {
 		return safety.KindQueue
 	case "table":
 		return safety.KindTable
+	case "function":
+		return safety.KindFunction
 	default:
 		return ""
 	}
@@ -438,6 +443,58 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 			if !owned {
 				return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
 					fmt.Sprintf("table %q exists but is not owned by this run", target.Name))
+			}
+		}
+		return nil
+
+	case "function":
+		fctx, cancel, e := h.opCtx("function", h.cfg.OpTimeout)
+		if e != nil {
+			return e
+		}
+		defer cancel()
+		fctx = hostkit.WithForbidLiveRoute(fctx)
+		if ce := checkAdapterLiveRouteAllowed(fctx, h.cfg.Functions); ce != nil {
+			return ce
+		}
+		ep := hostkit.EndpointFrom(fctx)
+		if dry {
+			exists, e := h.functionExists(fctx, true, target.Name)
+			if e != nil {
+				return e
+			}
+			if !exists {
+				return notFound("FunctionNotFound", fmt.Sprintf("function %q does not exist (dry-run preview)", target.Name))
+			}
+			if requireOwned {
+				if df, ok := h.ov(fctx).function(target.Name); !ok || !df.createdNow {
+					owned, cerr := h.cost.isOwnedResourceAt(safety.KindFunction, ep, target.Name)
+					if cerr != nil {
+						return cerr
+					}
+					if !owned {
+						return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
+							fmt.Sprintf("function %q exists but is not owned by this run", target.Name))
+					}
+				}
+			}
+			return nil
+		}
+		exists, ce := h.meteredFunctionExists(fctx, target.Name, false)
+		if ce != nil {
+			return ce
+		}
+		if !exists {
+			return notFound("FunctionNotFound", fmt.Sprintf("function %q does not exist", target.Name))
+		}
+		if requireOwned {
+			owned, cerr := h.cost.isOwnedResourceAt(safety.KindFunction, ep, target.Name)
+			if cerr != nil {
+				return cerr
+			}
+			if !owned {
+				return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
+					fmt.Sprintf("function %q exists but is not owned by this run", target.Name))
 			}
 		}
 		return nil

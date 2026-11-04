@@ -188,4 +188,97 @@ func (g guardPermissions) CheckPolicy(ctx context.Context, principal, action, re
 	return hostkit.NilIfTyped(g.p.CheckPolicy(ctx, principal, action, resource))
 }
 
+type guardFunctions struct{ f hostkit.Functions }
+
+func (g guardFunctions) CreateFunction(ctx context.Context, in hostkit.FunctionUpdateInput) (bool, hostkit.FunctionSnapshot, error) {
+	created, v, err := g.f.CreateFunction(ctx, in)
+	return created, v, hostkit.NilIfTyped(err)
+}
+
+func (g guardFunctions) UpdateFunction(ctx context.Context, in hostkit.FunctionUpdateInput) (hostkit.FunctionSnapshot, error) {
+	v, err := g.f.UpdateFunction(ctx, in)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardFunctions) DeleteFunction(ctx context.Context, name string) (bool, error) {
+	existed, err := g.f.DeleteFunction(ctx, name)
+	return existed, hostkit.NilIfTyped(err)
+}
+
+func (g guardFunctions) FunctionExists(ctx context.Context, name string) (bool, error) {
+	v, err := g.f.FunctionExists(ctx, name)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardFunctions) GetFunction(ctx context.Context, name, qualifier string) (hostkit.FunctionSnapshot, error) {
+	v, err := g.f.GetFunction(ctx, name, qualifier)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardFunctions) ListFunctions(ctx context.Context) ([]string, error) {
+	v, err := g.f.ListFunctions(ctx)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardFunctions) PublishFunctionVersion(ctx context.Context, name, expectRevision string) (string, error) {
+	ver, err := g.f.PublishFunctionVersion(ctx, name, expectRevision)
+	return ver, hostkit.NilIfTyped(err)
+}
+
+func (g guardFunctions) ListFunctionVersions(ctx context.Context, name string) ([]string, error) {
+	v, err := g.f.ListFunctionVersions(ctx, name)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardFunctions) SetFunctionAlias(ctx context.Context, name, alias, version string) (bool, error) {
+	created, err := g.f.SetFunctionAlias(ctx, name, alias, version)
+	return created, hostkit.NilIfTyped(err)
+}
+
+func (g guardFunctions) GetFunctionAlias(ctx context.Context, name, alias string) (string, error) {
+	v, err := g.f.GetFunctionAlias(ctx, name, alias)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardFunctions) DeleteFunctionAlias(ctx context.Context, name, alias string) (bool, error) {
+	existed, err := g.f.DeleteFunctionAlias(ctx, name, alias)
+	return existed, hostkit.NilIfTyped(err)
+}
+
+func (g guardFunctions) InvokeFunction(ctx context.Context, in hostkit.FunctionInvokeInput) (hostkit.FunctionInvokeOutput, error) {
+	v, err := g.f.InvokeFunction(ctx, in)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardFunctions) PeekFunctionQuota(ctx context.Context, name, qualifier string) (int64, int64, bool) {
+	if p, ok := g.f.(hostkit.FunctionQuotaPeeker); ok {
+		return p.PeekFunctionQuota(ctx, name, qualifier)
+	}
+	return 0, 0, false
+}
+
+func (g guardFunctions) PeekFunctionVersionHeadroom(ctx context.Context, name, expectRevision string) (string, error) {
+	if p, ok := g.f.(hostkit.FunctionQuotaPeeker); ok {
+		v, err := p.PeekFunctionVersionHeadroom(ctx, name, expectRevision)
+		return v, hostkit.NilIfTyped(err)
+	}
+	return "", nil
+}
+
+func (g guardFunctions) PeekFunctionAliasHeadroom(ctx context.Context, name, alias, version string) (bool, error) {
+	if p, ok := g.f.(hostkit.FunctionQuotaPeeker); ok {
+		created, err := p.PeekFunctionAliasHeadroom(ctx, name, alias, version)
+		return created, hostkit.NilIfTyped(err)
+	}
+	return true, nil
+}
+
+func (g guardFunctions) FunctionOwnerToken(ctx context.Context, name string) (string, bool, error) {
+	if r, ok := g.f.(hostkit.FunctionOwnershipReader); ok {
+		v, ex, err := r.FunctionOwnerToken(ctx, name)
+		return v, ex, hostkit.NilIfTyped(err)
+	}
+	return "", false, errNoToken
+}
+
 var errNoToken = hostkit.ProviderError(hostkit.Internal, 0, "", "adapter does not store create tokens")

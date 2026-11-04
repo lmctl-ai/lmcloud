@@ -470,6 +470,158 @@ func (r Router) CheckPolicy(ctx context.Context, principal, action, resource str
 	return p.CheckPolicy(ctx, principal, action, resource)
 }
 
+var errNoFunctions = ProviderError(Internal, 0, "", "backend does not support functions")
+
+func (r Router) pickFunctions(ctx context.Context) (Functions, error) {
+	be, err := r.pick(WithForbidLiveRoute(ctx))
+	if err != nil {
+		return nil, err
+	}
+	if fn, ok := be.(Functions); ok && !isNilPointer(fn) {
+		return fn, nil
+	}
+	return nil, errNoFunctions
+}
+
+func (r Router) CreateFunction(ctx context.Context, in FunctionUpdateInput) (bool, FunctionSnapshot, error) {
+	fn, err := r.pickFunctions(ctx)
+	if err != nil {
+		return false, FunctionSnapshot{}, err
+	}
+	return fn.CreateFunction(ctx, in)
+}
+
+func (r Router) UpdateFunction(ctx context.Context, in FunctionUpdateInput) (FunctionSnapshot, error) {
+	fn, err := r.pickFunctions(ctx)
+	if err != nil {
+		return FunctionSnapshot{}, err
+	}
+	return fn.UpdateFunction(ctx, in)
+}
+
+func (r Router) DeleteFunction(ctx context.Context, name string) (bool, error) {
+	fn, err := r.pickFunctions(ctx)
+	if err != nil {
+		return false, err
+	}
+	return fn.DeleteFunction(ctx, name)
+}
+
+func (r Router) FunctionExists(ctx context.Context, name string) (bool, error) {
+	fn, err := r.pickFunctions(ctx)
+	if err != nil {
+		return false, err
+	}
+	return fn.FunctionExists(ctx, name)
+}
+
+func (r Router) GetFunction(ctx context.Context, name, qualifier string) (FunctionSnapshot, error) {
+	fn, err := r.pickFunctions(ctx)
+	if err != nil {
+		return FunctionSnapshot{}, err
+	}
+	return fn.GetFunction(ctx, name, qualifier)
+}
+
+func (r Router) ListFunctions(ctx context.Context) ([]string, error) {
+	fn, err := r.pickFunctions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return fn.ListFunctions(ctx)
+}
+
+func (r Router) PublishFunctionVersion(ctx context.Context, name, expectRevision string) (string, error) {
+	fn, err := r.pickFunctions(ctx)
+	if err != nil {
+		return "", err
+	}
+	return fn.PublishFunctionVersion(ctx, name, expectRevision)
+}
+
+func (r Router) ListFunctionVersions(ctx context.Context, name string) ([]string, error) {
+	fn, err := r.pickFunctions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return fn.ListFunctionVersions(ctx, name)
+}
+
+func (r Router) SetFunctionAlias(ctx context.Context, name, alias, version string) (bool, error) {
+	fn, err := r.pickFunctions(ctx)
+	if err != nil {
+		return false, err
+	}
+	return fn.SetFunctionAlias(ctx, name, alias, version)
+}
+
+func (r Router) GetFunctionAlias(ctx context.Context, name, alias string) (string, error) {
+	fn, err := r.pickFunctions(ctx)
+	if err != nil {
+		return "", err
+	}
+	return fn.GetFunctionAlias(ctx, name, alias)
+}
+
+func (r Router) DeleteFunctionAlias(ctx context.Context, name, alias string) (bool, error) {
+	fn, err := r.pickFunctions(ctx)
+	if err != nil {
+		return false, err
+	}
+	return fn.DeleteFunctionAlias(ctx, name, alias)
+}
+
+func (r Router) InvokeFunction(ctx context.Context, in FunctionInvokeInput) (FunctionInvokeOutput, error) {
+	fn, err := r.pickFunctions(ctx)
+	if err != nil {
+		return FunctionInvokeOutput{}, err
+	}
+	return fn.InvokeFunction(ctx, in)
+}
+
+func (r Router) PeekFunctionQuota(ctx context.Context, name, qualifier string) (int64, int64, bool) {
+	be, err := r.pick(WithForbidLiveRoute(ctx))
+	if err != nil {
+		return 0, 0, false
+	}
+	if p, ok := be.(FunctionQuotaPeeker); ok && !isNilPointer(p) {
+		return p.PeekFunctionQuota(ctx, name, qualifier)
+	}
+	return 0, 0, false
+}
+
+func (r Router) PeekFunctionVersionHeadroom(ctx context.Context, name, expectRevision string) (string, error) {
+	be, err := r.pick(WithForbidLiveRoute(ctx))
+	if err != nil {
+		return "", err
+	}
+	if p, ok := be.(FunctionQuotaPeeker); ok && !isNilPointer(p) {
+		return p.PeekFunctionVersionHeadroom(ctx, name, expectRevision)
+	}
+	return "", nil
+}
+
+func (r Router) PeekFunctionAliasHeadroom(ctx context.Context, name, alias, version string) (bool, error) {
+	be, err := r.pick(WithForbidLiveRoute(ctx))
+	if err != nil {
+		return true, err
+	}
+	if p, ok := be.(FunctionQuotaPeeker); ok && !isNilPointer(p) {
+		return p.PeekFunctionAliasHeadroom(ctx, name, alias, version)
+	}
+	return true, nil
+}
+
+func (r Router) FunctionOwnerToken(ctx context.Context, name string) (string, bool, error) {
+	be, err := r.pick(WithForbidLiveRoute(ctx))
+	if err != nil {
+		return "", false, err
+	}
+	if or, ok := be.(FunctionOwnershipReader); ok && !isNilPointer(or) {
+		return or.FunctionOwnerToken(ctx, name)
+	}
+	return "", false, errNoToken
+}
 
 // isNilPointer catches a typed-nil backend (e.g. a nil *Client stored in a
 // Backend), which would otherwise panic on the first method call.

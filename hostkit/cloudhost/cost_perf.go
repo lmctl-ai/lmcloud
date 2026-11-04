@@ -137,6 +137,8 @@ func serviceForOp(op string) string {
 		return "tables"
 	case op == "principal_current", strings.HasPrefix(op, "policy_"):
 		return "permissions"
+	case strings.HasPrefix(op, "function_"):
+		return "function"
 	default:
 		return "cloud"
 	}
@@ -222,6 +224,7 @@ type campaignJournalRecord struct {
 	IntentID                 string `json:"intent_id,omitempty"`
 	ExpectedOwnerToken       string `json:"expected_owner_token,omitempty"`
 	ExpectedGeneration       string `json:"expected_generation,omitempty"`
+	FunctionDigest           string `json:"function_digest,omitempty"`
 }
 
 type replayedCampaignState struct {
@@ -244,6 +247,15 @@ type replayedCampaignState struct {
 	maxPolicyGen           map[string]uint64
 	latestPolicyIntent     map[string]string
 	policyCleanup          map[string]int64
+	activeFunctions        map[string]int64
+	activeFunctionVersions map[string]int64
+	activeFunctionAliases  map[string]int64
+	activeFunctionEntries  map[string]safety.JournalFunctionEntry
+	ambiguousFunctions     map[string]safety.JournalFunctionEntry
+	ambiguousFunctionStack map[string][]safety.JournalFunctionEntry
+	functionOwnerTokens    map[string]string
+	maxFunctionGen         map[string]uint64
+	latestFunctionIntent   map[string]string
 	pending                map[string]campaignJournalRecord
 }
 
@@ -313,36 +325,45 @@ func extractTablesLiveGuard(tables hostkit.Tables) *safety.LiveGuard {
 }
 
 type costTracker struct {
-	mu                 sync.Mutex
-	provider           string
-	scope              string
-	meter              *safety.CostMeter
-	journal            *safety.Journal
-	liveGuard          *safety.LiveGuard
-	storeDelegated     bool
-	queueDelegated     bool
-	tablesDelegated    bool
-	liveMode           bool
-	unconfiguredLive   bool
-	poisoned           *hostkit.CloudError
-	statePath          string
-	onSetWorkCap       func(workCapNanoUSD int64) error
-	onToken            func(token string)
-	capExceededCount   int64
-	ops                map[string]persistedOpCost
-	activeBuckets      map[string]int64
-	activeObjects      map[string]int64
-	activeQueues       map[string]int64
-	activeTables       map[string]int64
-	activeItems        map[string]int64
-	activePolicies     map[string]hostkit.PolicyAttachment
-	ambiguousPolicies  map[string]hostkit.PolicyAttachment
-	ambiguousStack     map[string][]hostkit.PolicyAttachment
-	policyOwnerTokens  map[string]string
-	maxPolicyGen       map[string]uint64
-	latestPolicyIntent map[string]string
-	policyCleanup      map[string]int64
-	inFlightAttempts   map[string]bool
+	mu                     sync.Mutex
+	provider               string
+	scope                  string
+	meter                  *safety.CostMeter
+	journal                *safety.Journal
+	liveGuard              *safety.LiveGuard
+	storeDelegated         bool
+	queueDelegated         bool
+	tablesDelegated        bool
+	liveMode               bool
+	unconfiguredLive       bool
+	poisoned               *hostkit.CloudError
+	statePath              string
+	onSetWorkCap           func(workCapNanoUSD int64) error
+	onToken                func(token string)
+	capExceededCount       int64
+	ops                    map[string]persistedOpCost
+	activeBuckets          map[string]int64
+	activeObjects          map[string]int64
+	activeQueues           map[string]int64
+	activeTables           map[string]int64
+	activeItems            map[string]int64
+	activePolicies         map[string]hostkit.PolicyAttachment
+	ambiguousPolicies      map[string]hostkit.PolicyAttachment
+	ambiguousStack         map[string][]hostkit.PolicyAttachment
+	policyOwnerTokens      map[string]string
+	maxPolicyGen           map[string]uint64
+	latestPolicyIntent     map[string]string
+	policyCleanup          map[string]int64
+	activeFunctions        map[string]int64
+	activeFunctionVersions map[string]int64
+	activeFunctionAliases  map[string]int64
+	activeFunctionEntries  map[string]safety.JournalFunctionEntry
+	ambiguousFunctions     map[string]safety.JournalFunctionEntry
+	ambiguousFunctionStack map[string][]safety.JournalFunctionEntry
+	functionOwnerTokens    map[string]string
+	maxFunctionGen         map[string]uint64
+	latestFunctionIntent   map[string]string
+	inFlightAttempts       map[string]bool
 }
 
 func scopedResKey(endpoint, resKey string) string {
@@ -382,6 +403,50 @@ func isPermissionsOp(op, resKind string) bool {
 	return op == "principal_current" || strings.HasPrefix(op, "policy_")
 }
 
+func isFunctionOp(op, resKind string) bool {
+	if resKind == safety.KindFunction || resKind == safety.KindFunctionVersion || resKind == safety.KindFunctionAlias {
+		return true
+	}
+	return strings.HasPrefix(op, "function_")
+}
+
+func hasFunctionChildren(activeVersions, activeAliases map[string]int64, scopedFunc string) bool {
+	if scopedFunc == "" {
+		return false
+	}
+	prefix := scopedFunc + "/"
+	for k := range activeVersions {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	for k := range activeAliases {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasJournalFunctionChildren(activeCleanup map[string]int64, endpoint, fnName string) bool {
+	if fnName == "" || len(activeCleanup) == 0 {
+		return false
+	}
+	verPrefix := safety.KindFunctionVersion + "\x00" + endpoint + "\x00" + fnName + "/"
+	verPrefixUnscoped := safety.KindFunctionVersion + "\x00\x00" + fnName + "/"
+	verParent := safety.KindFunctionVersion + "\x00" + fnName + "\x00"
+	aliasPrefix := safety.KindFunctionAlias + "\x00" + endpoint + "\x00" + fnName + "/"
+	aliasPrefixUnscoped := safety.KindFunctionAlias + "\x00\x00" + fnName + "/"
+	aliasParent := safety.KindFunctionAlias + "\x00" + fnName + "\x00"
+	for k := range activeCleanup {
+		if strings.HasPrefix(k, verPrefix) || strings.HasPrefix(k, verPrefixUnscoped) || strings.HasPrefix(k, verParent) ||
+			strings.HasPrefix(k, aliasPrefix) || strings.HasPrefix(k, aliasPrefixUnscoped) || strings.HasPrefix(k, aliasParent) {
+			return true
+		}
+	}
+	return false
+}
+
 func hasTableChildItems(activeItems map[string]int64, scopedTable string) bool {
 	if scopedTable == "" || len(activeItems) == 0 {
 		return false
@@ -411,7 +476,7 @@ func hasJournalTableChildItems(activeCleanup map[string]int64, endpoint, table s
 }
 
 func (ct *costTracker) isServiceDelegated(op, resKind string) bool {
-	if isPermissionsOp(op, resKind) {
+	if isPermissionsOp(op, resKind) || isFunctionOp(op, resKind) {
 		return false
 	}
 	switch resKind {
@@ -442,6 +507,19 @@ func (ct *costTracker) checkPermissionsAllowed() *hostkit.CloudError {
 	if ct.liveGuard != nil || ct.liveMode || ct.unconfiguredLive {
 		return hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveGuardRequired",
 			"live mode refuses permissions operations: live permissions slice is not enabled")
+	}
+	return nil
+}
+
+func (ct *costTracker) checkFunctionAllowed() *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	if ct.liveGuard != nil || ct.liveMode || ct.unconfiguredLive {
+		return hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveFunctionNotCertified",
+			"live mode refuses function operations: live function slice is not certified")
 	}
 	return nil
 }
@@ -511,30 +589,39 @@ func newCostTracker(cfg Config) *costTracker {
 	liveMode := isLiveModeEnv() || lg != nil
 
 	ct := &costTracker{
-		provider:           provider,
-		scope:              resolveCampaignScope(),
-		journal:            cfg.Journal,
-		liveGuard:          lg,
-		storeDelegated:     storeGuard != nil,
-		queueDelegated:     queueGuard != nil,
-		tablesDelegated:    tablesGuard != nil,
-		liveMode:           liveMode,
-		statePath:          strings.TrimSpace(cfg.CampaignStatePath),
-		onSetWorkCap:       cfg.OnSetWorkCap,
-		ops:                map[string]persistedOpCost{},
-		activeBuckets:      map[string]int64{},
-		activeObjects:      map[string]int64{},
-		activeQueues:       map[string]int64{},
-		activeTables:       map[string]int64{},
-		activeItems:        map[string]int64{},
-		activePolicies:     map[string]hostkit.PolicyAttachment{},
-		ambiguousPolicies:  map[string]hostkit.PolicyAttachment{},
-		ambiguousStack:     map[string][]hostkit.PolicyAttachment{},
-		policyOwnerTokens:  map[string]string{},
-		maxPolicyGen:       map[string]uint64{},
-		latestPolicyIntent: map[string]string{},
-		policyCleanup:      map[string]int64{},
-		inFlightAttempts:   map[string]bool{},
+		provider:               provider,
+		scope:                  resolveCampaignScope(),
+		journal:                cfg.Journal,
+		liveGuard:              lg,
+		storeDelegated:         storeGuard != nil,
+		queueDelegated:         queueGuard != nil,
+		tablesDelegated:        tablesGuard != nil,
+		liveMode:               liveMode,
+		statePath:              strings.TrimSpace(cfg.CampaignStatePath),
+		onSetWorkCap:           cfg.OnSetWorkCap,
+		ops:                    map[string]persistedOpCost{},
+		activeBuckets:          map[string]int64{},
+		activeObjects:          map[string]int64{},
+		activeQueues:           map[string]int64{},
+		activeTables:           map[string]int64{},
+		activeItems:            map[string]int64{},
+		activePolicies:         map[string]hostkit.PolicyAttachment{},
+		ambiguousPolicies:      map[string]hostkit.PolicyAttachment{},
+		ambiguousStack:         map[string][]hostkit.PolicyAttachment{},
+		policyOwnerTokens:      map[string]string{},
+		maxPolicyGen:           map[string]uint64{},
+		latestPolicyIntent:     map[string]string{},
+		policyCleanup:          map[string]int64{},
+		activeFunctions:        map[string]int64{},
+		activeFunctionVersions: map[string]int64{},
+		activeFunctionAliases:  map[string]int64{},
+		activeFunctionEntries:  map[string]safety.JournalFunctionEntry{},
+		ambiguousFunctions:     map[string]safety.JournalFunctionEntry{},
+		ambiguousFunctionStack: map[string][]safety.JournalFunctionEntry{},
+		functionOwnerTokens:    map[string]string{},
+		maxFunctionGen:         map[string]uint64{},
+		latestFunctionIntent:   map[string]string{},
+		inFlightAttempts:       map[string]bool{},
 	}
 
 	if !isKnownProvider(provider) {
@@ -799,6 +886,8 @@ func policyScopeMatchesResourceEndpoint(policyScope, resKind, resEndpoint string
 			wantPrefix = "queue="
 		case safety.KindTable:
 			wantPrefix = "tables="
+		case safety.KindFunction:
+			wantPrefix = "function="
 		default:
 			return false
 		}
@@ -824,6 +913,8 @@ func deleteResourcePolicyAttachments(policies, ambiguous map[string]hostkit.Poli
 		target = "queue:queue:" + resKey
 	case safety.KindTable:
 		target = "tables:table:" + resKey
+	case safety.KindFunction:
+		target = "function:function:" + resKey
 	default:
 		return 0
 	}
@@ -863,22 +954,57 @@ func countCampaignAttachmentKeys(st *replayedCampaignState) int {
 	return len(seen)
 }
 
+func countCampaignFunctionKeys(st *replayedCampaignState) int {
+	seen := make(map[string]struct{}, len(st.activeFunctionEntries)+len(st.ambiguousFunctions))
+	for k := range st.activeFunctionEntries {
+		seen[k] = struct{}{}
+	}
+	for k := range st.ambiguousFunctions {
+		seen[k] = struct{}{}
+	}
+	return len(seen)
+}
+
+func deleteCampaignFunctionCleanup(st *replayedCampaignState, sKey string) {
+	delete(st.activeFunctions, sKey)
+	prefix := sKey + "/"
+	for k := range st.activeFunctionVersions {
+		if strings.HasPrefix(k, prefix) {
+			delete(st.activeFunctionVersions, k)
+		}
+	}
+	for k := range st.activeFunctionAliases {
+		if strings.HasPrefix(k, prefix) {
+			delete(st.activeFunctionAliases, k)
+		}
+	}
+}
+
 func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, error) {
 	st := &replayedCampaignState{
-		ops:                map[string]persistedOpCost{},
-		activeBuckets:      map[string]int64{},
-		activeObjects:      map[string]int64{},
-		activeQueues:       map[string]int64{},
-		activeTables:       map[string]int64{},
-		activeItems:        map[string]int64{},
-		activePolicies:     map[string]hostkit.PolicyAttachment{},
-		ambiguousPolicies:  map[string]hostkit.PolicyAttachment{},
-		ambiguousStack:     map[string][]hostkit.PolicyAttachment{},
-		policyOwnerTokens:  map[string]string{},
-		maxPolicyGen:       map[string]uint64{},
-		latestPolicyIntent: map[string]string{},
-		policyCleanup:      map[string]int64{},
-		pending:            map[string]campaignJournalRecord{},
+		ops:                    map[string]persistedOpCost{},
+		activeBuckets:          map[string]int64{},
+		activeObjects:          map[string]int64{},
+		activeQueues:           map[string]int64{},
+		activeTables:           map[string]int64{},
+		activeItems:            map[string]int64{},
+		activePolicies:         map[string]hostkit.PolicyAttachment{},
+		ambiguousPolicies:      map[string]hostkit.PolicyAttachment{},
+		ambiguousStack:         map[string][]hostkit.PolicyAttachment{},
+		policyOwnerTokens:      map[string]string{},
+		maxPolicyGen:           map[string]uint64{},
+		latestPolicyIntent:     map[string]string{},
+		policyCleanup:          map[string]int64{},
+		activeFunctions:        map[string]int64{},
+		activeFunctionVersions: map[string]int64{},
+		activeFunctionAliases:  map[string]int64{},
+		activeFunctionEntries:  map[string]safety.JournalFunctionEntry{},
+		ambiguousFunctions:     map[string]safety.JournalFunctionEntry{},
+		ambiguousFunctionStack: map[string][]safety.JournalFunctionEntry{},
+		functionOwnerTokens:    map[string]string{},
+		maxFunctionGen:         map[string]uint64{},
+		latestFunctionIntent:   map[string]string{},
+		pending:                map[string]campaignJournalRecord{},
 	}
 	if len(raw) == 0 {
 		return st, nil
@@ -1015,6 +1141,18 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 					if _, exists := st.policyCleanup[p.ResKey]; !exists {
 						st.policyCleanup[p.ResKey] = p.CleanupReserveNanoUSD
 					}
+				case safety.KindFunction:
+					if _, exists := st.activeFunctions[sKey]; !exists {
+						st.activeFunctions[sKey] = p.CleanupReserveNanoUSD
+					}
+				case safety.KindFunctionVersion:
+					if _, exists := st.activeFunctionVersions[sKey]; !exists {
+						st.activeFunctionVersions[sKey] = p.CleanupReserveNanoUSD
+					}
+				case safety.KindFunctionAlias:
+					if _, exists := st.activeFunctionAliases[sKey]; !exists {
+						st.activeFunctionAliases[sKey] = p.CleanupReserveNanoUSD
+					}
 				}
 			}
 			if rec.ReleaseCleanup && p.ResKey != "" {
@@ -1038,6 +1176,10 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 					delete(st.activeItems, sKey)
 				case safety.KindPolicyAttachment:
 					delete(st.policyCleanup, p.ResKey)
+				case safety.KindFunction:
+					deleteCampaignFunctionCleanup(st, sKey)
+				case safety.KindFunctionAlias:
+					delete(st.activeFunctionAliases, sKey)
 				}
 			}
 		case safety.EventPolicyIntent:
@@ -1235,6 +1377,153 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 			delete(st.ambiguousPolicies, pKey)
 			delete(st.activePolicies, pKey)
 			delete(st.policyCleanup, pKey)
+		case safety.EventFunctionIntent:
+			if rec.ResKey == "" || len(rec.ResKey) > 64 || rec.Generation == "" {
+				return nil, errors.New("corrupt campaign journal function_intent missing name or generation")
+			}
+			if rec.PolicyIntentOp != "create" && rec.PolicyIntentOp != "update" && rec.PolicyIntentOp != "delete" && rec.PolicyIntentOp != "abort" {
+				return nil, fmt.Errorf("corrupt campaign journal function_intent invalid op %q", rec.PolicyIntentOp)
+			}
+			genNum, err := strconv.ParseUint(rec.Generation, 10, 64)
+			if err != nil || genNum == 0 {
+				return nil, fmt.Errorf("corrupt campaign journal function_intent generation %q", rec.Generation)
+			}
+			if err := safety.ValidateToken128(rec.OwnerToken); err != nil {
+				return nil, fmt.Errorf("corrupt campaign journal function_intent owner_token: %w", err)
+			}
+			if err := safety.ValidateToken128(rec.IntentID); err != nil {
+				return nil, fmt.Errorf("corrupt campaign journal function_intent intent_id: %w", err)
+			}
+			fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			if rec.PolicyIntentOp == "abort" {
+				stack := st.ambiguousFunctionStack[fKey]
+				if len(stack) > 0 {
+					filtered := stack[:0]
+					for _, item := range stack {
+						if item.IntentID != rec.IntentID {
+							filtered = append(filtered, item)
+						}
+					}
+					if len(filtered) > 0 {
+						st.ambiguousFunctionStack[fKey] = filtered
+						st.ambiguousFunctions[fKey] = filtered[len(filtered)-1]
+					} else {
+						delete(st.ambiguousFunctionStack, fKey)
+						delete(st.ambiguousFunctions, fKey)
+						if _, inActive := st.activeFunctionEntries[fKey]; !inActive {
+							deleteCampaignFunctionCleanup(st, fKey)
+						}
+					}
+				} else if st.latestFunctionIntent[fKey] == "" || st.latestFunctionIntent[fKey] == rec.IntentID {
+					delete(st.ambiguousFunctions, fKey)
+					if _, inActive := st.activeFunctionEntries[fKey]; !inActive {
+						deleteCampaignFunctionCleanup(st, fKey)
+					}
+				}
+				continue
+			}
+			if genNum <= st.maxFunctionGen[fKey] {
+				return nil, fmt.Errorf("corrupt campaign journal function_intent non-monotonic generation %d (max %d)", genNum, st.maxFunctionGen[fKey])
+			}
+			if rec.PolicyIntentOp == "create" {
+				if _, inActive := st.activeFunctionEntries[fKey]; !inActive {
+					if _, inAmb := st.ambiguousFunctions[fKey]; !inAmb && countCampaignFunctionKeys(st) >= hostkit.MaxFunctionsPerRun {
+						return nil, errors.New("corrupt campaign journal function_intent exceeds MaxFunctionsPerRun")
+					}
+				}
+			}
+			st.maxFunctionGen[fKey] = genNum
+			st.latestFunctionIntent[fKey] = rec.IntentID
+			st.functionOwnerTokens[fKey] = rec.OwnerToken
+			jfe := safety.JournalFunctionEntry{
+				Key:        fKey,
+				Scope:      rec.Endpoint,
+				Name:       rec.ResKey,
+				Digest:     rec.FunctionDigest,
+				OwnerToken: rec.OwnerToken,
+				Generation: rec.Generation,
+				IntentID:   rec.IntentID,
+				Ambiguous:  true,
+				IntentOp:   rec.PolicyIntentOp,
+			}
+			st.ambiguousFunctionStack[fKey] = append(st.ambiguousFunctionStack[fKey], jfe)
+			st.ambiguousFunctions[fKey] = jfe
+			if rec.CleanupReserveNanoUSD > 0 {
+				st.activeFunctions[fKey] = rec.CleanupReserveNanoUSD
+			}
+		case safety.EventFunctionConfirm:
+			if rec.ResKey == "" || len(rec.ResKey) > 64 || rec.Generation == "" {
+				return nil, errors.New("corrupt campaign journal function_confirm missing name or generation")
+			}
+			genNum, err := strconv.ParseUint(rec.Generation, 10, 64)
+			if err != nil || genNum == 0 {
+				return nil, fmt.Errorf("corrupt campaign journal function_confirm generation %q", rec.Generation)
+			}
+			if err := safety.ValidateToken128(rec.OwnerToken); err != nil {
+				return nil, fmt.Errorf("corrupt campaign journal function_confirm owner_token: %w", err)
+			}
+			if rec.IntentID != "" {
+				if err := safety.ValidateToken128(rec.IntentID); err != nil {
+					return nil, fmt.Errorf("corrupt campaign journal function_confirm intent_id: %w", err)
+				}
+			}
+			fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			if genNum < st.maxFunctionGen[fKey] {
+				return nil, fmt.Errorf("corrupt campaign journal stale function_confirm generation %d (max %d)", genNum, st.maxFunctionGen[fKey])
+			}
+			if rec.IntentID != "" && st.latestFunctionIntent[fKey] != "" && rec.IntentID != st.latestFunctionIntent[fKey] {
+				return nil, fmt.Errorf("corrupt campaign journal stale function_confirm intent_id %q (latest %q)", rec.IntentID, st.latestFunctionIntent[fKey])
+			}
+			if _, inActive := st.activeFunctionEntries[fKey]; !inActive {
+				if _, inAmb := st.ambiguousFunctions[fKey]; !inAmb && countCampaignFunctionKeys(st) >= hostkit.MaxFunctionsPerRun {
+					return nil, errors.New("corrupt campaign journal function_confirm exceeds MaxFunctionsPerRun")
+				}
+			}
+			st.maxFunctionGen[fKey] = genNum
+			if rec.IntentID != "" {
+				st.latestFunctionIntent[fKey] = rec.IntentID
+			}
+			st.functionOwnerTokens[fKey] = rec.OwnerToken
+			delete(st.ambiguousFunctionStack, fKey)
+			delete(st.ambiguousFunctions, fKey)
+			st.activeFunctionEntries[fKey] = safety.JournalFunctionEntry{
+				Key:        fKey,
+				Scope:      rec.Endpoint,
+				Name:       rec.ResKey,
+				Digest:     rec.FunctionDigest,
+				OwnerToken: rec.OwnerToken,
+				Generation: rec.Generation,
+				IntentID:   rec.IntentID,
+			}
+			if rec.CleanupReserveNanoUSD > 0 {
+				st.activeFunctions[fKey] = rec.CleanupReserveNanoUSD
+			}
+		case safety.EventFunctionDelete:
+			if rec.ResKey == "" || len(rec.ResKey) > 64 {
+				return nil, errors.New("corrupt campaign journal function_delete missing name")
+			}
+			fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			if rec.Generation != "" {
+				genNum, err := strconv.ParseUint(rec.Generation, 10, 64)
+				if err != nil || genNum == 0 || genNum < st.maxFunctionGen[fKey] {
+					return nil, fmt.Errorf("corrupt campaign journal stale function_delete generation %q", rec.Generation)
+				}
+				st.maxFunctionGen[fKey] = genNum
+			}
+			if rec.IntentID != "" && st.latestFunctionIntent[fKey] != "" && rec.IntentID != st.latestFunctionIntent[fKey] {
+				return nil, fmt.Errorf("corrupt campaign journal stale function_delete intent_id %q", rec.IntentID)
+			}
+			if rec.IntentID != "" {
+				st.latestFunctionIntent[fKey] = rec.IntentID
+			}
+			if rec.OwnerToken != "" {
+				st.functionOwnerTokens[fKey] = rec.OwnerToken
+			}
+			delete(st.ambiguousFunctionStack, fKey)
+			delete(st.ambiguousFunctions, fKey)
+			delete(st.activeFunctionEntries, fKey)
+			deleteCampaignFunctionCleanup(st, fKey)
+			deleteResourcePolicyAttachments(st.activePolicies, st.ambiguousPolicies, st.ambiguousStack, st.policyCleanup, safety.KindFunction, rec.Endpoint, rec.ResKey)
 		default:
 			return nil, fmt.Errorf("corrupt campaign journal: unknown event %q", rec.Event)
 		}
@@ -1256,6 +1545,15 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 		st.resourceCleanupNanoUSD += v
 	}
 	for _, v := range st.policyCleanup {
+		st.resourceCleanupNanoUSD += v
+	}
+	for _, v := range st.activeFunctions {
+		st.resourceCleanupNanoUSD += v
+	}
+	for _, v := range st.activeFunctionVersions {
+		st.resourceCleanupNanoUSD += v
+	}
+	for _, v := range st.activeFunctionAliases {
 		st.resourceCleanupNanoUSD += v
 	}
 	return st, nil
@@ -1325,6 +1623,50 @@ func (ct *costTracker) applyReplayedStateLocked(st *replayedCampaignState) {
 	for k, v := range st.policyCleanup {
 		ct.policyCleanup[k] = v
 	}
+	ct.activeFunctions = make(map[string]int64, len(st.activeFunctions))
+	for k, v := range st.activeFunctions {
+		ct.activeFunctions[k] = v
+	}
+	ct.activeFunctionVersions = make(map[string]int64, len(st.activeFunctionVersions))
+	for k, v := range st.activeFunctionVersions {
+		ct.activeFunctionVersions[k] = v
+	}
+	ct.activeFunctionAliases = make(map[string]int64, len(st.activeFunctionAliases))
+	for k, v := range st.activeFunctionAliases {
+		ct.activeFunctionAliases[k] = v
+	}
+	ct.activeFunctionEntries = make(map[string]safety.JournalFunctionEntry, len(st.activeFunctionEntries))
+	for k, v := range st.activeFunctionEntries {
+		ct.activeFunctionEntries[k] = v
+		if ct.onToken != nil && v.OwnerToken != "" {
+			ct.onToken(v.OwnerToken)
+		}
+	}
+	ct.ambiguousFunctions = make(map[string]safety.JournalFunctionEntry, len(st.ambiguousFunctions))
+	for k, v := range st.ambiguousFunctions {
+		ct.ambiguousFunctions[k] = v
+		if ct.onToken != nil && v.OwnerToken != "" {
+			ct.onToken(v.OwnerToken)
+		}
+	}
+	ct.ambiguousFunctionStack = make(map[string][]safety.JournalFunctionEntry, len(st.ambiguousFunctionStack))
+	for k, stack := range st.ambiguousFunctionStack {
+		cp := make([]safety.JournalFunctionEntry, len(stack))
+		copy(cp, stack)
+		ct.ambiguousFunctionStack[k] = cp
+	}
+	ct.functionOwnerTokens = make(map[string]string, len(st.functionOwnerTokens))
+	for k, v := range st.functionOwnerTokens {
+		ct.functionOwnerTokens[k] = v
+	}
+	ct.maxFunctionGen = make(map[string]uint64, len(st.maxFunctionGen))
+	for k, v := range st.maxFunctionGen {
+		ct.maxFunctionGen[k] = v
+	}
+	ct.latestFunctionIntent = make(map[string]string, len(st.latestFunctionIntent))
+	for k, v := range st.latestFunctionIntent {
+		ct.latestFunctionIntent[k] = v
+	}
 
 	charged := st.chargedNanoUSD
 	cleanup := st.resourceCleanupNanoUSD
@@ -1338,7 +1680,11 @@ func (ct *costTracker) applyReplayedStateLocked(st *replayedCampaignState) {
 		charged += p.AttemptNanoUSD
 		cur := ops[p.Operation]
 		cur.Requests++
-		cur.BillingUnits += ct.defaultBillingUnits(p.Operation, p.ReservedBytes)
+		if p.BillingUnits > 0 {
+			cur.BillingUnits += p.BillingUnits
+		} else {
+			cur.BillingUnits += ct.defaultBillingUnits(p.Operation, p.ReservedBytes)
+		}
 		cur.Bytes += p.ReservedBytes
 		cur.ChargedNanoUSD += p.AttemptNanoUSD
 		ops[p.Operation] = cur
@@ -1486,6 +1832,12 @@ func (ct *costTracker) syncFromSafetyJournalLocked() {
 				activeCleanup += pt.Operations["table_create"].CleanupReserveNanoUSD
 			case safety.KindTableItem:
 				activeCleanup += pt.Operations["item_put"].CleanupReserveNanoUSD
+			case safety.KindFunction:
+				activeCleanup += pt.Operations["function_create"].CleanupReserveNanoUSD
+			case safety.KindFunctionVersion:
+				activeCleanup += pt.Operations["function_publish_version"].CleanupReserveNanoUSD
+			case safety.KindFunctionAlias:
+				activeCleanup += pt.Operations["function_alias_set"].CleanupReserveNanoUSD
 			}
 		}
 	}
@@ -1609,6 +1961,40 @@ func (ct *costTracker) syncFromSafetyJournalLocked() {
 	for k, v := range st.LatestPolicyIntent {
 		ct.latestPolicyIntent[k] = v
 	}
+	ct.activeFunctionEntries = make(map[string]safety.JournalFunctionEntry, len(st.ActiveFunctions))
+	for k, fe := range st.ActiveFunctions {
+		ct.activeFunctionEntries[k] = fe
+		if ct.onToken != nil && fe.OwnerToken != "" {
+			ct.onToken(fe.OwnerToken)
+		}
+	}
+	ct.ambiguousFunctions = make(map[string]safety.JournalFunctionEntry, len(st.AmbiguousFunctions))
+	for k, fe := range st.AmbiguousFunctions {
+		ct.ambiguousFunctions[k] = fe
+		if ct.onToken != nil && fe.OwnerToken != "" {
+			ct.onToken(fe.OwnerToken)
+		}
+	}
+	ct.ambiguousFunctionStack = make(map[string][]safety.JournalFunctionEntry, len(st.AmbiguousFunctionStack))
+	for k, stack := range st.AmbiguousFunctionStack {
+		cp := make([]safety.JournalFunctionEntry, len(stack))
+		copy(cp, stack)
+		ct.ambiguousFunctionStack[k] = cp
+	}
+	ct.functionOwnerTokens = make(map[string]string, len(st.FunctionTombstones))
+	for k, tb := range st.FunctionTombstones {
+		if tb.OwnerToken != "" {
+			ct.functionOwnerTokens[k] = tb.OwnerToken
+		}
+	}
+	ct.maxFunctionGen = make(map[string]uint64, len(st.MaxFunctionGen))
+	for k, v := range st.MaxFunctionGen {
+		ct.maxFunctionGen[k] = v
+	}
+	ct.latestFunctionIntent = make(map[string]string, len(st.LatestFunctionIntent))
+	for k, v := range st.LatestFunctionIntent {
+		ct.latestFunctionIntent[k] = v
+	}
 }
 
 func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey string) (*safety.AttemptReservation, string, *hostkit.CloudError) {
@@ -1650,7 +2036,7 @@ func (ct *costTracker) reserveForOp(recordOp, endpoint string, in safety.Attempt
 			}
 			return nil, "", hostkit.ProviderError(hostkit.Internal, 0, "PricingFailure", err.Error())
 		}
-		if ct.liveGuard != nil || (ct.liveMode && (isTablesOp(in.Operation, resKind) || isPermissionsOp(in.Operation, resKind))) {
+		if ct.liveGuard != nil || (ct.liveMode && (isTablesOp(in.Operation, resKind) || isPermissionsOp(in.Operation, resKind) || isFunctionOp(in.Operation, resKind))) {
 			res.Release()
 			return nil, "", hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveGuardRequired",
 				fmt.Sprintf("live mode refuses unguarded adapter for %s (%s): LiveGuard ownership and recovery enforcement is required", in.Operation, resKind))
@@ -1658,6 +2044,8 @@ func (ct *costTracker) reserveForOp(recordOp, endpoint string, in safety.Attempt
 		reservedBytes := in.PayloadSize
 		if in.Operation == "object_get" {
 			reservedBytes = in.EgressBytes
+		} else if in.Operation == "function_invoke" {
+			reservedBytes = in.PayloadSize + in.EgressBytes
 		}
 		reservedNano := res.Quote().AttemptNanoUSD + res.Quote().CleanupReserveNanoUSD
 		attID, jerr := ct.journal.BeginAttempt(resKind, endpoint, journalAttemptName(resKey), recordOp, reservedNano, reservedBytes)
@@ -1670,7 +2058,7 @@ func (ct *costTracker) reserveForOp(recordOp, endpoint string, in safety.Attempt
 		return res, attID, nil
 	}
 
-	if ct.liveGuard != nil || (ct.liveMode && (isTablesOp(in.Operation, resKind) || isPermissionsOp(in.Operation, resKind))) {
+	if ct.liveGuard != nil || (ct.liveMode && (isTablesOp(in.Operation, resKind) || isPermissionsOp(in.Operation, resKind) || isFunctionOp(in.Operation, resKind))) {
 		return nil, "", hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveGuardRequired",
 			fmt.Sprintf("live mode refuses unguarded adapter for %s (%s): LiveGuard ownership and recovery enforcement is required", in.Operation, resKind))
 	}
@@ -1703,6 +2091,8 @@ func (ct *costTracker) reserveForOp(recordOp, endpoint string, in safety.Attempt
 			reservedBytes := in.PayloadSize
 			if in.Operation == "object_get" {
 				reservedBytes = in.EgressBytes
+			} else if in.Operation == "function_invoke" {
+				reservedBytes = in.PayloadSize + in.EgressBytes
 			}
 			if aerr := appendRec(campaignJournalRecord{
 				Event:                 safety.EventReserve,
@@ -1715,6 +2105,7 @@ func (ct *costTracker) reserveForOp(recordOp, endpoint string, in safety.Attempt
 				AttemptNanoUSD:        res.Quote().AttemptNanoUSD,
 				CleanupReserveNanoUSD: res.Quote().CleanupReserveNanoUSD,
 				ReservedBytes:         reservedBytes,
+				BillingUnits:          res.Quote().BillingUnits,
 			}); aerr != nil {
 				res.Release()
 				res = nil
@@ -1791,6 +2182,10 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 }
 
 func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, endpoint string, chargeBytes, reportedBytes int64, resKind, resKey string, cleanSuccess, opSucceeded bool) *hostkit.CloudError {
+	return ct.settleAtWithUnits(res, attemptID, op, endpoint, chargeBytes, reportedBytes, 0, resKind, resKey, cleanSuccess, opSucceeded)
+}
+
+func (ct *costTracker) settleAtWithUnits(res *safety.AttemptReservation, attemptID, op, endpoint string, chargeBytes, reportedBytes, overrideUnits int64, resKind, resKey string, cleanSuccess, opSucceeded bool) *hostkit.CloudError {
 	if res == nil {
 		return nil
 	}
@@ -1804,20 +2199,24 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 	pt := ct.meter.Table()
 	var actualNano int64 = -1
 	var units int64 = 1
+	if overrideUnits > 0 {
+		units = overrideUnits
+	}
 	if pt != nil {
 		t, ok := pt.Operations[tariffOp]
 		if !ok && tariffOp == "object_list_all" {
 			t, ok = pt.Operations["object_list"]
 		}
 		if ok {
-			if t.ChunkBytes > 0 && chargeBytes > t.ChunkBytes {
+			if overrideUnits <= 0 && t.ChunkBytes > 0 && chargeBytes > t.ChunkBytes {
 				units = (chargeBytes + t.ChunkBytes - 1) / t.ChunkBytes
 			}
 			in := safety.AttemptPricingInput{
-				Operation: tariffOp,
-				IsCleanup: res.Quote().IsCleanup,
+				Operation:    tariffOp,
+				IsCleanup:    res.Quote().IsCleanup,
+				BillingUnits: units,
 			}
-			if tariffOp == "object_get" {
+			if tariffOp == "object_get" || tariffOp == "function_invoke" {
 				in.EgressBytes = chargeBytes
 			} else {
 				in.PayloadSize = chargeBytes
@@ -1830,6 +2229,9 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 	if !cleanSuccess && actualNano < res.Quote().AttemptNanoUSD {
 		// Ambiguous or interrupted transfer: preserve the full reserved quote.
 		actualNano = res.Quote().AttemptNanoUSD
+		if res.Quote().BillingUnits > units {
+			units = res.Quote().BillingUnits
+		}
 	}
 	var excessErr *hostkit.CloudError
 	if actualNano > res.Quote().AttemptNanoUSD {
@@ -1850,17 +2252,21 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 		var cleanupNano int64
 		if opSucceeded {
 			switch op {
-			case "bucket_create", "object_put", "queue_create", "table_create", "item_put", "policy_attach", "policy_attach_principal":
+			case "bucket_create", "object_put", "queue_create", "table_create", "item_put", "policy_attach", "policy_attach_principal", "function_create", "function_publish_version", "function_alias_set":
 				if !inEntries && !inActiveCleanup && res.Quote().CleanupReserveNanoUSD > 0 {
 					lockCleanup = true
 					cleanupNano = res.Quote().CleanupReserveNanoUSD
 				}
-			case "bucket_delete", "object_delete", "queue_delete", "item_delete", "policy_detach", "policy_detach_principal":
+			case "bucket_delete", "object_delete", "queue_delete", "item_delete", "policy_detach", "policy_detach_principal", "function_alias_delete":
 				if inActiveCleanup || inEntries {
 					releaseCleanup = true
 				}
 			case "table_delete":
 				if inActiveCleanup || inEntries || hasJournalTableChildItems(st.ActiveCleanup, endpoint, resKey) {
+					releaseCleanup = true
+				}
+			case "function_delete":
+				if inActiveCleanup || inEntries || hasJournalFunctionChildren(st.ActiveCleanup, endpoint, resKey) {
 					releaseCleanup = true
 				}
 			}
@@ -1909,6 +2315,18 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 					if _, exists := st.policyCleanup[resKey]; !exists {
 						lockCleanup = true
 					}
+				case "function_create":
+					if _, exists := st.activeFunctions[sKey]; !exists {
+						lockCleanup = true
+					}
+				case "function_publish_version":
+					if _, exists := st.activeFunctionVersions[sKey]; !exists {
+						lockCleanup = true
+					}
+				case "function_alias_set":
+					if _, exists := st.activeFunctionAliases[sKey]; !exists {
+						lockCleanup = true
+					}
 				case "bucket_delete":
 					if _, exists := st.activeBuckets[sKey]; exists {
 						releaseCleanup = true
@@ -1931,6 +2349,14 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 					}
 				case "policy_detach", "policy_detach_principal":
 					if _, exists := st.policyCleanup[resKey]; exists {
+						releaseCleanup = true
+					}
+				case "function_delete":
+					if _, exists := st.activeFunctions[sKey]; exists || hasFunctionChildren(st.activeFunctionVersions, st.activeFunctionAliases, sKey) {
+						releaseCleanup = true
+					}
+				case "function_alias_delete":
+					if _, exists := st.activeFunctionAliases[sKey]; exists {
 						releaseCleanup = true
 					}
 				}
@@ -1971,6 +2397,12 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 					st.activeItems[sKey] = res.Quote().CleanupReserveNanoUSD
 				case safety.KindPolicyAttachment:
 					st.policyCleanup[resKey] = res.Quote().CleanupReserveNanoUSD
+				case safety.KindFunction:
+					st.activeFunctions[sKey] = res.Quote().CleanupReserveNanoUSD
+				case safety.KindFunctionVersion:
+					st.activeFunctionVersions[sKey] = res.Quote().CleanupReserveNanoUSD
+				case safety.KindFunctionAlias:
+					st.activeFunctionAliases[sKey] = res.Quote().CleanupReserveNanoUSD
 				}
 				st.resourceCleanupNanoUSD += res.Quote().CleanupReserveNanoUSD
 			}
@@ -2013,6 +2445,29 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 				case safety.KindPolicyAttachment:
 					if v, ok := st.policyCleanup[resKey]; ok {
 						delete(st.policyCleanup, resKey)
+						st.resourceCleanupNanoUSD -= v
+					}
+				case safety.KindFunction:
+					if v, ok := st.activeFunctions[sKey]; ok {
+						delete(st.activeFunctions, sKey)
+						st.resourceCleanupNanoUSD -= v
+					}
+					prefix := sKey + "/"
+					for k, v := range st.activeFunctionVersions {
+						if strings.HasPrefix(k, prefix) {
+							delete(st.activeFunctionVersions, k)
+							st.resourceCleanupNanoUSD -= v
+						}
+					}
+					for k, v := range st.activeFunctionAliases {
+						if strings.HasPrefix(k, prefix) {
+							delete(st.activeFunctionAliases, k)
+							st.resourceCleanupNanoUSD -= v
+						}
+					}
+				case safety.KindFunctionAlias:
+					if v, ok := st.activeFunctionAliases[sKey]; ok {
+						delete(st.activeFunctionAliases, sKey)
 						st.resourceCleanupNanoUSD -= v
 					}
 				}
@@ -2063,6 +2518,21 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 		case "policy_attach", "policy_attach_principal":
 			if _, exists := ct.policyCleanup[resKey]; !exists && res.Quote().CleanupReserveNanoUSD > 0 {
 				ct.policyCleanup[resKey] = res.Quote().CleanupReserveNanoUSD
+				lockCleanup = true
+			}
+		case "function_create":
+			if _, exists := ct.activeFunctions[sKey]; !exists && res.Quote().CleanupReserveNanoUSD > 0 {
+				ct.activeFunctions[sKey] = res.Quote().CleanupReserveNanoUSD
+				lockCleanup = true
+			}
+		case "function_publish_version":
+			if _, exists := ct.activeFunctionVersions[sKey]; !exists && res.Quote().CleanupReserveNanoUSD > 0 {
+				ct.activeFunctionVersions[sKey] = res.Quote().CleanupReserveNanoUSD
+				lockCleanup = true
+			}
+		case "function_alias_set":
+			if _, exists := ct.activeFunctionAliases[sKey]; !exists && res.Quote().CleanupReserveNanoUSD > 0 {
+				ct.activeFunctionAliases[sKey] = res.Quote().CleanupReserveNanoUSD
 				lockCleanup = true
 			}
 		}
@@ -2116,6 +2586,32 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 		case "policy_detach", "policy_detach_principal":
 			if v, exists := ct.policyCleanup[resKey]; exists {
 				delete(ct.policyCleanup, resKey)
+				ct.meter.ReleaseResourceCleanup(v)
+			}
+		case "function_delete":
+			if released := deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.ambiguousStack, ct.policyCleanup, safety.KindFunction, endpoint, resKey); released > 0 {
+				ct.meter.ReleaseResourceCleanup(released)
+			}
+			if v, exists := ct.activeFunctions[sKey]; exists {
+				delete(ct.activeFunctions, sKey)
+				ct.meter.ReleaseResourceCleanup(v)
+			}
+			prefix := sKey + "/"
+			for k, v := range ct.activeFunctionVersions {
+				if strings.HasPrefix(k, prefix) {
+					delete(ct.activeFunctionVersions, k)
+					ct.meter.ReleaseResourceCleanup(v)
+				}
+			}
+			for k, v := range ct.activeFunctionAliases {
+				if strings.HasPrefix(k, prefix) {
+					delete(ct.activeFunctionAliases, k)
+					ct.meter.ReleaseResourceCleanup(v)
+				}
+			}
+		case "function_alias_delete":
+			if v, exists := ct.activeFunctionAliases[sKey]; exists {
+				delete(ct.activeFunctionAliases, sKey)
 				ct.meter.ReleaseResourceCleanup(v)
 			}
 		}
@@ -2189,6 +2685,15 @@ func (ct *costTracker) isOwnedResourceAt(resKind, endpoint, resKey string) (bool
 				return true, nil
 			}
 		}
+		if resKind == safety.KindFunction {
+			fKey := scopedResKey(endpoint, resKey)
+			if _, ok := st.ActiveFunctions[fKey]; ok {
+				return true, nil
+			}
+			if _, ok := st.AmbiguousFunctions[fKey]; ok {
+				return true, nil
+			}
+		}
 		return false, nil
 	}
 	sKey := scopedResKey(endpoint, resKey)
@@ -2202,6 +2707,17 @@ func (ct *costTracker) isOwnedResourceAt(resKind, endpoint, resKey string) (bool
 	case safety.KindTable:
 		_, ok := ct.activeTables[sKey]
 		return ok, nil
+	case safety.KindFunction:
+		if _, ok := ct.activeFunctions[sKey]; ok {
+			return true, nil
+		}
+		if _, ok := ct.activeFunctionEntries[sKey]; ok {
+			return true, nil
+		}
+		if _, ok := ct.ambiguousFunctions[sKey]; ok {
+			return true, nil
+		}
+		return false, nil
 	default:
 		return false, nil
 	}
@@ -2939,6 +3455,10 @@ func (ct *costTracker) lockResourceCleanupIfNeeded(endpoint, op, resKind, resKey
 				if _, ok := st.activeTables[sKey]; ok {
 					return nil
 				}
+			case safety.KindFunction:
+				if _, ok := st.activeFunctions[sKey]; ok {
+					return nil
+				}
 			default:
 				return nil
 			}
@@ -2980,7 +3500,518 @@ func (ct *costTracker) lockResourceCleanupIfNeeded(endpoint, op, resKind, resKey
 			ct.activeTables[sKey] = resNano
 			ct.meter.RestoreCharged(0, ct.meter.Snapshot().ResourceCleanupNanoUSD+resNano)
 		}
+	case safety.KindFunction:
+		if _, exists := ct.activeFunctions[sKey]; !exists {
+			ct.activeFunctions[sKey] = resNano
+			ct.meter.RestoreCharged(0, ct.meter.Snapshot().ResourceCleanupNanoUSD+resNano)
+		}
 	}
+}
+
+func countDistinctFunctionKeys(active, ambiguous map[string]safety.JournalFunctionEntry, excludeKey string) int {
+	seen := make(map[string]struct{}, len(active)+len(ambiguous))
+	for k := range active {
+		if k != excludeKey {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range ambiguous {
+		if k != excludeKey {
+			seen[k] = struct{}{}
+		}
+	}
+	return len(seen)
+}
+
+func hasPendingFunctionIntent(stack []safety.JournalFunctionEntry, amb map[string]safety.JournalFunctionEntry, key, intentID string) bool {
+	if intentID == "" {
+		return false
+	}
+	for _, item := range stack {
+		if item.IntentID == intentID {
+			return true
+		}
+	}
+	if cur, ok := amb[key]; ok && cur.IntentID == intentID {
+		return true
+	}
+	return false
+}
+
+func (ct *costTracker) checkFunctionCreateHeadroom(endpoint, name string) *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if cerr := ct.refreshStateLocked(); cerr != nil {
+		return cerr
+	}
+	key := scopedResKey(endpoint, name)
+	if countDistinctFunctionKeys(ct.activeFunctionEntries, ct.ambiguousFunctions, key) >= hostkit.MaxFunctionsPerRun {
+		return hostkit.ProviderError(hostkit.InvalidArgument, 0, "FunctionLimitExceeded",
+			fmt.Sprintf("run function count exceeds maximum (%d)", hostkit.MaxFunctionsPerRun))
+	}
+	return nil
+}
+
+func (ct *costTracker) lookupFunctionEntry(endpoint, name string) (safety.JournalFunctionEntry, bool, safety.JournalFunctionEntry, bool, *hostkit.CloudError) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if cerr := ct.refreshStateLocked(); cerr != nil {
+		return safety.JournalFunctionEntry{}, false, safety.JournalFunctionEntry{}, false, cerr
+	}
+	key := scopedResKey(endpoint, name)
+	act, hasAct := ct.activeFunctionEntries[key]
+	amb, hasAmb := ct.ambiguousFunctions[key]
+	return act, hasAct, amb, hasAmb, nil
+}
+
+func (ct *costTracker) listAmbiguousFunctionsForEndpoint(endpoint string) ([]safety.JournalFunctionEntry, *hostkit.CloudError) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if cerr := ct.refreshStateLocked(); cerr != nil {
+		return nil, cerr
+	}
+	var out []safety.JournalFunctionEntry
+	for _, amb := range ct.ambiguousFunctions {
+		if amb.Scope != "" && endpoint != "" && amb.Scope != endpoint {
+			continue
+		}
+		if amb.Scope == "" && endpoint != "" {
+			continue
+		}
+		out = append(out, amb)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (ct *costTracker) beginFunctionIntent(endpoint, name, intentOp, digest string) (safety.JournalFunctionEntry, *hostkit.CloudError) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if cerr := ct.refreshStateLocked(); cerr != nil {
+		return safety.JournalFunctionEntry{}, cerr
+	}
+	key := scopedResKey(endpoint, name)
+	if intentOp == "create" {
+		if countDistinctFunctionKeys(ct.activeFunctionEntries, ct.ambiguousFunctions, key) >= hostkit.MaxFunctionsPerRun {
+			return safety.JournalFunctionEntry{}, hostkit.ProviderError(hostkit.InvalidArgument, 0, "FunctionLimitExceeded",
+				fmt.Sprintf("run function count exceeds maximum (%d)", hostkit.MaxFunctionsPerRun))
+		}
+	}
+
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return safety.JournalFunctionEntry{}, ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return safety.JournalFunctionEntry{}, ct.poisoned
+		}
+		if intentOp == "create" && countDistinctFunctionKeys(ct.activeFunctionEntries, ct.ambiguousFunctions, key) >= hostkit.MaxFunctionsPerRun {
+			return safety.JournalFunctionEntry{}, hostkit.ProviderError(hostkit.InvalidArgument, 0, "FunctionLimitExceeded",
+				fmt.Sprintf("run function count exceeds maximum (%d)", hostkit.MaxFunctionsPerRun))
+		}
+		ownerToken := ""
+		if existing, ok := ct.activeFunctionEntries[key]; ok && existing.OwnerToken != "" {
+			ownerToken = existing.OwnerToken
+		} else if amb, ok := ct.ambiguousFunctions[key]; ok && amb.OwnerToken != "" {
+			ownerToken = amb.OwnerToken
+		} else if tok := ct.functionOwnerTokens[key]; tok != "" && intentOp != "create" {
+			ownerToken = tok
+		} else {
+			ownerToken = safety.NewToken128()
+		}
+		nextGen := ct.maxFunctionGen[key] + 1
+		genStr := strconv.FormatUint(nextGen, 10)
+		intentID := safety.NewToken128()
+		if err := ct.journal.RecordFunctionIntent(endpoint, name, intentOp, digest, ownerToken, genStr, intentID, "", "", 0); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return safety.JournalFunctionEntry{}, ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return safety.JournalFunctionEntry{}, ct.poisoned
+		}
+		if ct.onToken != nil {
+			ct.onToken(ownerToken)
+		}
+		return safety.JournalFunctionEntry{
+			Key:        key,
+			Scope:      endpoint,
+			Name:       name,
+			Digest:     digest,
+			OwnerToken: ownerToken,
+			Generation: genStr,
+			IntentID:   intentID,
+			Ambiguous:  true,
+			IntentOp:   intentOp,
+		}, nil
+	}
+
+	if ct.statePath != "" {
+		var outEntry safety.JournalFunctionEntry
+		var cerr *hostkit.CloudError
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			if intentOp == "create" && countDistinctFunctionKeys(st.activeFunctionEntries, st.ambiguousFunctions, key) >= hostkit.MaxFunctionsPerRun {
+				cerr = hostkit.ProviderError(hostkit.InvalidArgument, 0, "FunctionLimitExceeded",
+					fmt.Sprintf("run function count exceeds maximum (%d)", hostkit.MaxFunctionsPerRun))
+				return nil
+			}
+			ownerToken := ""
+			if existing, ok := st.activeFunctionEntries[key]; ok && existing.OwnerToken != "" {
+				ownerToken = existing.OwnerToken
+			} else if amb, ok := st.ambiguousFunctions[key]; ok && amb.OwnerToken != "" {
+				ownerToken = amb.OwnerToken
+			} else if tok := st.functionOwnerTokens[key]; tok != "" && intentOp != "create" {
+				ownerToken = tok
+			} else {
+				ownerToken = safety.NewToken128()
+			}
+			nextGen := st.maxFunctionGen[key] + 1
+			genStr := strconv.FormatUint(nextGen, 10)
+			intentID := safety.NewToken128()
+			if err := appendRec(campaignJournalRecord{
+				Event:          safety.EventFunctionIntent,
+				IntentID:       intentID,
+				Endpoint:       endpoint,
+				ResKey:         name,
+				PolicyIntentOp: intentOp,
+				FunctionDigest: digest,
+				OwnerToken:     ownerToken,
+				Generation:     genStr,
+			}); err != nil {
+				return err
+			}
+			outEntry = safety.JournalFunctionEntry{
+				Key:        key,
+				Scope:      endpoint,
+				Name:       name,
+				Digest:     digest,
+				OwnerToken: ownerToken,
+				Generation: genStr,
+				IntentID:   intentID,
+				Ambiguous:  true,
+				IntentOp:   intentOp,
+			}
+			st.ambiguousFunctionStack[key] = append(st.ambiguousFunctionStack[key], outEntry)
+			st.ambiguousFunctions[key] = outEntry
+			st.functionOwnerTokens[key] = ownerToken
+			st.maxFunctionGen[key] = nextGen
+			st.latestFunctionIntent[key] = intentID
+			ct.applyReplayedStateLocked(st)
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return safety.JournalFunctionEntry{}, ct.poisoned
+		}
+		if cerr != nil {
+			return safety.JournalFunctionEntry{}, cerr
+		}
+		if ct.onToken != nil {
+			ct.onToken(outEntry.OwnerToken)
+		}
+		return outEntry, nil
+	}
+
+	ownerToken := ""
+	if existing, ok := ct.activeFunctionEntries[key]; ok && existing.OwnerToken != "" {
+		ownerToken = existing.OwnerToken
+	} else if amb, ok := ct.ambiguousFunctions[key]; ok && amb.OwnerToken != "" {
+		ownerToken = amb.OwnerToken
+	} else if tok := ct.functionOwnerTokens[key]; tok != "" && intentOp != "create" {
+		ownerToken = tok
+	} else {
+		ownerToken = safety.NewToken128()
+	}
+	nextGen := ct.maxFunctionGen[key] + 1
+	genStr := strconv.FormatUint(nextGen, 10)
+	intentID := safety.NewToken128()
+	outEntry := safety.JournalFunctionEntry{
+		Key:        key,
+		Scope:      endpoint,
+		Name:       name,
+		Digest:     digest,
+		OwnerToken: ownerToken,
+		Generation: genStr,
+		IntentID:   intentID,
+		Ambiguous:  true,
+		IntentOp:   intentOp,
+	}
+	ct.ambiguousFunctionStack[key] = append(ct.ambiguousFunctionStack[key], outEntry)
+	ct.ambiguousFunctions[key] = outEntry
+	ct.functionOwnerTokens[key] = ownerToken
+	ct.maxFunctionGen[key] = nextGen
+	ct.latestFunctionIntent[key] = intentID
+	if ct.onToken != nil {
+		ct.onToken(ownerToken)
+	}
+	return outEntry, nil
+}
+
+func (ct *costTracker) confirmFunctionIntent(entry safety.JournalFunctionEntry) *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	key := entry.Key
+	if key == "" {
+		key = scopedResKey(entry.Scope, entry.Name)
+		entry.Key = key
+	}
+	entryGen, _ := strconv.ParseUint(entry.Generation, 10, 64)
+
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return ct.poisoned
+		}
+		if !hasPendingFunctionIntent(ct.ambiguousFunctionStack[key], ct.ambiguousFunctions, key, entry.IntentID) ||
+			ct.latestFunctionIntent[key] != entry.IntentID || entryGen < ct.maxFunctionGen[key] {
+			return nil
+		}
+		if err := ct.journal.RecordFunctionConfirm(entry.Scope, entry.Name, entry.Digest, entry.OwnerToken, entry.Generation, entry.IntentID, 0); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		return ct.poisoned
+	}
+
+	if ct.statePath != "" {
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			if !hasPendingFunctionIntent(st.ambiguousFunctionStack[key], st.ambiguousFunctions, key, entry.IntentID) ||
+				st.latestFunctionIntent[key] != entry.IntentID || entryGen < st.maxFunctionGen[key] {
+				return nil
+			}
+			if err := appendRec(campaignJournalRecord{
+				Event:          safety.EventFunctionConfirm,
+				IntentID:       entry.IntentID,
+				Endpoint:       entry.Scope,
+				ResKey:         entry.Name,
+				FunctionDigest: entry.Digest,
+				OwnerToken:     entry.OwnerToken,
+				Generation:     entry.Generation,
+			}); err != nil {
+				return err
+			}
+			confirmed := entry
+			confirmed.Ambiguous = false
+			confirmed.IntentOp = ""
+			st.activeFunctionEntries[key] = confirmed
+			st.functionOwnerTokens[key] = entry.OwnerToken
+			delete(st.ambiguousFunctionStack, key)
+			delete(st.ambiguousFunctions, key)
+			ct.applyReplayedStateLocked(st)
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		return nil
+	}
+
+	if !hasPendingFunctionIntent(ct.ambiguousFunctionStack[key], ct.ambiguousFunctions, key, entry.IntentID) ||
+		ct.latestFunctionIntent[key] != entry.IntentID || entryGen < ct.maxFunctionGen[key] {
+		return nil
+	}
+	confirmed := entry
+	confirmed.Ambiguous = false
+	confirmed.IntentOp = ""
+	ct.activeFunctionEntries[key] = confirmed
+	ct.functionOwnerTokens[key] = entry.OwnerToken
+	delete(ct.ambiguousFunctionStack, key)
+	delete(ct.ambiguousFunctions, key)
+	return nil
+}
+
+func (ct *costTracker) confirmFunctionDelete(entry safety.JournalFunctionEntry) *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	key := entry.Key
+	if key == "" {
+		key = scopedResKey(entry.Scope, entry.Name)
+		entry.Key = key
+	}
+	entryGen, _ := strconv.ParseUint(entry.Generation, 10, 64)
+
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return ct.poisoned
+		}
+		if !hasPendingFunctionIntent(ct.ambiguousFunctionStack[key], ct.ambiguousFunctions, key, entry.IntentID) ||
+			ct.latestFunctionIntent[key] != entry.IntentID || entryGen < ct.maxFunctionGen[key] {
+			return nil
+		}
+		if err := ct.journal.RecordFunctionDelete(entry.Scope, entry.Name, entry.OwnerToken, entry.Generation, entry.IntentID); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		return ct.poisoned
+	}
+
+	if ct.statePath != "" {
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			if !hasPendingFunctionIntent(st.ambiguousFunctionStack[key], st.ambiguousFunctions, key, entry.IntentID) ||
+				st.latestFunctionIntent[key] != entry.IntentID || entryGen < st.maxFunctionGen[key] {
+				return nil
+			}
+			if err := appendRec(campaignJournalRecord{
+				Event:      safety.EventFunctionDelete,
+				IntentID:   entry.IntentID,
+				Endpoint:   entry.Scope,
+				ResKey:     entry.Name,
+				OwnerToken: entry.OwnerToken,
+				Generation: entry.Generation,
+			}); err != nil {
+				return err
+			}
+			delete(st.activeFunctionEntries, key)
+			delete(st.ambiguousFunctionStack, key)
+			delete(st.ambiguousFunctions, key)
+			deleteCampaignFunctionCleanup(st, key)
+			deleteResourcePolicyAttachments(st.activePolicies, st.ambiguousPolicies, st.ambiguousStack, st.policyCleanup, safety.KindFunction, entry.Scope, entry.Name)
+			ct.applyReplayedStateLocked(st)
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		return nil
+	}
+
+	if !hasPendingFunctionIntent(ct.ambiguousFunctionStack[key], ct.ambiguousFunctions, key, entry.IntentID) ||
+		ct.latestFunctionIntent[key] != entry.IntentID || entryGen < ct.maxFunctionGen[key] {
+		return nil
+	}
+	delete(ct.activeFunctionEntries, key)
+	delete(ct.ambiguousFunctionStack, key)
+	delete(ct.ambiguousFunctions, key)
+	return nil
+}
+
+func (ct *costTracker) abortFunctionIntent(entry safety.JournalFunctionEntry) *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	key := entry.Key
+	if key == "" {
+		key = scopedResKey(entry.Scope, entry.Name)
+		entry.Key = key
+	}
+
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return ct.poisoned
+		}
+		if !hasPendingFunctionIntent(ct.ambiguousFunctionStack[key], ct.ambiguousFunctions, key, entry.IntentID) {
+			return nil
+		}
+		if err := ct.journal.RecordFunctionIntent(entry.Scope, entry.Name, "abort", "", entry.OwnerToken, entry.Generation, entry.IntentID, "", "", 0); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		return ct.poisoned
+	}
+
+	if ct.statePath != "" {
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			if !hasPendingFunctionIntent(st.ambiguousFunctionStack[key], st.ambiguousFunctions, key, entry.IntentID) {
+				return nil
+			}
+			if err := appendRec(campaignJournalRecord{
+				Event:          safety.EventFunctionIntent,
+				IntentID:       entry.IntentID,
+				Endpoint:       entry.Scope,
+				ResKey:         entry.Name,
+				PolicyIntentOp: "abort",
+				OwnerToken:     entry.OwnerToken,
+				Generation:     entry.Generation,
+			}); err != nil {
+				return err
+			}
+			stack := st.ambiguousFunctionStack[key]
+			if len(stack) > 0 {
+				filtered := stack[:0]
+				for _, item := range stack {
+					if item.IntentID != entry.IntentID {
+						filtered = append(filtered, item)
+					}
+				}
+				if len(filtered) > 0 {
+					st.ambiguousFunctionStack[key] = filtered
+					st.ambiguousFunctions[key] = filtered[len(filtered)-1]
+				} else {
+					delete(st.ambiguousFunctionStack, key)
+					delete(st.ambiguousFunctions, key)
+					if _, inActive := st.activeFunctionEntries[key]; !inActive {
+						deleteCampaignFunctionCleanup(st, key)
+					}
+				}
+			} else {
+				delete(st.ambiguousFunctions, key)
+				if _, inActive := st.activeFunctionEntries[key]; !inActive {
+					deleteCampaignFunctionCleanup(st, key)
+				}
+			}
+			ct.applyReplayedStateLocked(st)
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		return nil
+	}
+
+	if !hasPendingFunctionIntent(ct.ambiguousFunctionStack[key], ct.ambiguousFunctions, key, entry.IntentID) {
+		return nil
+	}
+	stack := ct.ambiguousFunctionStack[key]
+	if len(stack) > 0 {
+		filtered := stack[:0]
+		for _, item := range stack {
+			if item.IntentID != entry.IntentID {
+				filtered = append(filtered, item)
+			}
+		}
+		if len(filtered) > 0 {
+			ct.ambiguousFunctionStack[key] = filtered
+			ct.ambiguousFunctions[key] = filtered[len(filtered)-1]
+			return nil
+		}
+		delete(ct.ambiguousFunctionStack, key)
+	}
+	delete(ct.ambiguousFunctions, key)
+	if _, inActive := ct.activeFunctionEntries[key]; !inActive {
+		if releaseNano, ok := ct.activeFunctions[key]; ok {
+			delete(ct.activeFunctions, key)
+			if ct.meter != nil && releaseNano > 0 {
+				ct.meter.ReleaseResourceCleanup(releaseNano)
+			}
+		}
+	}
+	return nil
 }
 
 func (ct *costTracker) costCapUSD() float64 {
@@ -3478,6 +4509,10 @@ func (s *attemptScope) releaseNotSent() *hostkit.CloudError {
 }
 
 func (s *attemptScope) finish(chargeBytes, reportedBytes int64, cleanSuccess, opSucceeded bool) (retries, throttles int64, abortErr *hostkit.CloudError) {
+	return s.finishWithUnits(chargeBytes, reportedBytes, 0, cleanSuccess, opSucceeded)
+}
+
+func (s *attemptScope) finishWithUnits(chargeBytes, reportedBytes, overrideUnits int64, cleanSuccess, opSucceeded bool) (retries, throttles int64, abortErr *hostkit.CloudError) {
 	if s == nil {
 		return 0, 0, nil
 	}
@@ -3496,7 +4531,7 @@ func (s *attemptScope) finish(chargeBytes, reportedBytes int64, cleanSuccess, op
 					chargeBytes = s.in.EgressBytes
 				}
 			}
-			if scerr := s.ct.settleAt(s.res, s.attemptID, s.op, s.endpoint, chargeBytes, reportedBytes, s.resKind, s.resKey, cleanSuccess, opSucceeded); scerr != nil && s.abortErr == nil {
+			if scerr := s.ct.settleAtWithUnits(s.res, s.attemptID, s.op, s.endpoint, chargeBytes, reportedBytes, overrideUnits, s.resKind, s.resKey, cleanSuccess, opSucceeded); scerr != nil && s.abortErr == nil {
 				s.abortErr = scerr
 			}
 		}

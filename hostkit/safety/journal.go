@@ -37,22 +37,28 @@ const (
 	KindTable            = "table"
 	KindTableItem        = "table_item"
 	KindPolicyAttachment = "policy_attachment"
+	KindFunction         = "function"
+	KindFunctionVersion  = "function_version"
+	KindFunctionAlias    = "function_alias"
 
 	// Journal event types.
-	EventMeta         = "meta"
-	EventIntent       = "intent"
-	EventConfirmed    = "confirmed"
-	EventFailed       = "failed"
-	EventRetained     = "retained"
-	EventDeleted      = "deleted"
-	EventCost         = "cost"
-	EventReserve      = "reserve"
-	EventSettle       = "settle"
-	EventWorkCap      = "work_cap"
-	EventCapExceeded  = "cap_exceeded"
-	EventPolicyIntent = "policy_intent"
-	EventPolicyAttach = "policy_attach"
-	EventPolicyDetach = "policy_detach"
+	EventMeta            = "meta"
+	EventIntent          = "intent"
+	EventConfirmed       = "confirmed"
+	EventFailed          = "failed"
+	EventRetained        = "retained"
+	EventDeleted         = "deleted"
+	EventCost            = "cost"
+	EventReserve         = "reserve"
+	EventSettle          = "settle"
+	EventWorkCap         = "work_cap"
+	EventCapExceeded     = "cap_exceeded"
+	EventPolicyIntent    = "policy_intent"
+	EventPolicyAttach    = "policy_attach"
+	EventPolicyDetach    = "policy_detach"
+	EventFunctionIntent  = "function_intent"
+	EventFunctionConfirm = "function_confirm"
+	EventFunctionDelete  = "function_delete"
 
 	// Resource lifecycle states after journal replay.
 	StatePending   = "pending"
@@ -177,33 +183,33 @@ func (m JournalMeta) sameIdentity(o JournalMeta) bool {
 
 // JournalRecord is a single line in the append-only JSONL journal.
 type JournalRecord struct {
-	Version             int    `json:"v"`
-	Seq                 uint64 `json:"seq"`
-	Time                string `json:"ts"`
-	Event               string `json:"event"`
-	RunID               string `json:"run_id"`
-	SessionID           string `json:"session_id,omitempty"`
-	PolicyHash          string `json:"policy_hash"`
-	Provider            string `json:"provider"`
-	Account             string `json:"account"`
-	Tenant              string `json:"tenant,omitempty"`
-	Scope               string `json:"scope"`
-	Region              string `json:"region"`
-	Endpoint            string `json:"endpoint,omitempty"`
-	StartedAtUnix       int64  `json:"started_at_unix,omitempty"`
-	Kind                string `json:"kind,omitempty"`
-	Parent              string `json:"parent,omitempty"`
-	Location            string `json:"location,omitempty"`
-	Name                string `json:"name,omitempty"`
-	ProviderID          string `json:"provider_id,omitempty"`
-	OwnerNonce          string `json:"owner_nonce,omitempty"`
-	CreateToken         string `json:"create_token,omitempty"`
-	ETag                string `json:"etag,omitempty"`
-	Generation          string `json:"generation,omitempty"`
-	IntentAtUnix        int64  `json:"intent_at_unix,omitempty"`
-	ConfirmedAtUnix     int64  `json:"confirmed_at_unix,omitempty"`
-	ServerCreatedAtUnix int64  `json:"server_created_at_unix,omitempty"`
-	AttemptID           string `json:"attempt_id,omitempty"`
+	Version               int                     `json:"v"`
+	Seq                   uint64                  `json:"seq"`
+	Time                  string                  `json:"ts"`
+	Event                 string                  `json:"event"`
+	RunID                 string                  `json:"run_id"`
+	SessionID             string                  `json:"session_id,omitempty"`
+	PolicyHash            string                  `json:"policy_hash"`
+	Provider              string                  `json:"provider"`
+	Account               string                  `json:"account"`
+	Tenant                string                  `json:"tenant,omitempty"`
+	Scope                 string                  `json:"scope"`
+	Region                string                  `json:"region"`
+	Endpoint              string                  `json:"endpoint,omitempty"`
+	StartedAtUnix         int64                   `json:"started_at_unix,omitempty"`
+	Kind                  string                  `json:"kind,omitempty"`
+	Parent                string                  `json:"parent,omitempty"`
+	Location              string                  `json:"location,omitempty"`
+	Name                  string                  `json:"name,omitempty"`
+	ProviderID            string                  `json:"provider_id,omitempty"`
+	OwnerNonce            string                  `json:"owner_nonce,omitempty"`
+	CreateToken           string                  `json:"create_token,omitempty"`
+	ETag                  string                  `json:"etag,omitempty"`
+	Generation            string                  `json:"generation,omitempty"`
+	IntentAtUnix          int64                   `json:"intent_at_unix,omitempty"`
+	ConfirmedAtUnix       int64                   `json:"confirmed_at_unix,omitempty"`
+	ServerCreatedAtUnix   int64                   `json:"server_created_at_unix,omitempty"`
+	AttemptID             string                  `json:"attempt_id,omitempty"`
 	ReservedNanoUSD       int64                   `json:"reserved_nano_usd,omitempty"`
 	ChargedNanoUSD        int64                   `json:"charged_nano_usd,omitempty"`
 	CleanupReserveNanoUSD int64                   `json:"cleanup_reserve_nano_usd,omitempty"`
@@ -217,11 +223,11 @@ type JournalRecord struct {
 	CapExceededCount      int64                   `json:"cap_exceeded_count,omitempty"`
 	OpStats               map[string]OpLedgerStat `json:"op_stats,omitempty"`
 	BucketsCreated        int                     `json:"buckets_created,omitempty"`
-	QueuesCreated       int    `json:"queues_created,omitempty"`
-	ObjectsCreated      int    `json:"objects_created,omitempty"`
-	MessagesSent        int    `json:"messages_sent,omitempty"`
-	Reason              string `json:"reason,omitempty"`
-	Retain              bool   `json:"retain,omitempty"`
+	QueuesCreated         int                     `json:"queues_created,omitempty"`
+	ObjectsCreated        int                     `json:"objects_created,omitempty"`
+	MessagesSent          int                     `json:"messages_sent,omitempty"`
+	Reason                string                  `json:"reason,omitempty"`
+	Retain                bool                    `json:"retain,omitempty"`
 	PolicyScope           string                  `json:"policy_scope,omitempty"`
 	PolicyKind            string                  `json:"policy_kind,omitempty"`
 	PolicyTarget          string                  `json:"policy_target,omitempty"`
@@ -306,6 +312,27 @@ type JournalPolicyAttachment struct {
 	IntentOp   string `json:"intent_op,omitempty"`
 }
 
+// JournalFunctionEntry is a durable function authority entry replayed from
+// EventFunctionIntent / EventFunctionConfirm / EventFunctionDelete records.
+type JournalFunctionEntry struct {
+	Key        string `json:"key"`
+	Scope      string `json:"scope,omitempty"`
+	Name       string `json:"name"`
+	Digest     string `json:"digest,omitempty"`
+	OwnerToken string `json:"owner_token,omitempty"`
+	Generation string `json:"generation,omitempty"`
+	IntentID   string `json:"intent_id,omitempty"`
+	Ambiguous  bool   `json:"ambiguous,omitempty"`
+	IntentOp   string `json:"intent_op,omitempty"`
+}
+
+func scopedFunctionKey(scope, name string) string {
+	if scope == "" {
+		return name
+	}
+	return scope + "\x00" + name
+}
+
 func scopedPolicyKey(scope, kind, target, principal string) string {
 	if kind == "principal" {
 		target = ""
@@ -322,28 +349,34 @@ func resourceKey(kind, parent, name string) string {
 
 // LedgerState represents the validated, replayed state of a run journal.
 type LedgerState struct {
-	Meta               JournalMeta
-	StartedAtUnix      int64
-	LastSeq            uint64
-	Entries            []LedgerEntry
-	PendingAttempts    []AttemptLedgerEntry
-	ReservedNanoUSD    int64
-	ChargedNanoUSD     int64
-	WorkCapNanoUSD     int64
-	CapExceededCount   int64
-	OpStats            map[string]OpLedgerStat
-	ActiveCleanup      map[string]int64
-	PolicyAttachments  map[string]JournalPolicyAttachment
-	AmbiguousPolicies  map[string]JournalPolicyAttachment
-	AmbiguousStack     map[string][]JournalPolicyAttachment
-	PolicyTombstones   map[string]JournalPolicyAttachment
-	MaxPolicyGen       map[string]uint64
-	LatestPolicyIntent map[string]string
-	BucketsCreated     int
-	QueuesCreated      int
-	ObjectsCreated     int
-	MessagesSent       int
-	TotalPayloadBytes  int64
+	Meta                   JournalMeta
+	StartedAtUnix          int64
+	LastSeq                uint64
+	Entries                []LedgerEntry
+	PendingAttempts        []AttemptLedgerEntry
+	ReservedNanoUSD        int64
+	ChargedNanoUSD         int64
+	WorkCapNanoUSD         int64
+	CapExceededCount       int64
+	OpStats                map[string]OpLedgerStat
+	ActiveCleanup          map[string]int64
+	PolicyAttachments      map[string]JournalPolicyAttachment
+	AmbiguousPolicies      map[string]JournalPolicyAttachment
+	AmbiguousStack         map[string][]JournalPolicyAttachment
+	PolicyTombstones       map[string]JournalPolicyAttachment
+	MaxPolicyGen           map[string]uint64
+	LatestPolicyIntent     map[string]string
+	ActiveFunctions        map[string]JournalFunctionEntry
+	AmbiguousFunctions     map[string]JournalFunctionEntry
+	AmbiguousFunctionStack map[string][]JournalFunctionEntry
+	FunctionTombstones     map[string]JournalFunctionEntry
+	MaxFunctionGen         map[string]uint64
+	LatestFunctionIntent   map[string]string
+	BucketsCreated         int
+	QueuesCreated          int
+	ObjectsCreated         int
+	MessagesSent           int
+	TotalPayloadBytes      int64
 
 	byKey       map[string]int
 	byAttemptID map[string]int
@@ -577,16 +610,24 @@ func OpenJournal(dir string, meta JournalMeta) (*Journal, error) {
 		}
 		j.meta.StartedAtUnix = startedUnix
 		j.state = &LedgerState{
-			Meta:               j.meta,
-			StartedAtUnix:      startedUnix,
-			OpStats:            make(map[string]OpLedgerStat),
-			ActiveCleanup:      make(map[string]int64),
-			PolicyAttachments:  make(map[string]JournalPolicyAttachment),
-			AmbiguousPolicies:  make(map[string]JournalPolicyAttachment),
-			MaxPolicyGen:       make(map[string]uint64),
-			LatestPolicyIntent: make(map[string]string),
-			byKey:              make(map[string]int),
-			byAttemptID:        make(map[string]int),
+			Meta:                   j.meta,
+			StartedAtUnix:          startedUnix,
+			OpStats:                make(map[string]OpLedgerStat),
+			ActiveCleanup:          make(map[string]int64),
+			PolicyAttachments:      make(map[string]JournalPolicyAttachment),
+			AmbiguousPolicies:      make(map[string]JournalPolicyAttachment),
+			AmbiguousStack:         make(map[string][]JournalPolicyAttachment),
+			PolicyTombstones:       make(map[string]JournalPolicyAttachment),
+			MaxPolicyGen:           make(map[string]uint64),
+			LatestPolicyIntent:     make(map[string]string),
+			ActiveFunctions:        make(map[string]JournalFunctionEntry),
+			AmbiguousFunctions:     make(map[string]JournalFunctionEntry),
+			AmbiguousFunctionStack: make(map[string][]JournalFunctionEntry),
+			FunctionTombstones:     make(map[string]JournalFunctionEntry),
+			MaxFunctionGen:         make(map[string]uint64),
+			LatestFunctionIntent:   make(map[string]string),
+			byKey:                  make(map[string]int),
+			byAttemptID:            make(map[string]int),
 		}
 		if err := j.appendLocked(JournalRecord{
 			Event:         EventMeta,
@@ -714,6 +755,30 @@ func (j *Journal) State() LedgerState {
 	cp.LatestPolicyIntent = make(map[string]string, len(j.state.LatestPolicyIntent))
 	for k, v := range j.state.LatestPolicyIntent {
 		cp.LatestPolicyIntent[k] = v
+	}
+	cp.ActiveFunctions = make(map[string]JournalFunctionEntry, len(j.state.ActiveFunctions))
+	for k, v := range j.state.ActiveFunctions {
+		cp.ActiveFunctions[k] = v
+	}
+	cp.AmbiguousFunctions = make(map[string]JournalFunctionEntry, len(j.state.AmbiguousFunctions))
+	for k, v := range j.state.AmbiguousFunctions {
+		cp.AmbiguousFunctions[k] = v
+	}
+	cp.AmbiguousFunctionStack = make(map[string][]JournalFunctionEntry, len(j.state.AmbiguousFunctionStack))
+	for k, v := range j.state.AmbiguousFunctionStack {
+		cp.AmbiguousFunctionStack[k] = append([]JournalFunctionEntry(nil), v...)
+	}
+	cp.FunctionTombstones = make(map[string]JournalFunctionEntry, len(j.state.FunctionTombstones))
+	for k, v := range j.state.FunctionTombstones {
+		cp.FunctionTombstones[k] = v
+	}
+	cp.MaxFunctionGen = make(map[string]uint64, len(j.state.MaxFunctionGen))
+	for k, v := range j.state.MaxFunctionGen {
+		cp.MaxFunctionGen[k] = v
+	}
+	cp.LatestFunctionIntent = make(map[string]string, len(j.state.LatestFunctionIntent))
+	for k, v := range j.state.LatestFunctionIntent {
+		cp.LatestFunctionIntent[k] = v
 	}
 	cp.byKey = make(map[string]int, len(j.state.byKey))
 	for k, v := range j.state.byKey {
@@ -1241,6 +1306,69 @@ func (j *Journal) RecordPolicyDetachScoped(scope, kind, target, principal, owner
 	})
 }
 
+// RecordFunctionIntent durably appends an EventFunctionIntent record (with ownerToken,
+// generation, intentID, and optional cleanup reserve) BEFORE dispatching a function
+// create, update, or delete operation.
+func (j *Journal) RecordFunctionIntent(scope, name, intentOp, digest, ownerToken, generation, intentID, expOwner, expGen string, cleanupReserveNanoUSD int64) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	return j.appendLocked(JournalRecord{
+		Event:                 EventFunctionIntent,
+		Kind:                  KindFunction,
+		PolicyScope:           scope,
+		Name:                  name,
+		PolicyIntentOp:        intentOp,
+		ETag:                  digest,
+		CreateToken:           ownerToken,
+		Generation:            generation,
+		AttemptID:             intentID,
+		ExpectedOwnerToken:    expOwner,
+		ExpectedGeneration:    expGen,
+		CleanupReserveNanoUSD: cleanupReserveNanoUSD,
+	})
+}
+
+// RecordFunctionConfirm durably appends an EventFunctionConfirm record confirming a function create or update.
+func (j *Journal) RecordFunctionConfirm(scope, name, digest, ownerToken, generation, intentID string, cleanupReserveNanoUSD int64) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	return j.appendLocked(JournalRecord{
+		Event:                 EventFunctionConfirm,
+		Kind:                  KindFunction,
+		PolicyScope:           scope,
+		Name:                  name,
+		ETag:                  digest,
+		CreateToken:           ownerToken,
+		Generation:            generation,
+		AttemptID:             intentID,
+		CleanupReserveNanoUSD: cleanupReserveNanoUSD,
+	})
+}
+
+// RecordFunctionDelete durably appends an EventFunctionDelete record confirming function removal.
+func (j *Journal) RecordFunctionDelete(scope, name, ownerToken, generation, intentID string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	return j.appendLocked(JournalRecord{
+		Event:       EventFunctionDelete,
+		Kind:        KindFunction,
+		PolicyScope: scope,
+		Name:        name,
+		CreateToken: ownerToken,
+		Generation:  generation,
+		AttemptID:   intentID,
+	})
+}
+
 func (j *Journal) rollbackAndPoisonLocked(prevOffset int64, cause error) {
 	if j.f != nil {
 		_ = j.f.Truncate(prevOffset)
@@ -1675,6 +1803,186 @@ func (j *Journal) Compact() error {
 		}
 	}
 
+	if len(j.state.ActiveFunctions) > 0 {
+		fnKeys := make([]string, 0, len(j.state.ActiveFunctions))
+		for k := range j.state.ActiveFunctions {
+			fnKeys = append(fnKeys, k)
+		}
+		sort.Strings(fnKeys)
+		for _, k := range fnKeys {
+			fe := j.state.ActiveFunctions[k]
+			seq++
+			compacted = append(compacted, JournalRecord{
+				Version:     JournalVersion,
+				Seq:         seq,
+				Time:        nowStr,
+				Event:       EventFunctionConfirm,
+				RunID:       j.meta.RunID,
+				SessionID:   j.meta.SessionID,
+				PolicyHash:  j.meta.PolicyHash,
+				Provider:    j.meta.Provider,
+				Account:     j.meta.Account,
+				Tenant:      j.meta.Tenant,
+				Scope:       j.meta.Scope,
+				Region:      j.meta.Region,
+				Endpoint:    j.meta.Endpoint,
+				Kind:        KindFunction,
+				PolicyScope: fe.Scope,
+				Name:        fe.Name,
+				ETag:        fe.Digest,
+				CreateToken: fe.OwnerToken,
+				Generation:  fe.Generation,
+				AttemptID:   fe.IntentID,
+			})
+		}
+	}
+	if len(j.state.AmbiguousFunctionStack) > 0 {
+		ambKeys := make([]string, 0, len(j.state.AmbiguousFunctionStack))
+		for k, stack := range j.state.AmbiguousFunctionStack {
+			if len(stack) > 0 {
+				ambKeys = append(ambKeys, k)
+			}
+		}
+		sort.Strings(ambKeys)
+		for _, k := range ambKeys {
+			for _, fe := range j.state.AmbiguousFunctionStack[k] {
+				seq++
+				intentID := fe.IntentID
+				if intentID == "" {
+					intentID = fe.OwnerToken
+				}
+				compacted = append(compacted, JournalRecord{
+					Version:        JournalVersion,
+					Seq:            seq,
+					Time:           nowStr,
+					Event:          EventFunctionIntent,
+					RunID:          j.meta.RunID,
+					SessionID:      j.meta.SessionID,
+					PolicyHash:     j.meta.PolicyHash,
+					Provider:       j.meta.Provider,
+					Account:        j.meta.Account,
+					Tenant:         j.meta.Tenant,
+					Scope:          j.meta.Scope,
+					Region:         j.meta.Region,
+					Endpoint:       j.meta.Endpoint,
+					Kind:           KindFunction,
+					PolicyScope:    fe.Scope,
+					Name:           fe.Name,
+					PolicyIntentOp: fe.IntentOp,
+					ETag:           fe.Digest,
+					CreateToken:    fe.OwnerToken,
+					Generation:     fe.Generation,
+					AttemptID:      intentID,
+				})
+			}
+		}
+	}
+	if len(j.state.FunctionTombstones) > 0 {
+		tbKeys := make([]string, 0, len(j.state.FunctionTombstones))
+		for k := range j.state.FunctionTombstones {
+			tbKeys = append(tbKeys, k)
+		}
+		sort.Strings(tbKeys)
+		for _, k := range tbKeys {
+			tb := j.state.FunctionTombstones[k]
+			maxGen := j.state.MaxFunctionGen[k]
+			if maxGen == 0 {
+				continue
+			}
+			latestIntent := j.state.LatestFunctionIntent[k]
+			if latestIntent == "" {
+				latestIntent = tb.IntentID
+			}
+			_, inActive := j.state.ActiveFunctions[k]
+			_, inAmb := j.state.AmbiguousFunctions[k]
+			if !inActive && !inAmb {
+				seq++
+				compacted = append(compacted, JournalRecord{
+					Version:     JournalVersion,
+					Seq:         seq,
+					Time:        nowStr,
+					Event:       EventFunctionDelete,
+					RunID:       j.meta.RunID,
+					SessionID:   j.meta.SessionID,
+					PolicyHash:  j.meta.PolicyHash,
+					Provider:    j.meta.Provider,
+					Account:     j.meta.Account,
+					Tenant:      j.meta.Tenant,
+					Scope:       j.meta.Scope,
+					Region:      j.meta.Region,
+					Endpoint:    j.meta.Endpoint,
+					Kind:        KindFunction,
+					PolicyScope: tb.Scope,
+					Name:        tb.Name,
+					CreateToken: tb.OwnerToken,
+					Generation:  strconv.FormatUint(maxGen, 10),
+					AttemptID:   latestIntent,
+				})
+				continue
+			}
+			var emittedGen uint64
+			if fe, ok := j.state.ActiveFunctions[k]; ok {
+				if g, err := strconv.ParseUint(fe.Generation, 10, 64); err == nil && g > emittedGen {
+					emittedGen = g
+				}
+			}
+			if fe, ok := j.state.AmbiguousFunctions[k]; ok {
+				if g, err := strconv.ParseUint(fe.Generation, 10, 64); err == nil && g > emittedGen {
+					emittedGen = g
+				}
+			}
+			if maxGen > emittedGen && tb.OwnerToken != "" && latestIntent != "" {
+				genStr := strconv.FormatUint(maxGen, 10)
+				seq++
+				compacted = append(compacted, JournalRecord{
+					Version:        JournalVersion,
+					Seq:            seq,
+					Time:           nowStr,
+					Event:          EventFunctionIntent,
+					RunID:          j.meta.RunID,
+					SessionID:      j.meta.SessionID,
+					PolicyHash:     j.meta.PolicyHash,
+					Provider:       j.meta.Provider,
+					Account:        j.meta.Account,
+					Tenant:         j.meta.Tenant,
+					Scope:          j.meta.Scope,
+					Region:         j.meta.Region,
+					Endpoint:       j.meta.Endpoint,
+					Kind:           KindFunction,
+					PolicyScope:    tb.Scope,
+					Name:           tb.Name,
+					PolicyIntentOp: "delete",
+					CreateToken:    tb.OwnerToken,
+					Generation:     genStr,
+					AttemptID:      latestIntent,
+				})
+				seq++
+				compacted = append(compacted, JournalRecord{
+					Version:        JournalVersion,
+					Seq:            seq,
+					Time:           nowStr,
+					Event:          EventFunctionIntent,
+					RunID:          j.meta.RunID,
+					SessionID:      j.meta.SessionID,
+					PolicyHash:     j.meta.PolicyHash,
+					Provider:       j.meta.Provider,
+					Account:        j.meta.Account,
+					Tenant:         j.meta.Tenant,
+					Scope:          j.meta.Scope,
+					Region:         j.meta.Region,
+					Endpoint:       j.meta.Endpoint,
+					Kind:           KindFunction,
+					PolicyScope:    tb.Scope,
+					Name:           tb.Name,
+					PolicyIntentOp: "abort",
+					CreateToken:    tb.OwnerToken,
+					Generation:     genStr,
+					AttemptID:      latestIntent,
+				})
+			}
+		}
+	}
+
 	newState, err := ReplayJournal(compacted)
 	if err != nil {
 		return fmt.Errorf("validate compacted journal: %w", err)
@@ -1858,18 +2166,24 @@ func ReplayJournal(records []JournalRecord) (*LedgerState, error) {
 		return nil, fmt.Errorf("meta record: %w", err)
 	}
 	state := &LedgerState{
-		Meta:               meta,
-		StartedAtUnix:      meta.StartedAtUnix,
-		OpStats:            make(map[string]OpLedgerStat),
-		ActiveCleanup:      make(map[string]int64),
-		PolicyAttachments:  make(map[string]JournalPolicyAttachment),
-		AmbiguousPolicies:  make(map[string]JournalPolicyAttachment),
-		AmbiguousStack:     make(map[string][]JournalPolicyAttachment),
-		PolicyTombstones:   make(map[string]JournalPolicyAttachment),
-		MaxPolicyGen:       make(map[string]uint64),
-		LatestPolicyIntent: make(map[string]string),
-		byKey:              make(map[string]int),
-		byAttemptID:        make(map[string]int),
+		Meta:                   meta,
+		StartedAtUnix:          meta.StartedAtUnix,
+		OpStats:                make(map[string]OpLedgerStat),
+		ActiveCleanup:          make(map[string]int64),
+		PolicyAttachments:      make(map[string]JournalPolicyAttachment),
+		AmbiguousPolicies:      make(map[string]JournalPolicyAttachment),
+		AmbiguousStack:         make(map[string][]JournalPolicyAttachment),
+		PolicyTombstones:       make(map[string]JournalPolicyAttachment),
+		MaxPolicyGen:           make(map[string]uint64),
+		LatestPolicyIntent:     make(map[string]string),
+		ActiveFunctions:        make(map[string]JournalFunctionEntry),
+		AmbiguousFunctions:     make(map[string]JournalFunctionEntry),
+		AmbiguousFunctionStack: make(map[string][]JournalFunctionEntry),
+		FunctionTombstones:     make(map[string]JournalFunctionEntry),
+		MaxFunctionGen:         make(map[string]uint64),
+		LatestFunctionIntent:   make(map[string]string),
+		byKey:                  make(map[string]int),
+		byAttemptID:            make(map[string]int),
 	}
 	for i, rec := range records {
 		wantSeq := uint64(i + 1)
@@ -2051,6 +2365,76 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 			}
 		}
 		return nil
+	case EventFunctionIntent:
+		if rec.Kind != KindFunction {
+			return fmt.Errorf("function_intent record must have kind %q (got %q)", KindFunction, rec.Kind)
+		}
+		if hasControlChars(rec.PolicyScope) || rec.Name == "" || len(rec.Name) > 64 || hasControlChars(rec.Name) {
+			return fmt.Errorf("invalid function_intent scope/name %q/%q", rec.PolicyScope, rec.Name)
+		}
+		if rec.PolicyIntentOp != "create" && rec.PolicyIntentOp != "update" && rec.PolicyIntentOp != "delete" && rec.PolicyIntentOp != "abort" {
+			return fmt.Errorf("invalid function_intent_op %q", rec.PolicyIntentOp)
+		}
+		if err := ValidateToken128(rec.CreateToken); err != nil {
+			return fmt.Errorf("function_intent owner_token (create_token): %w", err)
+		}
+		if err := ValidateToken128(rec.AttemptID); err != nil {
+			return fmt.Errorf("function_intent intent_id (attempt_id): %w", err)
+		}
+		genNum, err := strconv.ParseUint(rec.Generation, 10, 64)
+		if err != nil || genNum == 0 {
+			return fmt.Errorf("function_intent requires positive uint64 generation (got %q)", rec.Generation)
+		}
+		if hasControlChars(rec.ETag) || len(rec.ETag) > 512 {
+			return fmt.Errorf("invalid function_intent digest %q", rec.ETag)
+		}
+		return nil
+	case EventFunctionConfirm:
+		if rec.Kind != KindFunction {
+			return fmt.Errorf("function_confirm record must have kind %q (got %q)", KindFunction, rec.Kind)
+		}
+		if hasControlChars(rec.PolicyScope) || rec.Name == "" || len(rec.Name) > 64 || hasControlChars(rec.Name) {
+			return fmt.Errorf("invalid function_confirm scope/name %q/%q", rec.PolicyScope, rec.Name)
+		}
+		if err := ValidateToken128(rec.CreateToken); err != nil {
+			return fmt.Errorf("function_confirm owner_token (create_token): %w", err)
+		}
+		genNum, err := strconv.ParseUint(rec.Generation, 10, 64)
+		if err != nil || genNum == 0 {
+			return fmt.Errorf("function_confirm requires positive uint64 generation (got %q)", rec.Generation)
+		}
+		if rec.AttemptID != "" {
+			if err := ValidateToken128(rec.AttemptID); err != nil {
+				return fmt.Errorf("function_confirm attempt_id: %w", err)
+			}
+		}
+		if hasControlChars(rec.ETag) || len(rec.ETag) > 512 {
+			return fmt.Errorf("invalid function_confirm digest %q", rec.ETag)
+		}
+		return nil
+	case EventFunctionDelete:
+		if rec.Kind != KindFunction {
+			return fmt.Errorf("function_delete record must have kind %q (got %q)", KindFunction, rec.Kind)
+		}
+		if hasControlChars(rec.PolicyScope) || rec.Name == "" || len(rec.Name) > 64 || hasControlChars(rec.Name) {
+			return fmt.Errorf("invalid function_delete scope/name %q/%q", rec.PolicyScope, rec.Name)
+		}
+		if rec.CreateToken != "" {
+			if err := ValidateToken128(rec.CreateToken); err != nil {
+				return fmt.Errorf("function_delete owner_token (create_token): %w", err)
+			}
+		}
+		if rec.Generation != "" {
+			if genNum, err := strconv.ParseUint(rec.Generation, 10, 64); err != nil || genNum == 0 {
+				return fmt.Errorf("function_delete invalid generation %q", rec.Generation)
+			}
+		}
+		if rec.AttemptID != "" {
+			if err := ValidateToken128(rec.AttemptID); err != nil {
+				return fmt.Errorf("function_delete attempt_id: %w", err)
+			}
+		}
+		return nil
 	default:
 		return fmt.Errorf("unknown journal event %q", rec.Event)
 	}
@@ -2061,7 +2445,7 @@ func validateResourceIdentity(runID, kind, parent, name string) error {
 		return errors.New("resource parent/name contains control characters")
 	}
 	switch kind {
-	case KindBucket, KindQueue, KindTable:
+	case KindBucket, KindQueue, KindTable, KindFunction:
 		if parent != "" {
 			return fmt.Errorf("%s record must have empty parent (got %q)", kind, parent)
 		}
@@ -2069,7 +2453,7 @@ func validateResourceIdentity(runID, kind, parent, name string) error {
 			return fmt.Errorf("forged or unprefixed %s name in journal: %w", kind, err)
 		}
 		return nil
-	case KindObject, KindQueueMessage, KindTableItem:
+	case KindObject, KindQueueMessage, KindTableItem, KindFunctionVersion, KindFunctionAlias:
 		if err := ValidateLiveResourceName(runID, parent); err != nil {
 			return fmt.Errorf("forged or unprefixed parent %q for %s in journal: %w", parent, kind, err)
 		}
@@ -2255,12 +2639,41 @@ func inferJournalOp(rec JournalRecord, att AttemptLedgerEntry) string {
 		return "policy_detach_principal"
 	case "policy_check":
 		return "policy_check"
+	case "function_create", "function_overwrite":
+		return "function_create"
+	case "function_update":
+		return "function_update"
+	case "function_delete":
+		return "function_delete"
+	case "function_exists":
+		return "function_exists"
+	case "function_get":
+		return "function_get"
+	case "function_list":
+		return "function_list"
+	case "function_publish_version":
+		return "function_publish_version"
+	case "function_versions":
+		return "function_versions"
+	case "function_alias_set":
+		return "function_alias_set"
+	case "function_alias_get":
+		return "function_alias_get"
+	case "function_alias_delete":
+		return "function_alias_delete"
+	case "function_read_ownership", "function_create_token":
+		return "function_read_ownership"
+	case "function_invoke":
+		return "function_invoke"
 	case "verify_parent_ownership":
 		if rec.Kind == KindQueue || att.Kind == KindQueue {
 			return "queue_read_ownership"
 		}
 		if rec.Kind == KindTable || att.Kind == KindTable {
 			return "table_read_ownership"
+		}
+		if rec.Kind == KindFunction || att.Kind == KindFunction {
+			return "function_read_ownership"
 		}
 		return "bucket_read_ownership"
 	}
@@ -2277,6 +2690,12 @@ func inferJournalOp(rec JournalRecord, att AttemptLedgerEntry) string {
 			return "table_create"
 		case KindTableItem:
 			return "item_put"
+		case KindFunction:
+			return "function_create"
+		case KindFunctionVersion:
+			return "function_publish_version"
+		case KindFunctionAlias:
+			return "function_alias_set"
 		}
 	}
 	return ""
@@ -2342,6 +2761,24 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 	}
 	if state.LatestPolicyIntent == nil {
 		state.LatestPolicyIntent = make(map[string]string)
+	}
+	if state.ActiveFunctions == nil {
+		state.ActiveFunctions = make(map[string]JournalFunctionEntry)
+	}
+	if state.AmbiguousFunctions == nil {
+		state.AmbiguousFunctions = make(map[string]JournalFunctionEntry)
+	}
+	if state.AmbiguousFunctionStack == nil {
+		state.AmbiguousFunctionStack = make(map[string][]JournalFunctionEntry)
+	}
+	if state.FunctionTombstones == nil {
+		state.FunctionTombstones = make(map[string]JournalFunctionEntry)
+	}
+	if state.MaxFunctionGen == nil {
+		state.MaxFunctionGen = make(map[string]uint64)
+	}
+	if state.LatestFunctionIntent == nil {
+		state.LatestFunctionIntent = make(map[string]string)
 	}
 	state.LastSeq = rec.Seq
 	if rec.Event != EventSettle {
@@ -2534,6 +2971,141 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		deletePolicyActiveCleanup(state, pKey)
 		return nil
 	}
+	if rec.Event == EventFunctionIntent {
+		fKey := scopedFunctionKey(rec.PolicyScope, rec.Name)
+		genNum, _ := strconv.ParseUint(rec.Generation, 10, 64)
+		if rec.PolicyIntentOp == "abort" {
+			stack := state.AmbiguousFunctionStack[fKey]
+			if len(stack) > 0 {
+				filtered := stack[:0]
+				for _, item := range stack {
+					if item.IntentID != rec.AttemptID {
+						filtered = append(filtered, item)
+					}
+				}
+				if len(filtered) > 0 {
+					state.AmbiguousFunctionStack[fKey] = filtered
+					state.AmbiguousFunctions[fKey] = filtered[len(filtered)-1]
+				} else {
+					delete(state.AmbiguousFunctionStack, fKey)
+					delete(state.AmbiguousFunctions, fKey)
+					if _, inActive := state.ActiveFunctions[fKey]; !inActive {
+						deleteFunctionActiveCleanup(state, rec.PolicyScope, rec.Name, fKey)
+					}
+				}
+			} else if state.LatestFunctionIntent[fKey] == "" || state.LatestFunctionIntent[fKey] == rec.AttemptID {
+				delete(state.AmbiguousFunctions, fKey)
+				if _, inActive := state.ActiveFunctions[fKey]; !inActive {
+					deleteFunctionActiveCleanup(state, rec.PolicyScope, rec.Name, fKey)
+				}
+			}
+			return nil
+		}
+		if genNum <= state.MaxFunctionGen[fKey] {
+			return fmt.Errorf("non-monotonic function_intent generation %d for key %q (max=%d)", genNum, fKey, state.MaxFunctionGen[fKey])
+		}
+		if rec.PolicyIntentOp == "create" {
+			if _, inActive := state.ActiveFunctions[fKey]; !inActive {
+				if _, inAmb := state.AmbiguousFunctions[fKey]; !inAmb {
+					if countFunctionKeys(state) >= 64 {
+						return errors.New("function count in journal exceeds maximum of 64 per run")
+					}
+				}
+			}
+		}
+		state.MaxFunctionGen[fKey] = genNum
+		state.LatestFunctionIntent[fKey] = rec.AttemptID
+		jfe := JournalFunctionEntry{
+			Key:        fKey,
+			Scope:      rec.PolicyScope,
+			Name:       rec.Name,
+			Digest:     rec.ETag,
+			OwnerToken: rec.CreateToken,
+			Generation: rec.Generation,
+			IntentID:   rec.AttemptID,
+			Ambiguous:  true,
+			IntentOp:   rec.PolicyIntentOp,
+		}
+		state.AmbiguousFunctionStack[fKey] = append(state.AmbiguousFunctionStack[fKey], jfe)
+		state.AmbiguousFunctions[fKey] = jfe
+		state.FunctionTombstones[fKey] = jfe
+		if rec.CleanupReserveNanoUSD > 0 {
+			state.ActiveCleanup[resourceKey(KindFunction, rec.PolicyScope, rec.Name)] = rec.CleanupReserveNanoUSD
+		}
+		return nil
+	}
+	if rec.Event == EventFunctionConfirm {
+		fKey := scopedFunctionKey(rec.PolicyScope, rec.Name)
+		genNum, _ := strconv.ParseUint(rec.Generation, 10, 64)
+		if genNum < state.MaxFunctionGen[fKey] {
+			return fmt.Errorf("stale function_confirm generation %d for key %q (max=%d)", genNum, fKey, state.MaxFunctionGen[fKey])
+		}
+		if rec.AttemptID != "" && state.LatestFunctionIntent[fKey] != "" && rec.AttemptID != state.LatestFunctionIntent[fKey] {
+			return fmt.Errorf("stale function_confirm intent_id %q for key %q (latest=%q)", rec.AttemptID, fKey, state.LatestFunctionIntent[fKey])
+		}
+		if _, inActive := state.ActiveFunctions[fKey]; !inActive {
+			if _, inAmb := state.AmbiguousFunctions[fKey]; !inAmb {
+				if countFunctionKeys(state) >= 64 {
+					return errors.New("function count in journal exceeds maximum of 64 per run")
+				}
+			}
+		}
+		state.MaxFunctionGen[fKey] = genNum
+		if rec.AttemptID != "" {
+			state.LatestFunctionIntent[fKey] = rec.AttemptID
+		}
+		delete(state.AmbiguousFunctionStack, fKey)
+		delete(state.AmbiguousFunctions, fKey)
+		jfe := JournalFunctionEntry{
+			Key:        fKey,
+			Scope:      rec.PolicyScope,
+			Name:       rec.Name,
+			Digest:     rec.ETag,
+			OwnerToken: rec.CreateToken,
+			Generation: rec.Generation,
+			IntentID:   rec.AttemptID,
+		}
+		state.ActiveFunctions[fKey] = jfe
+		state.FunctionTombstones[fKey] = jfe
+		if rec.CleanupReserveNanoUSD > 0 {
+			state.ActiveCleanup[resourceKey(KindFunction, rec.PolicyScope, rec.Name)] = rec.CleanupReserveNanoUSD
+		}
+		return nil
+	}
+	if rec.Event == EventFunctionDelete {
+		fKey := scopedFunctionKey(rec.PolicyScope, rec.Name)
+		if rec.Generation != "" {
+			genNum, _ := strconv.ParseUint(rec.Generation, 10, 64)
+			if genNum < state.MaxFunctionGen[fKey] {
+				return fmt.Errorf("stale function_delete generation %d for key %q (max=%d)", genNum, fKey, state.MaxFunctionGen[fKey])
+			}
+			state.MaxFunctionGen[fKey] = genNum
+		}
+		if rec.AttemptID != "" && state.LatestFunctionIntent[fKey] != "" && rec.AttemptID != state.LatestFunctionIntent[fKey] {
+			return fmt.Errorf("stale function_delete intent_id %q for key %q (latest=%q)", rec.AttemptID, fKey, state.LatestFunctionIntent[fKey])
+		}
+		if rec.AttemptID != "" {
+			state.LatestFunctionIntent[fKey] = rec.AttemptID
+		}
+		ownerTok := rec.CreateToken
+		if ownerTok == "" {
+			ownerTok = state.FunctionTombstones[fKey].OwnerToken
+		}
+		state.FunctionTombstones[fKey] = JournalFunctionEntry{
+			Key:        fKey,
+			Scope:      rec.PolicyScope,
+			Name:       rec.Name,
+			OwnerToken: ownerTok,
+			Generation: rec.Generation,
+			IntentID:   state.LatestFunctionIntent[fKey],
+		}
+		delete(state.AmbiguousFunctionStack, fKey)
+		delete(state.AmbiguousFunctions, fKey)
+		delete(state.ActiveFunctions, fKey)
+		deleteFunctionActiveCleanup(state, rec.PolicyScope, rec.Name, fKey)
+		removeResourcePolicyAttachments(state, KindFunction, rec.PolicyScope, rec.Name)
+		return nil
+	}
 	if rec.Event == EventCost {
 		if rec.Kind == KindQueueMessage && rec.Reason == "queue_send" {
 			state.MessagesSent++
@@ -2606,6 +3178,9 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 						delete(state.ActiveCleanup, k)
 					}
 				}
+			}
+			if att.Kind == KindFunction {
+				deleteFunctionActiveCleanup(state, att.Parent, att.Name, scopedFunctionKey(att.Parent, att.Name))
 			}
 		}
 		if rec.BillingUnits == 0 && rec.ChargedNanoUSD == 0 && rec.CleanupReserveNanoUSD == 0 && !rec.ReleaseCleanup {
@@ -3003,6 +3578,35 @@ func deletePolicyActiveCleanup(state *LedgerState, pKey string) {
 	}
 }
 
+func countFunctionKeys(state *LedgerState) int {
+	if state == nil {
+		return 0
+	}
+	seen := make(map[string]struct{}, len(state.ActiveFunctions)+len(state.AmbiguousFunctions))
+	for k := range state.ActiveFunctions {
+		seen[k] = struct{}{}
+	}
+	for k := range state.AmbiguousFunctions {
+		seen[k] = struct{}{}
+	}
+	return len(seen)
+}
+
+func deleteFunctionActiveCleanup(state *LedgerState, scope, name, fKey string) {
+	if state == nil || name == "" {
+		return
+	}
+	delete(state.ActiveCleanup, "function\x00"+fKey)
+	delete(state.ActiveCleanup, resourceKey(KindFunction, scope, name))
+	verPrefix := resourceKey(KindFunctionVersion, scope, name+"/")
+	aliasPrefix := resourceKey(KindFunctionAlias, scope, name+"/")
+	for ck := range state.ActiveCleanup {
+		if strings.HasPrefix(ck, verPrefix) || strings.HasPrefix(ck, aliasPrefix) {
+			delete(state.ActiveCleanup, ck)
+		}
+	}
+}
+
 func policyScopeMatchesResourceEndpoint(policyScope, resKind, resEndpoint string) bool {
 	if strings.HasPrefix(policyScope, "perm=") && strings.Contains(policyScope, "|storage=") {
 		var wantPrefix string
@@ -3013,6 +3617,8 @@ func policyScopeMatchesResourceEndpoint(policyScope, resKind, resEndpoint string
 			wantPrefix = "queue="
 		case KindTable:
 			wantPrefix = "tables="
+		case KindFunction:
+			wantPrefix = "function="
 		default:
 			return false
 		}
@@ -3038,6 +3644,8 @@ func removeResourcePolicyAttachments(state *LedgerState, kind, resEndpoint, name
 		target = "queue:queue:" + name
 	case KindTable:
 		target = "tables:table:" + name
+	case KindFunction:
+		target = "function:function:" + name
 	default:
 		return
 	}

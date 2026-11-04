@@ -309,4 +309,3 @@ func TestSetWorkCapUSD_TinyAndSetterErrorMapping(t *testing.T) {
 		t.Fatalf("expected hostkit.InvalidArgument with HTTPStatus=0, got %#v", cerr)
 	}
 }
-

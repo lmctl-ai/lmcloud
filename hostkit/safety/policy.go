@@ -41,13 +41,13 @@ const (
 	DefaultCleanupReserveUSD = 0.01
 
 	// Default resource and runtime bounds (live-mode-design.md §5).
-	DefaultMaxBuckets        = 4
-	DefaultMaxQueues         = 4
-	DefaultMaxObjects        = 100
-	DefaultMaxMessages       = 100
-	DefaultMaxObjectBytes    = 16 * 1024 * 1024 // 16 MiB
-	DefaultMaxMessageBytes   = 48 * 1024        // 48 KiB
-	DefaultMaxTotalBytes     = 64 * 1024 * 1024 // 64 MiB
+	DefaultMaxBuckets               = 4
+	DefaultMaxQueues                = 4
+	DefaultMaxObjects               = 100
+	DefaultMaxMessages              = 100
+	DefaultMaxObjectBytes           = 16 * 1024 * 1024 // 16 MiB
+	DefaultMaxMessageBytes          = 48 * 1024        // 48 KiB
+	DefaultMaxTotalBytes            = 64 * 1024 * 1024 // 64 MiB
 	DefaultMaxRunSeconds            = 20 * 60          // 20 minutes
 	DefaultMaxCleanupSeconds        = 5 * 60           // 5 minutes
 	DefaultMaxRequestTimeoutSeconds = 10               // 10 seconds per physical cloud request attempt

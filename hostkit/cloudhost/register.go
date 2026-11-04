@@ -467,6 +467,108 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 		return lmcode.Bool(v), hostErr(err)
 	})
 
+	// Functions.
+	fnCfgVal := func(fc *FunctionConfig, err error) (lmcode.Value, error) {
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return lmcode.Object("FunctionConfig", fc), nil
+	}
+	fnCfgArg := func(v lmcode.Value) (*FunctionConfig, error) {
+		if v.Obj == nil {
+			return nil, lmcode.NewHostError("expected FunctionConfig, got nil")
+		}
+		fc, ok := v.Obj.(*FunctionConfig)
+		if !ok {
+			return nil, lmcode.NewHostError(fmt.Sprintf("expected FunctionConfig, got %T", v.Obj))
+		}
+		return fc, nil
+	}
+	fnInvVal := func(res *FunctionInvokeResult, err error) (lmcode.Value, error) {
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return lmcode.Object("FunctionInvokeResult", res), nil
+	}
+	r.pure("Cloud", "function_config", []string{"string", "string"}, "FunctionConfig", func(self any, a []lmcode.Value) (lmcode.Value, error) {
+		return fnCfgVal(self.(*Host).FunctionConfig(a[0].Str, a[1].Str))
+	})
+	r.op("function_create", []string{"string", "FunctionConfig"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		fc, err := fnCfgArg(a[1])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		v, err := h.FunctionCreate(dry, a[0].Str, fc)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("function_update", []string{"string", "FunctionConfig"}, "FunctionConfig", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		fc, err := fnCfgArg(a[1])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		return fnCfgVal(h.FunctionUpdate(dry, a[0].Str, fc, "", false))
+	})
+	r.op("function_update", []string{"string", "FunctionConfig", "string"}, "FunctionConfig", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		fc, err := fnCfgArg(a[1])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		return fnCfgVal(h.FunctionUpdate(dry, a[0].Str, fc, a[2].Str, true))
+	})
+	r.op("function_delete", []string{"string"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.FunctionDelete(dry, a[0].Str)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("function_exists", []string{"string"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.FunctionExists(dry, a[0].Str)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("function_get", []string{"string"}, "FunctionConfig", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return fnCfgVal(h.FunctionGet(dry, a[0].Str, "", false))
+	})
+	r.op("function_get", []string{"string", "string"}, "FunctionConfig", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return fnCfgVal(h.FunctionGet(dry, a[0].Str, a[1].Str, true))
+	})
+	r.op("function_list", nil, "StrList", func(h *Host, dry bool, _ []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.FunctionList(dry)
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return r.strList(v)
+	})
+	r.op("function_publish_version", []string{"string"}, "string", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.FunctionPublishVersion(dry, a[0].Str, "", false)
+		return lmcode.String(v), hostErr(err)
+	})
+	r.op("function_publish_version", []string{"string", "string"}, "string", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.FunctionPublishVersion(dry, a[0].Str, a[1].Str, true)
+		return lmcode.String(v), hostErr(err)
+	})
+	r.op("function_versions", []string{"string"}, "StrList", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.FunctionVersions(dry, a[0].Str)
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return r.strList(v)
+	})
+	r.op("function_alias_set", []string{"string", "string", "string"}, "void", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.None(), hostErr(h.FunctionAliasSet(dry, a[0].Str, a[1].Str, a[2].Str))
+	})
+	r.op("function_alias_get", []string{"string", "string"}, "string", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.FunctionAliasGet(dry, a[0].Str, a[1].Str)
+		return lmcode.String(v), hostErr(err)
+	})
+	r.op("function_alias_delete", []string{"string", "string"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.FunctionAliasDelete(dry, a[0].Str, a[1].Str)
+		return lmcode.Bool(v), hostErr(err)
+	})
+	r.op("function_invoke", []string{"string", "string"}, "FunctionInvokeResult", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return fnInvVal(h.FunctionInvoke(dry, a[0].Str, "", a[1].Str, false))
+	})
+	r.op("function_invoke", []string{"string", "string", "string"}, "FunctionInvokeResult", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return fnInvVal(h.FunctionInvoke(dry, a[0].Str, a[1].Str, a[2].Str, true))
+	})
+
 	// Cost & Performance.
 	r.pure("Cloud", "cost_cap_usd", nil, "float", func(self any, _ []lmcode.Value) (lmcode.Value, error) {
 		return lmcode.Float(self.(*Host).CostCapUSD()), nil
@@ -553,12 +655,16 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 	r.pure("CostLineItem", "billing_units", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(cli(s).BillingUnits), nil })
 	r.pure("CostLineItem", "bytes", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Int(cli(s).Bytes), nil })
 	r.pure("CostLineItem", "unit_price_usd", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(cli(s).UnitPriceUSD), nil })
-	r.pure("CostLineItem", "byte_price_usd_per_gib", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(cli(s).BytePriceUSDPerGiB), nil })
+	r.pure("CostLineItem", "byte_price_usd_per_gib", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Float(cli(s).BytePriceUSDPerGiB), nil
+	})
 	r.pure("CostLineItem", "estimated_usd", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(cli(s).EstimatedUSD), nil })
 
 	cr := func(self any) CostReport { return self.(*costReportSnapshot).r }
 	r.pure("CostReport", "provider", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.String(cr(s).Provider), nil })
-	r.pure("CostReport", "price_table_version", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.String(cr(s).PriceTableVersion), nil })
+	r.pure("CostReport", "price_table_version", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(cr(s).PriceTableVersion), nil
+	})
 	r.pure("CostReport", "cap_usd", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(cr(s).CapUSD), nil })
 	r.pure("CostReport", "ceiling_usd", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(cr(s).CeilingUSD), nil })
 	r.pure("CostReport", "estimated_usd", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) { return lmcode.Float(cr(s).EstimatedUSD), nil })
@@ -738,6 +844,122 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 	})
 	r.pure("LintFinding", "message", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
 		return lmcode.String(lf(s).Message()), nil
+	})
+
+	fc := func(self any) *FunctionConfig { return self.(*FunctionConfig) }
+	r.pure("FunctionConfig", "name", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fc(s).Name()), nil
+	})
+	r.pure("FunctionConfig", "exists", nil, "bool", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Bool(fc(s).Exists()), nil
+	})
+	r.pure("FunctionConfig", "state", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fc(s).State()), nil
+	})
+	r.pure("FunctionConfig", "runtime", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fc(s).Runtime()), nil
+	})
+	r.pure("FunctionConfig", "set_runtime", []string{"string"}, "FunctionConfig", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return fnCfgVal(fc(s).SetRuntime(a[0].Str))
+	})
+	r.pure("FunctionConfig", "handler", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fc(s).Handler()), nil
+	})
+	r.pure("FunctionConfig", "set_handler", []string{"string"}, "FunctionConfig", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return fnCfgVal(fc(s).SetHandler(a[0].Str))
+	})
+	r.pure("FunctionConfig", "code_source", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fc(s).CodeSource()), nil
+	})
+	r.pure("FunctionConfig", "inline_code", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fc(s).InlineCode()), nil
+	})
+	r.pure("FunctionConfig", "set_inline_code", []string{"string"}, "FunctionConfig", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return fnCfgVal(fc(s).SetInlineCode(a[0].Str))
+	})
+	r.pure("FunctionConfig", "package_bucket", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fc(s).PackageBucket()), nil
+	})
+	r.pure("FunctionConfig", "package_key", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fc(s).PackageKey()), nil
+	})
+	r.pure("FunctionConfig", "set_package_object", []string{"string", "string"}, "FunctionConfig", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return fnCfgVal(fc(s).SetPackageObject(a[0].Str, a[1].Str))
+	})
+	r.pure("FunctionConfig", "code_sha256", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fc(s).CodeSHA256()), nil
+	})
+	r.pure("FunctionConfig", "timeout_seconds", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(fc(s).TimeoutSeconds()), nil
+	})
+	r.pure("FunctionConfig", "set_timeout_seconds", []string{"int"}, "FunctionConfig", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return fnCfgVal(fc(s).SetTimeoutSeconds(a[0].Int))
+	})
+	r.pure("FunctionConfig", "memory_mb", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(fc(s).MemoryMB()), nil
+	})
+	r.pure("FunctionConfig", "set_memory_mb", []string{"int"}, "FunctionConfig", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return fnCfgVal(fc(s).SetMemoryMB(a[0].Int))
+	})
+	r.pure("FunctionConfig", "concurrency", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(fc(s).Concurrency()), nil
+	})
+	r.pure("FunctionConfig", "set_concurrency", []string{"int"}, "FunctionConfig", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return fnCfgVal(fc(s).SetConcurrency(a[0].Int))
+	})
+	r.pure("FunctionConfig", "env", []string{"string"}, "string", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := fc(s).Env(a[0].Str)
+		return lmcode.String(v), hostErr(err)
+	})
+	r.pure("FunctionConfig", "has_env", []string{"string"}, "bool", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Bool(fc(s).HasEnv(a[0].Str)), nil
+	})
+	r.pure("FunctionConfig", "set_env", []string{"string", "string"}, "FunctionConfig", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return fnCfgVal(fc(s).SetEnv(a[0].Str, a[1].Str))
+	})
+	r.pure("FunctionConfig", "remove_env", []string{"string"}, "FunctionConfig", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		return fnCfgVal(fc(s).RemoveEnv(a[0].Str))
+	})
+	r.pure("FunctionConfig", "env_names", nil, "StrList", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return r.strList(fc(s).EnvNames())
+	})
+	r.pure("FunctionConfig", "env_len", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(fc(s).EnvLen()), nil
+	})
+	r.pure("FunctionConfig", "version", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fc(s).Version()), nil
+	})
+	r.pure("FunctionConfig", "revision_id", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fc(s).RevisionID()), nil
+	})
+
+	fir := func(self any) *FunctionInvokeResult { return self.(*FunctionInvokeResult) }
+	r.pure("FunctionInvokeResult", "status_code", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(fir(s).StatusCode()), nil
+	})
+	r.pure("FunctionInvokeResult", "payload", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fir(s).Payload()), nil
+	})
+	r.pure("FunctionInvokeResult", "logs", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fir(s).Logs()), nil
+	})
+	r.pure("FunctionInvokeResult", "function_error", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fir(s).FunctionError()), nil
+	})
+	r.pure("FunctionInvokeResult", "is_error", nil, "bool", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Bool(fir(s).IsError()), nil
+	})
+	r.pure("FunctionInvokeResult", "executed_version", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(fir(s).ExecutedVersion()), nil
+	})
+	r.pure("FunctionInvokeResult", "duration_ms", nil, "float", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Float(fir(s).DurationMS()), nil
+	})
+	r.pure("FunctionInvokeResult", "billed_ms", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(fir(s).BilledMS()), nil
+	})
+	r.pure("FunctionInvokeResult", "memory_mb", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(fir(s).MemoryMB()), nil
 	})
 
 	return r.first

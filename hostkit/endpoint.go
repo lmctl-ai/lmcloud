@@ -16,7 +16,7 @@ import (
 )
 
 // Services are the per-service endpoint selectors of design 02 §2.1.
-var Services = []string{"storage", "queue", "tables", "vm", "container", "lambda", "valkey", "userpool", "permissions", "cost"}
+var Services = []string{"storage", "queue", "tables", "function", "vm", "container", "lambda", "valkey", "userpool", "permissions", "cost"}
 
 // AllServices is the wildcard selector accepted by set_endpoint.
 const AllServices = "all"

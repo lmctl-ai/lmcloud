@@ -1814,8 +1814,3 @@ func TestSubOperationsPurgeAndReceiveSettlement(t *testing.T) {
 		t.Fatalf("expected 2 requests/units, 5 bytes, and $0.0000028 for queue_receive+:modifyAckDeadline, got %+v", recvLine)
 	}
 }
-
-
-
-
-

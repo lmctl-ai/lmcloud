@@ -848,5 +848,3 @@ func TestOwnTablesR3PriorSizerRaceHardCeiling(t *testing.T) {
 		t.Fatalf("expected 0 spend when conservative reservation exceeds ceiling/cap, got %+v", h.CostReport())
 	}
 }
-
-

@@ -30,6 +30,7 @@ type Config struct {
 	Queue       hostkit.Queue
 	Tables      hostkit.Tables
 	Permissions hostkit.Permissions
+	Functions   hostkit.Functions
 	Endpoints   *hostkit.EndpointResolver
 	Validator   *hostkit.Validator
 	// OpTimeout bounds one operation (default 2m); ListTimeout bounds exhaustive lists (default 10m).
@@ -96,6 +97,9 @@ func New(cfg Config) *Host {
 	if cfg.Permissions != nil {
 		cfg.Permissions = guardPermissions{cfg.Permissions}
 	}
+	if cfg.Functions != nil {
+		cfg.Functions = guardFunctions{cfg.Functions}
+	}
 	errs := hostkit.NewErrorState()
 	ct := newCostTracker(cfg)
 	ct.mu.Lock()
@@ -108,6 +112,16 @@ func New(cfg Config) *Host {
 	for _, pa := range ct.ambiguousPolicies {
 		if pa.OwnerToken != "" {
 			errs.AddRedaction(pa.OwnerToken)
+		}
+	}
+	for _, fe := range ct.activeFunctionEntries {
+		if fe.OwnerToken != "" {
+			errs.AddRedaction(fe.OwnerToken)
+		}
+	}
+	for _, fe := range ct.ambiguousFunctions {
+		if fe.OwnerToken != "" {
+			errs.AddRedaction(fe.OwnerToken)
 		}
 	}
 	ct.mu.Unlock()
@@ -1948,30 +1962,41 @@ type dryTableItem struct {
 	item *hostkit.Item // nil = deleted in this dry run
 }
 
+type dryFunction struct {
+	exists       bool
+	createdNow   bool
+	snap         hostkit.FunctionSnapshot
+	versions     map[string]hostkit.FunctionSnapshot
+	versionOrder []string
+	aliases      map[string]string
+}
+
 // overlay records what a dry run would have changed, so later reads in the
 // same dry run see the previewed state instead of aborting. It never reaches
 // the provider.
 type overlay struct {
-	mu       sync.Mutex
-	buckets  map[string]bool // true created, false deleted
-	created  map[string]bool // bucket did not exist before this dry run
-	objects  map[string]map[string]dryObject
-	queues   map[string]bool
-	tables   map[string]dryTable
-	items    map[string]map[string]dryTableItem
-	policies map[string]*hostkit.PolicyAttachment // nil = detached in this dry run
-	drySeq   int64
+	mu        sync.Mutex
+	buckets   map[string]bool // true created, false deleted
+	created   map[string]bool // bucket did not exist before this dry run
+	objects   map[string]map[string]dryObject
+	queues    map[string]bool
+	tables    map[string]dryTable
+	items     map[string]map[string]dryTableItem
+	policies  map[string]*hostkit.PolicyAttachment // nil = detached in this dry run
+	functions map[string]dryFunction
+	drySeq    int64
 }
 
 func newOverlay() *overlay {
 	return &overlay{
-		buckets:  map[string]bool{},
-		created:  map[string]bool{},
-		objects:  map[string]map[string]dryObject{},
-		queues:   map[string]bool{},
-		tables:   map[string]dryTable{},
-		items:    map[string]map[string]dryTableItem{},
-		policies: map[string]*hostkit.PolicyAttachment{},
+		buckets:   map[string]bool{},
+		created:   map[string]bool{},
+		objects:   map[string]map[string]dryObject{},
+		queues:    map[string]bool{},
+		tables:    map[string]dryTable{},
+		items:     map[string]map[string]dryTableItem{},
+		policies:  map[string]*hostkit.PolicyAttachment{},
+		functions: map[string]dryFunction{},
 	}
 }
 
@@ -2266,6 +2291,64 @@ func (o *overlay) mergePolicies(real []hostkit.PolicyAttachment) []hostkit.Polic
 	for _, k := range keys {
 		out = append(out, byKey[k])
 	}
+	return out
+}
+
+func (o *overlay) function(name string) (dryFunction, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	df, ok := o.functions[name]
+	if !ok {
+		return dryFunction{}, false
+	}
+	cp := dryFunction{
+		exists:       df.exists,
+		createdNow:   df.createdNow,
+		snap:         df.snap.Clone(),
+		versions:     make(map[string]hostkit.FunctionSnapshot, len(df.versions)),
+		versionOrder: append([]string(nil), df.versionOrder...),
+		aliases:      copyMap(df.aliases),
+	}
+	for k, v := range df.versions {
+		cp.versions[k] = v.Clone()
+	}
+	return cp, true
+}
+
+func (o *overlay) setFunction(name string, df dryFunction) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	cp := dryFunction{
+		exists:       df.exists,
+		createdNow:   df.createdNow,
+		snap:         df.snap.Clone(),
+		versions:     make(map[string]hostkit.FunctionSnapshot, len(df.versions)),
+		versionOrder: append([]string(nil), df.versionOrder...),
+		aliases:      copyMap(df.aliases),
+	}
+	for k, v := range df.versions {
+		cp.versions[k] = v.Clone()
+	}
+	o.functions[name] = cp
+}
+
+func (o *overlay) mergeFunctions(names []string) []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	set := map[string]bool{}
+	for _, n := range names {
+		set[n] = true
+	}
+	for n, df := range o.functions {
+		set[n] = df.exists
+	}
+	var out []string
+	for n, live := range set {
+		if live {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 

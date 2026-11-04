@@ -86,6 +86,20 @@ type Options struct {
 	// The error is built as a struct literal, bypassing hostkit's constructors.
 	// Added in hostkit v4.
 	EchoCreateToken bool
+	// DisableNamespaceSandbox simulates an environment where Linux user/PID/mount/net
+	// namespaces are unavailable so InvokeFunction fails closed with Internal.
+	DisableNamespaceSandbox bool
+	// OverrideBilledMS, if non-zero, overrides the BilledMS returned by InvokeFunction
+	// (used to test host settlement of malformed/out-of-range provider billing metadata).
+	OverrideBilledMS int64
+	// FaultInvokeAfterDispatch, if non-nil, is called after InvokeFunction dispatches
+	// execution and if it returns an error, InvokeFunction returns that error (simulating
+	// a lost reply / mid-flight connection drop).
+	FaultInvokeAfterDispatch func() error
+	// FaultMutatorAfterCommit, if non-nil, is called after a function control-plane
+	// mutator (CreateFunction, UpdateFunction, DeleteFunction) commits its state mutation;
+	// if it returns a non-nil error, the mutator returns that error (simulating a lost reply).
+	FaultMutatorAfterCommit func(op string) error
 }
 
 func (f *Fake) echoToken(ctx context.Context, kind string) error {
@@ -100,10 +114,11 @@ func (f *Fake) echoToken(ctx context.Context, kind string) error {
 
 // Fake implements hostkit.ObjectStore and hostkit.Queue.
 type Fake struct {
-	opts  Options
-	mu    sync.Mutex
-	mem   *state
-	calls map[string]int
+	opts            Options
+	mu              sync.Mutex
+	mem             *state
+	calls           map[string]int
+	lastSandboxPIDs []int
 }
 
 type object struct {
@@ -147,11 +162,12 @@ type tableState struct {
 }
 
 type state struct {
-	Seq      int64
-	Buckets  map[string]map[string]*object
-	Queues   map[string][]*message
-	Tables   map[string]*tableState            `json:",omitempty"`
-	Policies map[string]hostkit.PolicyAttachment `json:",omitempty"`
+	Seq       int64
+	Buckets   map[string]map[string]*object
+	Queues    map[string][]*message
+	Tables    map[string]*tableState              `json:",omitempty"`
+	Policies  map[string]hostkit.PolicyAttachment `json:",omitempty"`
+	Functions map[string]*functionState           `json:",omitempty"`
 	// Create tokens stored atomically with each create (hostkit.CreateToken).
 	BucketTokens      map[string]string `json:",omitempty"`
 	QueueTokens       map[string]string `json:",omitempty"`
@@ -166,6 +182,7 @@ func newState() *state {
 		Queues:            map[string][]*message{},
 		Tables:            map[string]*tableState{},
 		Policies:          map[string]hostkit.PolicyAttachment{},
+		Functions:         map[string]*functionState{},
 		PolicyGenerations: map[string]uint64{},
 		PolicyOwners:      map[string]string{},
 	}
@@ -188,6 +205,8 @@ var Mutators = []string{
 	"CreateQueue", "DeleteQueue", "Send", "Receive", "Ack", "Nack",
 	"CreateTable", "DeleteTable", "PutItem", "DeleteItem", "UpdateItem",
 	"AttachPolicy", "DetachPolicy",
+	"CreateFunction", "UpdateFunction", "DeleteFunction",
+	"PublishFunctionVersion", "SetFunctionAlias", "DeleteFunctionAlias", "InvokeFunction",
 }
 
 // Calls returns a copy of the per-method call counters.
@@ -259,6 +278,9 @@ func (f *Fake) doTarget(name, target string, fn func(s *state) error) error {
 		}
 		if s.PolicyOwners == nil {
 			s.PolicyOwners = map[string]string{}
+		}
+		if s.Functions == nil {
+			s.Functions = map[string]*functionState{}
 		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state read: "+err.Error())

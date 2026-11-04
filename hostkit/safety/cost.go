@@ -323,6 +323,49 @@ func SyntheticSimPriceTable(provider string) *PriceTable {
 			"policy_check": {
 				RequestNanoUSD: 400,
 			},
+			"function_create": {
+				RequestNanoUSD:        200,
+				CleanupReserveNanoUSD: 150_000,
+			},
+			"function_update": {
+				RequestNanoUSD: 200,
+			},
+			"function_delete": {
+				RequestNanoUSD: 200,
+			},
+			"function_exists": {
+				RequestNanoUSD: 200,
+			},
+			"function_get": {
+				RequestNanoUSD: 200,
+			},
+			"function_list": {
+				RequestNanoUSD: 200,
+			},
+			"function_publish_version": {
+				RequestNanoUSD:        200,
+				CleanupReserveNanoUSD: 30_000,
+			},
+			"function_versions": {
+				RequestNanoUSD: 200,
+			},
+			"function_alias_set": {
+				RequestNanoUSD:        200,
+				CleanupReserveNanoUSD: 10_000,
+			},
+			"function_alias_get": {
+				RequestNanoUSD: 200,
+			},
+			"function_alias_delete": {
+				RequestNanoUSD: 200,
+			},
+			"function_read_ownership": {
+				RequestNanoUSD: 200,
+			},
+			"function_invoke": {
+				RequestNanoUSD:   2,
+				EgressGiBNanoUSD: 90_000_000,
+			},
 		},
 	}
 }
@@ -420,10 +463,11 @@ func (pt *PriceTable) Validate(expectedProvider, expectedRegion string, now time
 
 // AttemptPricingInput describes a single cloud request attempt to be priced BEFORE dispatch.
 type AttemptPricingInput struct {
-	Operation   string
-	PayloadSize int64
-	EgressBytes int64
-	IsCleanup   bool
+	Operation    string
+	PayloadSize  int64
+	EgressBytes  int64
+	BillingUnits int64
+	IsCleanup    bool
 }
 
 // AttemptQuote is the worst-case pre-dispatch cost estimate for a single attempt.
@@ -431,6 +475,7 @@ type AttemptQuote struct {
 	Operation             string
 	AttemptNanoUSD        int64
 	CleanupReserveNanoUSD int64
+	BillingUnits          int64
 	IsCleanup             bool
 }
 
@@ -446,7 +491,7 @@ func (pt *PriceTable) Quote(in AttemptPricingInput) (AttemptQuote, error) {
 	if pt == nil {
 		return AttemptQuote{}, errors.New("nil price table (fail closed)")
 	}
-	if in.PayloadSize < 0 || in.EgressBytes < 0 {
+	if in.PayloadSize < 0 || in.EgressBytes < 0 || in.BillingUnits < 0 {
 		return AttemptQuote{}, errors.New("negative payload or egress size (fail closed)")
 	}
 	tariff, ok := pt.Operations[in.Operation]
@@ -458,7 +503,9 @@ func (pt *PriceTable) Quote(in AttemptPricingInput) (AttemptQuote, error) {
 	}
 
 	units := int64(1)
-	if tariff.ChunkBytes > 0 && in.PayloadSize > tariff.ChunkBytes {
+	if in.BillingUnits > 0 {
+		units = in.BillingUnits
+	} else if tariff.ChunkBytes > 0 && in.PayloadSize > tariff.ChunkBytes {
 		units = (in.PayloadSize + tariff.ChunkBytes - 1) / tariff.ChunkBytes
 	}
 	attemptNano := tariff.RequestNanoUSD * units
@@ -488,6 +535,7 @@ func (pt *PriceTable) Quote(in AttemptPricingInput) (AttemptQuote, error) {
 		Operation:             in.Operation,
 		AttemptNanoUSD:        attemptNano,
 		CleanupReserveNanoUSD: cleanupNano,
+		BillingUnits:          units,
 		IsCleanup:             in.IsCleanup,
 	}, nil
 }
