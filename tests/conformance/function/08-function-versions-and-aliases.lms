@@ -1,0 +1,103 @@
+# Requires: function
+# Scenario 08: Immutable published versions (function_publish_version, function_versions) and mutable aliases (function_alias_set, function_alias_get, function_alias_delete), plus qualified function_get and function_invoke.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+fname = "lmf08" + run_id + "ver";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("function", ep);
+  }
+  let fn_name = ${fname};
+
+  let code_v1 = "def handler(event, context):\n    return {\"impl\": \"v1\"}\n";
+  let code_v2 = "def handler(event, context):\n    return {\"impl\": \"v2\"}\n";
+  let code_head = "def handler(event, context):\n    return {\"impl\": \"head\"}\n";
+
+  let cfg1 = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code(code_v1)
+    .set_memory_mb(128);
+  cloud.function_create(fn_name, cfg1);
+
+  let initial_vers = cloud.function_versions(fn_name);
+  let v1 = cloud.function_publish_version(fn_name);
+
+  # Update $LATEST to v2 and publish v2 conditionally on current revision_id
+  let cfg2 = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code(code_v2)
+    .set_memory_mb(256);
+  let upd2 = cloud.function_update(fn_name, cfg2);
+  let v2 = cloud.function_publish_version(fn_name, upd2.revision_id());
+
+  # Update $LATEST again to head without publishing a version
+  let cfg_head = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code(code_head)
+    .set_memory_mb(512);
+  cloud.function_update(fn_name, cfg_head);
+
+  let vers = cloud.function_versions(fn_name);
+  let vers_ok = initial_vers.len() == 0 &&
+                vers.len() == 2 &&
+                vers.at(0) == v1 &&
+                vers.at(1) == v2 &&
+                v1 == "1" &&
+                v2 == "2";
+
+  # Qualified function_get returns frozen config for v1 and v2
+  let got_v1 = cloud.function_get(fn_name, v1);
+  let got_v2 = cloud.function_get(fn_name, v2);
+  let got_head = cloud.function_get(fn_name, "$LATEST");
+  let get_qual_ok = got_v1.exists() && got_v1.version() == v1 && got_v1.memory_mb() == 128 &&
+                    got_v2.exists() && got_v2.version() == v2 && got_v2.memory_mb() == 256 &&
+                    got_head.exists() && got_head.version() == "$LATEST" && got_head.memory_mb() == 512;
+
+  # Alias lifecycle: create "prod" -> v1, invoke via "prod", retarget "prod" -> v2, delete "prod"
+  let missing_alias_before = cloud.function_alias_get(fn_name, "prod");
+  cloud.function_alias_set(fn_name, "prod", v1);
+  let prod_target1 = cloud.function_alias_get(fn_name, "prod");
+  let got_prod1 = cloud.function_get(fn_name, "prod");
+
+  let inv_v1 = cloud.function_invoke(fn_name, v1, "{}");
+  let inv_v2 = cloud.function_invoke(fn_name, v2, "{}");
+  let inv_head = cloud.function_invoke(fn_name, "$LATEST", "{}");
+  let inv_prod1 = cloud.function_invoke(fn_name, "prod", "{}");
+
+  cloud.function_alias_set(fn_name, "prod", v2);
+  let prod_target2 = cloud.function_alias_get(fn_name, "prod");
+  let inv_prod2 = cloud.function_invoke(fn_name, "prod", "{}");
+
+  let alias_del1 = cloud.function_alias_delete(fn_name, "prod");
+  let alias_del2 = cloud.function_alias_delete(fn_name, "prod");
+  let missing_alias_after = cloud.function_alias_get(fn_name, "prod");
+
+  let invoke_ok = str_contains(inv_v1.payload(), "\"v1\"") && inv_v1.executed_version() == v1 &&
+                  str_contains(inv_v2.payload(), "\"v2\"") && inv_v2.executed_version() == v2 &&
+                  str_contains(inv_head.payload(), "\"head\"") && inv_head.executed_version() == "$LATEST" &&
+                  str_contains(inv_prod1.payload(), "\"v1\"") && inv_prod1.executed_version() == v1 &&
+                  str_contains(inv_prod2.payload(), "\"v2\"") && inv_prod2.executed_version() == v2;
+
+  let alias_ok = str_len(missing_alias_before) == 0 &&
+                 prod_target1 == v1 &&
+                 got_prod1.exists() && got_prod1.memory_mb() == 128 &&
+                 prod_target2 == v2 &&
+                 alias_del1 &&
+                 !alias_del2 &&
+                 str_len(missing_alias_after) == 0;
+
+  let deleted = cloud.function_delete(fn_name);
+
+  lmcode_return_put("vers_ok", vers_ok);
+  lmcode_return_put("get_qual_ok", get_qual_ok);
+  lmcode_return_put("invoke_ok", invoke_ok);
+  lmcode_return_put("alias_ok", alias_ok);
+  lmcode_return_put("deleted", deleted);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "08-function-versions-and-aliases host execution failed");
+assert(r.result.vers_ok, "function_publish_version and function_versions should allocate and list immutable versions 1 and 2");
+assert(r.result.get_qual_ok, "qualified function_get should return the frozen snapshot for each published version and mutable $LATEST");
+assert(r.result.invoke_ok, "qualified function_invoke via version, alias, and $LATEST should execute the corresponding snapshot and report executed_version()");
+assert(r.result.alias_ok, "function_alias_set/get/delete should bind, retarget, and remove aliases idempotently");
+assert(r.result.deleted, "function_delete should clean up function, versions, and aliases");

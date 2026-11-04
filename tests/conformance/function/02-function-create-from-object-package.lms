@@ -1,0 +1,82 @@
+# Requires: function
+# Scenario 02: Create and update a function from an Object Storage deployment package (set_package_object), invoke synchronously, and clean up.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bkt = "lmcloud-fn02-" + run_id + "-bkt";
+fname = "lmf02" + run_id + "pkg";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("all", ep);
+  }
+  let b = ${bkt};
+  let fn_name = ${fname};
+
+  cloud.bucket_create(b);
+
+  let pkg_v1 = "def handler(event, context):\n    print(\"pkg-v1-log\")\n    return {\"source\": \"object-v1\", \"in\": event}\n";
+  let pkg_v2 = "def handler(event, context):\n    print(\"pkg-v2-log\")\n    return {\"source\": \"object-v2\", \"in\": event}\n";
+
+  let put1 = cloud.object_put(b, " bundles/fn-v1.py", pkg_v1);
+  let put2 = cloud.object_put(b, "bundles/fn-v2.py", pkg_v2);
+
+  let cfg1 = cloud.function_config("python3.12", "index.handler")
+    .set_package_object(b, " bundles/fn-v1.py")
+    .set_package_object(b, "bundles/fn-v1.py");
+
+  # Verify setting object source clears inline_code and sets code_source == "object"
+  let local_ok = cfg1.code_source() == "object" &&
+                 cfg1.package_bucket() == b &&
+                 cfg1.package_key() == "bundles/fn-v1.py" &&
+                 str_len(cfg1.inline_code()) == 0;
+
+  cloud.object_put(b, "bundles/fn-v1.py", pkg_v1);
+  let created = cloud.function_create(fn_name, cfg1);
+  let got1 = cloud.function_get(fn_name);
+  let sha1 = got1.code_sha256();
+  let rev1 = got1.revision_id();
+
+  let inv1 = cloud.function_invoke(fn_name, "{\"x\":1}");
+  let inv1_ok = inv1.status_code() == 200 &&
+                !inv1.is_error() &&
+                str_contains(inv1.payload(), "object-v1") &&
+                str_contains(inv1.logs(), "pkg-v1-log");
+
+  # Update function to use the v2 package object
+  let cfg2 = cloud.function_config("python3.12", "index.handler")
+    .set_package_object(b, "bundles/fn-v2.py");
+  let got2 = cloud.function_update(fn_name, cfg2, rev1);
+  let sha2 = got2.code_sha256();
+  let rev2 = got2.revision_id();
+
+  let inv2 = cloud.function_invoke(fn_name, "{\"x\":2}");
+  let inv2_ok = inv2.status_code() == 200 &&
+                !inv2.is_error() &&
+                str_contains(inv2.payload(), "object-v2") &&
+                str_contains(inv2.logs(), "pkg-v2-log");
+
+  let deleted_fn = cloud.function_delete(fn_name);
+  cloud.object_delete(b, " bundles/fn-v1.py");
+  cloud.object_delete(b, "bundles/fn-v1.py");
+  cloud.object_delete(b, "bundles/fn-v2.py");
+  let deleted_bkt = cloud.bucket_delete(b);
+
+  lmcode_return_put("local_ok", local_ok && put1.exists() && put2.exists());
+  lmcode_return_put("created", created);
+  lmcode_return_put("got1_ok", got1.exists() && got1.code_source() == "object" && got1.package_bucket() == b && got1.package_key() == "bundles/fn-v1.py" && str_len(sha1) > 0);
+  lmcode_return_put("inv1_ok", inv1_ok);
+  lmcode_return_put("updated_ok", got2.exists() && got2.package_key() == "bundles/fn-v2.py" && sha2 != sha1 && rev2 != rev1);
+  lmcode_return_put("inv2_ok", inv2_ok);
+  lmcode_return_put("cleanup_ok", deleted_fn && deleted_bkt);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "02-function-create-from-object-package host execution failed");
+assert(r.result.local_ok, "FunctionConfig.set_package_object should set code_source()==\"object\" and bucket/key");
+assert(r.result.created, "function_create from object-storage package should succeed");
+assert(r.result.got1_ok, "function_get should report object package source and non-empty code_sha256");
+assert(r.result.inv1_ok, "function_invoke on v1 object package should return v1 payload and logs");
+assert(r.result.updated_ok, "function_update to v2 object package should update package_key, code_sha256, and revision_id");
+assert(r.result.inv2_ok, "function_invoke after package update should return v2 payload and logs");
+assert(r.result.cleanup_ok, "function_delete and bucket_delete should succeed");

@@ -352,3 +352,47 @@ type Tables interface {
 - Verification additions to `scripts/test-hostkit.sh`: conformance `tables` 14/14 open on the
   reference host, auth scenario 14 against fakeadapter enforce mode (allow/deny credentials), and a
   dry-run zero-mutator proof for the 14 programs.
+
+## hostkit v6 (planned, design only — DO NOT implement) — Slice 6 `Functions` adapter
+
+Design doc: `15-function-design.md`, conformance doc: `16-function-conformance.md`. Additive: no
+existing Slice 1/2/3/5 signature changes; `Functions` sits alongside `ObjectStore`, `Queue`, and
+`Tables`, and `Router`/`EndpointRoutes` gain a `Function` (`"function"`) route. Planned shape:
+
+```go
+type Functions interface {
+    CreateFunction(ctx context.Context, name string, cfg FunctionSpec) (created bool, err error)
+    UpdateFunction(ctx context.Context, name string, cfg FunctionSpec, expectRevision string) (FunctionSpec, error)
+    DeleteFunction(ctx context.Context, name string) (deleted bool, err error)
+    GetFunction(ctx context.Context, name, qualifier string) (FunctionSpec, error) // NOT_FOUND -> AbsentFunction
+    ListFunctions(ctx context.Context, max int, token string) (names []string, next string, err error)
+    PublishVersion(ctx context.Context, name, expectRevision string) (version string, err error)
+    ListVersions(ctx context.Context, name string) (versions []string, err error)
+    SetAlias(ctx context.Context, name, alias, version string) error
+    GetAlias(ctx context.Context, name, alias string) (version string, err error)
+    DeleteAlias(ctx context.Context, name, alias string) (deleted bool, err error)
+    InvokeFunction(ctx context.Context, name, qualifier, payloadJSON string) (InvokeResult, error)
+}
+```
+
+- **Pre-flight validation (`cloudhost` / `hostkit`):** function name (`^[a-z][a-z0-9]{2,31}$`;
+  reserved `lmcloudmeta`, `lmcloudfnmeta`, `tables`, `functions`, `default`, `system` rejected),
+  runtime allowlist (`"python3.12"`, `"nodejs20.x"`), handler (`<module>.<export>`), exclusive code
+  source (`"inline"` 1..65536 UTF-8 bytes normalized into a deterministic ZIP with fixed timestamp
+  `1980-01-01T00:00:00Z` for reproducible `code_sha256()`, or `"object"` `(bucket, key)` bounded at
+  16 MiB via `RunSubOperation`), timeout (`1..230` s), memory (`{128, 256, 512, 1024, 2048}` MiB),
+  concurrency (`-1`, `0`, or `1..100`), user env vars (`<= 64` vars, `<= 4096` total user UTF-8 bytes,
+  reserved provider/host prefixes rejected), alias names (`^[a-z][a-z0-9_]{1,31}$`, reserved `latest`/
+  `default`/`system` rejected), and sync invoke payload (`1..1048576` bytes valid JSON; response
+  bounded at 1 MiB, log tail bounded at 4 KiB).
+- **Catalog & sub-operation accounting (`lmcloudfnmeta` + `hostkit.RunSubOperation`):** multi-step
+  deployments (reading Object Storage package, staging, updating code + config + concurrency,
+  publishing versions, managing aliases, and fenced `"deleting"` tombstone teardown) execute every
+  extra physical network attempt through `hostkit.RunSubOperation` so admission, journal recording,
+  and settlement stay exact.
+- **Cost & metrics (`service == "function"`):** control-plane calls consume 1 unit/attempt
+  (`$0.00000020`); `function_create` locks a per-function cleanup reserve released on
+  `function_delete` (`isCleanup = true`); `function_invoke` reserves worst-case compute units
+  (`1 + timeout_seconds * 1000 * (memory_mb / 128)`) + 1 MiB egress before dispatch and settles on
+  completion to `1 + billed_ms * (memory_mb / 128)` units (`$0.0000000021`/unit) + actual payload
+  bytes (`bytes_out + bytes_in`).

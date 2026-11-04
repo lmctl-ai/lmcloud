@@ -1,0 +1,103 @@
+# Requires: function
+# Scenario 13: Auth-enforced denial for function — runs ONLY under <provider>sim --auth enforce
+# (emits TAP SKIP in open mode). Pass 1 = bogus credentials -> UNAUTHENTICATED on function_create and
+# function_invoke. Pass 2 = valid restricted principal denied by policy -> PERMISSION_DENIED on
+# function_exists (never masked as false/OK), function_create, and function_invoke.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+denied_fn = "lmf13" + run_id + "d";
+
+orig_aws_key = env("LMAWS_SIM_ACCESS_KEY_ID", "");
+orig_aws_sec = env("LMAWS_SIM_SECRET_ACCESS_KEY", "");
+orig_az_tok = env("LMAZURE_SIM_TOKEN", "");
+orig_az_key = env("LMAZURE_SIM_KEY", "");
+orig_gcp_tok = env("LMGCP_SIM_TOKEN", "");
+
+set_env("LMAWS_SIM_ACCESS_KEY_ID", "AKIAUNAUTH0000000000");
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", "wrong-secret-key-for-unauthenticated-pass");
+set_env("LMAZURE_SIM_TOKEN", "invalid-bearer-token-unauthenticated");
+set_env("LMAZURE_SIM_KEY", "d3JvbmdrZXl1bmF1dGhlbnRpY2F0ZWQ=");
+set_env("LMGCP_SIM_TOKEN", "invalid-bearer-token-unauthenticated");
+
+unauth_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("function", ep);
+  }
+  let fn_name = ${denied_fn};
+  let cfg = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code("def handler(event, context):\n    return {\"ok\": True}\n");
+  cloud.set_abort_on_error(false);
+
+  let created = cloud.function_create(fn_name, cfg);
+  let create_err = cloud.last_error();
+
+  # If function_create with bogus credentials succeeded, the simulator is in --auth open mode
+  let open_mode = create_err.code() == ErrorCode.OK;
+  let create_unauth = create_err.code() == ErrorCode.UNAUTHENTICATED;
+  let invoke_unauth = false;
+
+  if (open_mode) {
+    if (created || cloud.function_exists(fn_name)) {
+      cloud.function_delete(fn_name);
+    }
+  } else {
+    cloud.function_invoke(fn_name, "{}");
+    let inv_err = cloud.last_error();
+    invoke_unauth = inv_err.code() == ErrorCode.UNAUTHENTICATED;
+  }
+
+  lmcode_return_put("open_mode", open_mode);
+  lmcode_return_put("create_unauth", create_unauth);
+  lmcode_return_put("invoke_unauth", invoke_unauth);
+end _lmcode_
+
+r_unauth = run_lmcode(unauth_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r_unauth.ok, "13 unauthenticated pass host execution failed");
+
+if (r_unauth.result.open_mode) {
+  println("SKIP: simulator is in --auth open mode; 13-function-auth-enforced-denial requires --auth enforce");
+  exit(0);
+}
+
+assert(r_unauth.result.create_unauth, "Pass 1 (wrong creds): function_create must fail UNAUTHENTICATED");
+assert(r_unauth.result.invoke_unauth, "Pass 1 (wrong creds): function_invoke must fail UNAUTHENTICATED");
+
+# Pass 2: valid restricted principal denied by policy -> PERMISSION_DENIED
+set_env("LMAWS_SIM_ACCESS_KEY_ID", env("LMCLOUD_ENFORCE_DENIED_AWS_ACCESS_KEY_ID", orig_aws_key));
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", env("LMCLOUD_ENFORCE_DENIED_AWS_SECRET_ACCESS_KEY", orig_aws_sec));
+set_env("LMAZURE_SIM_TOKEN", env("LMCLOUD_ENFORCE_DENIED_AZURE_TOKEN", orig_az_tok));
+set_env("LMAZURE_SIM_KEY", env("LMCLOUD_ENFORCE_DENIED_AZURE_KEY", orig_az_key));
+set_env("LMGCP_SIM_TOKEN", env("LMCLOUD_ENFORCE_DENIED_GCP_TOKEN", orig_gcp_tok));
+
+denied_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("function", ep);
+  }
+  let fn_name = ${denied_fn};
+  let cfg = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code("def handler(event, context):\n    return {\"ok\": True}\n");
+  cloud.set_abort_on_error(false);
+
+  let exists_val = cloud.function_exists(fn_name);
+  let exists_err = cloud.last_error();
+
+  let created = cloud.function_create(fn_name, cfg);
+  let create_err = cloud.last_error();
+
+  cloud.function_invoke(fn_name, "{}");
+  let inv_err = cloud.last_error();
+
+  lmcode_return_put("created", created);
+  lmcode_return_put("exists_val", exists_val);
+  lmcode_return_put("exists_denied", exists_err.code() == ErrorCode.PERMISSION_DENIED);
+  lmcode_return_put("create_denied", create_err.code() == ErrorCode.PERMISSION_DENIED);
+  lmcode_return_put("invoke_denied", inv_err.code() == ErrorCode.PERMISSION_DENIED);
+end _lmcode_
+
+r_denied = run_lmcode(denied_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r_denied.ok, "13 policy-denied pass host execution failed");
+assert(!r_denied.result.created && !r_denied.result.exists_val, "denied principal must not create or observe functions");
+assert(r_denied.result.exists_denied && r_denied.result.create_denied && r_denied.result.invoke_denied,
+  "Pass 2 (policy denied): function_exists/function_create/function_invoke must all fail PERMISSION_DENIED (probe never masked as false/OK)");

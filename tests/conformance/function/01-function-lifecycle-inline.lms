@@ -1,0 +1,99 @@
+# Requires: function
+# Scenario 01: Function lifecycle with inline code — create, exists, get, sorted list (bounded poll), idempotent recreate, delete, post-delete disappearance, and repeat delete.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+f1 = "lmf01" + run_id + "a";
+f2 = "lmf01" + run_id + "b";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("function", ep);
+  }
+  let name1 = ${f1};
+  let name2 = ${f2};
+
+  let code1 = "def handler(event, context):\n    return {\"fn\": \"one\"}\n";
+  let code2 = "def handler(event, context):\n    return {\"fn\": \"two\"}\n";
+
+  let cfg1 = cloud.function_config("python3.12", "index.handler").set_inline_code(code1);
+  let cfg2 = cloud.function_config("python3.12", "index.handler").set_inline_code(code2);
+
+  let existed_before = cloud.function_exists(name1) || cloud.function_exists(name2);
+
+  # Create out of order (name2 then name1) to verify function_list ascending lexicographical sort
+  let created2 = cloud.function_create(name2, cfg2);
+  let created1 = cloud.function_create(name1, cfg1);
+
+  # Idempotent re-create with identical canonical config returns false and ErrorCode.OK
+  let created1_again = cloud.function_create(name1, cfg1);
+
+  let exists1 = cloud.function_exists(name1);
+  let exists2 = cloud.function_exists(name2);
+
+  let got1 = cloud.function_get(name1);
+  let got1_ok = got1.exists() &&
+                got1.name() == name1 &&
+                got1.state() == "active" &&
+                got1.runtime() == "python3.12" &&
+                got1.handler() == "index.handler" &&
+                got1.code_source() == "inline" &&
+                str_len(got1.code_sha256()) > 0 &&
+                got1.timeout_seconds() == 3 &&
+                got1.memory_mb() == 128 &&
+                got1.concurrency() == 0 &&
+                got1.version() == "$LATEST" &&
+                str_len(got1.revision_id()) > 0;
+
+  let idx1 = -1;
+  let idx2 = -1;
+  let list_polls = 0;
+  while ((idx1 < 0 || idx2 < 0) && list_polls < 10) {
+    list_polls = list_polls + 1;
+    let funcs = cloud.function_list();
+    idx1 = funcs.index_of(name1);
+    idx2 = funcs.index_of(name2);
+  }
+
+  let deleted1 = cloud.function_delete(name1);
+  let deleted2 = cloud.function_delete(name2);
+  let deleted1_again = cloud.function_delete(name1);
+
+  let exists_after1 = true;
+  let exists_after2 = true;
+  let del_polls = 0;
+  while ((exists_after1 || exists_after2) && del_polls < 10) {
+    del_polls = del_polls + 1;
+    exists_after1 = cloud.function_exists(name1);
+    exists_after2 = cloud.function_exists(name2);
+  }
+
+  let got_after = cloud.function_get(name1);
+
+  lmcode_return_put("existed_before", existed_before);
+  lmcode_return_put("created1", created1);
+  lmcode_return_put("created2", created2);
+  lmcode_return_put("created1_again", created1_again);
+  lmcode_return_put("exists1", exists1);
+  lmcode_return_put("exists2", exists2);
+  lmcode_return_put("got1_ok", got1_ok);
+  lmcode_return_put("found_both", idx1 >= 0 && idx2 >= 0);
+  lmcode_return_put("sorted_order", idx1 < idx2);
+  lmcode_return_put("deleted1", deleted1);
+  lmcode_return_put("deleted2", deleted2);
+  lmcode_return_put("deleted1_again", deleted1_again);
+  lmcode_return_put("exists_after", exists_after1 || exists_after2 || got_after.exists());
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "01-function-lifecycle-inline host execution failed");
+assert(!r.result.existed_before, "functions should not exist before create");
+assert(r.result.created1 && r.result.created2, "function_create should return true for newly created functions");
+assert(!r.result.created1_again, "idempotent function_create with identical config should return false");
+assert(r.result.exists1 && r.result.exists2, "function_exists should return true after create");
+assert(r.result.got1_ok, "function_get should populate active state, runtime, handler, defaults, code_sha256, and revision_id");
+assert(r.result.found_both, "function_list should include both created functions within bounded poll");
+assert(r.result.sorted_order, "function_list should be sorted in ascending lexicographical order");
+assert(r.result.deleted1 && r.result.deleted2, "function_delete should return true for existing functions");
+assert(!r.result.deleted1_again, "second function_delete should return false idempotently");
+assert(!r.result.exists_after, "function_exists and function_get().exists() should be false after delete");

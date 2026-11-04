@@ -1,0 +1,65 @@
+# Requires: function
+# Scenario 04: Synchronous invocation (RequestResponse) for python3.12 and nodejs20.x with JSON payload, returned JSON payload, tail logs, and execution duration/billing fields.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+f_py = "lmf04" + run_id + "py";
+f_js = "lmf04" + run_id + "js";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("function", ep);
+  }
+  let py_name = ${f_py};
+  let js_name = ${f_js};
+
+  let py_code = "def handler(event, context):\n    print(\"py-log-entry:\" + str(event.get(\"msg\", \"\")))\n    return {\"runtime\": \"python3.12\", \"echo\": event.get(\"msg\", \"\"), \"count\": event.get(\"n\", 0) + 1}\n";
+  let js_code = "exports.handler = async (event, context) => {\n  console.log(\"js-log-entry:\" + (event.msg || \"\"));\n  return { runtime: \"nodejs20.x\", echo: event.msg || \"\", count: (event.n || 0) + 10 };\n};\n";
+
+  let py_cfg = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code(py_code)
+    .set_memory_mb(256);
+  let js_cfg = cloud.function_config("nodejs20.x", "index.handler")
+    .set_inline_code(js_code)
+    .set_memory_mb(128);
+
+  cloud.function_create(py_name, py_cfg);
+  cloud.function_create(js_name, js_cfg);
+
+  let r_py = cloud.function_invoke(py_name, "{\"msg\":\"hello-py\",\"n\":41}");
+  let py_ok = r_py.status_code() == 200 &&
+              !r_py.is_error() &&
+              str_len(r_py.function_error()) == 0 &&
+              r_py.executed_version() == "$LATEST" &&
+              r_py.duration_ms() >= 0.0 &&
+              r_py.billed_ms() >= 1 &&
+              r_py.memory_mb() == 256 &&
+              str_contains(r_py.payload(), "\"hello-py\"") &&
+              str_contains(r_py.payload(), "42") &&
+              str_contains(r_py.logs(), "py-log-entry:hello-py");
+
+  let r_js = cloud.function_invoke(js_name, "$LATEST", "{\"msg\":\"hello-js\",\"n\":5}");
+  let js_ok = r_js.status_code() == 200 &&
+              !r_js.is_error() &&
+              str_len(r_js.function_error()) == 0 &&
+              r_js.executed_version() == "$LATEST" &&
+              r_js.duration_ms() >= 0.0 &&
+              r_js.billed_ms() >= 1 &&
+              r_js.memory_mb() == 128 &&
+              str_contains(r_js.payload(), "\"hello-js\"") &&
+              str_contains(r_js.payload(), "15") &&
+              str_contains(r_js.logs(), "js-log-entry:hello-js");
+
+  let del_py = cloud.function_delete(py_name);
+  let del_js = cloud.function_delete(js_name);
+
+  lmcode_return_put("py_ok", py_ok);
+  lmcode_return_put("js_ok", js_ok);
+  lmcode_return_put("cleanup_ok", del_py && del_js);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "04-function-invoke-sync-json-and-logs host execution failed");
+assert(r.result.py_ok, "python3.12 synchronous invoke must return 200, JSON payload, tail logs, executed_version, and metrics");
+assert(r.result.js_ok, "nodejs20.x synchronous invoke must return 200, JSON payload, tail logs, executed_version, and metrics");
+assert(r.result.cleanup_ok, "function_delete should succeed for both functions");

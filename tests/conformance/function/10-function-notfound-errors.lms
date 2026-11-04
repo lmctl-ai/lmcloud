@@ -1,0 +1,98 @@
+# Requires: function
+# Scenario 10: Missing-function, missing-qualifier, and missing-package-object error contracts (NOT_FOUND vs exists()==false/OK).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+missing_fn = "lmf10" + run_id + "miss";
+live_fn = "lmf10" + run_id + "live";
+missing_bkt = "lmcloud-fn10-" + run_id + "-nobkt";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("all", ep);
+  }
+  let mfn = ${missing_fn};
+  let lfn = ${live_fn};
+  let mbkt = ${missing_bkt};
+
+  let code = "def handler(event, context):\n    return {\"ok\": True}\n";
+  let cfg = cloud.function_config("python3.12", "index.handler").set_inline_code(code);
+
+  cloud.set_abort_on_error(false);
+
+  # 1. Probe operations on a missing function return false / exists()==false with ErrorCode.OK
+  let ex_miss = cloud.function_exists(mfn);
+  let ex_err = cloud.last_error();
+  let get_miss = cloud.function_get(mfn);
+  let get_err = cloud.last_error();
+  let del_miss = cloud.function_delete(mfn);
+  let del_err = cloud.last_error();
+  let probes_ok = !ex_miss && ex_err.code() == ErrorCode.OK &&
+                  !get_miss.exists() && get_err.code() == ErrorCode.OK &&
+                  !del_miss && del_err.code() == ErrorCode.OK;
+
+  # 2. Mutating/invoking/version/alias operations on a missing function fail with ErrorCode.NOT_FOUND
+  let nf_count = 0;
+  cloud.function_update(mfn, cfg);
+  if (cloud.last_error().code() == ErrorCode.NOT_FOUND) { nf_count = nf_count + 1; }
+
+  cloud.function_invoke(mfn, "{}");
+  if (cloud.last_error().code() == ErrorCode.NOT_FOUND) { nf_count = nf_count + 1; }
+
+  cloud.function_publish_version(mfn);
+  if (cloud.last_error().code() == ErrorCode.NOT_FOUND) { nf_count = nf_count + 1; }
+
+  cloud.function_versions(mfn);
+  if (cloud.last_error().code() == ErrorCode.NOT_FOUND) { nf_count = nf_count + 1; }
+
+  cloud.function_alias_set(mfn, "prod", "1");
+  if (cloud.last_error().code() == ErrorCode.NOT_FOUND) { nf_count = nf_count + 1; }
+
+  cloud.function_alias_get(mfn, "prod");
+  if (cloud.last_error().code() == ErrorCode.NOT_FOUND) { nf_count = nf_count + 1; }
+
+  cloud.function_alias_delete(mfn, "prod");
+  if (cloud.last_error().code() == ErrorCode.NOT_FOUND) { nf_count = nf_count + 1; }
+
+  # 3. Missing package bucket on function_create fails with ErrorCode.NOT_FOUND
+  let pkg_cfg = cloud.function_config("python3.12", "index.handler")
+    .set_package_object(mbkt, "missing.zip");
+  cloud.function_create(mfn, pkg_cfg);
+  if (cloud.last_error().code() == ErrorCode.NOT_FOUND) { nf_count = nf_count + 1; }
+
+  # 4. On an existing function: missing version/alias invoke or alias_set -> NOT_FOUND; missing get/alias_get/alias_delete -> OK
+  cloud.function_create(lfn, cfg);
+
+  let get_bad_ver = cloud.function_get(lfn, "99");
+  let get_bad_ver_ok = !get_bad_ver.exists() && cloud.last_error().code() == ErrorCode.OK;
+
+  let alias_get_abs = cloud.function_alias_get(lfn, "prod");
+  let alias_get_abs_ok = str_len(alias_get_abs) == 0 && cloud.last_error().code() == ErrorCode.OK;
+
+  let alias_del_abs = cloud.function_alias_delete(lfn, "prod");
+  let alias_del_abs_ok = !alias_del_abs && cloud.last_error().code() == ErrorCode.OK;
+
+  cloud.function_invoke(lfn, "99", "{}");
+  if (cloud.last_error().code() == ErrorCode.NOT_FOUND) { nf_count = nf_count + 1; }
+
+  cloud.function_invoke(lfn, "prod", "{}");
+  if (cloud.last_error().code() == ErrorCode.NOT_FOUND) { nf_count = nf_count + 1; }
+
+  cloud.function_alias_set(lfn, "prod", "99");
+  if (cloud.last_error().code() == ErrorCode.NOT_FOUND) { nf_count = nf_count + 1; }
+
+  cloud.set_abort_on_error(true);
+  let deleted = cloud.function_delete(lfn);
+
+  lmcode_return_put("probes_ok", probes_ok);
+  lmcode_return_put("nf_count", nf_count);
+  lmcode_return_put("existing_probes_ok", get_bad_ver_ok && alias_get_abs_ok && alias_del_abs_ok);
+  lmcode_return_put("deleted", deleted);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "10-function-notfound-errors host execution failed");
+assert(r.result.probes_ok, "function_exists, function_get, and function_delete on a missing function must succeed with ErrorCode.OK and false/exists()==false");
+assert(r.result.nf_count == 11, "all 11 operations targeting a missing function, missing version/alias, or missing package bucket must fail with ErrorCode.NOT_FOUND");
+assert(r.result.existing_probes_ok, "qualified function_get, function_alias_get, and function_alias_delete for absent qualifier/alias on existing function must return empty/false with ErrorCode.OK");
+assert(r.result.deleted, "function_delete should succeed");

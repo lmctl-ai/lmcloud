@@ -609,6 +609,236 @@
         ]
       }
     },
+    "FunctionConfig": {
+      "methods": {
+        "name": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "exists": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ],
+        "state": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "runtime": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "set_runtime": [
+          {
+            "params": ["string"],
+            "returns": "self"
+          }
+        ],
+        "handler": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "set_handler": [
+          {
+            "params": ["string"],
+            "returns": "self"
+          }
+        ],
+        "code_source": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "inline_code": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "set_inline_code": [
+          {
+            "params": ["string"],
+            "returns": "self"
+          }
+        ],
+        "package_bucket": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "package_key": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "set_package_object": [
+          {
+            "params": ["string", "string"],
+            "returns": "self"
+          }
+        ],
+        "code_sha256": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "timeout_seconds": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "set_timeout_seconds": [
+          {
+            "params": ["int"],
+            "returns": "self"
+          }
+        ],
+        "memory_mb": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "set_memory_mb": [
+          {
+            "params": ["int"],
+            "returns": "self"
+          }
+        ],
+        "concurrency": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "set_concurrency": [
+          {
+            "params": ["int"],
+            "returns": "self"
+          }
+        ],
+        "env": [
+          {
+            "params": ["string"],
+            "returns": "string"
+          }
+        ],
+        "has_env": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "set_env": [
+          {
+            "params": ["string", "string"],
+            "returns": "self"
+          }
+        ],
+        "remove_env": [
+          {
+            "params": ["string"],
+            "returns": "self"
+          }
+        ],
+        "env_names": [
+          {
+            "params": [],
+            "returns": "StrList"
+          }
+        ],
+        "env_len": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "version": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "revision_id": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ]
+      }
+    },
+    "FunctionInvokeResult": {
+      "methods": {
+        "status_code": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "payload": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "logs": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "function_error": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "is_error": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ],
+        "executed_version": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "duration_ms": [
+          {
+            "params": [],
+            "returns": "float"
+          }
+        ],
+        "billed_ms": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "memory_mb": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ]
+      }
+    },
     "Cloud": {
       "methods": {
         "provider": [
@@ -899,6 +1129,100 @@
           {
             "params": ["string", "int", "string"],
             "returns": "TablePage"
+          }
+        ],
+        "function_config": [
+          {
+            "params": ["string", "string"],
+            "returns": "FunctionConfig"
+          }
+        ],
+        "function_create": [
+          {
+            "params": ["string", "FunctionConfig"],
+            "returns": "bool"
+          }
+        ],
+        "function_update": [
+          {
+            "params": ["string", "FunctionConfig"],
+            "returns": "FunctionConfig"
+          },
+          {
+            "params": ["string", "FunctionConfig", "string"],
+            "returns": "FunctionConfig"
+          }
+        ],
+        "function_delete": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "function_exists": [
+          {
+            "params": ["string"],
+            "returns": "bool"
+          }
+        ],
+        "function_get": [
+          {
+            "params": ["string"],
+            "returns": "FunctionConfig"
+          },
+          {
+            "params": ["string", "string"],
+            "returns": "FunctionConfig"
+          }
+        ],
+        "function_list": [
+          {
+            "params": [],
+            "returns": "StrList"
+          }
+        ],
+        "function_publish_version": [
+          {
+            "params": ["string"],
+            "returns": "string"
+          },
+          {
+            "params": ["string", "string"],
+            "returns": "string"
+          }
+        ],
+        "function_versions": [
+          {
+            "params": ["string"],
+            "returns": "StrList"
+          }
+        ],
+        "function_alias_set": [
+          {
+            "params": ["string", "string", "string"],
+            "returns": "void"
+          }
+        ],
+        "function_alias_get": [
+          {
+            "params": ["string", "string"],
+            "returns": "string"
+          }
+        ],
+        "function_alias_delete": [
+          {
+            "params": ["string", "string"],
+            "returns": "bool"
+          }
+        ],
+        "function_invoke": [
+          {
+            "params": ["string", "string"],
+            "returns": "FunctionInvokeResult"
+          },
+          {
+            "params": ["string", "string", "string"],
+            "returns": "FunctionInvokeResult"
           }
         ]
       }

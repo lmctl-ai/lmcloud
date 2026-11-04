@@ -1,0 +1,50 @@
+# Requires: function
+# Scenario 05: Synchronous invocation application error handling — raising an error inside the handler returns FunctionInvokeResult with is_error()==true, function_error()!="", logs(), and last_error().code()==ErrorCode.OK.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+fname = "lmf05" + run_id + "err";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("function", ep);
+  }
+  let fn_name = ${fname};
+
+  let code = "def handler(event, context):\n    print(\"before-check:\" + str(event.get(\"fail\", False)))\n    if event.get(\"fail\", False):\n        raise ValueError(\"synthetic-handler-failure\")\n    return {\"ok\": True}\n";
+
+  let cfg = cloud.function_config("python3.12", "index.handler").set_inline_code(code);
+  cloud.function_create(fn_name, cfg);
+
+  # 1. Successful invocation
+  let res_ok = cloud.function_invoke(fn_name, "{\"fail\":false}");
+  let ok_pass = res_ok.status_code() == 200 &&
+                !res_ok.is_error() &&
+                str_len(res_ok.function_error()) == 0 &&
+                str_contains(res_ok.payload(), "true") &&
+                str_contains(res_ok.logs(), "before-check:False");
+
+  # 2. Handler raises ValueError -> application-level error inside FunctionInvokeResult; host last_error() remains ErrorCode.OK
+  let res_err = cloud.function_invoke(fn_name, "{\"fail\":true}");
+  let host_err = cloud.last_error();
+  let ferr = res_err.function_error();
+  let err_pass = host_err.code() == ErrorCode.OK &&
+                 res_err.status_code() == 200 &&
+                 res_err.is_error() &&
+                 (ferr == "Handled" || ferr == "Unhandled") &&
+                 str_len(res_err.payload()) > 0 &&
+                 str_contains(res_err.logs(), "before-check:True") &&
+                 res_err.billed_ms() >= 1;
+
+  let deleted = cloud.function_delete(fn_name);
+
+  lmcode_return_put("ok_pass", ok_pass);
+  lmcode_return_put("err_pass", err_pass);
+  lmcode_return_put("deleted", deleted);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "05-function-invoke-error-handling host execution failed");
+assert(r.result.ok_pass, "non-failing invocation should succeed with is_error()==false");
+assert(r.result.err_pass, "handler exception must return FunctionInvokeResult with is_error()==true, function_error() in {Handled,Unhandled}, captured logs, and host ErrorCode.OK");
+assert(r.result.deleted, "function_delete should succeed");

@@ -1,0 +1,99 @@
+# Requires: function
+# Scenario 03: Configuration conflict on function_create (CONFLICT) and unconditional/conditional function_update (PRECONDITION_FAILED on stale revision_id).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+fname = "lmf03" + run_id + "cfg";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("function", ep);
+  }
+  let fn_name = ${fname};
+
+  let code_a = "def handler(event, context):\n    return {\"rev\": \"a\"}\n";
+  let code_b = "def handler(event, context):\n    return {\"rev\": \"b\"}\n";
+  let code_c = "def handler(event, context):\n    return {\"rev\": \"c\"}\n";
+
+  let base_cfg = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code(code_a)
+    .set_timeout_seconds(5)
+    .set_memory_mb(128)
+    .set_env("MODE", "alpha");
+
+  let created = cloud.function_create(fn_name, base_cfg);
+  let same_create = cloud.function_create(fn_name, base_cfg);
+  let got0 = cloud.function_get(fn_name);
+  let rev0 = got0.revision_id();
+
+  cloud.set_abort_on_error(false);
+
+  # 1. Conflict on different code
+  let diff_code = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code(code_b)
+    .set_timeout_seconds(5)
+    .set_memory_mb(128)
+    .set_env("MODE", "alpha");
+  cloud.function_create(fn_name, diff_code);
+  let conflict_code = cloud.last_error().code() == ErrorCode.CONFLICT;
+
+  # 2. Conflict on different memory_mb
+  let diff_mem = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code(code_a)
+    .set_timeout_seconds(5)
+    .set_memory_mb(256)
+    .set_env("MODE", "alpha");
+  cloud.function_create(fn_name, diff_mem);
+  let conflict_mem = cloud.last_error().code() == ErrorCode.CONFLICT;
+
+  # 3. Conflict on different env var
+  let diff_env = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code(code_a)
+    .set_timeout_seconds(5)
+    .set_memory_mb(128)
+    .set_env("MODE", "beta");
+  cloud.function_create(fn_name, diff_env);
+  let conflict_env = cloud.last_error().code() == ErrorCode.CONFLICT;
+
+  # 4. Unconditional function_update mutates code+config and rotates revision_id
+  let upd1_cfg = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code(code_b)
+    .set_timeout_seconds(10)
+    .set_memory_mb(256)
+    .set_env("MODE", "beta");
+  let upd1 = cloud.function_update(fn_name, upd1_cfg);
+  let upd1_err = cloud.last_error();
+  let rev1 = upd1.revision_id();
+
+  # 5. Conditional function_update with stale rev0 must fail PRECONDITION_FAILED
+  let upd_stale_cfg = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code(code_c)
+    .set_timeout_seconds(15)
+    .set_memory_mb(512);
+  let upd_stale = cloud.function_update(fn_name, upd_stale_cfg, rev0);
+  let stale_precond = cloud.last_error().code() == ErrorCode.PRECONDITION_FAILED && !upd_stale.exists();
+
+  # 6. Conditional function_update with current rev1 succeeds and rotates to rev2
+  let upd2 = cloud.function_update(fn_name, upd_stale_cfg, rev1);
+  let upd2_err = cloud.last_error();
+  let rev2 = upd2.revision_id();
+
+  cloud.set_abort_on_error(true);
+  let deleted = cloud.function_delete(fn_name);
+
+  lmcode_return_put("created_ok", created && !same_create && str_len(rev0) > 0);
+  lmcode_return_put("conflicts_ok", conflict_code && conflict_mem && conflict_env);
+  lmcode_return_put("upd1_ok", upd1_err.ok() && upd1.exists() && upd1.timeout_seconds() == 10 && upd1.memory_mb() == 256 && upd1.env("MODE") == "beta" && rev1 != rev0);
+  lmcode_return_put("stale_precond", stale_precond);
+  lmcode_return_put("upd2_ok", upd2_err.ok() && upd2.exists() && upd2.timeout_seconds() == 15 && upd2.memory_mb() == 512 && rev2 != rev1 && rev2 != rev0);
+  lmcode_return_put("deleted", deleted);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "03-function-config-conflict-and-update host execution failed");
+assert(r.result.created_ok, "initial create should return true and idempotent create should return false");
+assert(r.result.conflicts_ok, "function_create with mismatched code, memory, or env must fail with CONFLICT");
+assert(r.result.upd1_ok, "unconditional function_update should update config and rotate revision_id");
+assert(r.result.stale_precond, "conditional function_update with stale expect_revision must fail with PRECONDITION_FAILED");
+assert(r.result.upd2_ok, "conditional function_update with matching expect_revision should succeed and rotate revision_id");
+assert(r.result.deleted, "function_delete should succeed");

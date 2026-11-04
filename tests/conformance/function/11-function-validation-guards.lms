@@ -1,0 +1,102 @@
+# Requires: function
+# Scenario 11: Pre-flight validation guards — invalid function names, reserved names, invalid runtimes/handlers, missing/oversize code, invalid memory/timeout/concurrency, reserved/oversize env vars, invalid aliases, and invalid invoke payloads: all fail locally with INVALID_ARGUMENT and http_status() == 0.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+fname = "lmf11" + run_id + "val";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("function", ep);
+  }
+  let fn_name = ${fname};
+  let valid_code = "def handler(event, context):\n    return {}\n";
+  let valid_cfg = cloud.function_config("python3.12", "index.handler").set_inline_code(valid_code);
+  cloud.function_create(fn_name, valid_cfg);
+
+  cloud.set_abort_on_error(false);
+  let fails = 0;
+  let want = 24;
+
+  # 1-6: invalid & reserved function names ("ab", "1abc", "BadName", "bad-hyphen", 33-char, reserved "lmcloudfnmeta")
+  let bad_fn_names = str_list()
+    .add("ab")
+    .add("1abc")
+    .add("BadName")
+    .add("bad-hyphen")
+    .add("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    .add("lmcloudfnmeta");
+  let i = 0;
+  while (i < bad_fn_names.len()) {
+    cloud.function_create(bad_fn_names.at(i), valid_cfg);
+    let e = cloud.last_error();
+    if (e.code() == ErrorCode.INVALID_ARGUMENT && e.http_status() == 0) { fails = fails + 1; }
+    i = i + 1;
+  }
+
+  # 7-8: invalid runtimes ("", "python2.7")
+  cloud.function_config("", "index.handler");
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+  cloud.function_config("python2.7", "index.handler");
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+
+  # 9-10: invalid handlers ("no_dot", "../evil.handler")
+  cloud.function_config("python3.12", "no_dot");
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+  cloud.function_config("python3.12", "../evil.handler");
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+
+  # 11-12: unset code source on function_create, and empty inline code ""
+  let unset_cfg = cloud.function_config("python3.12", "index.handler");
+  cloud.function_create(fn_name, unset_cfg);
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+  cloud.function_config("python3.12", "index.handler").set_inline_code("");
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+
+  # 13-14: invalid memory shapes (129 MiB, 4096 MiB)
+  cloud.function_config("python3.12", "index.handler").set_memory_mb(129);
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+  cloud.function_config("python3.12", "index.handler").set_memory_mb(4096);
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+
+  # 15-16: invalid timeout_seconds (0, 231)
+  cloud.function_config("python3.12", "index.handler").set_timeout_seconds(0);
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+  cloud.function_config("python3.12", "index.handler").set_timeout_seconds(231);
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+
+  # 17-18: invalid concurrency (-2, 101)
+  cloud.function_config("python3.12", "index.handler").set_concurrency(-2);
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+  cloud.function_config("python3.12", "index.handler").set_concurrency(101);
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+
+  # 19-21: invalid/reserved/oversize env vars ("1BAD", "AWS_REGION", >4096 bytes)
+  cloud.function_config("python3.12", "index.handler").set_env("1BAD", "v");
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+  cloud.function_config("python3.12", "index.handler").set_env("AWS_REGION", "us-east-1");
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+  let big_env_val = str_repeat("x", 4095);
+  cloud.function_config("python3.12", "index.handler").set_env("KEY4", big_env_val);
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+
+  # 22: invalid alias name ("123" or "latest")
+  cloud.function_alias_set(fn_name, "latest", "1");
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+
+  # 23-24: invalid invoke payload ("" empty string, "{bad-json")
+  cloud.function_invoke(fn_name, "");
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+  cloud.function_invoke(fn_name, "{bad-json");
+  if (cloud.last_error().code() == ErrorCode.INVALID_ARGUMENT && cloud.last_error().http_status() == 0) { fails = fails + 1; }
+
+  cloud.set_abort_on_error(true);
+  cloud.function_delete(fn_name);
+
+  lmcode_return_put("fails", fails);
+  lmcode_return_put("want", want);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "11-function-validation-guards host execution failed");
+assert(r.result.fails == r.result.want, "all 24 invalid inputs must fail pre-flight with INVALID_ARGUMENT and http_status()==0");

@@ -1,0 +1,79 @@
+# Requires: function
+# Scenario 06: Environment variables — set_env, remove_env, sorted env_names(), readback via function_get, runtime visibility via function_invoke, and removal on function_update.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+fname = "lmf06" + run_id + "env";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("function", ep);
+  }
+  let fn_name = ${fname};
+
+  let code = "import os\ndef handler(event, context):\n    return {\n        \"app_env\": os.environ.get(\"APP_ENV\", \"\"),\n        \"feature_x\": os.environ.get(\"FEATURE_X\", \"\"),\n        \"zeta_key\": os.environ.get(\"ZETA_KEY\", \"missing\")\n    }\n";
+
+  let cfg = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code(code)
+    .set_env("ZETA_KEY", "zval")
+    .set_env("APP_ENV", "staging")
+    .set_env("TEMP_DROP", "to-be-removed")
+    .set_env("FEATURE_X", "enabled")
+    .remove_env("TEMP_DROP");
+
+  let names_local = cfg.env_names();
+  let local_ok = cfg.env_len() == 3 &&
+                 cfg.has_env("APP_ENV") &&
+                 !cfg.has_env("TEMP_DROP") &&
+                 names_local.len() == 3 &&
+                 names_local.at(0) == "APP_ENV" &&
+                 names_local.at(1) == "FEATURE_X" &&
+                 names_local.at(2) == "ZETA_KEY";
+
+  cloud.function_create(fn_name, cfg);
+  let got1 = cloud.function_get(fn_name);
+  let names_remote = got1.env_names();
+  let remote1_ok = got1.env_len() == 3 &&
+                   got1.env("APP_ENV") == "staging" &&
+                   got1.env("FEATURE_X") == "enabled" &&
+                   got1.env("ZETA_KEY") == "zval" &&
+                   names_remote.at(0) == "APP_ENV" &&
+                   names_remote.at(1) == "FEATURE_X" &&
+                   names_remote.at(2) == "ZETA_KEY";
+
+  let inv1 = cloud.function_invoke(fn_name, "{}");
+  let inv1_ok = !inv1.is_error() &&
+                str_contains(inv1.payload(), "\"staging\"") &&
+                str_contains(inv1.payload(), "\"enabled\"") &&
+                str_contains(inv1.payload(), "\"zval\"");
+
+  # Remove ZETA_KEY and update APP_ENV to "production"
+  let cfg2 = got1.remove_env("ZETA_KEY").set_env("APP_ENV", "production");
+  let got2 = cloud.function_update(fn_name, cfg2);
+  let remote2_ok = got2.env_len() == 2 &&
+                   got2.env("APP_ENV") == "production" &&
+                   !got2.has_env("ZETA_KEY");
+
+  let inv2 = cloud.function_invoke(fn_name, "{}");
+  let inv2_ok = !inv2.is_error() &&
+                str_contains(inv2.payload(), "\"production\"") &&
+                str_contains(inv2.payload(), "\"missing\"");
+
+  let deleted = cloud.function_delete(fn_name);
+
+  lmcode_return_put("local_ok", local_ok);
+  lmcode_return_put("remote1_ok", remote1_ok);
+  lmcode_return_put("inv1_ok", inv1_ok);
+  lmcode_return_put("remote2_ok", remote2_ok);
+  lmcode_return_put("inv2_ok", inv2_ok);
+  lmcode_return_put("deleted", deleted);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "06-function-env-vars-isolation host execution failed");
+assert(r.result.local_ok, "local FunctionConfig env builder should sort env_names() and honor remove_env()");
+assert(r.result.remote1_ok, "function_get should round-trip configured user env vars in sorted order");
+assert(r.result.inv1_ok, "function_invoke runtime environment should expose configured user env vars");
+assert(r.result.remote2_ok, "function_update after remove_env should remove the deleted env var on the provider");
+assert(r.result.inv2_ok, "function_invoke after remove_env should no longer see the removed env var");
+assert(r.result.deleted, "function_delete should succeed");

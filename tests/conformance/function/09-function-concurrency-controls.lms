@@ -1,0 +1,57 @@
+# Requires: function
+# Scenario 09: Function concurrency controls — set_concurrency(0 | 1..100 | -1), readback via function_get, and throttling enforcement (ErrorCode.PRECONDITION_FAILED with HTTP 429 when concurrency == -1).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+fname = "lmf09" + run_id + "conc";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("function", ep);
+  }
+  let fn_name = ${fname};
+
+  let code = "def handler(event, context):\n    return {\"ok\": True}\n";
+
+  let cfg5 = cloud.function_config("python3.12", "index.handler")
+    .set_inline_code(code)
+    .set_concurrency(5);
+  cloud.function_create(fn_name, cfg5);
+
+  let got5 = cloud.function_get(fn_name);
+  let inv5 = cloud.function_invoke(fn_name, "{}");
+  let cap5_ok = got5.concurrency() == 5 && !inv5.is_error() && inv5.status_code() == 200;
+
+  # Set concurrency to -1 (ReservedConcurrentExecutions = 0 -> throttle all invocations with 429 -> PRECONDITION_FAILED)
+  let cfg_throttle = got5.set_concurrency(-1);
+  let got_throttle = cloud.function_update(fn_name, cfg_throttle);
+
+  cloud.set_abort_on_error(false);
+  let inv_throttled = cloud.function_invoke(fn_name, "{}");
+  let throttle_err = cloud.last_error();
+  let throttled_ok = got_throttle.concurrency() == -1 &&
+                     throttle_err.code() == ErrorCode.PRECONDITION_FAILED &&
+                     throttle_err.http_status() == 429 &&
+                     inv_throttled.status_code() == 0;
+  cloud.set_abort_on_error(true);
+
+  # Restore concurrency to 0 (unreserved) and verify invocation succeeds again
+  let cfg0 = got_throttle.set_concurrency(0);
+  let got0 = cloud.function_update(fn_name, cfg0);
+  let inv0 = cloud.function_invoke(fn_name, "{}");
+  let cap0_ok = got0.concurrency() == 0 && !inv0.is_error() && inv0.status_code() == 200;
+
+  let deleted = cloud.function_delete(fn_name);
+
+  lmcode_return_put("cap5_ok", cap5_ok);
+  lmcode_return_put("throttled_ok", throttled_ok);
+  lmcode_return_put("cap0_ok", cap0_ok);
+  lmcode_return_put("deleted", deleted);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "09-function-concurrency-controls host execution failed");
+assert(r.result.cap5_ok, "function created with concurrency=5 should report concurrency()==5 and allow invocation");
+assert(r.result.throttled_ok, "updating concurrency to -1 must throttle function_invoke with ErrorCode.PRECONDITION_FAILED (HTTP 429)");
+assert(r.result.cap0_ok, "restoring concurrency to 0 should clear throttling and allow invocation");
+assert(r.result.deleted, "function_delete should succeed");
