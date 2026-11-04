@@ -179,6 +179,52 @@ func (up *userpoolState) toInfo() hostkit.UserpoolInfo {
 	}
 }
 
+func isForeignPoolUser(up *userpoolState, username string, u *poolUserState) bool {
+	if up == nil || u == nil {
+		return true
+	}
+	if up.ForeignUsers[username] {
+		return true
+	}
+	if !validOwnerToken(up.OwnerToken) || !validOwnerToken(u.OwnerToken) || u.OwnerToken != up.OwnerToken {
+		return true
+	}
+	return false
+}
+
+func isForeignPoolGroup(up *userpoolState, group string, g *poolGroupState) bool {
+	if up == nil || g == nil {
+		return true
+	}
+	if up.ForeignGroups[group] {
+		return true
+	}
+	if !validOwnerToken(up.OwnerToken) || !validOwnerToken(g.OwnerToken) || g.OwnerToken != up.OwnerToken {
+		return true
+	}
+	return false
+}
+
+func hasAnyForeignPoolChildren(up *userpoolState) bool {
+	if up == nil {
+		return false
+	}
+	if len(up.ForeignUsers) > 0 || len(up.ForeignGroups) > 0 {
+		return true
+	}
+	for uname, u := range up.Users {
+		if u != nil && isForeignPoolUser(up, uname, u) {
+			return true
+		}
+	}
+	for gname, g := range up.Groups {
+		if g != nil && isForeignPoolGroup(up, gname, g) {
+			return true
+		}
+	}
+	return false
+}
+
 func verifyUserpoolWriteFence(ctx context.Context, up *userpoolState, name, expOwner, expInc string, gen uint64) error {
 	fence := hostkit.UserpoolMutationFenceFrom(ctx)
 	if expOwner == "" {
@@ -197,7 +243,7 @@ func verifyUserpoolWriteFence(ctx context.Context, up *userpoolState, name, expO
 		return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
 			fmt.Sprintf("userpool %q owner token mismatch", name))
 	}
-	if expInc != "" && up.IncarnationID != "" && up.IncarnationID != expInc {
+	if !validOwnerToken(up.IncarnationID) || (expInc != "" && up.IncarnationID != expInc) {
 		return hostkit.ProviderError(hostkit.Conflict, 409, "StaleIncarnation",
 			fmt.Sprintf("userpool %q incarnation mismatch: got %q, want %q", name, up.IncarnationID, expInc))
 	}
@@ -450,6 +496,10 @@ func (f *Fake) CreateUserPool(ctx context.Context, in hostkit.UserpoolCreateInpu
 				return hostkit.ProviderError(hostkit.Conflict, 409, "ResourceConflictException",
 					fmt.Sprintf("userpool %q already exists under a different owner", name))
 			}
+			if !validOwnerToken(existing.IncarnationID) || (in.IncarnationID != "" && existing.IncarnationID != in.IncarnationID) {
+				return hostkit.ProviderError(hostkit.Conflict, 409, "ResourceConflictException",
+					fmt.Sprintf("userpool %q already exists with a different physical incarnation", name))
+			}
 			if in.Generation > 0 && in.Generation < existing.MaxGeneration {
 				return hostkit.ProviderError(hostkit.Conflict, 409, "StaleGeneration",
 					fmt.Sprintf("stale generation %d < %d for userpool %q", in.Generation, existing.MaxGeneration, name))
@@ -510,7 +560,7 @@ func (f *Fake) DeleteUserPool(ctx context.Context, name string) (bool, error) {
 			return err
 		}
 		ensureUserpoolMaps(up)
-		if len(up.ForeignUsers) > 0 || len(up.ForeignGroups) > 0 {
+		if hasAnyForeignPoolChildren(up) {
 			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignChildPresent",
 				fmt.Sprintf("userpool %q contains foreign child resources and cannot be deleted", name))
 		}
@@ -683,7 +733,7 @@ func (f *Fake) DeleteUser(ctx context.Context, pool, username string) error {
 			hostkit.ReportUserpoolChildMutationSeq(ctx, up.ChildSeq)
 			return nil
 		}
-		if up.ForeignUsers[username] {
+		if isForeignPoolUser(up, username, u) {
 			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
 				fmt.Sprintf("user %q in pool %q belongs to another owner", username, pool))
 		}
@@ -728,7 +778,7 @@ func (f *Fake) SetUserEnabled(ctx context.Context, pool, username string, enable
 		if !exists || u == nil {
 			return f.notFound(hostkit.AbsentUser, "UserNotFoundException", fmt.Sprintf("user %q not found in pool %q", username, pool))
 		}
-		if up.ForeignUsers[username] {
+		if isForeignPoolUser(up, username, u) {
 			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
 				fmt.Sprintf("user %q in pool %q belongs to another owner", username, pool))
 		}
@@ -774,7 +824,7 @@ func (f *Fake) SetUserPassword(ctx context.Context, pool, username, password str
 		if !exists || u == nil {
 			return f.notFound(hostkit.AbsentUser, "UserNotFoundException", fmt.Sprintf("user %q not found in pool %q", username, pool))
 		}
-		if up.ForeignUsers[username] {
+		if isForeignPoolUser(up, username, u) {
 			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
 				fmt.Sprintf("user %q in pool %q belongs to another owner", username, pool))
 		}
@@ -949,7 +999,7 @@ func (f *Fake) CreateGroup(ctx context.Context, in hostkit.GroupCreateInput) (bo
 		}
 		ensureUserpoolMaps(up)
 		if existing, exists := up.Groups[group]; exists && existing != nil {
-			if up.ForeignGroups[group] {
+			if isForeignPoolGroup(up, group, existing) {
 				return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
 					fmt.Sprintf("group %q in pool %q belongs to another owner", group, pool))
 			}
@@ -1018,7 +1068,7 @@ func (f *Fake) DeleteGroup(ctx context.Context, pool, group string) (bool, error
 			existed = false
 			return nil
 		}
-		if up.ForeignGroups[group] {
+		if isForeignPoolGroup(up, group, g) {
 			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
 				fmt.Sprintf("group %q in pool %q belongs to another owner", group, pool))
 		}
@@ -1077,11 +1127,21 @@ func (f *Fake) AddUserToGroup(ctx context.Context, pool, group, username string)
 			return err
 		}
 		ensureUserpoolMaps(up)
-		if _, gok := up.Groups[group]; !gok {
+		g, gok := up.Groups[group]
+		if !gok || g == nil {
 			return f.notFound(hostkit.AbsentGroup, "ResourceNotFoundException", fmt.Sprintf("group %q not found in pool %q", group, pool))
 		}
-		if _, uok := up.Users[username]; !uok {
+		if isForeignPoolGroup(up, group, g) {
+			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
+				fmt.Sprintf("group %q in pool %q belongs to another owner", group, pool))
+		}
+		u, uok := up.Users[username]
+		if !uok || u == nil {
 			return f.notFound(hostkit.AbsentUser, "UserNotFoundException", fmt.Sprintf("user %q not found in pool %q", username, pool))
+		}
+		if isForeignPoolUser(up, username, u) {
+			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
+				fmt.Sprintf("user %q in pool %q belongs to another owner", username, pool))
 		}
 		if up.Memberships[group] != nil && up.Memberships[group][username] {
 			fence := hostkit.UserpoolMutationFenceFrom(ctx)
@@ -1135,11 +1195,21 @@ func (f *Fake) RemoveUserFromGroup(ctx context.Context, pool, group, username st
 			return err
 		}
 		ensureUserpoolMaps(up)
-		if _, gok := up.Groups[group]; !gok {
+		g, gok := up.Groups[group]
+		if !gok || g == nil {
 			return f.notFound(hostkit.AbsentGroup, "ResourceNotFoundException", fmt.Sprintf("group %q not found in pool %q", group, pool))
 		}
-		if _, uok := up.Users[username]; !uok {
+		if isForeignPoolGroup(up, group, g) {
+			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
+				fmt.Sprintf("group %q in pool %q belongs to another owner", group, pool))
+		}
+		u, uok := up.Users[username]
+		if !uok || u == nil {
 			return f.notFound(hostkit.AbsentUser, "UserNotFoundException", fmt.Sprintf("user %q not found in pool %q", username, pool))
+		}
+		if isForeignPoolUser(up, username, u) {
+			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
+				fmt.Sprintf("user %q in pool %q belongs to another owner", username, pool))
 		}
 		if up.Memberships[group] == nil || !up.Memberships[group][username] {
 			fence := hostkit.UserpoolMutationFenceFrom(ctx)
@@ -1188,6 +1258,71 @@ func (f *Fake) ListUserGroups(_ context.Context, pool, username string) ([]strin
 		}
 		sort.Strings(groups)
 		out = groups
+		return nil
+	})
+	return out, err
+}
+
+// MintSessionWithoutKDFForTesting mints a valid RS256 session token for an existing
+// user in pool without running the 600,000-iteration PBKDF2 derivation (used only
+// by high-count session-binding eviction unit tests).
+func (f *Fake) MintSessionWithoutKDFForTesting(in hostkit.UserSignInInput) (hostkit.SessionSnapshot, error) {
+	var out hostkit.SessionSnapshot
+	err := f.doTarget("SignIn", in.Pool+"/"+in.Username, func(s *state) error {
+		up, ok := s.Userpools[in.Pool]
+		if !ok || up == nil {
+			return f.notFound(hostkit.AbsentUserpool, "ResourceNotFoundException", fmt.Sprintf("userpool %q not found", in.Pool))
+		}
+		ensureUserpoolMaps(up)
+		u, exists := up.Users[in.Username]
+		if !exists || u == nil || !u.HasPermanentPassword || !u.Enabled {
+			return hostkit.ProviderError(hostkit.Unauthenticated, 401, "NotAuthorizedException", "invalid username or password")
+		}
+		nowUnix := in.NowUnix
+		if nowUnix <= 0 {
+			nowUnix = f.opts.Now().Unix()
+		}
+		ttl := in.TTLSeconds
+		if ttl <= 0 || ttl > hostkit.DefaultSessionTTLSeconds {
+			ttl = hostkit.DefaultSessionTTLSeconds
+		}
+		expUnix := nowUnix + ttl
+		sgen := u.SessionGen
+		if sgen == 0 {
+			sgen = 1
+		}
+		claimsPayload := map[string]any{
+			"sub":       u.UID,
+			"username":  u.Username,
+			"iss":       up.Issuer,
+			"client_id": up.ClientID,
+			"token_use": "access",
+			"jti":       randomHex16(),
+			"iat":       nowUnix,
+			"exp":       expUnix,
+		}
+		token, err := hostkit.MintRS256JWT(up.PrivateKeyPEM, up.KeyID, claimsPayload)
+		if err != nil {
+			return hostkit.ProviderError(hostkit.Internal, 500, "TokenMintError", "failed to mint session token")
+		}
+		out = hostkit.SessionSnapshot{
+			AccessToken:   token,
+			ExpiresIn:     ttl,
+			PoolID:        up.PoolID,
+			IncarnationID: up.IncarnationID,
+			SessionGen:    sgen,
+			IssuedAt:      nowUnix,
+			ExpiresAt:     expUnix,
+			Claims: map[string]string{
+				"sub":       u.UID,
+				"username":  u.Username,
+				"iss":       up.Issuer,
+				"client_id": up.ClientID,
+				"token_use": "access",
+				"iat":       strconv.FormatInt(nowUnix, 10),
+				"exp":       strconv.FormatInt(expUnix, 10),
+			},
+		}
 		return nil
 	})
 	return out, err

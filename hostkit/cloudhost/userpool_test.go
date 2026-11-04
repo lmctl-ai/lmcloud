@@ -277,7 +277,7 @@ func TestUserpoolTokenSecurityExpiryRevocationRotationAndEviction(t *testing.T) 
 				"iss":       issuer,
 				"aud":       clientID,
 				"client_id": clientID,
-				"token_use": "id",
+				"token_use": "access",
 				"iat":       now.Unix(),
 				"exp":       now.Unix() + 3600,
 			})
@@ -305,11 +305,24 @@ func TestUserpoolTokenSecurityExpiryRevocationRotationAndEviction(t *testing.T) 
 			// 7. >128 live session bindings per user deterministically evicts oldest.
 			_, _ = h.UserCreate(false, "secpool", "bob", nil)
 			_ = h.UserSetPassword(false, "secpool", "bob", "BobPass123")
+			fastCfg := Config{
+				Provider:          "aws",
+				Store:             f,
+				Userpools:         &fastMintSignInAdapter{Fake: f},
+				CampaignStatePath: campaignPath,
+				Journal:           j,
+				Now:               func() time.Time { return now },
+			}
+			if useSafetyJournal {
+				fastCfg.CampaignStatePath = ""
+			}
+			hFast := New(fastCfg)
+			hFast.SetAbortOnError(false)
 			var bobTokens []string
 			for i := 0; i < hostkit.MaxSessionBindingsPerUser+1; i++ {
-				s, err := h.UserSignIn(false, "secpool", "bob", "BobPass123")
+				s, err := hFast.UserSignIn(false, "secpool", "bob", "BobPass123")
 				if err != nil {
-					t.Fatalf("bob sign-in %d: %v (%+v)", i, err, h.LastError())
+					t.Fatalf("bob sign-in %d: %v (%+v)", i, err, hFast.LastError())
 				}
 				bobTokens = append(bobTokens, s.AccessToken())
 			}
@@ -866,5 +879,412 @@ func TestSolUserpoolDryRunAndLiveRoutePreflightAll(t *testing.T) {
 	afterCalls := fSim.Calls()
 	if len(afterCalls) != len(beforeCalls) {
 		t.Fatalf("expected zero adapter calls in dry mode without peeker, before=%v after=%v", beforeCalls, afterCalls)
+	}
+}
+
+type fastMintSignInAdapter struct {
+	*fakeadapter.Fake
+}
+
+func (a *fastMintSignInAdapter) SignIn(_ context.Context, in hostkit.UserSignInInput) (hostkit.SessionSnapshot, error) {
+	return a.Fake.MintSessionWithoutKDFForTesting(in)
+}
+
+func TestSolUPLostRevocationReply(t *testing.T) {
+	for _, jm := range []bool{false, true} {
+		for _, op := range []string{"SetUserPassword", "SetUserEnabled", "DeleteUser"} {
+			t.Run(fmt.Sprintf("journal=%v/%s", jm, op), func(t *testing.T) {
+				h, f, _, campaign := newUserpoolHost(t)
+				cfg := Config{Provider: "aws", Store: f, Userpools: f, CampaignStatePath: campaign}
+				var j *safety.Journal
+				dir := filepath.Join(t.TempDir(), "journal")
+				if jm {
+					j = openUserpoolSafetyJournal(t, dir)
+					cfg.Journal = j
+					cfg.CampaignStatePath = ""
+					defer func() { _ = j.Close() }()
+				}
+				h = New(cfg)
+				h.SetAbortOnError(false)
+				_, _ = h.UserpoolCreate(false, "proofpool")
+				_, _ = h.UserCreate(false, "proofpool", "alice", nil)
+				_ = h.UserSetPassword(false, "proofpool", "alice", "Original123")
+				sess, _ := h.UserSignIn(false, "proofpool", "alice", "Original123")
+				if sess.AccessToken() == "" {
+					t.Fatal("fixture", h.LastError())
+				}
+				f.SetFaultUserpoolMutatorAfterCommitForTesting(func(got string) error {
+					if got == op {
+						return hostkit.ProviderError(hostkit.Internal, 503, "LostReply", "synthetic lost reply")
+					}
+					return nil
+				})
+				switch op {
+				case "SetUserPassword":
+					_ = h.UserSetPassword(false, "proofpool", "alice", "Changed456")
+				case "SetUserEnabled":
+					_ = h.UserSetEnabled(false, "proofpool", "alice", false)
+				case "DeleteUser":
+					_ = h.UserDelete(false, "proofpool", "alice")
+				}
+				if h.LastError().Code != hostkit.Internal {
+					t.Fatal("fault not reached", h.LastError())
+				}
+				f.SetFaultUserpoolMutatorAfterCommitForTesting(nil)
+				_, _ = h.UserVerifyToken(false, "proofpool", sess.AccessToken())
+				if h.LastError().Code == hostkit.OK {
+					t.Fatal("old token remains authorized immediately after committed revoke with lost reply")
+				}
+				if jm {
+					if e := j.Compact(); e != nil {
+						t.Fatal(e)
+					}
+					_ = j.Close()
+					j = openUserpoolSafetyJournal(t, dir)
+					cfg.Journal = j
+				}
+				h = New(cfg)
+				h.SetAbortOnError(false)
+				_, _ = h.UserVerifyToken(false, "proofpool", sess.AccessToken())
+				t.Logf("old token after native %s and reopen: %s", op, h.LastError().Code)
+				if h.LastError().Code == hostkit.OK {
+					t.Fatal("old token remains authorized after committed revoke with lost reply")
+				}
+			})
+		}
+	}
+}
+
+func TestSolUPPBKDF2TimingOracle(t *testing.T) {
+	h, f, _, _ := newUserpoolHost(t)
+	_, _ = h.UserpoolCreate(false, "timingpool")
+	_, _ = h.UserCreate(false, "timingpool", "alice", nil)
+	_ = h.UserSetPassword(false, "timingpool", "alice", "ActualPass123")
+	guess := "WrongGuess987"
+	_, _ = f.SignIn(context.Background(), hostkit.UserSignInInput{Pool: "timingpool", Username: "primeghost", Password: guess})
+	start := time.Now()
+	_, missing := f.SignIn(context.Background(), hostkit.UserSignInInput{Pool: "timingpool", Username: "nobody", Password: guess})
+	fast := time.Since(start)
+	start = time.Now()
+	_, existing := f.SignIn(context.Background(), hostkit.UserSignInInput{Pool: "timingpool", Username: "alice", Password: guess})
+	slow := time.Since(start)
+	if hostkit.AsCloudError(missing).Code != hostkit.Unauthenticated || hostkit.AsCloudError(existing).Code != hostkit.Unauthenticated {
+		t.Fatal("fixture")
+	}
+	t.Logf("primed unknown-user check=%s; existing-user cold-salt check=%s; ratio=%.1f", fast, slow, float64(slow)/float64(fast))
+	if slow > 20*time.Millisecond && slow > fast*10 {
+		t.Fatal("global dummy memo gives a clear username enumeration oracle")
+	}
+}
+
+func TestSolUPSanitizedProfilesAreReadback(t *testing.T) {
+	for _, jm := range []bool{false, true} {
+		t.Run(fmt.Sprintf("journal=%v", jm), func(t *testing.T) {
+			h, f, _, campaign := newUserpoolHost(t)
+			cfg := Config{Provider: "aws", Store: f, Userpools: f, CampaignStatePath: campaign}
+			var j *safety.Journal
+			dir := filepath.Join(t.TempDir(), "journal")
+			if jm {
+				j = openUserpoolSafetyJournal(t, dir)
+				cfg.Journal = j
+				cfg.CampaignStatePath = ""
+				defer func() { _ = j.Close() }()
+			}
+			h = New(cfg)
+			h.SetAbortOnError(false)
+			_, _ = h.UserpoolCreate(false, "profilepool")
+			_, _ = h.UserCreate(false, "profilepool", "alice", map[string]string{
+				"note": "a perfectly valid eyJ profile",
+				"bio":  strings.Repeat("x", 300),
+			})
+			act, ok, _, _, e := h.cost.lookupUserpoolEntry("", "profilepool")
+			if e != nil || !ok {
+				t.Fatal("fixture", e)
+			}
+			st, _ := decodePersistedUserpoolState(act.StateJSON)
+			t.Logf("persisted attrs=%v campaign=%s", st.Users["alice"].Attributes, filepath.Base(campaign))
+			if !strings.Contains(st.Users["alice"].Attributes["note"], "eyJ") || len(st.Users["alice"].Attributes["bio"]) != 300 {
+				t.Fatalf("persisted user snapshot lost valid attributes: %+v", st.Users["alice"].Attributes)
+			}
+			u, _ := h.UserGet(false, "profilepool", "alice")
+			if !strings.Contains(u.Attribute("note"), "eyJ") || len(u.Attribute("bio")) != 300 {
+				t.Fatal("live readback lost value")
+			}
+			// Also verify dry readback without Peeker after reopen/compact.
+			if jm {
+				if err := j.Compact(); err != nil {
+					t.Fatal(err)
+				}
+				_ = j.Close()
+				j = openUserpoolSafetyJournal(t, dir)
+				cfg.Journal = j
+			}
+			cfg.Userpools = solUserpoolsOnly{Userpools: f}
+			hDry := New(cfg)
+			hDry.SetAbortOnError(false)
+			uDry, err := hDry.UserGet(true, "profilepool", "alice")
+			if err != nil || !strings.Contains(uDry.Attribute("note"), "eyJ") || len(uDry.Attribute("bio")) != 300 {
+				t.Fatalf("dry readback without peeker lost value: note=%q len(bio)=%d err=%v", uDry.Attribute("note"), len(uDry.Attribute("bio")), err)
+			}
+		})
+	}
+}
+
+func TestSolUPForeignReadsAndUnmarkedChildDelete(t *testing.T) {
+	t.Run("foreign_pool_read", func(t *testing.T) {
+		h, f, _, _ := newUserpoolHost(t)
+		if e := f.InjectUnmarkedUserpoolForTesting("foreignpool", strings.Repeat("f", 32)); e != nil {
+			t.Fatal(e)
+		}
+		if e := f.InjectForeignPoolChildForTesting("foreignpool", "user", "alice", strings.Repeat("f", 32)); e != nil {
+			t.Fatal(e)
+		}
+		u, _ := h.UserGet(false, "foreignpool", "alice")
+		t.Logf("foreign pool user_get exists=%v attrs=%v code=%s", u.Exists(), u.Attributes(), h.LastError().Code)
+		if h.LastError().Code == hostkit.OK && u.Exists() {
+			t.Fatal("read foreign pool user without journal ownership")
+		}
+		if h.LastError().Code != hostkit.PermissionDenied {
+			t.Fatalf("expected PERMISSION_DENIED on foreign UserGet, got %+v", h.LastError())
+		}
+		_, _ = h.GroupList(false, "foreignpool")
+		if h.LastError().Code != hostkit.PermissionDenied {
+			t.Fatalf("expected PERMISSION_DENIED on foreign GroupList, got %+v", h.LastError())
+		}
+		_, _ = h.UserGroups(false, "foreignpool", "alice")
+		if h.LastError().Code != hostkit.PermissionDenied {
+			t.Fatalf("expected PERMISSION_DENIED on foreign UserGroups, got %+v", h.LastError())
+		}
+	})
+	for _, owner := range []string{"", strings.Repeat("f", 32)} {
+		t.Run("unmarked_child_owner="+owner, func(t *testing.T) {
+			h, f, state, _ := newUserpoolHost(t)
+			_, _ = h.UserpoolCreate(false, "ownedpool")
+			_, _ = h.UserCreate(false, "ownedpool", "alice", nil)
+			raw, e := os.ReadFile(state)
+			if e != nil {
+				t.Fatal(e)
+			}
+			var doc map[string]any
+			if e = json.Unmarshal(raw, &doc); e != nil {
+				t.Fatal(e)
+			}
+			doc["Userpools"].(map[string]any)["ownedpool"].(map[string]any)["users"].(map[string]any)["alice"].(map[string]any)["owner_token"] = owner
+			raw, _ = json.Marshal(doc)
+			if e = os.WriteFile(state, raw, 0600); e != nil {
+				t.Fatal(e)
+			}
+			_ = h.UserDelete(false, "ownedpool", "alice")
+			u, e := f.GetUser(context.Background(), "ownedpool", "alice")
+			t.Logf("delete unmarked/foreign child: exists=%v err=%v code=%s", u.Exists, e, h.LastError().Code)
+			if !u.Exists {
+				t.Fatal("deleted child whose own owner token does not match")
+			}
+		})
+	}
+}
+
+type solUPLatePassword struct {
+	*fakeadapter.Fake
+	entered, release chan struct{}
+}
+
+func (a *solUPLatePassword) SetUserPassword(ctx context.Context, p, u, pw string) (hostkit.UserSnapshot, error) {
+	out, e := a.Fake.SetUserPassword(ctx, p, u, pw)
+	if e == nil {
+		close(a.entered)
+		<-a.release
+	}
+	return out, e
+}
+
+func TestSolUPDuplicateCreateErasesRevocation(t *testing.T) {
+	for _, jm := range []bool{false, true} {
+		t.Run(fmt.Sprintf("journal=%v", jm), func(t *testing.T) {
+			h, f, _, campaign := newUserpoolHost(t)
+			cfg := Config{Provider: "aws", Store: f, Userpools: f, CampaignStatePath: campaign}
+			var j *safety.Journal
+			dir := filepath.Join(t.TempDir(), "journal")
+			if jm {
+				j = openUserpoolSafetyJournal(t, dir)
+				cfg.Journal = j
+				cfg.CampaignStatePath = ""
+				defer func() { _ = j.Close() }()
+			}
+			h = New(cfg)
+			h.SetAbortOnError(false)
+			_, _ = h.UserpoolCreate(false, "duplicatepool")
+			_, _ = h.UserCreate(false, "duplicatepool", "alice", nil)
+			_ = h.UserSetPassword(false, "duplicatepool", "alice", "FirstPass123")
+			sess, _ := h.UserSignIn(false, "duplicatepool", "alice", "FirstPass123")
+			a := &solUPLatePassword{Fake: f, entered: make(chan struct{}), release: make(chan struct{})}
+			slowCfg := cfg
+			slowCfg.Userpools = a
+			slow := New(slowCfg)
+			slow.SetAbortOnError(false)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_ = slow.UserSetPassword(false, "duplicatepool", "alice", "SecondPass456")
+			}()
+			<-a.entered
+			_, _ = h.UserpoolCreate(false, "duplicatepool")
+			if h.LastError().Code != hostkit.OK {
+				t.Fatal(h.LastError())
+			}
+			close(a.release)
+			<-done
+			_, _ = h.UserVerifyToken(false, "duplicatepool", sess.AccessToken())
+			t.Logf("password-reset result=%s old-token verify=%s", slow.LastError().Code, h.LastError().Code)
+			if h.LastError().Code == hostkit.OK {
+				t.Fatal("successful password reset lost revocation after duplicate pool create")
+			}
+		})
+	}
+}
+
+func TestSolUPActiveSecretEvicted(t *testing.T) {
+	h, _, _, _ := newUserpoolHost(t)
+	active := "ActiveSecret987Example"
+	_, _ = h.UserpoolCreate(false, "activepool")
+	_, _ = h.UserCreate(false, "activepool", "alice", nil)
+	_ = h.UserSetPassword(false, "activepool", "alice", active)
+	for i := 0; i < 33000; i++ {
+		h.errs.AddRedaction(fmt.Sprintf("UnusedSecret%08d", i))
+	}
+	_ = h.fail("user_sign_in", "poolname", hostkit.ProviderError(hostkit.Internal, 500, "Failure", "upstream echoed "+active))
+	if strings.Contains(h.LastError().Message, active) {
+		t.Fatal("still-active secret leaked after fixed-size registration FIFO evicted it")
+	}
+}
+
+func TestSolUPLegalProfilesExceedJournal(t *testing.T) {
+	for _, jm := range []bool{false, true} {
+		t.Run(fmt.Sprintf("journal=%v", jm), func(t *testing.T) {
+			h, f, _, campaign := newUserpoolHost(t)
+			cfg := Config{Provider: "aws", Store: f, Userpools: f, CampaignStatePath: campaign}
+			var j *safety.Journal
+			dir := filepath.Join(t.TempDir(), "journal")
+			if jm {
+				j = openUserpoolSafetyJournal(t, dir)
+				cfg.Journal = j
+				cfg.CampaignStatePath = ""
+				defer func() { _ = j.Close() }()
+			}
+			h = New(cfg)
+			h.SetAbortOnError(false)
+			_, _ = h.UserpoolCreate(false, "largeprofiles")
+			attrs := map[string]string{}
+			for i := 0; i < 32; i++ {
+				attrs[fmt.Sprintf("attr%d", i)] = strings.Repeat("x", 2048)
+			}
+			for i := 0; i < 60; i++ {
+				_, _ = h.UserCreate(false, "largeprofiles", fmt.Sprintf("user%03d", i), attrs)
+				if h.LastError().Code != hostkit.OK {
+					if !jm {
+						info, _ := os.Stat(campaign)
+						t.Logf("legal user count before failure=%d campaign-bytes=%d error=%+v", i, info.Size(), h.LastError())
+					}
+					_, _ = h.UserpoolDelete(false, "largeprofiles")
+					t.Logf("cleanup after journal growth error=%+v", h.LastError())
+					t.Fatal("within-contract profiles exhaust authority journal and block cleanup")
+				}
+			}
+			if _, err := h.UserpoolDelete(false, "largeprofiles"); err != nil || h.LastError().Code != hostkit.OK {
+				t.Fatalf("UserpoolDelete after 60 legal large-profile users failed: err=%v last=%+v", err, h.LastError())
+			}
+		})
+	}
+}
+
+func TestSolUPSameOwnerDifferentIncarnationAdopted(t *testing.T) {
+	h, f, _, _ := newUserpoolHost(t)
+	_, _ = h.UserpoolCreate(false, "incarnationpool")
+	old, _ := f.DescribeUserPool(context.Background(), "incarnationpool")
+	if e := f.InjectUnmarkedUserpoolForTesting("incarnationpool", old.OwnerToken); e != nil {
+		t.Fatal(e)
+	}
+	fresh, _ := f.DescribeUserPool(context.Background(), "incarnationpool")
+	if fresh.IncarnationID == old.IncarnationID {
+		t.Fatal("fixture")
+	}
+	_, _ = h.UserpoolCreate(false, "incarnationpool")
+	act, _, _, _, _ := h.cost.lookupUserpoolEntry("", "incarnationpool")
+	t.Logf("different physical incarnation adopted=%v result=%s", act.Incarnation == fresh.IncarnationID, h.LastError().Code)
+	if h.LastError().Code == hostkit.OK {
+		t.Fatal("same owner token bypassed physical-incarnation fence")
+	}
+}
+
+func TestSolUPExactEndpointCascade(t *testing.T) {
+	a, b := fakeadapter.New(fakeadapter.Options{}), fakeadapter.New(fakeadapter.Options{})
+	ea, eb := "http://127.0.0.1:40171", "http://127.0.0.1:40172"
+	router := hostkit.Router{Pick: func(ctx context.Context) (hostkit.Backend, error) {
+		if hostkit.EndpointFrom(ctx) == ea {
+			return a, nil
+		}
+		return b, nil
+	}}
+	h := New(Config{Provider: "aws", Store: router, Userpools: router, CampaignStatePath: filepath.Join(t.TempDir(), "journal")})
+	h.SetAbortOnError(false)
+	for _, ep := range []string{ea, eb} {
+		_ = h.SetEndpoint("userpool", ep)
+		_, _ = h.UserpoolCreate(false, "samepool")
+		_, _ = h.UserCreate(false, "samepool", "alice", nil)
+		if h.LastError().Code != hostkit.OK {
+			t.Fatal(h.LastError())
+		}
+	}
+	_ = h.SetEndpoint("userpool", ea)
+	_, _ = h.UserpoolDelete(false, "samepool")
+	if h.LastError().Code != hostkit.OK {
+		t.Fatal(h.LastError())
+	}
+	_ = h.SetEndpoint("userpool", eb)
+	u, _ := h.UserGet(false, "samepool", "alice")
+	if !u.Exists() || h.LastError().Code != hostkit.OK {
+		t.Fatal("other endpoint child deleted", h.LastError())
+	}
+	if got := h.cost.meter.Snapshot().ResourceCleanupNanoUSD; got != 55000 {
+		t.Fatal("other endpoint cleanup reservation released", got)
+	}
+	t.Log("exact endpoint cascade preserves other endpoint child and 55000 cleanup reserve")
+}
+
+type solUPWrongTokenKind struct {
+	*fakeadapter.Fake
+}
+
+func (a solUPWrongTokenKind) SignIn(ctx context.Context, in hostkit.UserSignInInput) (hostkit.SessionSnapshot, error) {
+	out, e := a.Fake.SignIn(ctx, in)
+	if e != nil {
+		return out, e
+	}
+	priv, _, kid, issuer, _, _, _, _ := a.Fake.UserpoolSigningKeyMaterialForTesting(in.Pool)
+	out.AccessToken, e = hostkit.MintRS256JWT(priv, kid, map[string]any{
+		"sub":       out.Claims["sub"],
+		"username":  in.Username,
+		"iss":       issuer,
+		"iat":       out.IssuedAt,
+		"exp":       out.ExpiresAt,
+		"token_use": "id",
+	})
+	return out, e
+}
+
+func TestSolUPWrongTokenUseAndMissingClient(t *testing.T) {
+	h, f, _, _ := newUserpoolHost(t)
+	_, _ = h.UserpoolCreate(false, "tokenkindpool")
+	_, _ = h.UserCreate(false, "tokenkindpool", "alice", nil)
+	_ = h.UserSetPassword(false, "tokenkindpool", "alice", "CorrectPass123")
+	h.cfg.Userpools = solUPWrongTokenKind{f}
+	sess, _ := h.UserSignIn(false, "tokenkindpool", "alice", "CorrectPass123")
+	if sess.AccessToken() == "" {
+		t.Fatal("fixture", h.LastError())
+	}
+	verified, _ := h.UserVerifyToken(false, "tokenkindpool", sess.AccessToken())
+	t.Logf("verified token_use=%s client_id=%q result=%s", verified.Claims()["token_use"], verified.Claims()["client_id"], h.LastError().Code)
+	if h.LastError().Code == hostkit.OK {
+		t.Fatal("accepted signed ID token without required pool app-client binding as an access token")
 	}
 }

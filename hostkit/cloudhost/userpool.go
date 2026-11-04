@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/lmctl-ai/lmcloud/hostkit"
@@ -223,15 +224,94 @@ type tokenBindingRecord struct {
 }
 
 type persistedUserpoolCatalogState struct {
-	Pool          hostkit.UserpoolInfo            `json:"pool"`
-	Users         map[string]hostkit.UserSnapshot `json:"users,omitempty"`
-	Groups        map[string]bool                 `json:"groups,omitempty"`
-	Memberships   map[string][]string             `json:"memberships,omitempty"`
-	TokenBindings map[string][]tokenBindingRecord `json:"token_bindings,omitempty"`
-	ChildSeq      uint64                          `json:"child_seq,omitempty"`
-	UserSeq       map[string]uint64               `json:"user_seq,omitempty"`
-	GroupSeq      map[string]uint64               `json:"group_seq,omitempty"`
-	MembershipSeq map[string]uint64               `json:"membership_seq,omitempty"`
+	Pool              hostkit.UserpoolInfo            `json:"pool"`
+	Users             map[string]hostkit.UserSnapshot `json:"users,omitempty"`
+	UserProfileHashes map[string]string               `json:"user_profile_hashes,omitempty"`
+	UserProfileDir    string                          `json:"user_profile_dir,omitempty"`
+	RevokedSessionGen map[string]uint64               `json:"revoked_session_gen,omitempty"`
+	PendingUserRevoke map[string]string               `json:"pending_user_revoke,omitempty"`
+	Groups            map[string]bool                 `json:"groups,omitempty"`
+	Memberships       map[string][]string             `json:"memberships,omitempty"`
+	TokenBindings     map[string][]tokenBindingRecord `json:"token_bindings,omitempty"`
+	ChildSeq          uint64                          `json:"child_seq,omitempty"`
+	UserSeq           map[string]uint64               `json:"user_seq,omitempty"`
+	GroupSeq          map[string]uint64               `json:"group_seq,omitempty"`
+	MembershipSeq     map[string]uint64               `json:"membership_seq,omitempty"`
+}
+
+var (
+	userpoolProfileCacheMu sync.Mutex
+	userpoolProfileCache   = make(map[string]map[string]string, 256)
+)
+
+func cacheUserProfileAttrs(hashHex string, attrs map[string]string) {
+	if hashHex == "" || len(attrs) == 0 {
+		return
+	}
+	cp := copyMap(attrs)
+	userpoolProfileCacheMu.Lock()
+	if len(userpoolProfileCache) >= 4096 {
+		userpoolProfileCache = make(map[string]map[string]string, 256)
+	}
+	userpoolProfileCache[hashHex] = cp
+	userpoolProfileCacheMu.Unlock()
+}
+
+func loadUserProfileAttrs(profileDir, hashHex string) (map[string]string, bool) {
+	if hashHex == "" {
+		return nil, false
+	}
+	userpoolProfileCacheMu.Lock()
+	if cached, ok := userpoolProfileCache[hashHex]; ok {
+		userpoolProfileCacheMu.Unlock()
+		return cached, true
+	}
+	userpoolProfileCacheMu.Unlock()
+	if profileDir == "" {
+		return nil, false
+	}
+	p := filepath.Join(profileDir, hashHex+".json")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return nil, false
+	}
+	sum := sha256.Sum256(raw)
+	if hex.EncodeToString(sum[:]) != hashHex {
+		return nil, false
+	}
+	var attrs map[string]string
+	if err := json.Unmarshal(raw, &attrs); err != nil {
+		return nil, false
+	}
+	cacheUserProfileAttrs(hashHex, attrs)
+	return attrs, true
+}
+
+func writeUserProfileBlob(profileDir, hashHex string, raw []byte) {
+	if profileDir == "" || hashHex == "" || len(raw) == 0 {
+		return
+	}
+	_ = os.MkdirAll(profileDir, 0o700)
+	finalPath := filepath.Join(profileDir, hashHex+".json")
+	if _, err := os.Stat(finalPath); err == nil {
+		return
+	}
+	tmpPath := finalPath + ".tmp." + safety.NewToken128()
+	if err := os.WriteFile(tmpPath, raw, 0o600); err == nil {
+		_ = os.Rename(tmpPath, finalPath)
+	} else {
+		_ = os.Remove(tmpPath)
+	}
+}
+
+func (h *Host) userpoolProfileDir() string {
+	if h.cfg.CampaignStatePath != "" {
+		return h.cfg.CampaignStatePath + ".profiles"
+	}
+	if h.cfg.Journal != nil && h.cfg.Journal.Path() != "" {
+		return h.cfg.Journal.Path() + ".profiles"
+	}
+	return ""
 }
 
 func sanitizeUserSnapshotForJournal(u hostkit.UserSnapshot) hostkit.UserSnapshot {
@@ -239,7 +319,7 @@ func sanitizeUserSnapshotForJournal(u hostkit.UserSnapshot) hostkit.UserSnapshot
 	if len(cp.Attributes) > 0 {
 		clean := make(map[string]string, len(cp.Attributes))
 		for k, v := range cp.Attributes {
-			if strings.Contains(k, "password") || strings.Contains(v, "eyJ") || strings.Contains(v, "private_key") || strings.Contains(v, "access_token") {
+			if strings.Contains(k, "password") || strings.Contains(v, "private_key") || strings.Contains(v, "access_token") {
 				continue
 			}
 			clean[k] = v
@@ -250,10 +330,41 @@ func sanitizeUserSnapshotForJournal(u hostkit.UserSnapshot) hostkit.UserSnapshot
 }
 
 func encodePersistedUserpoolState(st persistedUserpoolCatalogState) string {
+	if st.UserProfileHashes == nil {
+		st.UserProfileHashes = map[string]string{}
+	}
+	for u := range st.UserProfileHashes {
+		if _, exists := st.Users[u]; !exists {
+			delete(st.UserProfileHashes, u)
+		}
+	}
 	if len(st.Users) > 0 {
 		cleanUsers := make(map[string]hostkit.UserSnapshot, len(st.Users))
 		for k, u := range st.Users {
-			cleanUsers[k] = sanitizeUserSnapshotForJournal(u)
+			if prevHash := st.UserProfileHashes[k]; prevHash != "" {
+				cu := u
+				cu.Attributes = nil
+				cleanUsers[k] = cu
+				continue
+			}
+			cu := sanitizeUserSnapshotForJournal(u)
+			if len(cu.Attributes) > 0 {
+				approxBytes := 2
+				for ak, av := range cu.Attributes {
+					approxBytes += len(ak) + len(av) + 6
+				}
+				if approxBytes > 256 {
+					if attrJSON, err := json.Marshal(cu.Attributes); err == nil && len(attrJSON) > 256 {
+						sum := sha256.Sum256(attrJSON)
+						hashHex := hex.EncodeToString(sum[:])
+						st.UserProfileHashes[k] = hashHex
+						cacheUserProfileAttrs(hashHex, cu.Attributes)
+						writeUserProfileBlob(st.UserProfileDir, hashHex, attrJSON)
+						cu.Attributes = nil
+					}
+				}
+			}
+			cleanUsers[k] = cu
 		}
 		st.Users = cleanUsers
 	}
@@ -265,31 +376,38 @@ func encodePersistedUserpoolState(st persistedUserpoolCatalogState) string {
 }
 
 func decodePersistedUserpoolState(raw string) (persistedUserpoolCatalogState, bool) {
-	if raw == "" {
+	empty := func() persistedUserpoolCatalogState {
 		return persistedUserpoolCatalogState{
-			Users:         map[string]hostkit.UserSnapshot{},
-			Groups:        map[string]bool{},
-			Memberships:   map[string][]string{},
-			TokenBindings: map[string][]tokenBindingRecord{},
-			UserSeq:       map[string]uint64{},
-			GroupSeq:      map[string]uint64{},
-			MembershipSeq: map[string]uint64{},
-		}, false
+			Users:             map[string]hostkit.UserSnapshot{},
+			UserProfileHashes: map[string]string{},
+			RevokedSessionGen: map[string]uint64{},
+			PendingUserRevoke: map[string]string{},
+			Groups:            map[string]bool{},
+			Memberships:       map[string][]string{},
+			TokenBindings:     map[string][]tokenBindingRecord{},
+			UserSeq:           map[string]uint64{},
+			GroupSeq:          map[string]uint64{},
+			MembershipSeq:     map[string]uint64{},
+		}
+	}
+	if raw == "" {
+		return empty(), false
 	}
 	var st persistedUserpoolCatalogState
 	if err := json.Unmarshal([]byte(raw), &st); err != nil || st.Pool.Name == "" {
-		return persistedUserpoolCatalogState{
-			Users:         map[string]hostkit.UserSnapshot{},
-			Groups:        map[string]bool{},
-			Memberships:   map[string][]string{},
-			TokenBindings: map[string][]tokenBindingRecord{},
-			UserSeq:       map[string]uint64{},
-			GroupSeq:      map[string]uint64{},
-			MembershipSeq: map[string]uint64{},
-		}, false
+		return empty(), false
 	}
 	if st.Users == nil {
 		st.Users = map[string]hostkit.UserSnapshot{}
+	}
+	if st.UserProfileHashes == nil {
+		st.UserProfileHashes = map[string]string{}
+	}
+	if st.RevokedSessionGen == nil {
+		st.RevokedSessionGen = map[string]uint64{}
+	}
+	if st.PendingUserRevoke == nil {
+		st.PendingUserRevoke = map[string]string{}
 	}
 	if st.Groups == nil {
 		st.Groups = map[string]bool{}
@@ -308,6 +426,20 @@ func decodePersistedUserpoolState(raw string) (persistedUserpoolCatalogState, bo
 	}
 	if st.MembershipSeq == nil {
 		st.MembershipSeq = map[string]uint64{}
+	}
+	for uname, u := range st.Users {
+		if len(u.Attributes) == 0 {
+			if hashHex := st.UserProfileHashes[uname]; hashHex != "" {
+				if attrs, ok := loadUserProfileAttrs(st.UserProfileDir, hashHex); ok {
+					u.Attributes = attrs
+					st.Users[uname] = u
+				}
+			}
+		}
+		if rgen := st.RevokedSessionGen[uname]; rgen > u.SessionGen {
+			u.SessionGen = rgen
+			st.Users[uname] = u
+		}
 	}
 	return st, true
 }
@@ -401,6 +533,15 @@ func (h *Host) meteredUserpoolOwnerToken(ctx context.Context, name string) (stri
 }
 
 func (h *Host) checkUserpoolOwnershipInScope(mctx context.Context, name, expectedOwnerToken string, hasJournalOwnership bool) (bool, *hostkit.CloudError) {
+	ep := hostkit.EndpointFrom(mctx)
+	var expectedIncarnation string
+	if h.cost != nil {
+		if act, hasAct, amb, hasAmb, _ := h.cost.lookupUserpoolEntry(ep, name); hasAct {
+			expectedIncarnation = act.Incarnation
+		} else if hasAmb {
+			expectedIncarnation = amb.Incarnation
+		}
+	}
 	rawUp := unwrapGuardAdapter(h.cfg.Userpools)
 	r, ok := rawUp.(hostkit.UserpoolOwnershipReader)
 	if !ok {
@@ -423,6 +564,14 @@ func (h *Host) checkUserpoolOwnershipInScope(mctx context.Context, name, expecte
 	if !hasJournalOwnership || expectedOwnerToken == "" || tok == "" || tok != expectedOwnerToken {
 		return true, hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
 			fmt.Sprintf("userpool %q exists but is not owned by this run", name))
+	}
+	if expectedIncarnation != "" && h.cfg.Userpools != nil {
+		info, derr := h.cfg.Userpools.DescribeUserPool(mctx, name)
+		derr = hostkit.NilIfTyped(derr)
+		if derr == nil && info.IncarnationID != "" && info.IncarnationID != expectedIncarnation {
+			return true, hostkit.ProviderError(hostkit.Conflict, 409, "ResourceConflictException",
+				fmt.Sprintf("userpool %q physical incarnation mismatch", name))
+		}
 	}
 	return true, nil
 }
@@ -486,6 +635,10 @@ func (h *Host) dryResolveUserpool(ctx context.Context, name string) (dryUserpool
 		if !hasAct || act.OwnerToken == "" || info.OwnerToken == "" || info.OwnerToken != act.OwnerToken {
 			return dryUserpool{}, hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
 				fmt.Sprintf("userpool %q exists but is not owned by this run", name))
+		}
+		if act.Incarnation != "" && info.IncarnationID != "" && info.IncarnationID != act.Incarnation {
+			return dryUserpool{}, hostkit.ProviderError(hostkit.Conflict, 409, "ResourceConflictException",
+				fmt.Sprintf("userpool %q physical incarnation mismatch", name))
 		}
 		memberships := make(map[string]map[string]bool, len(rawMemberships))
 		for g, list := range rawMemberships {
@@ -749,22 +902,29 @@ func (h *Host) UserpoolCreate(dry bool, name string) (bool, error) {
 				return false, h.fail(op, name, terr)
 			}
 			if exists && tok != "" && tok == entry.OwnerToken {
-				entry.StateJSON = encodePersistedUserpoolState(persistedUserpoolCatalogState{
-					Pool: hostkit.UserpoolInfo{
-						Name:          name,
-						PoolID:        "pool-" + name,
-						IncarnationID: entry.Incarnation,
-						OwnerToken:    entry.OwnerToken,
-						Generation:    genNum,
-					},
-				})
-				if cerr := h.cost.confirmUserpoolIntent(entry); cerr != nil {
-					failed = true
-					return false, h.fail(op, name, cerr)
+				var incMatches = true
+				if dInfo, derr := h.cfg.Userpools.DescribeUserPool(mctx, name); derr == nil && dInfo.IncarnationID != "" && entry.Incarnation != "" && dInfo.IncarnationID != entry.Incarnation {
+					incMatches = false
 				}
-				h.cost.lockResourceCleanupIfNeeded(ep, op, safety.KindUserpool, name)
-				h.ok()
-				return true, nil
+				if incMatches {
+					entry.StateJSON = encodePersistedUserpoolState(persistedUserpoolCatalogState{
+						Pool: hostkit.UserpoolInfo{
+							Name:          name,
+							PoolID:        "pool-" + name,
+							IncarnationID: entry.Incarnation,
+							OwnerToken:    entry.OwnerToken,
+							Generation:    genNum,
+						},
+						UserProfileDir: h.userpoolProfileDir(),
+					})
+					if cerr := h.cost.confirmUserpoolIntent(entry); cerr != nil {
+						failed = true
+						return false, h.fail(op, name, cerr)
+					}
+					h.cost.lockResourceCleanupIfNeeded(ep, op, safety.KindUserpool, name)
+					h.ok()
+					return true, nil
+				}
 			}
 		}
 		failed = true
@@ -783,19 +943,22 @@ func (h *Host) UserpoolCreate(dry bool, name string) (bool, error) {
 			Generation:    genNum,
 		}
 	}
+	if createdInfo.IncarnationID != "" && entry.Incarnation != "" && createdInfo.IncarnationID != entry.Incarnation {
+		failed = true
+		_ = h.cost.abortUserpoolIntent(entry)
+		return false, h.fail(op, name, hostkit.ProviderError(hostkit.Conflict, 409, "ResourceConflictException",
+			fmt.Sprintf("userpool %q physical incarnation mismatch", name)))
+	}
 	if createdInfo.IncarnationID != "" {
 		entry.Incarnation = createdInfo.IncarnationID
 	}
-	if hasAct && act.StateJSON != "" {
-		if st, ok := decodePersistedUserpoolState(act.StateJSON); ok {
-			st.Pool = createdInfo
-			entry.StateJSON = encodePersistedUserpoolState(st)
-		} else {
-			entry.StateJSON = act.StateJSON
-		}
+	if hasAct {
+		// Preserve latest committed child/revocation state in journal on idempotent pool create.
+		entry.StateJSON = ""
 	} else {
 		entry.StateJSON = encodePersistedUserpoolState(persistedUserpoolCatalogState{
-			Pool: createdInfo,
+			Pool:           createdInfo,
+			UserProfileDir: h.userpoolProfileDir(),
 		})
 	}
 	if cerr := h.cost.confirmUserpoolIntent(entry); cerr != nil {
@@ -1054,8 +1217,82 @@ func (h *Host) UserpoolDelete(dry bool, name string) (bool, error) {
 		failed = true
 		return false, h.fail(op, name, cerr)
 	}
+	h.errs.UnpinActiveSecretPrefix("pw:" + ep + "\x00" + name + "\x00")
+	h.errs.UnpinActiveSecretPrefix("tok:" + ep + "\x00" + name + "\x00")
 	h.ok()
 	return existed, nil
+}
+
+// beginUserRevocationIntent durably records a fenced per-user revocation intent
+// in the pool's journaled state BEFORE any native adapter mutation that revokes
+// existing user sessions (user_delete, user_set_enabled(false), user_set_password).
+// If the subsequent native call loses its reply or crashes, user_verify_token
+// fails closed (UNAUTHENTICATED) until reconciled.
+func (h *Host) beginUserRevocationIntent(ep, pool, username string, act safety.JournalUserpoolEntry, isDelete bool) (string, uint64, uint64, bool, *hostkit.CloudError) {
+	revokeID := safety.NewToken128()
+	var prevRevokedGen uint64
+	var prevUserGen uint64
+	var hadUser bool
+	cerr := h.cost.updateUserpoolState(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, func(cur string) string {
+		st, ok := decodePersistedUserpoolState(cur)
+		if !ok {
+			st.Pool = hostkit.UserpoolInfo{Name: pool, IncarnationID: act.Incarnation, OwnerToken: act.OwnerToken}
+		}
+		st.UserProfileDir = h.userpoolProfileDir()
+		prevRevokedGen = st.RevokedSessionGen[username]
+		baseGen := prevRevokedGen
+		if u, uok := st.Users[username]; uok {
+			hadUser = true
+			prevUserGen = u.SessionGen
+			if u.SessionGen > baseGen {
+				baseGen = u.SessionGen
+			}
+		}
+		if baseGen == 0 {
+			baseGen = 1
+		}
+		nextGen := baseGen + 1
+		st.RevokedSessionGen[username] = nextGen
+		st.PendingUserRevoke[username] = revokeID
+		if u, uok := st.Users[username]; uok {
+			u.SessionGen = nextGen
+			st.Users[username] = u
+		}
+		if isDelete {
+			delete(st.TokenBindings, username)
+		}
+		return encodePersistedUserpoolState(st)
+	})
+	return revokeID, prevRevokedGen, prevUserGen, hadUser, cerr
+}
+
+// rollbackUserRevocationIntent rolls back a pre-dispatch revocation intent ONLY
+// when the native adapter returned a definitive refusal (e.g., NotFound or PermissionDenied)
+// proving no physical revocation took place.
+func (h *Host) rollbackUserRevocationIntent(ep, pool, username string, act safety.JournalUserpoolEntry, revokeID string, prevRevokedGen, prevUserGen uint64, hadUser bool) {
+	_ = h.cost.updateUserpoolState(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, func(cur string) string {
+		st, ok := decodePersistedUserpoolState(cur)
+		if !ok {
+			return cur
+		}
+		st.UserProfileDir = h.userpoolProfileDir()
+		if st.PendingUserRevoke[username] != revokeID {
+			return cur
+		}
+		delete(st.PendingUserRevoke, username)
+		if prevRevokedGen == 0 {
+			delete(st.RevokedSessionGen, username)
+		} else {
+			st.RevokedSessionGen[username] = prevRevokedGen
+		}
+		if hadUser {
+			if u, uok := st.Users[username]; uok {
+				u.SessionGen = prevUserGen
+				st.Users[username] = u
+			}
+		}
+		return encodePersistedUserpoolState(st)
+	})
 }
 
 // UserpoolExists implements userpool_exists(name).
@@ -1397,6 +1634,11 @@ func (h *Host) UserCreate(dry bool, pool, username string, attrs map[string]stri
 		if !ok {
 			st.Pool = hostkit.UserpoolInfo{Name: pool, IncarnationID: act.Incarnation, OwnerToken: act.OwnerToken}
 		}
+		st.UserProfileDir = h.userpoolProfileDir()
+		delete(st.PendingUserRevoke, username)
+		delete(st.TokenBindings, username)
+		delete(st.UserProfileHashes, username)
+		st.RevokedSessionGen[username] = snap.SessionGen
 		if childSeq > 0 {
 			if st.UserSeq[username] > childSeq {
 				return cur
@@ -1418,9 +1660,6 @@ func (h *Host) UserCreate(dry bool, pool, username string, attrs map[string]stri
 				st.Users[username] = reconciledUser.Clone()
 			}
 			return encodePersistedUserpoolState(st)
-		}
-		if cur != act.StateJSON {
-			return cur
 		}
 		st.Users[username] = snap.Clone()
 		return encodePersistedUserpoolState(st)
@@ -1490,7 +1729,7 @@ func (h *Host) UserGet(dry bool, pool, username string) (*User, error) {
 	}
 
 	ep := hostkit.EndpointFrom(ctx)
-	_, _, amb, hasAmb, cerr := h.cost.lookupUserpoolEntry(ep, pool)
+	act, hasAct, amb, hasAmb, cerr := h.cost.lookupUserpoolEntry(ep, pool)
 	if cerr != nil {
 		failed = true
 		return missingUser(username), h.fail(op, pool, cerr)
@@ -1507,6 +1746,22 @@ func (h *Host) UserGet(dry bool, pool, username string) (*User, error) {
 	if cerr != nil {
 		failed = true
 		return missingUser(username), h.fail(op, pool, cerr)
+	}
+	exists, ownErr := h.checkUserpoolOwnershipInScope(mctx, pool, act.OwnerToken, hasAct)
+	if ownErr != nil {
+		retries, throttles, _ = scope.finish(0, 0, isDefinitiveUserpoolRefusal(ownErr), false)
+		failed = true
+		return missingUser(username), h.fail(op, pool, ownErr)
+	}
+	if !exists {
+		var abortErr *hostkit.CloudError
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		if abortErr != nil {
+			failed = true
+			return missingUser(username), h.fail(op, pool, abortErr)
+		}
+		failed = true
+		return missingUser(username), h.fail(op, pool, notFound(hostkit.AbsentUserpool, fmt.Sprintf("userpool %q does not exist", pool)))
 	}
 	snap, err := h.cfg.Userpools.GetUser(mctx, pool, username)
 	ce := hostkit.AsCloudError(err)
@@ -1627,21 +1882,35 @@ func (h *Host) UserDelete(dry bool, pool, username string) error {
 		return h.fail(op, pool, notFound(hostkit.AbsentUserpool, fmt.Sprintf("userpool %q does not exist", pool)))
 	}
 
+	revokeID, prevRevGen, prevUserGen, hadUser, rcerr := h.beginUserRevocationIntent(ep, pool, username, act, true)
+	if rcerr != nil {
+		_ = scope.releaseNotSent()
+		failed = true
+		return h.fail(op, pool, rcerr)
+	}
+
 	var childSeq uint64
 	mctx = userpoolFenceCtx(mctx, act.OwnerToken, act.Incarnation, act.Generation)
 	mctx = hostkit.WithUserpoolChildMutationSeqOut(mctx, &childSeq)
 	err := h.cfg.Userpools.DeleteUser(mctx, pool, username)
 	ce := hostkit.AsCloudError(err)
+	definitiveRefusal := ce != nil && isDefinitiveUserpoolRefusal(ce)
 	var abortErr *hostkit.CloudError
-	retries, throttles, abortErr = scope.finish(0, 0, ce == nil || isDefinitiveUserpoolRefusal(ce), ce == nil)
+	retries, throttles, abortErr = scope.finish(0, 0, ce == nil || definitiveRefusal, ce == nil)
 	if abortErr != nil {
 		failed = true
 		return h.fail(op, pool, abortErr)
 	}
 	if ce != nil {
+		if definitiveRefusal {
+			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser)
+		}
 		failed = true
 		return h.fail(op, pool, ce)
 	}
+
+	h.errs.UnpinActiveSecret("pw:" + ep + "\x00" + pool + "\x00" + username)
+	h.errs.UnpinActiveSecretPrefix("tok:" + ep + "\x00" + pool + "\x00" + username + "\x00")
 
 	var reconciledUser hostkit.UserSnapshot
 	var hasReconciledUser bool
@@ -1656,6 +1925,9 @@ func (h *Host) UserDelete(dry bool, pool, username string) error {
 		if !ok {
 			return cur
 		}
+		st.UserProfileDir = h.userpoolProfileDir()
+		delete(st.PendingUserRevoke, username)
+		delete(st.UserProfileHashes, username)
 		if childSeq > 0 {
 			if st.UserSeq[username] <= childSeq {
 				st.UserSeq[username] = childSeq
@@ -1693,9 +1965,6 @@ func (h *Host) UserDelete(dry bool, pool, username string) error {
 				st.Users[username] = reconciledUser.Clone()
 			}
 			return encodePersistedUserpoolState(st)
-		}
-		if cur != act.StateJSON {
-			return cur
 		}
 		delete(st.Users, username)
 		delete(st.TokenBindings, username)
@@ -1822,18 +2091,35 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 		return h.fail(op, pool, notFound(hostkit.AbsentUserpool, fmt.Sprintf("userpool %q does not exist", pool)))
 	}
 
+	var revokeID string
+	var prevRevGen, prevUserGen uint64
+	var hadUser bool
+	if !enabled {
+		var rcerr *hostkit.CloudError
+		revokeID, prevRevGen, prevUserGen, hadUser, rcerr = h.beginUserRevocationIntent(ep, pool, username, act, false)
+		if rcerr != nil {
+			_ = scope.releaseNotSent()
+			failed = true
+			return h.fail(op, pool, rcerr)
+		}
+	}
+
 	var childSeq uint64
 	mctx = userpoolFenceCtx(mctx, act.OwnerToken, act.Incarnation, act.Generation)
 	mctx = hostkit.WithUserpoolChildMutationSeqOut(mctx, &childSeq)
 	updatedUser, err := h.cfg.Userpools.SetUserEnabled(mctx, pool, username, enabled)
 	ce := hostkit.AsCloudError(err)
+	definitiveRefusal := ce != nil && isDefinitiveUserpoolRefusal(ce)
 	var abortErr *hostkit.CloudError
-	retries, throttles, abortErr = scope.finish(0, 0, ce == nil || isDefinitiveUserpoolRefusal(ce), false)
+	retries, throttles, abortErr = scope.finish(0, 0, ce == nil || definitiveRefusal, false)
 	if abortErr != nil {
 		failed = true
 		return h.fail(op, pool, abortErr)
 	}
 	if ce != nil {
+		if !enabled && definitiveRefusal {
+			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser)
+		}
 		failed = true
 		return h.fail(op, pool, ce)
 	}
@@ -1851,6 +2137,8 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 		if !ok {
 			return cur
 		}
+		st.UserProfileDir = h.userpoolProfileDir()
+		delete(st.PendingUserRevoke, username)
 		if childSeq > 0 {
 			if st.UserSeq[username] > childSeq {
 				return cur
@@ -1864,15 +2152,18 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 				}
 			} else {
 				u.Enabled = enabled
-				if !enabled {
-					if u.SessionGen == 0 {
-						u.SessionGen = 1
-					}
-					u.SessionGen++
+				if !enabled && u.SessionGen == 0 {
+					u.SessionGen = 2
 				}
 				if updatedUser.SessionGen > u.SessionGen {
 					u.SessionGen = updatedUser.SessionGen
 				}
+				if revGen := st.RevokedSessionGen[username]; revGen > u.SessionGen {
+					u.SessionGen = revGen
+				}
+			}
+			if u.SessionGen > st.RevokedSessionGen[username] {
+				st.RevokedSessionGen[username] = u.SessionGen
 			}
 			st.Users[username] = u
 			if childSeq > st.ChildSeq {
@@ -1892,12 +2183,13 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 				if !reconciledUser.Enabled && uok && u.Enabled {
 					reconciledUser.SessionGen++
 				}
+				if revGen := st.RevokedSessionGen[username]; revGen > reconciledUser.SessionGen {
+					reconciledUser.SessionGen = revGen
+				}
+				st.RevokedSessionGen[username] = reconciledUser.SessionGen
 				st.Users[username] = reconciledUser.Clone()
 			}
 			return encodePersistedUserpoolState(st)
-		}
-		if cur != act.StateJSON {
-			return cur
 		}
 		u, uok := st.Users[username]
 		if !uok {
@@ -1907,15 +2199,18 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 			}
 		} else {
 			u.Enabled = enabled
-			if !enabled {
-				if u.SessionGen == 0 {
-					u.SessionGen = 1
-				}
-				u.SessionGen++
+			if !enabled && u.SessionGen == 0 {
+				u.SessionGen = 2
 			}
 			if updatedUser.SessionGen > u.SessionGen {
 				u.SessionGen = updatedUser.SessionGen
 			}
+			if revGen := st.RevokedSessionGen[username]; revGen > u.SessionGen {
+				u.SessionGen = revGen
+			}
+		}
+		if u.SessionGen > st.RevokedSessionGen[username] {
+			st.RevokedSessionGen[username] = u.SessionGen
 		}
 		st.Users[username] = u
 		return encodePersistedUserpoolState(st)
@@ -1997,6 +2292,8 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 	}
 
 	ep := hostkit.EndpointFrom(ctx)
+	h.errs.PinActiveSecret("pw:"+ep+"\x00"+pool+"\x00"+username, password)
+
 	act, hasAct, amb, hasAmb, cerr := h.cost.lookupUserpoolEntry(ep, pool)
 	if cerr != nil {
 		failed = true
@@ -2033,18 +2330,29 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 		return h.fail(op, pool, notFound(hostkit.AbsentUserpool, fmt.Sprintf("userpool %q does not exist", pool)))
 	}
 
+	revokeID, prevRevGen, prevUserGen, hadUser, rcerr := h.beginUserRevocationIntent(ep, pool, username, act, false)
+	if rcerr != nil {
+		_ = scope.releaseNotSent()
+		failed = true
+		return h.fail(op, pool, rcerr)
+	}
+
 	var childSeq uint64
 	mctx = userpoolFenceCtx(mctx, act.OwnerToken, act.Incarnation, act.Generation)
 	mctx = hostkit.WithUserpoolChildMutationSeqOut(mctx, &childSeq)
 	updatedUser, err := h.cfg.Userpools.SetUserPassword(mctx, pool, username, password)
 	ce := hostkit.AsCloudError(err)
+	definitiveRefusal := ce != nil && isDefinitiveUserpoolRefusal(ce)
 	var abortErr *hostkit.CloudError
-	retries, throttles, abortErr = scope.finish(0, 0, ce == nil || isDefinitiveUserpoolRefusal(ce), false)
+	retries, throttles, abortErr = scope.finish(0, 0, ce == nil || definitiveRefusal, false)
 	if abortErr != nil {
 		failed = true
 		return h.fail(op, pool, abortErr)
 	}
 	if ce != nil {
+		if definitiveRefusal {
+			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser)
+		}
 		failed = true
 		return h.fail(op, pool, ce)
 	}
@@ -2062,10 +2370,15 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 		if !ok {
 			return cur
 		}
+		st.UserProfileDir = h.userpoolProfileDir()
+		delete(st.PendingUserRevoke, username)
 		if childSeq > 0 {
 			if st.UserSeq[username] > childSeq {
 				if u, uok := st.Users[username]; uok && updatedUser.SessionGen > u.SessionGen {
 					u.SessionGen = updatedUser.SessionGen
+					if u.SessionGen > st.RevokedSessionGen[username] {
+						st.RevokedSessionGen[username] = u.SessionGen
+					}
 					st.Users[username] = u
 					return encodePersistedUserpoolState(st)
 				}
@@ -2081,12 +2394,17 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 			} else {
 				u.Status = hostkit.UserStatusConfirmed
 				if u.SessionGen == 0 {
-					u.SessionGen = 1
+					u.SessionGen = 2
 				}
-				u.SessionGen++
 				if updatedUser.SessionGen > u.SessionGen {
 					u.SessionGen = updatedUser.SessionGen
 				}
+				if revGen := st.RevokedSessionGen[username]; revGen > u.SessionGen {
+					u.SessionGen = revGen
+				}
+			}
+			if u.SessionGen > st.RevokedSessionGen[username] {
+				st.RevokedSessionGen[username] = u.SessionGen
 			}
 			st.Users[username] = u
 			if childSeq > st.ChildSeq {
@@ -2100,17 +2418,18 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 				delete(st.TokenBindings, username)
 			} else {
 				u, uok := st.Users[username]
-				if uok && u.SessionGen >= reconciledUser.SessionGen {
-					reconciledUser.SessionGen = u.SessionGen + 1
+				if uok && u.SessionGen > reconciledUser.SessionGen {
+					reconciledUser.SessionGen = u.SessionGen
 				} else if reconciledUser.SessionGen <= 1 {
 					reconciledUser.SessionGen = 2
 				}
+				if revGen := st.RevokedSessionGen[username]; revGen > reconciledUser.SessionGen {
+					reconciledUser.SessionGen = revGen
+				}
+				st.RevokedSessionGen[username] = reconciledUser.SessionGen
 				st.Users[username] = reconciledUser.Clone()
 			}
 			return encodePersistedUserpoolState(st)
-		}
-		if cur != act.StateJSON {
-			return cur
 		}
 		u, uok := st.Users[username]
 		if !uok {
@@ -2121,12 +2440,17 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 		} else {
 			u.Status = hostkit.UserStatusConfirmed
 			if u.SessionGen == 0 {
-				u.SessionGen = 1
+				u.SessionGen = 2
 			}
-			u.SessionGen++
 			if updatedUser.SessionGen > u.SessionGen {
 				u.SessionGen = updatedUser.SessionGen
 			}
+			if revGen := st.RevokedSessionGen[username]; revGen > u.SessionGen {
+				u.SessionGen = revGen
+			}
+		}
+		if u.SessionGen > st.RevokedSessionGen[username] {
+			st.RevokedSessionGen[username] = u.SessionGen
 		}
 		st.Users[username] = u
 		return encodePersistedUserpoolState(st)
@@ -2569,6 +2893,12 @@ func (h *Host) UserSignIn(dry bool, pool, username, password string) (*Session, 
 
 	sum := sha256.Sum256([]byte(out.AccessToken))
 	tokenHash := hex.EncodeToString(sum[:])
+	if out.AccessToken != "" {
+		h.errs.PinActiveSecret("tok:"+ep+"\x00"+pool+"\x00"+username+"\x00"+tokenHash, out.AccessToken)
+	}
+	if password != "" {
+		h.errs.PinActiveSecret("pw:"+ep+"\x00"+pool+"\x00"+username, password)
+	}
 	iat := out.IssuedAt
 	if iat == 0 {
 		iat, _ = strconv.ParseInt(out.Claims["iat"], 10, 64)
@@ -2579,6 +2909,17 @@ func (h *Host) UserSignIn(dry bool, pool, username, password string) (*Session, 
 	}
 	sub := out.Claims["sub"]
 	scopeFP := h.userpoolScopeFingerprint()
+
+	canBindToken := false
+	var tokenClientID string
+	if parsedOut, pce := hostkit.ValidateJWTFormatAndParseUntrusted(out.AccessToken); pce == nil {
+		tu, _ := parsedOut.Payload["token_use"].(string)
+		cid, _ := parsedOut.Payload["client_id"].(string)
+		if tu == "access" && strings.TrimSpace(cid) != "" {
+			canBindToken = true
+			tokenClientID = cid
+		}
+	}
 
 	var preSGen uint64
 	if preSt, ok := decodePersistedUserpoolState(act.StateJSON); ok {
@@ -2592,6 +2933,7 @@ func (h *Host) UserSignIn(dry bool, pool, username, password string) (*Session, 
 		if !ok {
 			st.Pool = hostkit.UserpoolInfo{Name: pool, PoolID: out.PoolID, IncarnationID: act.Incarnation, OwnerToken: act.OwnerToken}
 		}
+		st.UserProfileDir = h.userpoolProfileDir()
 		sgen := out.SessionGen
 		if sgen == 0 {
 			if preSGen > 0 {
@@ -2602,6 +2944,19 @@ func (h *Host) UserSignIn(dry bool, pool, username, password string) (*Session, 
 				sgen = 1
 			}
 		}
+		if revGen := st.RevokedSessionGen[username]; revGen > sgen {
+			sgen = revGen
+		}
+		if u, uok := st.Users[username]; uok {
+			if u.SessionGen > sgen {
+				sgen = u.SessionGen
+			}
+			u.SessionGen = sgen
+			st.Users[username] = u
+		}
+		st.RevokedSessionGen[username] = sgen
+		delete(st.PendingUserRevoke, username)
+
 		poolID := out.PoolID
 		if poolID == "" && st.Pool.PoolID != "" {
 			poolID = st.Pool.PoolID
@@ -2610,28 +2965,35 @@ func (h *Host) UserSignIn(dry bool, pool, username, password string) (*Session, 
 		if incID == "" {
 			incID = out.IncarnationID
 		}
-		existing := st.TokenBindings[username]
-		live := make([]tokenBindingRecord, 0, len(existing)+1)
-		for _, b := range existing {
-			if b.ExpiresAt > nowUnix {
-				live = append(live, b)
+		if canBindToken && (st.Pool.ClientID == "" || tokenClientID == st.Pool.ClientID) {
+			existing := st.TokenBindings[username]
+			live := make([]tokenBindingRecord, 0, len(existing)+1)
+			for _, b := range existing {
+				if b.ExpiresAt > nowUnix {
+					live = append(live, b)
+				} else {
+					h.errs.UnpinActiveSecret("tok:" + ep + "\x00" + pool + "\x00" + username + "\x00" + b.TokenSHA256)
+				}
 			}
+			live = append(live, tokenBindingRecord{
+				TokenSHA256:   tokenHash,
+				Sub:           sub,
+				Username:      username,
+				PoolID:        poolID,
+				IncarnationID: incID,
+				SessionGen:    sgen,
+				IssuedAt:      iat,
+				ExpiresAt:     exp,
+				Scope:         scopeFP,
+			})
+			if len(live) > hostkit.MaxSessionBindingsPerUser {
+				for _, evicted := range live[:len(live)-hostkit.MaxSessionBindingsPerUser] {
+					h.errs.UnpinActiveSecret("tok:" + ep + "\x00" + pool + "\x00" + username + "\x00" + evicted.TokenSHA256)
+				}
+				live = live[len(live)-hostkit.MaxSessionBindingsPerUser:]
+			}
+			st.TokenBindings[username] = live
 		}
-		live = append(live, tokenBindingRecord{
-			TokenSHA256:   tokenHash,
-			Sub:           sub,
-			Username:      username,
-			PoolID:        poolID,
-			IncarnationID: incID,
-			SessionGen:    sgen,
-			IssuedAt:      iat,
-			ExpiresAt:     exp,
-			Scope:         scopeFP,
-		})
-		if len(live) > hostkit.MaxSessionBindingsPerUser {
-			live = live[len(live)-hostkit.MaxSessionBindingsPerUser:]
-		}
-		st.TokenBindings[username] = live
 		return encodePersistedUserpoolState(st)
 	}); cerr != nil {
 		failed = true
@@ -2760,36 +3122,47 @@ func (h *Host) UserVerifyToken(dry bool, pool, token string) (*Session, error) {
 	ce = nil
 	if vce != nil {
 		ce = unauthErr
-	} else if poolInfo.ClientID != "" && verified.ClientID != "" && verified.ClientID != poolInfo.ClientID {
+	} else if poolInfo.ClientID == "" || verified.ClientID == "" || verified.ClientID != poolInfo.ClientID || verified.ClaimsMap["token_use"] != "access" {
 		ce = unauthErr
 	} else {
-		// Journaled token-binding registry lookup by SHA-256 digest + per-user session_generation equality.
-		sum := sha256.Sum256([]byte(token))
-		tokenHash := hex.EncodeToString(sum[:])
-		scopeFP := h.userpoolScopeFingerprint()
-		st, ok := decodePersistedUserpoolState(act.StateJSON)
-		if !ok {
+		curAct, hasCurAct, _, hasCurAmb, lerr := h.cost.lookupUserpoolEntry(ep, pool)
+		if lerr != nil || !hasCurAct || hasCurAmb {
 			ce = unauthErr
 		} else {
-			username := verified.Username
-			var matched *tokenBindingRecord
-			for i := range st.TokenBindings[username] {
-				b := &st.TokenBindings[username][i]
-				if b.TokenSHA256 == tokenHash {
-					matched = b
-					break
-				}
-			}
-			if matched == nil {
-				ce = unauthErr
-			} else if matched.IncarnationID != act.Incarnation || (poolInfo.PoolID != "" && matched.PoolID != "" && matched.PoolID != poolInfo.PoolID) || matched.Scope != scopeFP {
-				ce = unauthErr
-			} else if nowUnix >= matched.ExpiresAt || matched.IssuedAt > nowUnix+hostkit.MaxClockSkewSeconds {
+			// Journaled token-binding registry lookup by SHA-256 digest + per-user session_generation equality.
+			sum := sha256.Sum256([]byte(token))
+			tokenHash := hex.EncodeToString(sum[:])
+			scopeFP := h.userpoolScopeFingerprint()
+			st, ok := decodePersistedUserpoolState(curAct.StateJSON)
+			if !ok {
 				ce = unauthErr
 			} else {
-				u, uok := st.Users[username]
-				if !uok || !u.Enabled || u.SessionGen != matched.SessionGen {
+				username := verified.Username
+				if st.PendingUserRevoke[username] != "" {
 					ce = unauthErr
+				} else {
+					var matched *tokenBindingRecord
+					for i := range st.TokenBindings[username] {
+						b := &st.TokenBindings[username][i]
+						if b.TokenSHA256 == tokenHash {
+							matched = b
+							break
+						}
+					}
+					if matched == nil {
+						ce = unauthErr
+					} else if matched.IncarnationID != curAct.Incarnation || (poolInfo.PoolID != "" && matched.PoolID != "" && matched.PoolID != poolInfo.PoolID) || matched.Scope != scopeFP {
+						ce = unauthErr
+					} else if nowUnix >= matched.ExpiresAt || matched.IssuedAt > nowUnix+hostkit.MaxClockSkewSeconds {
+						ce = unauthErr
+					} else if revGen := st.RevokedSessionGen[username]; revGen > 0 && matched.SessionGen < revGen {
+						ce = unauthErr
+					} else {
+						u, uok := st.Users[username]
+						if !uok || !u.Enabled || u.SessionGen != matched.SessionGen {
+							ce = unauthErr
+						}
+					}
 				}
 			}
 		}
@@ -2961,6 +3334,7 @@ func (h *Host) GroupCreate(dry bool, pool, group string) (bool, error) {
 		if !ok {
 			st.Pool = hostkit.UserpoolInfo{Name: pool, IncarnationID: act.Incarnation, OwnerToken: act.OwnerToken}
 		}
+		st.UserProfileDir = h.userpoolProfileDir()
 		if childSeq > 0 {
 			if st.GroupSeq[group] > childSeq {
 				return cur
@@ -2980,9 +3354,6 @@ func (h *Host) GroupCreate(dry bool, pool, group string) (bool, error) {
 				delete(st.Memberships, group)
 			}
 			return encodePersistedUserpoolState(st)
-		}
-		if cur != act.StateJSON {
-			return cur
 		}
 		st.Groups[group] = true
 		return encodePersistedUserpoolState(st)
@@ -3118,6 +3489,7 @@ func (h *Host) GroupDelete(dry bool, pool, group string) (bool, error) {
 		if !ok {
 			return cur
 		}
+		st.UserProfileDir = h.userpoolProfileDir()
 		if childSeq > 0 {
 			if st.GroupSeq[group] <= childSeq {
 				st.GroupSeq[group] = childSeq
@@ -3152,9 +3524,6 @@ func (h *Host) GroupDelete(dry bool, pool, group string) (bool, error) {
 				delete(st.Memberships, group)
 			}
 			return encodePersistedUserpoolState(st)
-		}
-		if cur != act.StateJSON {
-			return cur
 		}
 		delete(st.Groups, group)
 		delete(st.Memberships, group)
@@ -3222,7 +3591,7 @@ func (h *Host) GroupList(dry bool, pool string) ([]string, error) {
 	}
 
 	ep := hostkit.EndpointFrom(ctx)
-	_, _, amb, hasAmb, cerr := h.cost.lookupUserpoolEntry(ep, pool)
+	act, hasAct, amb, hasAmb, cerr := h.cost.lookupUserpoolEntry(ep, pool)
 	if cerr != nil {
 		failed = true
 		return nil, h.fail(op, pool, cerr)
@@ -3239,6 +3608,22 @@ func (h *Host) GroupList(dry bool, pool string) ([]string, error) {
 	if cerr != nil {
 		failed = true
 		return nil, h.fail(op, pool, cerr)
+	}
+	exists, ownErr := h.checkUserpoolOwnershipInScope(mctx, pool, act.OwnerToken, hasAct)
+	if ownErr != nil {
+		retries, throttles, _ = scope.finish(0, 0, isDefinitiveUserpoolRefusal(ownErr), false)
+		failed = true
+		return nil, h.fail(op, pool, ownErr)
+	}
+	if !exists {
+		var abortErr *hostkit.CloudError
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		if abortErr != nil {
+			failed = true
+			return nil, h.fail(op, pool, abortErr)
+		}
+		failed = true
+		return nil, h.fail(op, pool, notFound(hostkit.AbsentUserpool, fmt.Sprintf("userpool %q does not exist", pool)))
 	}
 	groups, err := h.cfg.Userpools.ListGroups(mctx, pool)
 	ce := hostkit.AsCloudError(err)
@@ -3408,6 +3793,7 @@ func (h *Host) GroupAddUser(dry bool, pool, group, username string) error {
 		if !ok {
 			st.Pool = hostkit.UserpoolInfo{Name: pool, IncarnationID: act.Incarnation, OwnerToken: act.OwnerToken}
 		}
+		st.UserProfileDir = h.userpoolProfileDir()
 		mKey := group + "/" + username
 		if childSeq > 0 {
 			if st.MembershipSeq[mKey] > childSeq {
@@ -3467,9 +3853,6 @@ func (h *Host) GroupAddUser(dry bool, pool, group, username string) error {
 				}
 			}
 			return encodePersistedUserpoolState(st)
-		}
-		if cur != act.StateJSON {
-			return cur
 		}
 		members := st.Memberships[group]
 		found := false
@@ -3629,6 +4012,7 @@ func (h *Host) GroupRemoveUser(dry bool, pool, group, username string) error {
 		if !ok {
 			return cur
 		}
+		st.UserProfileDir = h.userpoolProfileDir()
 		mKey := group + "/" + username
 		if childSeq > 0 {
 			if st.MembershipSeq[mKey] > childSeq {
@@ -3682,9 +4066,6 @@ func (h *Host) GroupRemoveUser(dry bool, pool, group, username string) error {
 				}
 			}
 			return encodePersistedUserpoolState(st)
-		}
-		if cur != act.StateJSON {
-			return cur
 		}
 		if members, gok := st.Memberships[group]; gok {
 			filtered := members[:0]
@@ -3773,7 +4154,7 @@ func (h *Host) UserGroups(dry bool, pool, username string) ([]string, error) {
 	}
 
 	ep := hostkit.EndpointFrom(ctx)
-	_, _, amb, hasAmb, cerr := h.cost.lookupUserpoolEntry(ep, pool)
+	act, hasAct, amb, hasAmb, cerr := h.cost.lookupUserpoolEntry(ep, pool)
 	if cerr != nil {
 		failed = true
 		return nil, h.fail(op, pool, cerr)
@@ -3790,6 +4171,22 @@ func (h *Host) UserGroups(dry bool, pool, username string) ([]string, error) {
 	if cerr != nil {
 		failed = true
 		return nil, h.fail(op, pool, cerr)
+	}
+	exists, ownErr := h.checkUserpoolOwnershipInScope(mctx, pool, act.OwnerToken, hasAct)
+	if ownErr != nil {
+		retries, throttles, _ = scope.finish(0, 0, isDefinitiveUserpoolRefusal(ownErr), false)
+		failed = true
+		return nil, h.fail(op, pool, ownErr)
+	}
+	if !exists {
+		var abortErr *hostkit.CloudError
+		retries, throttles, abortErr = scope.finish(0, 0, true, false)
+		if abortErr != nil {
+			failed = true
+			return nil, h.fail(op, pool, abortErr)
+		}
+		failed = true
+		return nil, h.fail(op, pool, notFound(hostkit.AbsentUserpool, fmt.Sprintf("userpool %q does not exist", pool)))
 	}
 	groups, err := h.cfg.Userpools.ListUserGroups(mctx, pool, username)
 	ce := hostkit.AsCloudError(err)

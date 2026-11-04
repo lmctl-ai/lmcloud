@@ -25,7 +25,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"unicode/utf8"
 )
 
@@ -426,50 +425,6 @@ func ValidateJWTFormatAndParseUntrusted(token string) (*ParsedUntrustedJWT, *Clo
 	}, nil
 }
 
-var (
-	pbkdf2MemoMu sync.Mutex
-	// pbkdf2Memo maps SHA-256(password || 0x00 || salt) -> derived 32-byte key
-	// for up to 32 active entries in memory (never storing plaintext passwords).
-	pbkdf2Memo = make(map[[32]byte][PBKDF2KeyBytes]byte, 32)
-)
-
-func pbkdf2MemoKey(password string, salt []byte) [32]byte {
-	h := sha256.New()
-	_, _ = io.WriteString(h, password)
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write(salt)
-	var sum [32]byte
-	copy(sum[:], h.Sum(nil))
-	return sum
-}
-
-func derivePBKDF2Cached(password string, salt []byte) ([]byte, error) {
-	key := pbkdf2MemoKey(password, salt)
-	pbkdf2MemoMu.Lock()
-	if cached, ok := pbkdf2Memo[key]; ok {
-		pbkdf2MemoMu.Unlock()
-		out := make([]byte, PBKDF2KeyBytes)
-		copy(out, cached[:])
-		return out, nil
-	}
-	pbkdf2MemoMu.Unlock()
-
-	dk, err := pbkdf2.Key(sha256.New, password, salt, PBKDF2Iterations, PBKDF2KeyBytes)
-	if err != nil || len(dk) != PBKDF2KeyBytes {
-		return dk, err
-	}
-
-	var entry [PBKDF2KeyBytes]byte
-	copy(entry[:], dk)
-	pbkdf2MemoMu.Lock()
-	if len(pbkdf2Memo) >= 32 {
-		pbkdf2Memo = make(map[[32]byte][PBKDF2KeyBytes]byte, 32)
-	}
-	pbkdf2Memo[key] = entry
-	pbkdf2MemoMu.Unlock()
-	return dk, nil
-}
-
 // DerivePasswordPBKDF2 computes a salted PBKDF2-HMAC-SHA256 (600,000 iterations)
 // verifier with a fresh 16-byte crypto/rand salt.
 func DerivePasswordPBKDF2(password string) (saltHex, verifierHex string, err error) {
@@ -477,7 +432,7 @@ func DerivePasswordPBKDF2(password string) (saltHex, verifierHex string, err err
 	if _, err := io.ReadFull(rand.Reader, salt[:]); err != nil {
 		return "", "", err
 	}
-	dk, err := derivePBKDF2Cached(password, salt[:])
+	dk, err := pbkdf2.Key(sha256.New, password, salt[:], PBKDF2Iterations, PBKDF2KeyBytes)
 	if err != nil {
 		return "", "", err
 	}
@@ -497,7 +452,7 @@ func VerifyPasswordPBKDF2(password, saltHex, verifierHex string) bool {
 		DummyVerifyPasswordPBKDF2(password)
 		return false
 	}
-	dk, err := derivePBKDF2Cached(password, salt)
+	dk, err := pbkdf2.Key(sha256.New, password, salt, PBKDF2Iterations, PBKDF2KeyBytes)
 	if err != nil || len(dk) != PBKDF2KeyBytes {
 		return false
 	}
@@ -511,7 +466,7 @@ var dummyPBKDF2Want = make([]byte, PBKDF2KeyBytes)
 // derivation and constant-time comparison when a user does not exist, has no
 // password set, or is disabled, preventing timing-based user enumeration.
 func DummyVerifyPasswordPBKDF2(password string) {
-	dk, err := derivePBKDF2Cached(password, dummyPBKDF2Salt)
+	dk, err := pbkdf2.Key(sha256.New, password, dummyPBKDF2Salt, PBKDF2Iterations, PBKDF2KeyBytes)
 	if err == nil && len(dk) == PBKDF2KeyBytes {
 		_ = subtle.ConstantTimeCompare(dk, dummyPBKDF2Want)
 	}
@@ -712,12 +667,15 @@ func VerifyRS256JWTWithKeySet(parsed *ParsedUntrustedJWT, pubPEM, expectedKid st
 		claimsMap["iss"] = iss
 	}
 	clientID, _ := parsed.Payload["client_id"].(string)
-	if clientID != "" {
-		claimsMap["client_id"] = clientID
+	if clientID == "" {
+		return nil, ProviderError(Unauthenticated, 401, "InvalidTokenClient", "JWT missing mandatory client_id claim")
 	}
-	if tokenUse, ok := parsed.Payload["token_use"].(string); ok && tokenUse != "" {
-		claimsMap["token_use"] = tokenUse
+	tokenUse, _ := parsed.Payload["token_use"].(string)
+	if tokenUse != "access" {
+		return nil, ProviderError(Unauthenticated, 401, "InvalidTokenUse", "JWT token_use claim must be access")
 	}
+	claimsMap["client_id"] = clientID
+	claimsMap["token_use"] = tokenUse
 	return &VerifiedJWTClaims{
 		Sub:       sub,
 		Username:  username,

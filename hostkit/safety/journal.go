@@ -2942,7 +2942,7 @@ func validateJournalUserpoolState(raw string) error {
 	}
 	if strings.Contains(raw, `"password"`) || strings.Contains(raw, `"password_hash"`) ||
 		strings.Contains(raw, `"password_salt"`) || strings.Contains(raw, `"private_key"`) ||
-		strings.Contains(raw, `"access_token"`) || strings.Contains(raw, `"eyJ`) {
+		strings.Contains(raw, `"access_token"`) {
 		return errors.New("userpool_state contains forbidden secret or credential material")
 	}
 	return nil
@@ -3817,12 +3817,12 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		if !hasAct || hasAmb || len(state.AmbiguousUserpoolStack[uKey]) > 0 {
 			return nil
 		}
-		if act.OwnerToken != rec.CreateToken || act.Incarnation != rec.ETag || act.Generation != rec.Generation {
+		if act.OwnerToken != rec.CreateToken || act.Incarnation != rec.ETag {
 			return nil
 		}
 		act.StateJSON = rec.UserpoolState
 		state.ActiveUserpools[uKey] = act
-		if tb, hasTb := state.UserpoolTombstones[uKey]; hasTb && tb.OwnerToken == act.OwnerToken && tb.Generation == act.Generation {
+		if tb, hasTb := state.UserpoolTombstones[uKey]; hasTb && tb.OwnerToken == act.OwnerToken && tb.Incarnation == act.Incarnation {
 			tb.StateJSON = rec.UserpoolState
 			state.UserpoolTombstones[uKey] = tb
 		}

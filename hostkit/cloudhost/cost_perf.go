@@ -1868,7 +1868,7 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 			act, hasAct := st.activeUserpoolEntries[uKey]
 			_, hasAmb := st.ambiguousUserpools[uKey]
 			if hasAct && !hasAmb && len(st.ambiguousUserpoolStack[uKey]) == 0 &&
-				act.OwnerToken == rec.OwnerToken && act.Incarnation == rec.UserpoolIncarnation && act.Generation == rec.Generation {
+				act.OwnerToken == rec.OwnerToken && act.Incarnation == rec.UserpoolIncarnation {
 				act.StateJSON = rec.UserpoolState
 				st.activeUserpoolEntries[uKey] = act
 			}
@@ -2209,6 +2209,13 @@ func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(s
 	if err != nil {
 		return err
 	}
+	if fn != nil && len(raw) > 256<<10 {
+		if compactedRaw, compactedSeq, ok := compactSupersededCampaignStates(raw); ok && len(compactedRaw) < len(raw) {
+			if err := rewriteCampaignFileInPlace(f, compactedRaw); err == nil {
+				st.lastSeq = compactedSeq
+			}
+		}
+	}
 	ct.applyReplayedStateLocked(st)
 
 	if fn != nil {
@@ -2238,6 +2245,97 @@ func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(s
 		}
 	}
 	return nil
+}
+
+func compactSupersededCampaignStates(raw []byte) ([]byte, uint64, bool) {
+	lines := bytes.Split(raw, []byte{'\n'})
+	recs := make([]campaignJournalRecord, 0, len(lines))
+	for i, line := range lines {
+		if i == len(lines)-1 && len(line) == 0 {
+			continue
+		}
+		var rec campaignJournalRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return nil, 0, false
+		}
+		recs = append(recs, rec)
+	}
+	lastUserpoolState := make(map[string]int)
+	lastFunctionState := make(map[string]int)
+	for idx, rec := range recs {
+		switch rec.Event {
+		case safety.EventUserpoolState:
+			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			lastUserpoolState[uKey] = idx
+		case safety.EventUserpoolConfirm:
+			if rec.UserpoolState != "" {
+				uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+				delete(lastUserpoolState, uKey)
+			}
+		case safety.EventUserpoolDelete:
+			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			delete(lastUserpoolState, uKey)
+		case safety.EventFunctionPreviewState:
+			fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			lastFunctionState[fKey] = idx
+		case safety.EventFunctionConfirm:
+			if rec.FunctionState != "" {
+				fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+				delete(lastFunctionState, fKey)
+			}
+		case safety.EventFunctionDelete:
+			fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			delete(lastFunctionState, fKey)
+		}
+	}
+	var buf bytes.Buffer
+	var seq uint64
+	dropped := 0
+	for idx, rec := range recs {
+		if rec.Event == safety.EventUserpoolState {
+			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			if lastIdx, ok := lastUserpoolState[uKey]; !ok || lastIdx != idx {
+				dropped++
+				continue
+			}
+		}
+		if rec.Event == safety.EventFunctionPreviewState {
+			fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			if lastIdx, ok := lastFunctionState[fKey]; !ok || lastIdx != idx {
+				dropped++
+				continue
+			}
+		}
+		seq++
+		rec.Seq = seq
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return nil, 0, false
+		}
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+	if dropped == 0 {
+		return nil, 0, false
+	}
+	return buf.Bytes(), seq, true
+}
+
+func rewriteCampaignFileInPlace(f *os.File, raw []byte) error {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	n, err := f.Write(raw)
+	if err != nil {
+		return err
+	}
+	if n != len(raw) {
+		return io.ErrShortWrite
+	}
+	return f.Sync()
 }
 
 func (ct *costTracker) syncFromSafetyJournalLocked() {
@@ -5157,7 +5255,7 @@ func (ct *costTracker) confirmUserpoolIntent(entry safety.JournalUserpoolEntry) 
 	return nil
 }
 
-func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expIncarnation, expGeneration string, mutate func(curStateJSON string) string) *hostkit.CloudError {
+func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expIncarnation, _ string, mutate func(curStateJSON string) string) *hostkit.CloudError {
 	if mutate == nil {
 		return nil
 	}
@@ -5167,6 +5265,8 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 		return ct.poisoned
 	}
 	key := scopedResKey(endpoint, name)
+	staleErr := hostkit.ProviderError(hostkit.Conflict, 409, "AmbiguousUserpoolState",
+		fmt.Sprintf("userpool %q state changed concurrently during operation", name))
 
 	if ct.journal != nil {
 		if err := ct.journal.CheckHealth(); err != nil {
@@ -5180,10 +5280,10 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 		act, ok := ct.activeUserpoolEntries[key]
 		_, hasAmb := ct.ambiguousUserpools[key]
 		if !ok || hasAmb || len(ct.ambiguousUserpoolStack[key]) > 0 {
-			return nil
+			return staleErr
 		}
-		if act.OwnerToken != expOwnerToken || act.Incarnation != expIncarnation || act.Generation != expGeneration {
-			return nil
+		if act.OwnerToken != expOwnerToken || act.Incarnation != expIncarnation {
+			return staleErr
 		}
 		newState := mutate(act.StateJSON)
 		if newState == act.StateJSON {
@@ -5198,13 +5298,16 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 	}
 
 	if ct.statePath != "" {
+		var cerr *hostkit.CloudError
 		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
 			act, ok := st.activeUserpoolEntries[key]
 			_, hasAmb := st.ambiguousUserpools[key]
 			if !ok || hasAmb || len(st.ambiguousUserpoolStack[key]) > 0 {
+				cerr = staleErr
 				return nil
 			}
-			if act.OwnerToken != expOwnerToken || act.Incarnation != expIncarnation || act.Generation != expGeneration {
+			if act.OwnerToken != expOwnerToken || act.Incarnation != expIncarnation {
+				cerr = staleErr
 				return nil
 			}
 			newState := mutate(act.StateJSON)
@@ -5230,16 +5333,19 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
 			return ct.poisoned
 		}
+		if cerr != nil {
+			return cerr
+		}
 		return nil
 	}
 
 	act, ok := ct.activeUserpoolEntries[key]
 	_, hasAmb := ct.ambiguousUserpools[key]
 	if !ok || hasAmb || len(ct.ambiguousUserpoolStack[key]) > 0 {
-		return nil
+		return staleErr
 	}
-	if act.OwnerToken != expOwnerToken || act.Incarnation != expIncarnation || act.Generation != expGeneration {
-		return nil
+	if act.OwnerToken != expOwnerToken || act.Incarnation != expIncarnation {
+		return staleErr
 	}
 	act.StateJSON = mutate(act.StateJSON)
 	ct.activeUserpoolEntries[key] = act

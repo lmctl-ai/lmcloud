@@ -197,18 +197,48 @@ type ErrorState struct {
 	secrets         []string
 	retainedSecrets []string
 	retainedSet     map[string]struct{}
+	retainedBytes   int
+	pinnedSecrets   map[string][]string
+	pinnedOrder     []string
+	pinnedBytes     int
 }
 
 // maxRedactions bounds the primary secrets slice (oldest dropped first).
 const maxRedactions = 256
 
-// maxRetainedRedactions bounds the session-wide retained secret set (including
-// JSON-escaped and URL-encoded forms) so >256 secret registrations across a
-// session never evict active passwords, session tokens, or create tokens.
-const maxRetainedRedactions = 32768
+// maxRetainedRedactions and maxRetainedRedactionBytes bound the transient
+// redaction FIFO (including JSON-escaped and URL-encoded forms).
+const (
+	maxRetainedRedactions     = 4096
+	maxRetainedRedactionBytes = 1 << 20
+	maxSingleRedactionBytes   = 8192
+	maxPinnedRedactionKeys    = 16384
+	maxPinnedRedactionBytes   = 4 << 20
+)
+
+func expandSecretVariants(secret string) []string {
+	if len(secret) < 8 || len(secret) > maxSingleRedactionBytes {
+		return nil
+	}
+	out := make([]string, 0, 4)
+	out = append(out, secret)
+	if jb, err := json.Marshal(secret); err == nil && len(jb) >= 2 {
+		jEsc := string(jb[1 : len(jb)-1])
+		if len(jEsc) >= 8 && jEsc != secret {
+			out = append(out, jEsc)
+		}
+	}
+	if uEsc := url.QueryEscape(secret); len(uEsc) >= 8 && uEsc != secret {
+		out = append(out, uEsc)
+	}
+	if pEsc := url.PathEscape(secret); len(pEsc) >= 8 && pEsc != secret {
+		out = append(out, pEsc)
+	}
+	return out
+}
 
 func (s *ErrorState) addRetainedLocked(sec string) {
-	if len(sec) < 8 {
+	if len(sec) < 8 || len(sec) > maxSingleRedactionBytes*4 {
 		return
 	}
 	if s.retainedSet == nil {
@@ -217,20 +247,26 @@ func (s *ErrorState) addRetainedLocked(sec string) {
 	if _, exists := s.retainedSet[sec]; exists {
 		return
 	}
-	s.retainedSet[sec] = struct{}{}
-	s.retainedSecrets = append(s.retainedSecrets, sec)
-	if len(s.retainedSecrets) > maxRetainedRedactions {
+	for len(s.retainedSecrets) >= maxRetainedRedactions || (s.retainedBytes+len(sec) > maxRetainedRedactionBytes && len(s.retainedSecrets) > 0) {
 		dropped := s.retainedSecrets[0]
 		delete(s.retainedSet, dropped)
+		s.retainedBytes -= len(dropped)
+		if s.retainedBytes < 0 {
+			s.retainedBytes = 0
+		}
 		s.retainedSecrets = s.retainedSecrets[1:]
 	}
+	s.retainedSet[sec] = struct{}{}
+	s.retainedSecrets = append(s.retainedSecrets, sec)
+	s.retainedBytes += len(sec)
 }
 
 // AddRedaction registers an exact string (a create token, password, or session
 // token) that must never appear in last_error, its provider_code, the abort
-// message or its target. Strings shorter than 8 bytes are ignored. Added in v4.
+// message or its target. Strings shorter than 8 bytes or larger than 8192 bytes
+// are ignored. Added in v4.
 func (s *ErrorState) AddRedaction(secret string) {
-	if len(secret) < 8 {
+	if len(secret) < 8 || len(secret) > maxSingleRedactionBytes {
 		return
 	}
 	s.mu.Lock()
@@ -239,23 +275,107 @@ func (s *ErrorState) AddRedaction(secret string) {
 	if len(s.secrets) > maxRedactions {
 		s.secrets = s.secrets[len(s.secrets)-maxRedactions:]
 	}
-	s.addRetainedLocked(secret)
-	if jb, err := json.Marshal(secret); err == nil && len(jb) >= 2 {
-		jEsc := string(jb[1 : len(jb)-1])
-		if jEsc != secret {
-			s.addRetainedLocked(jEsc)
+	for _, v := range expandSecretVariants(secret) {
+		s.addRetainedLocked(v)
+	}
+}
+
+// PinActiveSecret pins an active credential (such as a user's current password
+// or an active session token) under lifecycle key so transient AddRedaction
+// churn cannot evict it while the credential remains active.
+func (s *ErrorState) PinActiveSecret(key, secret string) {
+	if key == "" || len(secret) < 8 || len(secret) > maxSingleRedactionBytes {
+		return
+	}
+	variants := expandSecretVariants(secret)
+	if len(variants) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.secrets = append(s.secrets, secret)
+	if len(s.secrets) > maxRedactions {
+		s.secrets = s.secrets[len(s.secrets)-maxRedactions:]
+	}
+	for _, v := range variants {
+		s.addRetainedLocked(v)
+	}
+	if s.pinnedSecrets == nil {
+		s.pinnedSecrets = make(map[string][]string, 64)
+	}
+	var addedBytes int
+	for _, v := range variants {
+		addedBytes += len(v)
+	}
+	if prev, exists := s.pinnedSecrets[key]; exists {
+		for _, pv := range prev {
+			s.pinnedBytes -= len(pv)
+		}
+		if s.pinnedBytes < 0 {
+			s.pinnedBytes = 0
+		}
+	} else {
+		for (len(s.pinnedSecrets) >= maxPinnedRedactionKeys || (s.pinnedBytes+addedBytes > maxPinnedRedactionBytes && len(s.pinnedSecrets) > 0)) && len(s.pinnedOrder) > 0 {
+			evictKey := s.pinnedOrder[0]
+			s.pinnedOrder = s.pinnedOrder[1:]
+			if old, ok := s.pinnedSecrets[evictKey]; ok {
+				for _, ov := range old {
+					s.pinnedBytes -= len(ov)
+				}
+				delete(s.pinnedSecrets, evictKey)
+			}
+		}
+		s.pinnedOrder = append(s.pinnedOrder, key)
+	}
+	s.pinnedSecrets[key] = variants
+	s.pinnedBytes += addedBytes
+}
+
+// UnpinActiveSecret unpins an active credential when it is deleted or superseded.
+func (s *ErrorState) UnpinActiveSecret(key string) {
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if prev, ok := s.pinnedSecrets[key]; ok {
+		for _, pv := range prev {
+			s.pinnedBytes -= len(pv)
+		}
+		if s.pinnedBytes < 0 {
+			s.pinnedBytes = 0
+		}
+		delete(s.pinnedSecrets, key)
+	}
+}
+
+// UnpinActiveSecretPrefix unpins all active credentials whose key starts with prefix.
+func (s *ErrorState) UnpinActiveSecretPrefix(prefix string) {
+	if prefix == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, prev := range s.pinnedSecrets {
+		if strings.HasPrefix(k, prefix) {
+			for _, pv := range prev {
+				s.pinnedBytes -= len(pv)
+			}
+			delete(s.pinnedSecrets, k)
 		}
 	}
-	if uEsc := url.QueryEscape(secret); uEsc != secret {
-		s.addRetainedLocked(uEsc)
-	}
-	if pEsc := url.PathEscape(secret); pEsc != secret {
-		s.addRetainedLocked(pEsc)
+	if s.pinnedBytes < 0 {
+		s.pinnedBytes = 0
 	}
 }
 
 // scrubLocked replaces the registered exact strings, then applies RedactText.
 func (s *ErrorState) scrubLocked(text string) string {
+	for _, variants := range s.pinnedSecrets {
+		for _, sec := range variants {
+			text = strings.ReplaceAll(text, sec, CreateTokenMarker)
+		}
+	}
 	for _, sec := range s.secrets {
 		text = strings.ReplaceAll(text, sec, CreateTokenMarker)
 	}
