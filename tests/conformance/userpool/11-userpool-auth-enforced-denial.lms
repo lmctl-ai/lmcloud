@@ -1,87 +1,108 @@
 # Requires: userpool
-# Scenario 11: Auth-enforced denial — runs ONLY under <provider>sim --auth enforce (TAP SKIP in open).
-# Mode probe is an authenticated op (userpool_create with bogus creds). Pass 1: bogus creds ->
-# UNAUTHENTICATED. Pass 2: restricted-but-valid identity -> PERMISSION_DENIED on pool/user admin ops.
-# Azure leg SKIPs pending AZ-UP1; GCP pending G-UP1; OCI runner-skips (oci-identity-domains-epic).
+# Scenario 11: Auth-enforced denial — <provider>sim --auth enforce only (TAP SKIP in open).
+# Pass 1: bogus credentials -> UNAUTHENTICATED (probe must observe EXACTLY that or the scenario fails).
+# Pass 2: the SEED identity creates the target pool (seed success asserted), then a valid restricted
+# identity must be PERMISSION_DENIED (exact) on userpool_create and on user_create against the SEEDED
+# existing pool (never NOT_FOUND-acceptable — an authorization bypass on a present pool must fail).
+# Non-AWS legs are fixture-gated upfront (never probed with wrong-provider credentials).
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 probe_pool = "lmu11" + run_id + "z";
 target_pool = "lmu11" + run_id + "t";
 host = ARGV[0];
-is_azure = contains(host, "lmazure");
-is_gcp = contains(host, "lmgcp");
 
-orig_aws_key = env("LMAWS_SIM_ACCESS_KEY_ID", "");
-orig_aws_sec = env("LMAWS_SIM_SECRET_ACCESS_KEY", "");
-orig_az_tok = env("LMAZURE_SIM_TOKEN", "");
-orig_az_key = env("LMAZURE_SIM_KEY", "");
-orig_gcp_tok = env("LMGCP_SIM_TOKEN", "");
+if (!contains(host, "lmaws")) {
+  println("SKIP: scenario 11 userpool enforce fixtures are configured for awssim only (azure AZ-UP1, gcp G-UP1, oci O-UP1) — unsupported legs are gated, never probed");
+  exit(0);
+}
 
+seed_key = env("LMAWS_SIM_ACCESS_KEY_ID", "");
+seed_secret = env("LMAWS_SIM_SECRET_ACCESS_KEY", "");
+denied_key = env("LMCLOUD_ENFORCE_DENIED_AWS_ACCESS_KEY_ID", "");
+denied_secret = env("LMCLOUD_ENFORCE_DENIED_AWS_SECRET_ACCESS_KEY", "");
+
+if (len(denied_key) == 0 || len(denied_secret) == 0) {
+  println("SKIP: fixture unset (LMCLOUD_ENFORCE_DENIED_AWS_ACCESS_KEY_ID/_SECRET_ACCESS_KEY) — restricted-identity denial leg cannot run");
+  exit(0);
+}
+
+# ---- Pass 1 probe: bogus credentials ----
 set_env("LMAWS_SIM_ACCESS_KEY_ID", "AKIAUNAUTH0000000000");
 set_env("LMAWS_SIM_SECRET_ACCESS_KEY", "wrong-secret-key-for-unauthenticated-pass");
-set_env("LMAZURE_SIM_TOKEN", "invalid-bearer-token-unauthenticated");
-set_env("LMAZURE_SIM_KEY", "d3JvbmdrZXl1bmF1dGhlbnRpY2F0ZWQ=");
-set_env("LMGCP_SIM_TOKEN", "invalid-bearer-token-unauthenticated");
-
-unauth_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+probe_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
     cloud.set_endpoint("userpool", ep);
   }
   cloud.set_abort_on_error(false);
   let created = cloud.userpool_create(${probe_pool});
-  let open_mode = cloud.last_error().code() == ErrorCode.OK;
-  let unauth = cloud.last_error().code() == ErrorCode.UNAUTHENTICATED;
+  let e = cloud.last_error();
+  let open_mode = e.code() == ErrorCode.OK;
   if (open_mode) {
     if (created || cloud.userpool_exists(${probe_pool})) { cloud.userpool_delete(${probe_pool}); }
   }
   lmcode_return_put("open_mode", open_mode);
-  lmcode_return_put("unauth", unauth);
+  lmcode_return_put("unauth_ok", e.code() == ErrorCode.UNAUTHENTICATED);
 end _lmcode_
-
-r1 = run_lmcode(unauth_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+r1 = run_lmcode(probe_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r1.ok, "11 probe host execution failed");
 
-# restore seed identities on every later path
-set_env("LMAWS_SIM_ACCESS_KEY_ID", orig_aws_key);
-set_env("LMAWS_SIM_SECRET_ACCESS_KEY", orig_aws_sec);
-set_env("LMAZURE_SIM_TOKEN", orig_az_tok);
-set_env("LMAZURE_SIM_KEY", orig_az_key);
-set_env("LMGCP_SIM_TOKEN", orig_gcp_tok);
+# restore seed identity before anything else
+set_env("LMAWS_SIM_ACCESS_KEY_ID", seed_key);
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", seed_secret);
 
 if (r1.result.open_mode) {
   println("SKIP: simulator is in --auth open mode; 11-userpool-auth-enforced-denial requires --auth enforce");
   exit(0);
 }
-assert(r1.result.unauth, "Pass 1: bogus credentials must be UNAUTHENTICATED");
+assert(r1.result.unauth_ok, "Pass 1: bogus credentials must be EXACTLY UNAUTHENTICATED (any other code fails certification)");
 
-if (is_azure) {
-  println("SKIP: " + host + " userpool directory pending upstream epic AZ-UP1");
-  exit(0);
-}
-if (is_gcp) {
-  println("SKIP: " + host + " userpool enforcement mapping pending epic G-UP1");
-  exit(0);
-}
-
-set_env("LMAWS_SIM_ACCESS_KEY_ID", env("LMCLOUD_ENFORCE_DENIED_AWS_ACCESS_KEY_ID", orig_aws_key));
-set_env("LMAWS_SIM_SECRET_ACCESS_KEY", env("LMCLOUD_ENFORCE_DENIED_AWS_SECRET_ACCESS_KEY", orig_aws_sec));
-
+# ---- Pass 2: seed pool with privileged identity; restricted identity denied on attach ops ----
 denied_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let ep = ${endpoint};
   if (str_len(ep) > 0) {
     cloud.set_endpoint("userpool", ep);
   }
+  let t = ${target_pool};
+  cloud.userpool_create(t);
+  let seed_ok = cloud.last_error().ok();
+  lmcode_return_put("seed_ok", seed_ok);
+end _lmcode_
+rs = run_lmcode(denied_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(rs.ok, "11 seed host execution failed");
+assert(rs.result.seed_ok, "seed identity must create the target pool (fixture sanity)");
+
+set_env("LMAWS_SIM_ACCESS_KEY_ID", denied_key);
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", denied_secret);
+ops_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("userpool", ep);
+  }
   cloud.set_abort_on_error(false);
-  cloud.userpool_create(${target_pool});
+  cloud.userpool_create("lmu11" + ${run_id} + "n");   # a new pool under the restricted identity
   let e1 = cloud.last_error();
-  cloud.user_create(${target_pool}, "user11_x_any");
+  cloud.user_create(${target_pool}, "user11_x_any");  # against the SEEDED existing pool
   let e2 = cloud.last_error();
   lmcode_return_put("create_denied", e1.code() == ErrorCode.PERMISSION_DENIED);
-  lmcode_return_put("ucreate_denied", e2.code() == ErrorCode.PERMISSION_DENIED || e2.code() == ErrorCode.NOT_FOUND);
+  lmcode_return_put("ucreate_denied", e2.code() == ErrorCode.PERMISSION_DENIED);
 end _lmcode_
+r2 = run_lmcode(ops_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 
-r2 = run_lmcode(denied_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+# cleanup with restored seed identity BEFORE assertions
+set_env("LMAWS_SIM_ACCESS_KEY_ID", seed_key);
+set_env("LMAWS_SIM_SECRET_ACCESS_KEY", seed_secret);
+cleanup_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("userpool", ep);
+  }
+  cloud.set_abort_on_error(false);
+  cloud.userpool_delete(${target_pool});
+  cloud.userpool_delete("lmu11" + ${run_id} + "n");
+end _lmcode_
+rcl = run_lmcode(cleanup_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+
 assert(r2.ok, "11 denied pass host execution failed");
 assert(r2.result.create_denied, "Pass 2: restricted identity must be PERMISSION_DENIED on userpool_create");
-assert(r2.result.ucreate_denied, "Pass 2: restricted identity must not create users");
+assert(r2.result.ucreate_denied, "Pass 2: restricted identity must be PERMISSION_DENIED on user_create against an existing seeded pool (authorization, not absence)");

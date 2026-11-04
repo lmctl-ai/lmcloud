@@ -18,7 +18,7 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
 
   cloud.set_abort_on_error(false);
   let fails = 0;
-  let want = 12;
+  let want = 14;
 
   # invalid pool names: "Up" (uppercase short), hyphen, 2-char, 33-char
   let bad_pools = str_list().add("Up").add("bad-name").add("ab").add("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -53,10 +53,18 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let e_v = cloud.last_error();
   if (e_v.code() == ErrorCode.INVALID_ARGUMENT && e_v.http_status() == 0) { fails = fails + 1; }
 
-  # weak password: 6-byte alphanumeric-but-tiny
+  # attribute name too long (21 chars; portable bound is 20)
+  cloud.user_create(p, "user09_" + ${run_id} + "_g4", str_map().set("aaaaaaaaaaaaaaaaaaaaa", "x"));
+  let e_al = cloud.last_error();
+  if (e_al.code() == ErrorCode.INVALID_ARGUMENT && e_al.http_status() == 0) { fails = fails + 1; }
+
+  # weak passwords: too short; and whitespace-containing (letter+digit but a space inside)
   cloud.user_set_password(p, u, "short1");
   let e_w = cloud.last_error();
   if (e_w.code() == ErrorCode.INVALID_ARGUMENT && e_w.http_status() == 0) { fails = fails + 1; }
+  cloud.user_set_password(p, u, "has space1");
+  let e_ws = cloud.last_error();
+  if (e_ws.code() == ErrorCode.INVALID_ARGUMENT && e_ws.http_status() == 0) { fails = fails + 1; }
 
   cloud.set_abort_on_error(true);
   cloud.user_delete(p, u);
