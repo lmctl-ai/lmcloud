@@ -859,6 +859,25 @@ func FunctionMutationFenceFrom(ctx context.Context) FunctionMutationFence {
 	return FunctionMutationFence{}
 }
 
+type functionChildMutationSeqKey struct{}
+
+// WithFunctionChildMutationSeqOut attaches an output pointer to ctx so a Functions
+// adapter can report the monotonic child mutation sequence number assigned inside
+// its state lock for PublishFunctionVersion, SetFunctionAlias, or DeleteFunctionAlias.
+func WithFunctionChildMutationSeqOut(ctx context.Context, out *uint64) context.Context {
+	return context.WithValue(ctx, functionChildMutationSeqKey{}, out)
+}
+
+// ReportFunctionChildMutationSeq records the child mutation sequence number into ctx, if requested.
+func ReportFunctionChildMutationSeq(ctx context.Context, seq uint64) {
+	if ctx == nil || seq == 0 {
+		return
+	}
+	if out, ok := ctx.Value(functionChildMutationSeqKey{}).(*uint64); ok && out != nil {
+		*out = seq
+	}
+}
+
 // FunctionUpdateInput carries parameters for CreateFunction and UpdateFunction.
 type FunctionUpdateInput struct {
 	Snapshot           FunctionSnapshot

@@ -725,6 +725,8 @@ type persistedDryFunctionState struct {
 	Versions     map[string]hostkit.FunctionSnapshot `json:"versions,omitempty"`
 	VersionOrder []string                            `json:"version_order,omitempty"`
 	Aliases      map[string]string                   `json:"aliases,omitempty"`
+	ChildSeq     uint64                              `json:"child_seq,omitempty"`
+	AliasSeq     map[string]uint64                   `json:"alias_seq,omitempty"`
 }
 
 func sanitizeSnapshotForJournal(s hostkit.FunctionSnapshot) hostkit.FunctionSnapshot {
@@ -769,6 +771,9 @@ func decodePersistedDryFunctionState(raw string) (persistedDryFunctionState, boo
 	}
 	if st.Aliases == nil {
 		st.Aliases = map[string]string{}
+	}
+	if st.AliasSeq == nil {
+		st.AliasSeq = map[string]uint64{}
 	}
 	return st, true
 }
@@ -1782,7 +1787,9 @@ func (h *Host) FunctionPublishVersion(dry bool, name, expectRevision string, has
 		return "", h.fail(op, name, notFound("FunctionNotFound", fmt.Sprintf("function %q does not exist", name)))
 	}
 
+	var childSeq uint64
 	mctx = functionFenceCtx(mctx, act.OwnerToken, act.Generation)
+	mctx = hostkit.WithFunctionChildMutationSeqOut(mctx, &childSeq)
 	ver, err := h.cfg.Functions.PublishFunctionVersion(mctx, name, expectRevision)
 	ce := hostkit.AsCloudError(err)
 	definitiveRefusal := err != nil && isDefinitiveFunctionRefusal(ce)
@@ -1813,6 +1820,14 @@ func (h *Host) FunctionPublishVersion(dry bool, name, expectRevision string, has
 		}
 		if !found {
 			st.VersionOrder = append(st.VersionOrder, ver)
+			sort.Slice(st.VersionOrder, func(i, j int) bool {
+				vi, _ := strconv.Atoi(st.VersionOrder[i])
+				vj, _ := strconv.Atoi(st.VersionOrder[j])
+				return vi < vj
+			})
+		}
+		if childSeq > st.ChildSeq {
+			st.ChildSeq = childSeq
 		}
 		return encodePersistedDryFunctionState(st)
 	}); cerr != nil {
@@ -2029,7 +2044,9 @@ func (h *Host) FunctionAliasSet(dry bool, name, alias, version string) error {
 		return h.fail(op, name, notFound("FunctionNotFound", fmt.Sprintf("function %q does not exist", name)))
 	}
 
+	var childSeq uint64
 	mctx = functionFenceCtx(mctx, act.OwnerToken, act.Generation)
+	mctx = hostkit.WithFunctionChildMutationSeqOut(mctx, &childSeq)
 	created, err := h.cfg.Functions.SetFunctionAlias(mctx, name, alias, version)
 	ce := hostkit.AsCloudError(err)
 	definitiveRefusal := err != nil && isDefinitiveFunctionRefusal(ce)
@@ -2049,9 +2066,41 @@ func (h *Host) FunctionAliasSet(dry bool, name, alias, version string) error {
 		failed = true
 		return h.fail(op, name, ce)
 	}
+	reconciledAliasVer := version
+	hasReconciledAlias := false
+	if childSeq == 0 {
+		if curAct, hasCur, _, _, _ := h.cost.lookupFunctionEntry(ep, name); hasCur && curAct.StateJSON != act.StateJSON {
+			if actualVer, gerr := h.cfg.Functions.GetFunctionAlias(ctx, name, alias); gerr == nil {
+				reconciledAliasVer = actualVer
+				hasReconciledAlias = true
+			}
+		}
+	}
 	if cerr := h.cost.updateFunctionDryState(ep, name, act.OwnerToken, act.Digest, act.Generation, func(cur string) string {
 		st, ok := decodePersistedDryFunctionState(cur)
 		if !ok {
+			return cur
+		}
+		if childSeq > 0 {
+			if st.AliasSeq[alias] > childSeq {
+				return cur
+			}
+			st.Aliases[alias] = version
+			st.AliasSeq[alias] = childSeq
+			if childSeq > st.ChildSeq {
+				st.ChildSeq = childSeq
+			}
+			return encodePersistedDryFunctionState(st)
+		}
+		if hasReconciledAlias {
+			if reconciledAliasVer == "" {
+				delete(st.Aliases, alias)
+			} else {
+				st.Aliases[alias] = reconciledAliasVer
+			}
+			return encodePersistedDryFunctionState(st)
+		}
+		if cur != act.StateJSON {
 			return cur
 		}
 		st.Aliases[alias] = version
@@ -2259,7 +2308,9 @@ func (h *Host) FunctionAliasDelete(dry bool, name, alias string) (bool, error) {
 		return false, h.fail(op, name, notFound("FunctionNotFound", fmt.Sprintf("function %q does not exist", name)))
 	}
 
+	var childSeq uint64
 	mctx = functionFenceCtx(mctx, act.OwnerToken, act.Generation)
+	mctx = hostkit.WithFunctionChildMutationSeqOut(mctx, &childSeq)
 	existed, err := h.cfg.Functions.DeleteFunctionAlias(mctx, name, alias)
 	ce := hostkit.AsCloudError(err)
 	var abortErr *hostkit.CloudError
@@ -2272,9 +2323,41 @@ func (h *Host) FunctionAliasDelete(dry bool, name, alias string) (bool, error) {
 		failed = true
 		return false, h.fail(op, name, ce)
 	}
+	reconciledAliasVer := ""
+	hasReconciledAlias := false
+	if childSeq == 0 {
+		if curAct, hasCur, _, _, _ := h.cost.lookupFunctionEntry(ep, name); hasCur && curAct.StateJSON != act.StateJSON {
+			if actualVer, gerr := h.cfg.Functions.GetFunctionAlias(ctx, name, alias); gerr == nil {
+				reconciledAliasVer = actualVer
+				hasReconciledAlias = true
+			}
+		}
+	}
 	if cerr := h.cost.updateFunctionDryState(ep, name, act.OwnerToken, act.Digest, act.Generation, func(cur string) string {
 		st, ok := decodePersistedDryFunctionState(cur)
 		if !ok {
+			return cur
+		}
+		if childSeq > 0 {
+			if st.AliasSeq[alias] > childSeq {
+				return cur
+			}
+			delete(st.Aliases, alias)
+			st.AliasSeq[alias] = childSeq
+			if childSeq > st.ChildSeq {
+				st.ChildSeq = childSeq
+			}
+			return encodePersistedDryFunctionState(st)
+		}
+		if hasReconciledAlias {
+			if reconciledAliasVer == "" {
+				delete(st.Aliases, alias)
+			} else {
+				st.Aliases[alias] = reconciledAliasVer
+			}
+			return encodePersistedDryFunctionState(st)
+		}
+		if cur != act.StateJSON {
 			return cur
 		}
 		delete(st.Aliases, alias)

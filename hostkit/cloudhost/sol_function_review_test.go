@@ -5,6 +5,7 @@ package cloudhost
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1268,6 +1269,141 @@ def handler(e,c):
 				t.Fatal("aggregate fd/sparse bound not enforced", out.Payload())
 			}
 		})
+	}
+}
+
+type solR4LateAlias struct {
+	*fakeadapter.Fake
+	entered, release chan struct{}
+}
+
+func (a *solR4LateAlias) SetFunctionAlias(ctx context.Context, n, k, v string) (bool, error) {
+	made, e := a.Fake.SetFunctionAlias(ctx, n, k, v)
+	if e == nil {
+		close(a.entered)
+		<-a.release
+	}
+	return made, e
+}
+
+func TestSolR4FnLateAliasCache(t *testing.T) {
+	for _, journalMode := range []bool{false, true} {
+		mode := "campaign"
+		if journalMode {
+			mode = "journal"
+		}
+		t.Run(mode, func(t *testing.T) {
+			h, f, _, campaign := newFuncHost(t)
+			base := Config{Provider: "aws", Functions: f, CampaignStatePath: campaign}
+			var j *safety.Journal
+			if journalMode {
+				_, j, _ = solJournal(t)
+				base.Journal = j
+				base.CampaignStatePath = ""
+				h = New(base)
+				h.SetAbortOnError(false)
+			}
+			c := solFnConfig(t, h, "def handler(e,c): return {'v':1}\n")
+			h.FunctionCreate(false, "aliasorder", c)
+			h.FunctionPublishVersion(false, "aliasorder", "", false)
+			c = solFnConfig(t, h, "def handler(e,c): return {'v':2}\n")
+			h.FunctionUpdate(false, "aliasorder", c, "", false)
+			h.FunctionPublishVersion(false, "aliasorder", "", false)
+
+			a := &solR4LateAlias{Fake: f, entered: make(chan struct{}), release: make(chan struct{})}
+			slowCfg := base
+			slowCfg.Functions = a
+			slow := New(slowCfg)
+			slow.SetAbortOnError(false)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				slow.FunctionAliasSet(false, "aliasorder", "prod", "1")
+			}()
+			<-a.entered
+
+			peer := New(base)
+			peer.SetAbortOnError(false)
+			peer.FunctionAliasSet(false, "aliasorder", "prod", "2")
+			close(a.release)
+			<-done
+
+			if journalMode {
+				jDir := filepath.Dir(j.Path())
+				jMeta := j.State().Meta
+				if err := j.Compact(); err != nil {
+					t.Fatalf("Compact: %v", err)
+				}
+				if err := j.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+				reopened, err := safety.OpenJournal(jDir, jMeta)
+				if err != nil {
+					t.Fatalf("Reopen: %v", err)
+				}
+				t.Cleanup(func() { _ = reopened.Close() })
+				base.Journal = reopened
+			}
+
+			actual, e := f.GetFunctionAlias(context.Background(), "aliasorder", "prod")
+			if e != nil || actual != "2" {
+				t.Fatal("fixture ordering", actual, e)
+			}
+			previewCfg := base
+			previewCfg.Functions = solR2FunctionsOnly{Functions: f}
+			preview := New(previewCfg)
+			preview.SetAbortOnError(false)
+			out, _ := preview.FunctionInvoke(true, "aliasorder", "prod", "{}", true)
+			t.Logf("actual=%s dry=%s last=%+v", actual, out.ExecutedVersion(), preview.LastError())
+			if out.ExecutedVersion() != actual {
+				t.Fatal("older successful alias reply overwrote newer preview state")
+			}
+		})
+	}
+}
+
+func TestSolR4FnScratchEscape(t *testing.T) {
+	dir := t.TempDir()
+	canary := filepath.Join(dir, "canary")
+	if e := os.WriteFile(canary, []byte("sol-r4-escape-fixture"), 0o600); e != nil {
+		t.Fatal(e)
+	}
+	h, _, _, _ := newFuncHost(t)
+	c := solFnConfig(t, h, `import os,json,ctypes
+def handler(e,c):
+ td=os.environ['TMPDIR']
+ results={}
+ for key,p in [('symlink',os.path.join(td,'outside')),('parent',os.path.join(td,'..','outside'))]:
+  try:
+   if key=='symlink': os.symlink(e['canary'],p);open(p).read()
+   else: open(p,'w').write('x')
+   results[key]=True
+  except OSError: results[key]=False
+ try: os.link(e['canary'],os.path.join(td,'hard'));results['hardlink']=True
+ except OSError: results['hardlink']=False
+ lib=ctypes.CDLL(None,use_errno=True)
+ results['unmount_rc']=lib.umount2(td.encode(),2)
+ results['unmount_errno']=ctypes.get_errno()
+ return results
+`)
+	h.FunctionCreate(false, "escapeprobe", c)
+	payload := `{"canary":"` + canary + `"}`
+	out, _ := h.FunctionInvoke(false, "escapeprobe", "", payload, false)
+	t.Logf("last=%+v payload=%s", h.LastError(), out.Payload())
+	if h.LastError().Code != hostkit.OK || out.IsError() {
+		t.Fatal("escape fixture did not execute", h.LastError(), out.Payload())
+	}
+	var result map[string]any
+	if e := json.Unmarshal([]byte(out.Payload()), &result); e != nil {
+		t.Fatal(e)
+	}
+	for _, key := range []string{"symlink", "parent", "hardlink"} {
+		if value, ok := result[key].(bool); !ok || value {
+			t.Fatal("scratch escape", key, result)
+		}
+	}
+	if value, ok := result["unmount_rc"].(float64); !ok || value >= 0 {
+		t.Fatal("handler unmounted private scratch", result)
 	}
 }
 

@@ -38,6 +38,7 @@ type functionState struct {
 	OpGen             uint64                              `json:"op_gen"`
 	OwnerToken        string                              `json:"owner_token"`
 	MaxGeneration     uint64                              `json:"max_generation"`
+	ChildSeq          uint64                              `json:"child_seq,omitempty"`
 	NextRevSeq        int64                               `json:"next_rev_seq"`
 	NextVersion       int                                 `json:"next_version"`
 	Latest            hostkit.FunctionSnapshot            `json:"latest"`
@@ -859,6 +860,8 @@ func (f *Fake) PublishFunctionVersion(ctx context.Context, name, expectRevision 
 		fn.VersionOrder = append(fn.VersionOrder, version)
 		// Rotate $LATEST's revision_id on version publish (§2.2).
 		fn.Latest.RevisionID = nextFunctionRevisionID(fn, name)
+		fn.ChildSeq++
+		hostkit.ReportFunctionChildMutationSeq(ctx, fn.ChildSeq)
 		return nil
 	})
 	return version, err
@@ -910,6 +913,8 @@ func (f *Fake) SetFunctionAlias(ctx context.Context, name, alias, version string
 		}
 		fn.Aliases[alias] = version
 		created = !exists
+		fn.ChildSeq++
+		hostkit.ReportFunctionChildMutationSeq(ctx, fn.ChildSeq)
 		return nil
 	})
 	return created, err
@@ -946,6 +951,8 @@ func (f *Fake) DeleteFunctionAlias(ctx context.Context, name, alias string) (boo
 			delete(fn.Aliases, alias)
 			existed = true
 		}
+		fn.ChildSeq++
+		hostkit.ReportFunctionChildMutationSeq(ctx, fn.ChildSeq)
 		return nil
 	})
 	return existed, err

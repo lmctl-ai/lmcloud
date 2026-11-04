@@ -3,18 +3,28 @@
 package fakeadapter
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const (
-	maxScratchTmpInodes = 4096
+	maxScratchTmpInodes  = 4096
+	maxScratchFuseName   = 255
+	maxScratchSymlinkLen = 4096
+	fuseHelperTimeout    = 5 * time.Second
+	mfdCloexec           = 0x0001
+	exitDelayBytes       = 64 * 1024 * 1024
 
 	fuseKernelMajor = 7
 	fuseKernelMinor = 31
@@ -84,18 +94,23 @@ type fuseInode struct {
 }
 
 type scratchFuseFS struct {
-	mu           sync.Mutex
-	fd           int
-	mountDir     string
-	fusermount   string
-	maxBytes     int64
-	maxInodes    int
-	uid          uint32
-	gid          uint32
-	inodes       map[uint64]*fuseInode
-	nextIno      uint64
-	closed       bool
-	doneCh       chan struct{}
+	mu              sync.Mutex
+	fd              int
+	watchWFD        int
+	watchCmd        *exec.Cmd
+	exitDelayFD     int
+	mountDir        string
+	fusermount      string
+	maxBytes        int64
+	maxInodes       int
+	uid             uint32
+	gid             uint32
+	inodes          map[uint64]*fuseInode
+	nextIno         uint64
+	pendingReleases int
+	lastFlushTime   time.Time
+	closed          bool
+	doneCh          chan struct{}
 }
 
 func resolveFusermountBin() (string, error) {
@@ -113,19 +128,147 @@ func resolveFusermountBin() (string, error) {
 	return "", fmt.Errorf("fusermount3 not found")
 }
 
+func sweepDisconnectedScratchMounts(fmBin string) {
+	raw, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return
+	}
+	uidTag := fmt.Sprintf("user_id=%d", os.Getuid())
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+		mntPoint := fields[4]
+		sepIdx := -1
+		for i := 6; i < len(fields); i++ {
+			if fields[i] == "-" {
+				sepIdx = i
+				break
+			}
+		}
+		if sepIdx < 0 || sepIdx+3 >= len(fields) {
+			continue
+		}
+		fsType := fields[sepIdx+1]
+		source := fields[sepIdx+2]
+		superOpts := fields[sepIdx+3]
+		if fsType != "fuse.tmpfs" || source != "lmcloud_scratch" {
+			continue
+		}
+		ownedByUs := false
+		for _, opt := range strings.Split(superOpts, ",") {
+			if opt == uidTag {
+				ownedByUs = true
+				break
+			}
+		}
+		if !ownedByUs {
+			continue
+		}
+		var st syscall.Stat_t
+		if err := syscall.Stat(mntPoint, &st); errors.Is(err, syscall.ENOTCONN) {
+			if syscall.Unmount(mntPoint, syscall.MNT_DETACH) != nil && fmBin != "" {
+				ctx, cancel := context.WithTimeout(context.Background(), fuseHelperTimeout)
+				_ = exec.CommandContext(ctx, fmBin, "-u", "-z", "-q", "--", mntPoint).Run()
+				cancel()
+			}
+		}
+	}
+}
+
+func dupAboveCloexec(fd int, minFD int) int {
+	if fd < 0 || fd >= minFD {
+		return fd
+	}
+	newFD, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_DUPFD_CLOEXEC, uintptr(minFD))
+	if errno != 0 {
+		return fd
+	}
+	_ = syscall.Close(fd)
+	return int(newFD)
+}
+
+func createExitDelayFD() int {
+	var nr uintptr
+	switch runtime.GOARCH {
+	case "amd64":
+		nr = 319
+	case "arm64":
+		nr = 279
+	default:
+		return -1
+	}
+	nameBytes := []byte("lmcloud_fuse_exit_sync\x00")
+	r1, _, errno := syscall.Syscall(nr, uintptr(unsafe.Pointer(&nameBytes[0])), uintptr(mfdCloexec), 0)
+	if errno != 0 {
+		return -1
+	}
+	fd := int(r1)
+	if err := syscall.Fallocate(fd, 0, 0, exitDelayBytes); err != nil {
+		_ = syscall.Close(fd)
+		return -1
+	}
+	return fd
+}
+
+func startFuseUnmountWatchdog(fmBin, mountDir string, watchR *os.File) (*exec.Cmd, error) {
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("create watchdog readiness pipe: %w", err)
+	}
+	script := `echo ok >&3; exec 3>&-; read -r _ || true; exec "$1" -u -z -q -- "$2"`
+	cmd := exec.Command("/bin/sh", "-c", script, "lmcloud-fuse-watchdog", fmBin, mountDir)
+	cmd.Stdin = watchR
+	cmd.ExtraFiles = []*os.File{readyW}
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		_ = readyR.Close()
+		_ = readyW.Close()
+		return nil, fmt.Errorf("start fuse unmount watchdog: %w", err)
+	}
+	_ = readyW.Close()
+
+	_ = readyR.SetReadDeadline(time.Now().Add(fuseHelperTimeout))
+	var buf [8]byte
+	n, readErr := readyR.Read(buf[:])
+	_ = readyR.Close()
+	if readErr != nil || n == 0 {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("fuse unmount watchdog did not become ready: %w", readErr)
+	}
+	return cmd, nil
+}
+
 func mountScratchFuseFS(mountDir string, maxBytes int64, maxInodes int) (*scratchFuseFS, error) {
 	fmBin, err := resolveFusermountBin()
 	if err != nil {
 		return nil, err
 	}
+	sweepDisconnectedScratchMounts(fmBin)
+
+	// Allocate exitDelayFD at the lowest FD slot so in Linux's LIFO task_work_run()
+	// during do_exit(), watchWFD (highest FD) closes first to wake the watchdog,
+	// fuseFD closes second, and exitDelayFD (lowest FD) closes last to hold do_exit()
+	// until the watchdog finishes detaching the mount.
+	exitDelayFD := createExitDelayFD()
+
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
 	if err != nil {
+		if exitDelayFD >= 0 {
+			_ = syscall.Close(exitDelayFD)
+		}
 		return nil, fmt.Errorf("socketpair for fusermount3: %w", err)
 	}
 	parentSock := fds[0]
+	syscall.CloseOnExec(parentSock)
 	childFile := os.NewFile(uintptr(fds[1]), "fuse-commfd")
 
-	cmd := exec.Command(fmBin, "-o", "rw,nosuid,nodev,fsname=lmcloud_scratch,subtype=tmpfs", "--", mountDir)
+	mountCtx, mountCancel := context.WithTimeout(context.Background(), fuseHelperTimeout)
+	defer mountCancel()
+	cmd := exec.CommandContext(mountCtx, fmBin, "-o", "rw,nosuid,nodev,fsname=lmcloud_scratch,subtype=tmpfs", "--", mountDir)
 	cmd.ExtraFiles = []*os.File{childFile}
 	cmd.Env = []string{
 		"PATH=/usr/bin:/bin",
@@ -139,6 +282,9 @@ func mountScratchFuseFS(mountDir string, maxBytes int64, maxInodes int) (*scratc
 	if err := cmd.Start(); err != nil {
 		_ = childFile.Close()
 		_ = syscall.Close(parentSock)
+		if exitDelayFD >= 0 {
+			_ = syscall.Close(exitDelayFD)
+		}
 		if pipeErr == nil {
 			_ = rPipe.Close()
 			_ = wPipe.Close()
@@ -158,35 +304,87 @@ func mountScratchFuseFS(mountDir string, maxBytes int64, maxInodes int) (*scratc
 	waitErr := cmd.Wait()
 	var errText string
 	if pipeErr == nil {
+		_ = rPipe.SetReadDeadline(time.Now().Add(fuseHelperTimeout))
 		n, _ := rPipe.Read(stderrBuf[:])
 		_ = rPipe.Close()
 		errText = string(stderrBuf[:n])
 	}
 	if recvErr != nil {
+		if exitDelayFD >= 0 {
+			_ = syscall.Close(exitDelayFD)
+		}
 		return nil, fmt.Errorf("receive /dev/fuse fd from fusermount3: %w (wait=%v stderr=%q)", recvErr, waitErr, errText)
 	}
 	cmsgs, err := syscall.ParseSocketControlMessage(oobBuf[:oobn])
 	if err != nil || len(cmsgs) == 0 {
+		if exitDelayFD >= 0 {
+			_ = syscall.Close(exitDelayFD)
+		}
 		return nil, fmt.Errorf("parse fusermount3 control message: %w (wait=%v stderr=%q)", err, waitErr, errText)
 	}
 	gotFDs, err := syscall.ParseUnixRights(&cmsgs[0])
 	if err != nil || len(gotFDs) == 0 {
+		if exitDelayFD >= 0 {
+			_ = syscall.Close(exitDelayFD)
+		}
 		return nil, fmt.Errorf("parse /dev/fuse unix rights: %w", err)
 	}
 	fuseFD := gotFDs[0]
 	syscall.CloseOnExec(fuseFD)
+	if exitDelayFD >= 0 {
+		fuseFD = dupAboveCloexec(fuseFD, exitDelayFD+1)
+	}
+
+	var wpipe [2]int
+	if err := syscall.Pipe2(wpipe[:], syscall.O_CLOEXEC); err != nil {
+		_ = syscall.Close(fuseFD)
+		if exitDelayFD >= 0 {
+			_ = syscall.Close(exitDelayFD)
+		}
+		if syscall.Unmount(mountDir, syscall.MNT_DETACH) != nil {
+			uCtx, uCancel := context.WithTimeout(context.Background(), fuseHelperTimeout)
+			_ = exec.CommandContext(uCtx, fmBin, "-u", "-z", "-q", "--", mountDir).Run()
+			uCancel()
+		}
+		return nil, fmt.Errorf("create fuse watchdog pipe: %w", err)
+	}
+	watchR := os.NewFile(uintptr(wpipe[0]), "fuse-watch-r")
+	minWatchFD := fuseFD + 1
+	if exitDelayFD+1 > minWatchFD {
+		minWatchFD = exitDelayFD + 1
+	}
+	watchWFD := dupAboveCloexec(wpipe[1], minWatchFD)
+
+	watchCmd, err := startFuseUnmountWatchdog(fmBin, mountDir, watchR)
+	_ = watchR.Close()
+	if err != nil {
+		_ = syscall.Close(fuseFD)
+		_ = syscall.Close(watchWFD)
+		if exitDelayFD >= 0 {
+			_ = syscall.Close(exitDelayFD)
+		}
+		if syscall.Unmount(mountDir, syscall.MNT_DETACH) != nil {
+			uCtx, uCancel := context.WithTimeout(context.Background(), fuseHelperTimeout)
+			_ = exec.CommandContext(uCtx, fmBin, "-u", "-z", "-q", "--", mountDir).Run()
+			uCancel()
+		}
+		return nil, err
+	}
 
 	uid := uint32(os.Getuid())
 	gid := uint32(os.Getgid())
 	now := time.Now().Unix()
 	fs := &scratchFuseFS{
-		fd:         fuseFD,
-		mountDir:   mountDir,
-		fusermount: fmBin,
-		maxBytes:   maxBytes,
-		maxInodes:  maxInodes,
-		uid:        uid,
-		gid:        gid,
+		fd:          fuseFD,
+		watchWFD:    watchWFD,
+		watchCmd:    watchCmd,
+		exitDelayFD: exitDelayFD,
+		mountDir:    mountDir,
+		fusermount:  fmBin,
+		maxBytes:    maxBytes,
+		maxInodes:   maxInodes,
+		uid:         uid,
+		gid:         gid,
 		inodes: map[uint64]*fuseInode{
 			1: {
 				ino:      1,
@@ -206,10 +404,28 @@ func mountScratchFuseFS(mountDir string, maxBytes int64, maxInodes int) (*scratc
 	return fs, nil
 }
 
+func inodeAllocatedBytes(n *fuseInode) int64 {
+	if n == nil {
+		return 0
+	}
+	l := int64(len(n.data))
+	c := int64(cap(n.data))
+	if c > l {
+		return c
+	}
+	return l
+}
+
 func (fs *scratchFuseFS) UsedBytes() int64 {
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	return fs.usedBytesLocked()
+	for fs.pendingReleases > 0 && time.Since(fs.lastFlushTime) < 25*time.Millisecond {
+		fs.mu.Unlock()
+		time.Sleep(50 * time.Microsecond)
+		fs.mu.Lock()
+	}
+	used := fs.usedBytesLocked()
+	fs.mu.Unlock()
+	return used
 }
 
 func (fs *scratchFuseFS) usedBytesLocked() int64 {
@@ -219,10 +435,41 @@ func (fs *scratchFuseFS) usedBytesLocked() int64 {
 			continue
 		}
 		if n.nlink > 0 || n.openCount > 0 {
-			total += int64(len(n.data))
+			total += inodeAllocatedBytes(n)
 		}
 	}
 	return total
+}
+
+func (fs *scratchFuseFS) totalDirEntriesLocked() int {
+	var count int
+	for _, n := range fs.inodes {
+		if n != nil && n.children != nil {
+			count += len(n.children)
+		}
+	}
+	return count
+}
+
+func validateFuseEntryName(name string) syscall.Errno {
+	if name == "" || name == "." || name == ".." || strings.IndexByte(name, '/') >= 0 {
+		return syscall.EINVAL
+	}
+	if len(name) > maxScratchFuseName {
+		return syscall.ENAMETOOLONG
+	}
+	return 0
+}
+
+func (fs *scratchFuseFS) reclaimInodeLocked(ino uint64, n *fuseInode) {
+	if ino == 1 || n == nil {
+		return
+	}
+	if n.nlink == 0 && n.openCount <= 0 {
+		n.data = nil
+		n.children = nil
+		delete(fs.inodes, ino)
+	}
 }
 
 func (fs *scratchFuseFS) Close() {
@@ -235,13 +482,50 @@ func (fs *scratchFuseFS) Close() {
 	fs.closed = true
 	fd := fs.fd
 	fs.fd = -1
+	watchWFD := fs.watchWFD
+	fs.watchWFD = -1
+	watchCmd := fs.watchCmd
+	fs.watchCmd = nil
+	exitDelayFD := fs.exitDelayFD
+	fs.exitDelayFD = -1
+	for ino, n := range fs.inodes {
+		if n != nil {
+			n.data = nil
+			if ino != 1 {
+				n.children = nil
+			}
+		}
+	}
 	fs.mu.Unlock()
 
 	if fd >= 0 {
 		_ = syscall.Close(fd)
 	}
+	if watchWFD >= 0 {
+		_ = syscall.Close(watchWFD)
+	}
+	if watchCmd != nil {
+		waitCh := make(chan struct{})
+		go func() {
+			_ = watchCmd.Wait()
+			close(waitCh)
+		}()
+		select {
+		case <-waitCh:
+		case <-time.After(fuseHelperTimeout):
+			if watchCmd.Process != nil {
+				_ = watchCmd.Process.Kill()
+			}
+			<-waitCh
+		}
+	}
 	if syscall.Unmount(fs.mountDir, syscall.MNT_DETACH) != nil && fs.fusermount != "" {
-		_ = exec.Command(fs.fusermount, "-u", "-z", "--", fs.mountDir).Run()
+		ctx, cancel := context.WithTimeout(context.Background(), fuseHelperTimeout)
+		_ = exec.CommandContext(ctx, fs.fusermount, "-u", "-z", "-q", "--", fs.mountDir).Run()
+		cancel()
+	}
+	if exitDelayFD >= 0 {
+		_ = syscall.Close(exitDelayFD)
 	}
 	<-fs.doneCh
 }
@@ -463,14 +747,22 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 				fs.replyErr(fd, unique, syscall.ENOSPC)
 				return
 			}
-			other := fs.usedBytesLocked() - int64(len(n.data))
+			other := fs.usedBytesLocked() - inodeAllocatedBytes(n)
 			if other+int64(newSize) > fs.maxBytes {
 				fs.replyErr(fd, unique, syscall.ENOSPC)
 				return
 			}
 			sz := int(newSize)
-			if sz < len(n.data) {
-				n.data = n.data[:sz]
+			if sz == 0 {
+				n.data = nil
+			} else if sz < len(n.data) || cap(n.data) > sz {
+				shrunk := make([]byte, sz)
+				if sz < len(n.data) {
+					copy(shrunk, n.data[:sz])
+				} else {
+					copy(shrunk, n.data)
+				}
+				n.data = shrunk
 			} else if sz > len(n.data) {
 				grown := make([]byte, sz)
 				copy(grown, n.data)
@@ -499,8 +791,8 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 		flags := binary.LittleEndian.Uint32(body[0:4])
 		mode := binary.LittleEndian.Uint32(body[4:8])
 		name := cstrName(body[16:])
-		if name == "" {
-			fs.replyErr(fd, unique, syscall.EINVAL)
+		if errno := validateFuseEntryName(name); errno != 0 {
+			fs.replyErr(fd, unique, errno)
 			return
 		}
 		var cn *fuseInode
@@ -519,7 +811,7 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 			}
 			cn.openCount++
 		} else {
-			if len(fs.inodes) >= fs.maxInodes {
+			if len(fs.inodes) >= fs.maxInodes || fs.totalDirEntriesLocked() >= fs.maxInodes {
 				fs.replyErr(fd, unique, syscall.ENOSPC)
 				return
 			}
@@ -556,11 +848,15 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 		}
 		mode := binary.LittleEndian.Uint32(body[0:4])
 		name := cstrName(body[16:])
+		if errno := validateFuseEntryName(name); errno != 0 {
+			fs.replyErr(fd, unique, errno)
+			return
+		}
 		if _, exists := parent.children[name]; exists {
 			fs.replyErr(fd, unique, syscall.EEXIST)
 			return
 		}
-		if len(fs.inodes) >= fs.maxInodes {
+		if len(fs.inodes) >= fs.maxInodes || fs.totalDirEntriesLocked() >= fs.maxInodes {
 			fs.replyErr(fd, unique, syscall.ENOSPC)
 			return
 		}
@@ -596,11 +892,15 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 		}
 		mode := binary.LittleEndian.Uint32(body[0:4])
 		name := cstrName(body[8:])
+		if errno := validateFuseEntryName(name); errno != 0 {
+			fs.replyErr(fd, unique, errno)
+			return
+		}
 		if _, exists := parent.children[name]; exists {
 			fs.replyErr(fd, unique, syscall.EEXIST)
 			return
 		}
-		if len(fs.inodes) >= fs.maxInodes {
+		if len(fs.inodes) >= fs.maxInodes || fs.totalDirEntriesLocked() >= fs.maxInodes {
 			fs.replyErr(fd, unique, syscall.ENOSPC)
 			return
 		}
@@ -645,9 +945,7 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 			if cn.nlink > 0 {
 				cn.nlink--
 			}
-			if cn.nlink == 0 && cn.openCount <= 0 {
-				delete(fs.inodes, cino)
-			}
+			fs.reclaimInodeLocked(cino, cn)
 		}
 		fs.replyOK(fd, unique, nil)
 
@@ -677,9 +975,7 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 			parent.nlink--
 		}
 		cn.nlink = 0
-		if cn.openCount <= 0 {
-			delete(fs.inodes, cino)
-		}
+		fs.reclaimInodeLocked(cino, cn)
 		fs.replyOK(fd, unique, nil)
 
 	case fuseOpRename, fuseOpRename2:
@@ -709,6 +1005,14 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 			return
 		}
 		oldName, newName := splitTwoCStrings(names)
+		if errno := validateFuseEntryName(oldName); errno != 0 {
+			fs.replyErr(fd, unique, errno)
+			return
+		}
+		if errno := validateFuseEntryName(newName); errno != 0 {
+			fs.replyErr(fd, unique, errno)
+			return
+		}
 		srcIno, exists := oldParent.children[oldName]
 		if !exists {
 			fs.replyErr(fd, unique, syscall.ENOENT)
@@ -731,9 +1035,7 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 					if dst.mode&syscall.S_IFMT == syscall.S_IFDIR {
 						dst.nlink = 0
 					}
-					if dst.nlink == 0 && dst.openCount <= 0 {
-						delete(fs.inodes, dstIno)
-					}
+					fs.reclaimInodeLocked(dstIno, dst)
 				}
 			}
 		}
@@ -751,6 +1053,10 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 		}
 		oldIno := binary.LittleEndian.Uint64(body[0:8])
 		name := cstrName(body[8:])
+		if errno := validateFuseEntryName(name); errno != 0 {
+			fs.replyErr(fd, unique, errno)
+			return
+		}
 		parent, ok1 := fs.inodes[nodeid]
 		target, ok2 := fs.inodes[oldIno]
 		if !ok1 || !ok2 || parent.children == nil {
@@ -763,6 +1069,10 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 		}
 		if _, exists := parent.children[name]; exists {
 			fs.replyErr(fd, unique, syscall.EEXIST)
+			return
+		}
+		if fs.totalDirEntriesLocked() >= fs.maxInodes {
+			fs.replyErr(fd, unique, syscall.ENOSPC)
 			return
 		}
 		target.nlink++
@@ -778,23 +1088,37 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 			return
 		}
 		name, target := splitTwoCStrings(body)
+		if errno := validateFuseEntryName(name); errno != 0 {
+			fs.replyErr(fd, unique, errno)
+			return
+		}
+		if target == "" {
+			fs.replyErr(fd, unique, syscall.ENOENT)
+			return
+		}
+		if len(target) > maxScratchSymlinkLen {
+			fs.replyErr(fd, unique, syscall.ENAMETOOLONG)
+			return
+		}
 		if _, exists := parent.children[name]; exists {
 			fs.replyErr(fd, unique, syscall.EEXIST)
 			return
 		}
-		if len(fs.inodes) >= fs.maxInodes || fs.usedBytesLocked()+int64(len(target)) > fs.maxBytes {
+		if len(fs.inodes) >= fs.maxInodes || fs.totalDirEntriesLocked() >= fs.maxInodes || fs.usedBytesLocked()+int64(len(target)) > fs.maxBytes {
 			fs.replyErr(fd, unique, syscall.ENOSPC)
 			return
 		}
 		cino := fs.nextIno
 		fs.nextIno++
+		symData := make([]byte, len(target))
+		copy(symData, target)
 		cn := &fuseInode{
 			ino:   cino,
 			mode:  syscall.S_IFLNK | 0o777,
 			nlink: 1,
 			uid:   fs.uid,
 			gid:   fs.gid,
-			data:  []byte(target),
+			data:  symData,
 			mtime: time.Now().Unix(),
 		}
 		fs.inodes[cino] = cn
@@ -829,15 +1153,21 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 		fs.replyOK(fd, unique, out[:])
 
 	case fuseOpRelease, fuseOpReleasedir:
+		if fs.pendingReleases > 0 {
+			fs.pendingReleases--
+		}
 		if n, ok := fs.inodes[nodeid]; ok {
 			n.openCount--
-			if n.nlink == 0 && n.openCount <= 0 && nodeid != 1 {
-				delete(fs.inodes, nodeid)
-			}
+			fs.reclaimInodeLocked(nodeid, n)
 		}
 		fs.replyOK(fd, unique, nil)
 
-	case fuseOpFlush, fuseOpFsync, fuseOpFsyncdir:
+	case fuseOpFlush:
+		fs.pendingReleases++
+		fs.lastFlushTime = time.Now()
+		fs.replyOK(fd, unique, nil)
+
+	case fuseOpFsync, fuseOpFsyncdir:
 		fs.replyOK(fd, unique, nil)
 
 	case fuseOpRead:
@@ -887,7 +1217,7 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 		if int(end) > newSize {
 			newSize = int(end)
 		}
-		other := fs.usedBytesLocked() - int64(len(n.data))
+		other := fs.usedBytesLocked() - inodeAllocatedBytes(n)
 		if other+int64(newSize) > fs.maxBytes {
 			fs.replyErr(fd, unique, syscall.ENOSPC)
 			return
@@ -929,7 +1259,7 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 		if int(end) > newSize {
 			newSize = int(end)
 		}
-		other := fs.usedBytesLocked() - int64(len(n.data))
+		other := fs.usedBytesLocked() - inodeAllocatedBytes(n)
 		if other+int64(newSize) > fs.maxBytes {
 			fs.replyErr(fd, unique, syscall.ENOSPC)
 			return
