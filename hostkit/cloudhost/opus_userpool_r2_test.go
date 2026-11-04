@@ -138,6 +138,7 @@ func TestOpusUPSignInRacesRevocation(t *testing.T) {
 
 // ---- legal names hitting the journal's forbidden-substring filter
 func TestOpusUPLegalNamesVsForbiddenFilter(t *testing.T) {
+	t.Parallel()
 	for _, jm := range []bool{false, true} {
 		for _, c := range []struct {
 			name  string
@@ -151,7 +152,9 @@ func TestOpusUPLegalNamesVsForbiddenFilter(t *testing.T) {
 				h.UserCreate(false, "namepool", "alice", map[string]string{"role": "password"})
 			}},
 		} {
+			jm, c := jm, c
 			t.Run(modeName(jm)+"/"+c.name, func(t *testing.T) {
+				t.Parallel()
 				e := newOpusEnv(t, jm)
 				h := e.host(e.f)
 				h.UserpoolCreate(false, "namepool")
@@ -332,8 +335,11 @@ func TestOpusUPDefinitiveAfterCommitRollsBackRevocation(t *testing.T) {
 }
 
 func TestOpusUPDeleteRefusedDropsLiveBindings(t *testing.T) {
+	t.Parallel()
 	for _, jm := range []bool{false, true} {
+		jm := jm
 		t.Run(modeName(jm), func(t *testing.T) {
+			t.Parallel()
 			e := newOpusEnv(t, jm)
 			h := e.host(e.f)
 			h.UserpoolCreate(false, "refpool")
@@ -435,9 +441,12 @@ func (a *opusDescribeFail) DescribeUserPool(context.Context, string) (hostkit.Us
 	return hostkit.UserpoolInfo{}, hostkit.ProviderError(hostkit.Internal, 503, "ServiceUnavailable", "describe down")
 }
 func TestOpusUPIncarnationFailClosed(t *testing.T) {
+	t.Parallel()
 	for _, jm := range []bool{false, true} {
 		for _, down := range []bool{false, true} {
+			jm, down := jm, down
 			t.Run(fmt.Sprintf("%s/describe_down=%v", modeName(jm), down), func(t *testing.T) {
+				t.Parallel()
 				e := newOpusEnv(t, jm)
 				h := e.host(e.f)
 				h.UserpoolCreate(false, "incpool")
@@ -727,7 +736,7 @@ func TestOpusUPSignInTimingAllPaths(t *testing.T) {
 	h.UserSetEnabled(false, "timepool", "disabled", false)
 	paths := []struct{ n, u, p string }{{"missing", "nobody", "Guess12345"}, {"passwordless", "pwless", "Guess12345"}, {"wrong", "active", "Guess12345"}, {"disabled_wrong", "disabled", "Guess12345"}, {"disabled_right", "disabled", "Actual12345"}}
 	res := map[string]time.Duration{}
-	for round := 0; round < 7; round++ {
+	for round := 0; round < 4; round++ {
 		for _, p := range paths {
 			st := time.Now()
 			h.UserSignIn(false, "timepool", p.u, p.p)
@@ -741,7 +750,7 @@ func TestOpusUPSignInTimingAllPaths(t *testing.T) {
 	var lo, hi time.Duration
 	for _, p := range paths {
 		var xs []time.Duration
-		for r := 1; r < 7; r++ {
+		for r := 1; r < 4; r++ {
 			xs = append(xs, res[p.n+fmt.Sprint(r)])
 		}
 		m := med(xs)

@@ -313,7 +313,7 @@ func mountScratchFuseFS(mountDir string, maxBytes int64, maxInodes int) (*scratc
 	_ = syscall.SetsockoptTimeval(parentSock, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &syscall.Timeval{Sec: 5})
 	msgBuf := make([]byte, 64)
 	oobBuf := make([]byte, syscall.CmsgSpace(4))
-	_, oobn, _, _, recvErr := syscall.Recvmsg(parentSock, msgBuf, oobBuf, 0)
+	_, oobn, _, _, recvErr := recvmsgNoEINTR(parentSock, msgBuf, oobBuf, 0)
 	_ = syscall.Close(parentSock)
 	waitErr := cmd.Wait()
 	var errText string
@@ -1531,11 +1531,11 @@ func runScratchFuseHelperMain() {
 	syscall.CloseOnExec(watchWFD)
 	syscall.CloseOnExec(ctrlFD)
 
-	if _, err := syscall.Write(ctrlFD, []byte("READY")); err != nil {
+	if _, err := writeNoEINTR(ctrlFD, []byte("READY")); err != nil {
 		os.Exit(1)
 	}
 	var startBuf [16]byte
-	n, err := syscall.Read(ctrlFD, startBuf[:])
+	n, err := readNoEINTR(ctrlFD, startBuf[:])
 	if err != nil || string(startBuf[:n]) != "START" {
 		os.Exit(1)
 	}
@@ -1570,7 +1570,7 @@ func runScratchFuseHelperMain() {
 	}
 	go fs.serve()
 
-	if _, err := syscall.Write(ctrlFD, []byte("OK")); err != nil {
+	if _, err := writeNoEINTR(ctrlFD, []byte("OK")); err != nil {
 		fs.Close()
 		os.Exit(1)
 	}
@@ -1582,7 +1582,7 @@ func runScratchFuseHelperMain() {
 
 	var cmdBuf [16]byte
 	for {
-		n, err := syscall.Read(ctrlFD, cmdBuf[:])
+		n, err := readNoEINTR(ctrlFD, cmdBuf[:])
 		if err != nil || n == 0 {
 			break
 		}
@@ -1591,15 +1591,45 @@ func runScratchFuseHelperMain() {
 			used := fs.UsedBytes()
 			var reply [8]byte
 			binary.LittleEndian.PutUint64(reply[:], uint64(used))
-			_, _ = syscall.Write(ctrlFD, reply[:])
+			_, _ = writeNoEINTR(ctrlFD, reply[:])
 		case "CLOSE":
 			fs.Close()
-			_, _ = syscall.Write(ctrlFD, []byte("BYE"))
+			_, _ = writeNoEINTR(ctrlFD, []byte("BYE"))
 			os.Exit(0)
 		}
 	}
 	fs.Close()
 	os.Exit(0)
+}
+
+func readNoEINTR(fd int, p []byte) (int, error) {
+	for {
+		n, err := syscall.Read(fd, p)
+		if err == syscall.EINTR {
+			continue
+		}
+		return n, err
+	}
+}
+
+func writeNoEINTR(fd int, p []byte) (int, error) {
+	for {
+		n, err := syscall.Write(fd, p)
+		if err == syscall.EINTR {
+			continue
+		}
+		return n, err
+	}
+}
+
+func recvmsgNoEINTR(fd int, p, oob []byte, flags int) (int, int, int, syscall.Sockaddr, error) {
+	for {
+		n, oobn, recvflags, from, err := syscall.Recvmsg(fd, p, oob, flags)
+		if err == syscall.EINTR {
+			continue
+		}
+		return n, oobn, recvflags, from, err
+	}
 }
 
 func mountScratchFuseHelper(mountDir string, maxBytes int64, maxInodes int, cgParent string) (*scratchFuseHelper, error) {
@@ -1678,7 +1708,7 @@ func mountScratchFuseHelper(mountDir string, maxBytes int64, maxInodes int, cgPa
 	_ = syscall.SetsockoptTimeval(parentSock, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &syscall.Timeval{Sec: 5})
 	msgBuf := make([]byte, 64)
 	oobBuf := make([]byte, syscall.CmsgSpace(4))
-	_, oobn, _, _, recvErr := syscall.Recvmsg(parentSock, msgBuf, oobBuf, 0)
+	_, oobn, _, _, recvErr := recvmsgNoEINTR(parentSock, msgBuf, oobBuf, 0)
 	_ = syscall.Close(parentSock)
 	waitErr := mcmd.Wait()
 	var errText string
@@ -1789,7 +1819,7 @@ func mountScratchFuseHelper(mountDir string, maxBytes int64, maxInodes int, cgPa
 	}
 
 	var readyBuf [16]byte
-	rn, rerr := syscall.Read(ctrlParent, readyBuf[:])
+	rn, rerr := readNoEINTR(ctrlParent, readyBuf[:])
 	if rerr != nil || string(readyBuf[:rn]) != "READY" {
 		abortHelper()
 		return nil, fmt.Errorf("scratch fuse helper failed readiness handshake: %w", rerr)
@@ -1818,12 +1848,12 @@ func mountScratchFuseHelper(mountDir string, maxBytes int64, maxInodes int, cgPa
 		return nil, fmt.Errorf("tighten scratch fuse helper cgroup memory.max: %w", err)
 	}
 
-	if _, werr := syscall.Write(ctrlParent, []byte("START")); werr != nil {
+	if _, werr := writeNoEINTR(ctrlParent, []byte("START")); werr != nil {
 		abortHelper()
 		return nil, fmt.Errorf("send START to scratch fuse helper: %w", werr)
 	}
 	var okBuf [16]byte
-	on, oerr := syscall.Read(ctrlParent, okBuf[:])
+	on, oerr := readNoEINTR(ctrlParent, okBuf[:])
 	if oerr != nil || string(okBuf[:on]) != "OK" {
 		abortHelper()
 		return nil, fmt.Errorf("scratch fuse helper failed start confirmation: %w", oerr)
@@ -1853,14 +1883,14 @@ func (h *scratchFuseHelper) UsedBytes() int64 {
 	if h.ctrlFD < 0 {
 		return h.lastUsed
 	}
-	if _, err := syscall.Write(h.ctrlFD, []byte("USED")); err != nil {
+	if _, err := writeNoEINTR(h.ctrlFD, []byte("USED")); err != nil {
 		if h.cgDir != "" && cgroupHadOOM(h.cgDir) {
 			h.lastUsed = h.maxBytes + 1
 		}
 		return h.lastUsed
 	}
 	var reply [8]byte
-	n, err := syscall.Read(h.ctrlFD, reply[:])
+	n, err := readNoEINTR(h.ctrlFD, reply[:])
 	if err != nil || n != 8 {
 		if h.cgDir != "" && cgroupHadOOM(h.cgDir) {
 			h.lastUsed = h.maxBytes + 1
@@ -1890,7 +1920,7 @@ func (h *scratchFuseHelper) Close() {
 	h.mu.Unlock()
 
 	if ctrlFD >= 0 {
-		_, _ = syscall.Write(ctrlFD, []byte("CLOSE"))
+		_, _ = writeNoEINTR(ctrlFD, []byte("CLOSE"))
 		_ = syscall.Close(ctrlFD)
 	}
 	if cmd != nil && cmd.Process != nil {

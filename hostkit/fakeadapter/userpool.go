@@ -468,18 +468,29 @@ func (f *Fake) PeekDryUserpoolState(_ context.Context, name string) (hostkit.Use
 		info = up.toInfo()
 		users = make(map[string]hostkit.UserSnapshot, len(up.Users))
 		for k, u := range up.Users {
+			if isForeignPoolUser(up, k, u) {
+				continue
+			}
 			users[k] = u.toSnapshot()
 		}
 		groups = make(map[string]bool, len(up.Groups))
-		for k := range up.Groups {
+		for k, g := range up.Groups {
+			if isForeignPoolGroup(up, k, g) {
+				continue
+			}
 			groups[k] = true
 		}
 		memberships = make(map[string][]string, len(up.Memberships))
 		for g, m := range up.Memberships {
+			if !groups[g] {
+				continue
+			}
 			var list []string
 			for u, ok := range m {
 				if ok {
-					list = append(list, u)
+					if _, uok := users[u]; uok {
+						list = append(list, u)
+					}
 				}
 			}
 			sort.Strings(list)

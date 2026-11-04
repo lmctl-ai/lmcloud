@@ -295,8 +295,12 @@ func loadUserProfileAttrs(profileDir, hashHex string) (map[string]string, bool) 
 	if err != nil {
 		return nil, false
 	}
+	wantHash := hashHex
+	if idx := strings.LastIndexByte(hashHex, '_'); idx >= 0 {
+		wantHash = hashHex[idx+1:]
+	}
 	sum := sha256.Sum256(raw)
-	if hex.EncodeToString(sum[:]) != hashHex {
+	if hex.EncodeToString(sum[:]) != wantHash {
 		return nil, false
 	}
 	var attrs map[string]string
@@ -327,7 +331,21 @@ func writeUserProfileBlob(profileDir, hashHex string, raw []byte) error {
 		return nil
 	}
 	tmpPath := finalPath + ".tmp." + safety.NewToken128()
-	if err := os.WriteFile(tmpPath, raw, 0o600); err != nil {
+	tf, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := tf.Write(raw); err != nil {
+		_ = tf.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tf.Sync(); err != nil {
+		_ = tf.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tf.Close(); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
 	}
@@ -541,10 +559,18 @@ func encodePersistedUserpoolState(st persistedUserpoolCatalogState) string {
 				if approxBytes > 256 {
 					if attrJSON, err := json.Marshal(cu.Attributes); err == nil && len(attrJSON) > 256 {
 						sum := sha256.Sum256(attrJSON)
-						hashHex := hex.EncodeToString(sum[:])
-						if writeUserProfileBlob(st.UserProfileDir, hashHex, attrJSON) == nil {
-							st.UserProfileHashes[k] = hashHex
-							cacheUserProfileAttrs(hashHex, cu.Attributes)
+						rawHash := hex.EncodeToString(sum[:])
+						blobKey := rawHash
+						if st.Pool.Name != "" {
+							if st.Pool.IncarnationID != "" {
+								blobKey = st.Pool.Name + "_" + st.Pool.IncarnationID + "_" + rawHash
+							} else {
+								blobKey = st.Pool.Name + "_" + rawHash
+							}
+						}
+						if writeUserProfileBlob(st.UserProfileDir, blobKey, attrJSON) == nil {
+							st.UserProfileHashes[k] = blobKey
+							cacheUserProfileAttrs(blobKey, cu.Attributes)
 							cu.Attributes = nil
 						}
 					}
@@ -554,55 +580,35 @@ func encodePersistedUserpoolState(st persistedUserpoolCatalogState) string {
 		}
 		st.Users = cleanUsers
 	}
-	if len(st.TokenBindings) > 0 && st.UserProfileDir != "" {
-		cleanTB := make(map[string][]tokenBindingRecord)
-		for u, bindings := range st.TokenBindings {
-			if len(bindings) == 0 {
-				delete(st.TokenBindingHashes, u)
-				continue
-			}
-			if _, exists := st.Users[u]; !exists {
-				delete(st.TokenBindingHashes, u)
-				continue
-			}
-			bJSON, err := json.Marshal(bindings)
-			if err != nil {
-				cleanTB[u] = bindings
-				continue
-			}
-			sum := sha256.Sum256(bJSON)
-			hashHex := hex.EncodeToString(sum[:])
-			if writeTokenBindingBlob(st.UserProfileDir, hashHex, bJSON) == nil {
-				prevHash := st.TokenBindingHashes[u]
-				st.TokenBindingHashes[u] = hashHex
-				cacheUserTokenBindings(hashHex, bindings)
-				if prevHash != "" && prevHash != hashHex {
-					stillUsed := false
-					for _, h := range st.TokenBindingHashes {
-						if h == prevHash {
-							stillUsed = true
-							break
-						}
-					}
-					if !stillUsed {
-						removeTokenBindingBlob(st.UserProfileDir, prevHash)
-					}
-				}
-			} else {
-				cleanTB[u] = bindings
-			}
-		}
-		if len(cleanTB) == 0 {
-			st.TokenBindings = nil
-		} else {
-			st.TokenBindings = cleanTB
+	for u, bindings := range st.TokenBindings {
+		if _, exists := st.Users[u]; !exists || len(bindings) == 0 {
+			delete(st.TokenBindings, u)
 		}
 	}
+	st.TokenBindingHashes = nil
 	raw, err := json.Marshal(st)
 	if err != nil {
 		return ""
 	}
-	return string(raw)
+	s := string(raw)
+	if strings.IndexByte(s, 0x7f) >= 0 {
+		s = strings.ReplaceAll(s, "\x7f", `\u007f`)
+	}
+	return s
+}
+
+func journaledUserSessionGen(st *persistedUserpoolCatalogState, username string) uint64 {
+	if st == nil || username == "" {
+		return 1
+	}
+	gen := st.RevokedSessionGen[username]
+	if u, ok := st.Users[username]; ok && u.SessionGen > gen {
+		gen = u.SessionGen
+	}
+	if gen == 0 {
+		gen = 1
+	}
+	return gen
 }
 
 func decodePersistedUserpoolState(raw string) (persistedUserpoolCatalogState, bool) {
@@ -1331,8 +1337,35 @@ func (h *Host) UserpoolDelete(dry bool, name string) (bool, error) {
 	if st, ok := decodePersistedUserpoolState(stateJSON); ok {
 		deletedPoolState = st
 		hasDeletedPoolState = true
+		var (
+			nativeUsers       map[string]hostkit.UserSnapshot
+			nativeGroups      map[string]bool
+			nativeMemberships map[string]map[string]bool
+			hasNativePeek     bool
+		)
+		if peeker := resolveUserpoolDryPeeker(ctx, h.cfg.Userpools); peeker != nil {
+			_, uMap, gMap, mMap, found := peeker.PeekDryUserpoolState(ctx, name)
+			if found {
+				nativeUsers = uMap
+				nativeGroups = gMap
+				nativeMemberships = make(map[string]map[string]bool, len(mMap))
+				for g, list := range mMap {
+					s := make(map[string]bool, len(list))
+					for _, u := range list {
+						s[u] = true
+					}
+					nativeMemberships[g] = s
+				}
+				hasNativePeek = true
+			}
+		}
+
+		hasAnyMemCleanup := !hasNativePeek || h.cost.hasAnyPoolMembershipCleanup(ep, name)
 		groupNames := make([]string, 0, len(st.Memberships))
 		for g := range st.Memberships {
+			if hasNativePeek && len(nativeMemberships[g]) == 0 && !hasAnyMemCleanup {
+				continue
+			}
 			groupNames = append(groupNames, g)
 		}
 		sort.Strings(groupNames)
@@ -1340,6 +1373,11 @@ func (h *Host) UserpoolDelete(dry bool, name string) (bool, error) {
 			members := append([]string(nil), st.Memberships[g]...)
 			sort.Strings(members)
 			for _, u := range members {
+				if hasNativePeek {
+					if !nativeMemberships[g][u] && !h.cost.hasPoolMembershipCleanup(ep, name, g, u) {
+						continue
+					}
+				}
 				subCtx, subScope, scerr := h.beginAttemptScope(ctx, "group_remove_user", safety.AttemptPricingInput{
 					Operation: "group_remove_user",
 					IsCleanup: true,
@@ -1368,14 +1406,6 @@ func (h *Host) UserpoolDelete(dry bool, name string) (bool, error) {
 					return false, h.fail(op, name, rce)
 				}
 			}
-		}
-
-		var nativeUsers map[string]hostkit.UserSnapshot
-		hasNativePeek := false
-		if peeker := resolveUserpoolDryPeeker(ctx, h.cfg.Userpools); peeker != nil {
-			var found bool
-			_, nativeUsers, _, _, found = peeker.PeekDryUserpoolState(ctx, name)
-			hasNativePeek = found
 		}
 
 		userNames := make([]string, 0, len(st.Users))
@@ -1420,6 +1450,11 @@ func (h *Host) UserpoolDelete(dry bool, name string) (bool, error) {
 
 		grpList := make([]string, 0, len(st.Groups))
 		for g := range st.Groups {
+			if hasNativePeek {
+				if !nativeGroups[g] && !h.cost.hasPoolGroupCleanup(ep, name, g) {
+					continue
+				}
+			}
 			grpList = append(grpList, g)
 		}
 		sort.Strings(grpList)
@@ -1522,6 +1557,39 @@ func hasKnownCatalogUser(stateJSON, username string) bool {
 	return false
 }
 
+func (h *Host) checkCatalogMutationHeadroom(pool string, act safety.JournalUserpoolEntry, hasAct bool, simFn func(st *persistedUserpoolCatalogState)) *hostkit.CloudError {
+	if !hasAct || act.StateJSON == "" {
+		return nil
+	}
+	var candidateLen int
+	if len(act.StateJSON) > 8*1024*1024-65536 && simFn != nil {
+		if st, ok := decodePersistedUserpoolState(act.StateJSON); ok {
+			simFn(&st)
+			for u := range st.Users {
+				if prevHash := st.UserProfileHashes[u]; prevHash != "" {
+					cu := st.Users[u]
+					cu.Attributes = nil
+					st.Users[u] = cu
+				}
+			}
+			if raw, err := json.Marshal(st); err == nil {
+				s := string(raw)
+				if strings.IndexByte(s, 0x7f) >= 0 {
+					s = strings.ReplaceAll(s, "\x7f", `\u007f`)
+				}
+				candidateLen = len(s)
+			}
+		}
+	} else {
+		candidateLen = len(act.StateJSON) + 512
+	}
+	if candidateLen > 8*1024*1024 {
+		return hostkit.ProviderError(hostkit.InvalidArgument, 0, "UserpoolStateLimitExceeded",
+			fmt.Sprintf("userpool %q state size %d exceeds maximum 8 MiB", pool, candidateLen))
+	}
+	return nil
+}
+
 // beginUserRevocationIntent durably records a fenced per-user revocation intent
 // in the pool's journaled state BEFORE any native adapter mutation that revokes
 // existing user sessions (user_delete, user_set_enabled(false), user_set_password).
@@ -1539,16 +1607,10 @@ func (h *Host) beginUserRevocationIntent(ep, pool, username string, act safety.J
 		}
 		st.UserProfileDir = h.userpoolProfileDir()
 		prevRevokedGen = st.RevokedSessionGen[username]
-		baseGen := prevRevokedGen
+		baseGen := journaledUserSessionGen(&st, username)
 		if u, uok := st.Users[username]; uok {
 			hadUser = true
 			prevUserGen = u.SessionGen
-			if u.SessionGen > baseGen {
-				baseGen = u.SessionGen
-			}
-		}
-		if baseGen == 0 {
-			baseGen = 1
 		}
 		nextGen := baseGen + 1
 		st.RevokedSessionGen[username] = nextGen
@@ -1562,10 +1624,11 @@ func (h *Host) beginUserRevocationIntent(ep, pool, username string, act safety.J
 	return revokeID, prevRevokedGen, prevUserGen, hadUser, cerr
 }
 
-// rollbackUserRevocationIntent rolls back a pre-dispatch revocation intent ONLY
-// when the native adapter returned a definitive refusal (e.g., NotFound or PermissionDenied)
-// proving no physical revocation took place (childSeq == 0).
-func (h *Host) rollbackUserRevocationIntent(ep, pool, username string, act safety.JournalUserpoolEntry, revokeID string, prevRevokedGen, prevUserGen uint64, hadUser bool) {
+// rollbackUserRevocationIntent clears a pre-dispatch pending revocation intent
+// when the native adapter returned a definitive refusal (e.g., NotFound or PermissionDenied).
+// It restores prevRevokedGen only when restoreGen is true (authoritative proof that no
+// physical mutation committed); otherwise RevokedSessionGen remains monotonic.
+func (h *Host) rollbackUserRevocationIntent(ep, pool, username string, act safety.JournalUserpoolEntry, revokeID string, prevRevokedGen, prevUserGen uint64, hadUser, restoreGen bool) {
 	_ = h.cost.updateUserpoolState(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, func(cur string) string {
 		st, ok := decodePersistedUserpoolState(cur)
 		if !ok {
@@ -1576,15 +1639,17 @@ func (h *Host) rollbackUserRevocationIntent(ep, pool, username string, act safet
 			return cur
 		}
 		delete(st.PendingUserRevoke, username)
-		if prevRevokedGen == 0 {
-			delete(st.RevokedSessionGen, username)
-		} else {
-			st.RevokedSessionGen[username] = prevRevokedGen
-		}
-		if hadUser {
-			if u, uok := st.Users[username]; uok {
-				u.SessionGen = prevUserGen
-				st.Users[username] = u
+		if restoreGen {
+			if prevRevokedGen == 0 {
+				delete(st.RevokedSessionGen, username)
+			} else {
+				st.RevokedSessionGen[username] = prevRevokedGen
+			}
+			if hadUser {
+				if u, uok := st.Users[username]; uok {
+					u.SessionGen = prevUserGen
+					st.Users[username] = u
+				}
 			}
 		}
 		return encodePersistedUserpoolState(st)
@@ -1861,6 +1926,36 @@ func (h *Host) UserCreate(dry bool, pool, username string, attrs map[string]stri
 				return missingUser(username), h.fail(op, pool, hostkit.Preflightf("userpool %q user count exceeds maximum (%d)", pool, hostkit.MaxUsersPerPool))
 			}
 		}
+		if cerr := h.checkCatalogMutationHeadroom(pool, act, hasAct, func(st *persistedUserpoolCatalogState) {
+			st.ChildSeq++
+			st.UserSeq[username] = st.ChildSeq
+			st.RevokedSessionGen[username] = journaledUserSessionGen(st, username)
+			var simAttrs map[string]string
+			if len(attrs) > 0 {
+				approxBytes := 2
+				for ak, av := range attrs {
+					approxBytes += len(ak) + len(av) + 6
+				}
+				if approxBytes > 256 && h.userpoolProfileDir() != "" {
+					st.UserProfileHashes[username] = pool + "_" + act.Incarnation + "_" + strings.Repeat("0", 64)
+				} else {
+					simAttrs = attrs
+				}
+			}
+			st.Users[username] = hostkit.UserSnapshot{
+				Exists:     true,
+				Username:   username,
+				Sub:        "usr-" + strings.Repeat("0", 32),
+				Enabled:    true,
+				Status:     hostkit.UserStatusForceChangePassword,
+				Attributes: simAttrs,
+				CreatedAt:  h.cfg.Now().UTC().Unix(),
+				SessionGen: st.RevokedSessionGen[username],
+			}
+		}); cerr != nil {
+			failed = true
+			return missingUser(username), h.fail(op, pool, cerr)
+		}
 	}
 
 	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{
@@ -1931,13 +2026,18 @@ func (h *Host) UserCreate(dry bool, pool, username string, attrs map[string]stri
 			st.Pool = hostkit.UserpoolInfo{Name: pool, IncarnationID: act.Incarnation, OwnerToken: act.OwnerToken}
 		}
 		st.UserProfileDir = h.userpoolProfileDir()
-		delete(st.PendingUserRevoke, username)
-		deleteUserBlobsFromCatalog(&st, username)
-		st.RevokedSessionGen[username] = snap.SessionGen
+		curGen := journaledUserSessionGen(&st, username)
+		if snap.SessionGen > curGen {
+			curGen = snap.SessionGen
+		}
+		snap.SessionGen = curGen
 		if childSeq > 0 {
 			if st.UserSeq[username] > childSeq {
 				return cur
 			}
+			delete(st.PendingUserRevoke, username)
+			deleteUserBlobsFromCatalog(&st, username)
+			st.RevokedSessionGen[username] = curGen
 			st.UserSeq[username] = childSeq
 			st.Users[username] = snap.Clone()
 			if childSeq > st.ChildSeq {
@@ -1945,13 +2045,17 @@ func (h *Host) UserCreate(dry bool, pool, username string, attrs map[string]stri
 			}
 			return encodePersistedUserpoolState(st)
 		}
+		delete(st.PendingUserRevoke, username)
+		deleteUserBlobsFromCatalog(&st, username)
+		st.RevokedSessionGen[username] = curGen
 		if hasReconciledUser {
 			if !reconciledUser.Exists {
 				delete(st.Users, username)
 			} else {
-				if reconciledUser.SessionGen == 0 {
-					reconciledUser.SessionGen = 1
+				if reconciledUser.SessionGen < curGen {
+					reconciledUser.SessionGen = curGen
 				}
+				st.RevokedSessionGen[username] = reconciledUser.SessionGen
 				st.Users[username] = reconciledUser.Clone()
 			}
 			return encodePersistedUserpoolState(st)
@@ -2206,7 +2310,8 @@ func (h *Host) UserDelete(dry bool, pool, username string) error {
 	}
 	if ce != nil {
 		if knownInCatalog && definitiveRefusal && childSeq == 0 {
-			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser)
+			recSnap, recOK := h.reconcileUserForCatalog(ctx, pool, username, true)
+			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser, recOK && recSnap.Exists)
 		}
 		failed = true
 		return h.fail(op, pool, ce)
@@ -2403,6 +2508,7 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 	}
 
 	var revokeID string
+	var prePendingRevoke string
 	var prevRevGen, prevUserGen uint64
 	var hadUser bool
 	if !enabled {
@@ -2412,6 +2518,10 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 			_ = scope.releaseNotSent()
 			failed = true
 			return h.fail(op, pool, rcerr)
+		}
+	} else if act.StateJSON != "" {
+		if preSt, ok := decodePersistedUserpoolState(act.StateJSON); ok {
+			prePendingRevoke = preSt.PendingUserRevoke[username]
 		}
 	}
 
@@ -2429,7 +2539,7 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 	}
 	if ce != nil {
 		if !enabled && definitiveRefusal && childSeq == 0 {
-			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser)
+			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser, false)
 		}
 		failed = true
 		return h.fail(op, pool, ce)
@@ -2451,6 +2561,12 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 		st.UserProfileDir = h.userpoolProfileDir()
 		if revokeID != "" && st.PendingUserRevoke[username] == revokeID {
 			delete(st.PendingUserRevoke, username)
+		} else if enabled && prePendingRevoke != "" && st.PendingUserRevoke[username] == prePendingRevoke {
+			delete(st.PendingUserRevoke, username)
+		}
+		curGen := journaledUserSessionGen(&st, username)
+		if updatedUser.SessionGen > curGen {
+			curGen = updatedUser.SessionGen
 		}
 		if childSeq > 0 {
 			if st.UserSeq[username] > childSeq {
@@ -2460,24 +2576,11 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 			u, uok := st.Users[username]
 			if !uok {
 				u = updatedUser.Clone()
-				if u.SessionGen == 0 {
-					u.SessionGen = 1
-				}
 			} else {
 				u.Enabled = enabled
-				if !enabled && u.SessionGen == 0 {
-					u.SessionGen = 2
-				}
-				if updatedUser.SessionGen > u.SessionGen {
-					u.SessionGen = updatedUser.SessionGen
-				}
-				if revGen := st.RevokedSessionGen[username]; revGen > u.SessionGen {
-					u.SessionGen = revGen
-				}
 			}
-			if u.SessionGen > st.RevokedSessionGen[username] {
-				st.RevokedSessionGen[username] = u.SessionGen
-			}
+			u.SessionGen = curGen
+			st.RevokedSessionGen[username] = curGen
 			st.Users[username] = u
 			if childSeq > st.ChildSeq {
 				st.ChildSeq = childSeq
@@ -2489,17 +2592,11 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 				delete(st.Users, username)
 				deleteUserBlobsFromCatalog(&st, username)
 			} else {
-				u, uok := st.Users[username]
-				if uok && u.SessionGen > reconciledUser.SessionGen {
-					reconciledUser.SessionGen = u.SessionGen
+				if reconciledUser.SessionGen > curGen {
+					curGen = reconciledUser.SessionGen
 				}
-				if !reconciledUser.Enabled && uok && u.Enabled {
-					reconciledUser.SessionGen++
-				}
-				if revGen := st.RevokedSessionGen[username]; revGen > reconciledUser.SessionGen {
-					reconciledUser.SessionGen = revGen
-				}
-				st.RevokedSessionGen[username] = reconciledUser.SessionGen
+				reconciledUser.SessionGen = curGen
+				st.RevokedSessionGen[username] = curGen
 				st.Users[username] = reconciledUser.Clone()
 			}
 			return encodePersistedUserpoolState(st)
@@ -2507,24 +2604,11 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 		u, uok := st.Users[username]
 		if !uok {
 			u = updatedUser.Clone()
-			if u.SessionGen == 0 {
-				u.SessionGen = 1
-			}
 		} else {
 			u.Enabled = enabled
-			if !enabled && u.SessionGen == 0 {
-				u.SessionGen = 2
-			}
-			if updatedUser.SessionGen > u.SessionGen {
-				u.SessionGen = updatedUser.SessionGen
-			}
-			if revGen := st.RevokedSessionGen[username]; revGen > u.SessionGen {
-				u.SessionGen = revGen
-			}
 		}
-		if u.SessionGen > st.RevokedSessionGen[username] {
-			st.RevokedSessionGen[username] = u.SessionGen
-		}
+		u.SessionGen = curGen
+		st.RevokedSessionGen[username] = curGen
 		st.Users[username] = u
 		return encodePersistedUserpoolState(st)
 	}); cerr != nil {
@@ -2664,7 +2748,7 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 	}
 	if ce != nil {
 		if definitiveRefusal && childSeq == 0 {
-			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser)
+			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser, false)
 		}
 		failed = true
 		return h.fail(op, pool, ce)
@@ -2687,13 +2771,18 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 		if revokeID != "" && st.PendingUserRevoke[username] == revokeID {
 			delete(st.PendingUserRevoke, username)
 		}
+		curGen := journaledUserSessionGen(&st, username)
+		if updatedUser.SessionGen > curGen {
+			curGen = updatedUser.SessionGen
+		}
+		if curGen < 2 {
+			curGen = 2
+		}
 		if childSeq > 0 {
 			if st.UserSeq[username] > childSeq {
-				if u, uok := st.Users[username]; uok && updatedUser.SessionGen > u.SessionGen {
-					u.SessionGen = updatedUser.SessionGen
-					if u.SessionGen > st.RevokedSessionGen[username] {
-						st.RevokedSessionGen[username] = u.SessionGen
-					}
+				if u, uok := st.Users[username]; uok && curGen > u.SessionGen {
+					u.SessionGen = curGen
+					st.RevokedSessionGen[username] = curGen
 					st.Users[username] = u
 					return encodePersistedUserpoolState(st)
 				}
@@ -2703,24 +2792,11 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 			u, uok := st.Users[username]
 			if !uok {
 				u = updatedUser.Clone()
-				if u.SessionGen == 0 {
-					u.SessionGen = 2
-				}
 			} else {
 				u.Status = hostkit.UserStatusConfirmed
-				if u.SessionGen == 0 {
-					u.SessionGen = 2
-				}
-				if updatedUser.SessionGen > u.SessionGen {
-					u.SessionGen = updatedUser.SessionGen
-				}
-				if revGen := st.RevokedSessionGen[username]; revGen > u.SessionGen {
-					u.SessionGen = revGen
-				}
 			}
-			if u.SessionGen > st.RevokedSessionGen[username] {
-				st.RevokedSessionGen[username] = u.SessionGen
-			}
+			u.SessionGen = curGen
+			st.RevokedSessionGen[username] = curGen
 			st.Users[username] = u
 			if childSeq > st.ChildSeq {
 				st.ChildSeq = childSeq
@@ -2732,16 +2808,11 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 				delete(st.Users, username)
 				delete(st.TokenBindings, username)
 			} else {
-				u, uok := st.Users[username]
-				if uok && u.SessionGen > reconciledUser.SessionGen {
-					reconciledUser.SessionGen = u.SessionGen
-				} else if reconciledUser.SessionGen <= 1 {
-					reconciledUser.SessionGen = 2
+				if reconciledUser.SessionGen > curGen {
+					curGen = reconciledUser.SessionGen
 				}
-				if revGen := st.RevokedSessionGen[username]; revGen > reconciledUser.SessionGen {
-					reconciledUser.SessionGen = revGen
-				}
-				st.RevokedSessionGen[username] = reconciledUser.SessionGen
+				reconciledUser.SessionGen = curGen
+				st.RevokedSessionGen[username] = curGen
 				st.Users[username] = reconciledUser.Clone()
 			}
 			return encodePersistedUserpoolState(st)
@@ -2749,24 +2820,11 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 		u, uok := st.Users[username]
 		if !uok {
 			u = updatedUser.Clone()
-			if u.SessionGen == 0 {
-				u.SessionGen = 2
-			}
 		} else {
 			u.Status = hostkit.UserStatusConfirmed
-			if u.SessionGen == 0 {
-				u.SessionGen = 2
-			}
-			if updatedUser.SessionGen > u.SessionGen {
-				u.SessionGen = updatedUser.SessionGen
-			}
-			if revGen := st.RevokedSessionGen[username]; revGen > u.SessionGen {
-				u.SessionGen = revGen
-			}
 		}
-		if u.SessionGen > st.RevokedSessionGen[username] {
-			st.RevokedSessionGen[username] = u.SessionGen
-		}
+		u.SessionGen = curGen
+		st.RevokedSessionGen[username] = curGen
 		st.Users[username] = u
 		return encodePersistedUserpoolState(st)
 	}); cerr != nil {
@@ -3152,16 +3210,15 @@ func (h *Host) UserSignIn(dry bool, pool, username, password string) (*Session, 
 
 	var prePending string
 	var preSGen uint64
+	var preUserSeq uint64
 	var preSub string
 	var expectedClientID string
 	if preSt, ok := decodePersistedUserpoolState(act.StateJSON); ok {
 		prePending = preSt.PendingUserRevoke[username]
-		preSGen = preSt.RevokedSessionGen[username]
+		preSGen = journaledUserSessionGen(&preSt, username)
+		preUserSeq = preSt.UserSeq[username]
 		expectedClientID = preSt.Pool.ClientID
 		if u, uok := preSt.Users[username]; uok {
-			if u.SessionGen > preSGen {
-				preSGen = u.SessionGen
-			}
 			preSub = u.Sub
 		}
 	}
@@ -3273,7 +3330,8 @@ func (h *Host) UserSignIn(dry bool, pool, username, password string) (*Session, 
 			revokedConcurrently = true
 			return cur
 		}
-		if preSGen > 0 && st.RevokedSessionGen[username] > preSGen {
+		curGen := journaledUserSessionGen(&st, username)
+		if (preSGen > 0 && curGen != preSGen) || st.UserSeq[username] != preUserSeq {
 			revokedConcurrently = true
 			return cur
 		}
@@ -3282,28 +3340,11 @@ func (h *Host) UserSignIn(dry bool, pool, username, password string) (*Session, 
 			return cur
 		}
 		u, uok := st.Users[username]
-		if !uok || !u.Enabled || (preSGen > 0 && u.SessionGen > preSGen) || (u.Sub != "" && tokSub != u.Sub) {
+		if !uok || !u.Enabled || (u.Sub != "" && tokSub != u.Sub) {
 			revokedConcurrently = true
 			return cur
 		}
-		sgen := out.SessionGen
-		if sgen == 0 {
-			if preSGen > 0 {
-				sgen = preSGen
-			} else if u.SessionGen > 0 {
-				sgen = u.SessionGen
-			} else {
-				sgen = 1
-			}
-		}
-		if revGen := st.RevokedSessionGen[username]; revGen > sgen {
-			revokedConcurrently = true
-			return cur
-		}
-		if u.SessionGen > sgen {
-			revokedConcurrently = true
-			return cur
-		}
+		sgen := curGen
 		u.SessionGen = sgen
 		st.Users[username] = u
 		st.RevokedSessionGen[username] = sgen
@@ -3511,13 +3552,13 @@ func (h *Host) UserVerifyToken(dry bool, pool, token string) (*Session, error) {
 						ce = unauthErr
 					} else if nowUnix >= matched.ExpiresAt || matched.IssuedAt > nowUnix+hostkit.MaxClockSkewSeconds {
 						ce = unauthErr
-					} else if revGen := st.RevokedSessionGen[username]; revGen > 0 && matched.SessionGen < revGen {
+					} else if matched.SessionGen != journaledUserSessionGen(&st, username) {
 						ce = unauthErr
 					} else {
 						u, uok := st.Users[username]
-						if !uok || !u.Enabled || u.SessionGen != matched.SessionGen || (u.Sub != "" && u.Sub != verified.Sub) {
+						if !uok || !u.Enabled || (u.Sub != "" && u.Sub != verified.Sub) {
 							ce = unauthErr
-						} else if natUser, uerr := h.cfg.Userpools.GetUser(mctx, pool, username); uerr != nil || !natUser.Exists || !natUser.Enabled || natUser.SessionGen != matched.SessionGen || (natUser.Sub != "" && natUser.Sub != verified.Sub) {
+						} else if natUser, uerr := h.cfg.Userpools.GetUser(mctx, pool, username); uerr != nil || !natUser.Exists || !natUser.Enabled || (natUser.Sub != "" && natUser.Sub != verified.Sub) {
 							ce = unauthErr
 						}
 					}
@@ -3627,6 +3668,14 @@ func (h *Host) GroupCreate(dry bool, pool, group string) (bool, error) {
 				failed = true
 				return false, h.fail(op, pool, hostkit.Preflightf("userpool %q group count exceeds maximum (%d)", pool, hostkit.MaxGroupsPerPool))
 			}
+		}
+		if cerr := h.checkCatalogMutationHeadroom(pool, act, hasAct, func(st *persistedUserpoolCatalogState) {
+			st.ChildSeq++
+			st.GroupSeq[group] = st.ChildSeq
+			st.Groups[group] = true
+		}); cerr != nil {
+			failed = true
+			return false, h.fail(op, pool, cerr)
 		}
 	}
 
@@ -4095,6 +4144,16 @@ func (h *Host) GroupAddUser(dry bool, pool, group, username string) error {
 		failed = true
 		return h.fail(op, pool, hostkit.ProviderError(hostkit.Conflict, 409, "AmbiguousUserpoolState",
 			fmt.Sprintf("userpool %q has an unresolved ambiguous operation (%s) and requires reconciliation", pool, amb.IntentOp)))
+	}
+	if hasAct && act.StateJSON != "" {
+		if cerr := h.checkCatalogMutationHeadroom(pool, act, hasAct, func(st *persistedUserpoolCatalogState) {
+			st.ChildSeq++
+			st.MembershipSeq[group+"/"+username] = st.ChildSeq
+			st.Memberships[group] = append(st.Memberships[group], username)
+		}); cerr != nil {
+			failed = true
+			return h.fail(op, pool, cerr)
+		}
 	}
 
 	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{

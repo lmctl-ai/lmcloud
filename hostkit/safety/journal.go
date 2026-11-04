@@ -1568,6 +1568,13 @@ func (j *Journal) RecordUserpoolDelete(scope, name, ownerToken, generation, inte
 	})
 }
 
+// FileSize returns the current durable byte size of the journal file.
+func (j *Journal) FileSize() int64 {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.goodOffset
+}
+
 func (j *Journal) rollbackAndPoisonLocked(prevOffset int64, cause error) {
 	if j.f != nil {
 		_ = j.f.Truncate(prevOffset)
@@ -2954,11 +2961,20 @@ func hasForbiddenCredentialFieldKey(m map[string]any) bool {
 	return false
 }
 
+func hasControlCharsExceptDEL(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 {
+			return true
+		}
+	}
+	return false
+}
+
 func validateJournalUserpoolState(raw string) error {
 	if len(raw) > 8*1024*1024 {
 		return errors.New("userpool_state exceeds maximum size")
 	}
-	if hasControlChars(raw) {
+	if hasControlCharsExceptDEL(raw) {
 		return errors.New("userpool_state contains control characters")
 	}
 	if raw == "" {

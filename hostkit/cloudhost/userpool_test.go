@@ -52,6 +52,7 @@ func openUserpoolSafetyJournal(t *testing.T, dir string) *safety.Journal {
 }
 
 func TestUserpoolLifecycleAndNotFoundPrecedence(t *testing.T) {
+	t.Parallel()
 	h, _, _, _ := newUserpoolHost(t)
 
 	// Missing pool probes vs NOT_FOUND errors.
@@ -98,6 +99,7 @@ func TestUserpoolLifecycleAndNotFoundPrecedence(t *testing.T) {
 }
 
 func TestUserpoolRecreationIncarnationAndPageTokenQuarantine(t *testing.T) {
+	t.Parallel()
 	h, _, _, _ := newUserpoolHost(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
 	h.cfg.Now = func() time.Time { return now }
@@ -141,12 +143,15 @@ func TestUserpoolRecreationIncarnationAndPageTokenQuarantine(t *testing.T) {
 }
 
 func TestUserpoolTokenSecurityExpiryRevocationRotationAndEviction(t *testing.T) {
+	t.Parallel()
 	for _, useSafetyJournal := range []bool{false, true} {
+		useSafetyJournal := useSafetyJournal
 		mode := "campaign_journal"
 		if useSafetyJournal {
 			mode = "safety_journal"
 		}
 		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
 			dir := t.TempDir()
 			campaignPath := filepath.Join(dir, "campaign.jsonl")
 			journalDir := filepath.Join(dir, "sj")
@@ -359,6 +364,7 @@ func TestUserpoolTokenSecurityExpiryRevocationRotationAndEviction(t *testing.T) 
 }
 
 func TestUserpoolPBKDF2AndSecretRedactionCanaries(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "fake.json")
 	journalDir := filepath.Join(dir, "sj")
@@ -440,6 +446,7 @@ func TestUserpoolPBKDF2AndSecretRedactionCanaries(t *testing.T) {
 }
 
 func TestUserpoolPaginationPageTokenFileAndBounds(t *testing.T) {
+	t.Parallel()
 	h, f, _, campaignPath := newUserpoolHost(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
 	h.cfg.Now = func() time.Time { return now }
@@ -502,12 +509,15 @@ func TestUserpoolPaginationPageTokenFileAndBounds(t *testing.T) {
 }
 
 func TestSolUserpoolLostReplyAmbiguityAndCleanupReserves(t *testing.T) {
+	t.Parallel()
 	for _, useSafetyJournal := range []bool{false, true} {
+		useSafetyJournal := useSafetyJournal
 		mode := "campaign_journal"
 		if useSafetyJournal {
 			mode = "safety_journal"
 		}
 		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
 			dir := t.TempDir()
 			campaignPath := filepath.Join(dir, "campaign.jsonl")
 			journalDir := filepath.Join(dir, "sj")
@@ -650,12 +660,15 @@ func (a *solUserpoolNoSeqAdapter) GetUser(ctx context.Context, pool, username st
 }
 
 func TestSolUserpoolOutOfOrderChildReplyAndFallbackAdmission(t *testing.T) {
+	t.Parallel()
 	for _, useSafetyJournal := range []bool{false, true} {
+		useSafetyJournal := useSafetyJournal
 		mode := "campaign_journal"
 		if useSafetyJournal {
 			mode = "safety_journal"
 		}
 		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
 			dir := t.TempDir()
 			campaignPath := filepath.Join(dir, "campaign.jsonl")
 			journalDir := filepath.Join(dir, "sj")
@@ -755,6 +768,7 @@ func TestSolUserpoolOutOfOrderChildReplyAndFallbackAdmission(t *testing.T) {
 }
 
 func TestSolUserpoolForeignPoolAndForeignChildProtection(t *testing.T) {
+	t.Parallel()
 	h, f, _, _ := newUserpoolHost(t)
 
 	// 1. Foreign pool (both marked with foreign token and unmarked with empty token) must be refused.
@@ -801,6 +815,7 @@ type solUserpoolsOnly struct {
 }
 
 func TestSolUserpoolDryRunAndLiveRoutePreflightAll(t *testing.T) {
+	t.Parallel()
 	// 1. Live route preflight refuses all 18 userpool operations before any adapter I/O.
 	live := fakeadapter.New(fakeadapter.Options{})
 	routes := hostkit.EndpointRoutes{Live: live}
@@ -981,8 +996,11 @@ func TestSolUPPBKDF2TimingOracle(t *testing.T) {
 }
 
 func TestSolUPSanitizedProfilesAreReadback(t *testing.T) {
+	t.Parallel()
 	for _, jm := range []bool{false, true} {
+		jm := jm
 		t.Run(fmt.Sprintf("journal=%v", jm), func(t *testing.T) {
+			t.Parallel()
 			h, f, _, campaign := newUserpoolHost(t)
 			cfg := Config{Provider: "aws", Store: f, Userpools: f, CampaignStatePath: campaign}
 			var j *safety.Journal
@@ -1034,7 +1052,9 @@ func TestSolUPSanitizedProfilesAreReadback(t *testing.T) {
 }
 
 func TestSolUPForeignReadsAndUnmarkedChildDelete(t *testing.T) {
+	t.Parallel()
 	t.Run("foreign_pool_read", func(t *testing.T) {
+		t.Parallel()
 		h, f, _, _ := newUserpoolHost(t)
 		if e := f.InjectUnmarkedUserpoolForTesting("foreignpool", strings.Repeat("f", 32)); e != nil {
 			t.Fatal(e)
@@ -1060,7 +1080,9 @@ func TestSolUPForeignReadsAndUnmarkedChildDelete(t *testing.T) {
 		}
 	})
 	for _, owner := range []string{"", strings.Repeat("f", 32)} {
+		owner := owner
 		t.Run("unmarked_child_owner="+owner, func(t *testing.T) {
+			t.Parallel()
 			h, f, state, _ := newUserpoolHost(t)
 			_, _ = h.UserpoolCreate(false, "ownedpool")
 			_, _ = h.UserCreate(false, "ownedpool", "alice", nil)
@@ -1150,6 +1172,7 @@ func TestSolUPDuplicateCreateErasesRevocation(t *testing.T) {
 }
 
 func TestSolUPActiveSecretEvicted(t *testing.T) {
+	t.Parallel()
 	h, _, _, _ := newUserpoolHost(t)
 	active := "ActiveSecret987Example"
 	_, _ = h.UserpoolCreate(false, "activepool")
@@ -1165,8 +1188,11 @@ func TestSolUPActiveSecretEvicted(t *testing.T) {
 }
 
 func TestSolUPLegalProfilesExceedJournal(t *testing.T) {
+	t.Parallel()
 	for _, jm := range []bool{false, true} {
+		jm := jm
 		t.Run(fmt.Sprintf("journal=%v", jm), func(t *testing.T) {
+			t.Parallel()
 			h, f, _, campaign := newUserpoolHost(t)
 			cfg := Config{Provider: "aws", Store: f, Userpools: f, CampaignStatePath: campaign}
 			var j *safety.Journal
@@ -1204,6 +1230,7 @@ func TestSolUPLegalProfilesExceedJournal(t *testing.T) {
 }
 
 func TestSolUPSameOwnerDifferentIncarnationAdopted(t *testing.T) {
+	t.Parallel()
 	h, f, _, _ := newUserpoolHost(t)
 	_, _ = h.UserpoolCreate(false, "incarnationpool")
 	old, _ := f.DescribeUserPool(context.Background(), "incarnationpool")
@@ -1223,6 +1250,7 @@ func TestSolUPSameOwnerDifferentIncarnationAdopted(t *testing.T) {
 }
 
 func TestSolUPExactEndpointCascade(t *testing.T) {
+	t.Parallel()
 	a, b := fakeadapter.New(fakeadapter.Options{}), fakeadapter.New(fakeadapter.Options{})
 	ea, eb := "http://127.0.0.1:40171", "http://127.0.0.1:40172"
 	router := hostkit.Router{Pick: func(ctx context.Context) (hostkit.Backend, error) {
@@ -1279,6 +1307,7 @@ func (a solUPWrongTokenKind) SignIn(ctx context.Context, in hostkit.UserSignInIn
 }
 
 func TestSolUPWrongTokenUseAndMissingClient(t *testing.T) {
+	t.Parallel()
 	h, f, _, _ := newUserpoolHost(t)
 	_, _ = h.UserpoolCreate(false, "tokenkindpool")
 	_, _ = h.UserCreate(false, "tokenkindpool", "alice", nil)
