@@ -891,9 +891,12 @@ func (a *fastMintSignInAdapter) SignIn(_ context.Context, in hostkit.UserSignInI
 }
 
 func TestSolUPLostRevocationReply(t *testing.T) {
+	t.Parallel()
 	for _, jm := range []bool{false, true} {
 		for _, op := range []string{"SetUserPassword", "SetUserEnabled", "DeleteUser"} {
+			jm, op := jm, op
 			t.Run(fmt.Sprintf("journal=%v/%s", jm, op), func(t *testing.T) {
+				t.Parallel()
 				h, f, _, campaign := newUserpoolHost(t)
 				cfg := Config{Provider: "aws", Store: f, Userpools: f, CampaignStatePath: campaign}
 				var j *safety.Journal
@@ -1099,8 +1102,11 @@ func (a *solUPLatePassword) SetUserPassword(ctx context.Context, p, u, pw string
 }
 
 func TestSolUPDuplicateCreateErasesRevocation(t *testing.T) {
+	t.Parallel()
 	for _, jm := range []bool{false, true} {
+		jm := jm
 		t.Run(fmt.Sprintf("journal=%v", jm), func(t *testing.T) {
+			t.Parallel()
 			h, f, _, campaign := newUserpoolHost(t)
 			cfg := Config{Provider: "aws", Store: f, Userpools: f, CampaignStatePath: campaign}
 			var j *safety.Journal
@@ -1277,12 +1283,28 @@ func TestSolUPWrongTokenUseAndMissingClient(t *testing.T) {
 	_, _ = h.UserpoolCreate(false, "tokenkindpool")
 	_, _ = h.UserCreate(false, "tokenkindpool", "alice", nil)
 	_ = h.UserSetPassword(false, "tokenkindpool", "alice", "CorrectPass123")
-	h.cfg.Userpools = solUPWrongTokenKind{f}
-	sess, _ := h.UserSignIn(false, "tokenkindpool", "alice", "CorrectPass123")
-	if sess.AccessToken() == "" {
+	goodSess, _ := h.UserSignIn(false, "tokenkindpool", "alice", "CorrectPass123")
+	if goodSess.AccessToken() == "" {
 		t.Fatal("fixture", h.LastError())
 	}
-	verified, _ := h.UserVerifyToken(false, "tokenkindpool", sess.AccessToken())
+	h.cfg.Userpools = solUPWrongTokenKind{f}
+	sess, _ := h.UserSignIn(false, "tokenkindpool", "alice", "CorrectPass123")
+	if h.LastError().Code == hostkit.OK || sess.AccessToken() != "" {
+		t.Fatal("sign-in accepted ID token without required pool app-client binding")
+	}
+	priv, _, kid, issuer, _, _, _, _ := f.UserpoolSigningKeyMaterialForTesting("tokenkindpool")
+	badTok, err := hostkit.MintRS256JWT(priv, kid, map[string]any{
+		"sub":       goodSess.Claims()["sub"],
+		"username":  "alice",
+		"iss":       issuer,
+		"iat":       time.Now().Unix(),
+		"exp":       time.Now().Unix() + 3600,
+		"token_use": "id",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, _ := h.UserVerifyToken(false, "tokenkindpool", badTok)
 	t.Logf("verified token_use=%s client_id=%q result=%s", verified.Claims()["token_use"], verified.Claims()["client_id"], h.LastError().Code)
 	if h.LastError().Code == hostkit.OK {
 		t.Fatal("accepted signed ID token without required pool app-client binding as an access token")

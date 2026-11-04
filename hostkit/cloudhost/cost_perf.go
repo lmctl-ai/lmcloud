@@ -389,6 +389,8 @@ type costTracker struct {
 	maxUserpoolGen         map[string]uint64
 	latestUserpoolIntent   map[string]string
 	inFlightAttempts       map[string]bool
+	verifiedCampaignRaw    []byte
+	verifiedCampaignRecs   []campaignJournalRecord
 }
 
 func scopedResKey(endpoint, resKey string) string {
@@ -1154,31 +1156,47 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 	if raw[len(raw)-1] != '\n' {
 		return nil, errors.New("corrupt campaign journal: incomplete trailing line")
 	}
+	cachedCount := 0
+	if len(ct.verifiedCampaignRaw) > 0 && len(raw) >= len(ct.verifiedCampaignRaw) &&
+		bytes.Equal(raw[:len(ct.verifiedCampaignRaw)], ct.verifiedCampaignRaw) {
+		cachedCount = len(ct.verifiedCampaignRecs)
+	}
 	lines := bytes.Split(raw, []byte{'\n'})
+	newRecs := make([]campaignJournalRecord, 0, len(lines)-1)
+	if cachedCount > 0 && cachedCount <= len(lines)-1 {
+		newRecs = append(newRecs, ct.verifiedCampaignRecs[:cachedCount]...)
+	} else {
+		cachedCount = 0
+	}
 	for i, line := range lines {
 		if i == len(lines)-1 && len(line) == 0 {
 			continue
 		}
-		if len(bytes.TrimSpace(line)) == 0 {
-			return nil, fmt.Errorf("corrupt campaign journal line %d: empty line", i+1)
-		}
 		var rec campaignJournalRecord
-		dec := json.NewDecoder(bytes.NewReader(line))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&rec); err != nil {
-			return nil, fmt.Errorf("corrupt campaign journal line %d: %w", i+1, err)
-		}
-		var extra any
-		if err := dec.Decode(&extra); err != io.EOF {
-			return nil, fmt.Errorf("corrupt campaign journal line %d: trailing data", i+1)
-		}
-		wantSeq := uint64(i + 1)
-		if rec.Version != campaignJournalVersion || rec.Seq != wantSeq {
-			return nil, fmt.Errorf("corrupt campaign journal line %d: version=%d seq=%d (want v=%d seq=%d)",
-				i+1, rec.Version, rec.Seq, campaignJournalVersion, wantSeq)
-		}
-		if i == 0 && rec.Event != safety.EventMeta {
-			return nil, fmt.Errorf("corrupt campaign journal: first record must be %q, got %q", safety.EventMeta, rec.Event)
+		if i < cachedCount {
+			rec = newRecs[i]
+		} else {
+			if len(bytes.TrimSpace(line)) == 0 {
+				return nil, fmt.Errorf("corrupt campaign journal line %d: empty line", i+1)
+			}
+			dec := json.NewDecoder(bytes.NewReader(line))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&rec); err != nil {
+				return nil, fmt.Errorf("corrupt campaign journal line %d: %w", i+1, err)
+			}
+			var extra any
+			if err := dec.Decode(&extra); err != io.EOF {
+				return nil, fmt.Errorf("corrupt campaign journal line %d: trailing data", i+1)
+			}
+			wantSeq := uint64(i + 1)
+			if rec.Version != campaignJournalVersion || rec.Seq != wantSeq {
+				return nil, fmt.Errorf("corrupt campaign journal line %d: version=%d seq=%d (want v=%d seq=%d)",
+					i+1, rec.Version, rec.Seq, campaignJournalVersion, wantSeq)
+			}
+			if i == 0 && rec.Event != safety.EventMeta {
+				return nil, fmt.Errorf("corrupt campaign journal: first record must be %q, got %q", safety.EventMeta, rec.Event)
+			}
+			newRecs = append(newRecs, rec)
 		}
 		st.lastSeq = rec.Seq
 		switch rec.Event {
@@ -1186,32 +1204,34 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 			if i != 0 {
 				return nil, errors.New("corrupt campaign journal: duplicate meta record")
 			}
-			wantMeta := ct.campaignMetaRecord()
-			if rec.Provider == "" || rec.PriceTableVersion == "" || rec.PriceTableHash == "" || rec.PolicyHash == "" || rec.CapNanoUSD <= 0 || rec.CeilingNanoUSD <= 0 {
-				return nil, errors.New("corrupt campaign journal: incomplete authority metadata in meta record")
-			}
-			if rec.Provider != wantMeta.Provider {
-				return nil, fmt.Errorf("campaign journal provider mismatch: journal has %q, tracker has %q", rec.Provider, wantMeta.Provider)
-			}
-			if rec.Region != wantMeta.Region {
-				return nil, fmt.Errorf("campaign journal region mismatch: journal has %q, tracker has %q", rec.Region, wantMeta.Region)
-			}
-			if rec.Scope != wantMeta.Scope {
-				return nil, fmt.Errorf("campaign journal scope mismatch: journal has %q, tracker has %q", rec.Scope, wantMeta.Scope)
-			}
-			if rec.PriceTableVersion != wantMeta.PriceTableVersion {
-				return nil, fmt.Errorf("campaign journal price_table_version mismatch: journal has %q, tracker has %q", rec.PriceTableVersion, wantMeta.PriceTableVersion)
-			}
-			if rec.PriceTableHash != wantMeta.PriceTableHash {
-				return nil, fmt.Errorf("campaign journal price_table_hash mismatch: journal has %q, tracker has %q", rec.PriceTableHash, wantMeta.PriceTableHash)
-			}
-			if rec.CapNanoUSD != wantMeta.CapNanoUSD || rec.CeilingNanoUSD != wantMeta.CeilingNanoUSD || rec.MaxCleanupReserveNanoUSD != wantMeta.MaxCleanupReserveNanoUSD {
-				return nil, fmt.Errorf("campaign journal policy cap/ceiling/cleanup mismatch: journal has (%d/%d/%d), tracker has (%d/%d/%d)",
-					rec.CapNanoUSD, rec.CeilingNanoUSD, rec.MaxCleanupReserveNanoUSD,
-					wantMeta.CapNanoUSD, wantMeta.CeilingNanoUSD, wantMeta.MaxCleanupReserveNanoUSD)
-			}
-			if rec.PolicyHash != wantMeta.PolicyHash {
-				return nil, fmt.Errorf("campaign journal policy_hash mismatch: journal has %q, tracker has %q", rec.PolicyHash, wantMeta.PolicyHash)
+			if i >= cachedCount {
+				wantMeta := ct.campaignMetaRecord()
+				if rec.Provider == "" || rec.PriceTableVersion == "" || rec.PriceTableHash == "" || rec.PolicyHash == "" || rec.CapNanoUSD <= 0 || rec.CeilingNanoUSD <= 0 {
+					return nil, errors.New("corrupt campaign journal: incomplete authority metadata in meta record")
+				}
+				if rec.Provider != wantMeta.Provider {
+					return nil, fmt.Errorf("campaign journal provider mismatch: journal has %q, tracker has %q", rec.Provider, wantMeta.Provider)
+				}
+				if rec.Region != wantMeta.Region {
+					return nil, fmt.Errorf("campaign journal region mismatch: journal has %q, tracker has %q", rec.Region, wantMeta.Region)
+				}
+				if rec.Scope != wantMeta.Scope {
+					return nil, fmt.Errorf("campaign journal scope mismatch: journal has %q, tracker has %q", rec.Scope, wantMeta.Scope)
+				}
+				if rec.PriceTableVersion != wantMeta.PriceTableVersion {
+					return nil, fmt.Errorf("campaign journal price_table_version mismatch: journal has %q, tracker has %q", rec.PriceTableVersion, wantMeta.PriceTableVersion)
+				}
+				if rec.PriceTableHash != wantMeta.PriceTableHash {
+					return nil, fmt.Errorf("campaign journal price_table_hash mismatch: journal has %q, tracker has %q", rec.PriceTableHash, wantMeta.PriceTableHash)
+				}
+				if rec.CapNanoUSD != wantMeta.CapNanoUSD || rec.CeilingNanoUSD != wantMeta.CeilingNanoUSD || rec.MaxCleanupReserveNanoUSD != wantMeta.MaxCleanupReserveNanoUSD {
+					return nil, fmt.Errorf("campaign journal policy cap/ceiling/cleanup mismatch: journal has (%d/%d/%d), tracker has (%d/%d/%d)",
+						rec.CapNanoUSD, rec.CeilingNanoUSD, rec.MaxCleanupReserveNanoUSD,
+						wantMeta.CapNanoUSD, wantMeta.CeilingNanoUSD, wantMeta.MaxCleanupReserveNanoUSD)
+				}
+				if rec.PolicyHash != wantMeta.PolicyHash {
+					return nil, fmt.Errorf("campaign journal policy_hash mismatch: journal has %q, tracker has %q", rec.PolicyHash, wantMeta.PolicyHash)
+				}
 			}
 		case safety.EventWorkCap:
 			if rec.WorkCapNanoUSD <= 0 {
@@ -1866,8 +1886,7 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 			}
 			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
 			act, hasAct := st.activeUserpoolEntries[uKey]
-			_, hasAmb := st.ambiguousUserpools[uKey]
-			if hasAct && !hasAmb && len(st.ambiguousUserpoolStack[uKey]) == 0 &&
+			if hasAct && safety.OnlyDuplicateUserpoolCreateAmbiguity(act, st.ambiguousUserpoolStack[uKey]) &&
 				act.OwnerToken == rec.OwnerToken && act.Incarnation == rec.UserpoolIncarnation {
 				act.StateJSON = rec.UserpoolState
 				st.activeUserpoolEntries[uKey] = act
@@ -1941,6 +1960,8 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 	for _, v := range st.activePoolMemberships {
 		st.resourceCleanupNanoUSD += v
 	}
+	ct.verifiedCampaignRaw = append(ct.verifiedCampaignRaw[:0], raw...)
+	ct.verifiedCampaignRecs = newRecs
 	return st, nil
 }
 
@@ -2192,11 +2213,17 @@ func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(s
 		_ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
 	}()
 
+	_ = os.Remove(ct.statePath + ".compact.tmp")
+
 	f, fileCreated, err := openCampaignFileNoFollow(ct.statePath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if f != nil {
+			_ = f.Close()
+		}
+	}()
 
 	raw, err := io.ReadAll(io.LimitReader(f, safety.MaxJournalFileBytes+1))
 	if err != nil {
@@ -2209,10 +2236,14 @@ func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(s
 	if err != nil {
 		return err
 	}
-	if fn != nil && len(raw) > 256<<10 {
+	if createIfMissing && fn != nil && len(raw) > 310<<10 {
 		if compactedRaw, compactedSeq, ok := compactSupersededCampaignStates(raw); ok && len(compactedRaw) < len(raw) {
-			if err := rewriteCampaignFileInPlace(f, compactedRaw); err == nil {
+			if newF, err := rewriteCampaignFileAtomic(ct.statePath, compactedRaw); err == nil {
+				_ = f.Close()
+				f = newF
 				st.lastSeq = compactedSeq
+				ct.verifiedCampaignRaw = nil
+				ct.verifiedCampaignRecs = nil
 			}
 		}
 	}
@@ -2315,27 +2346,66 @@ func compactSupersededCampaignStates(raw []byte) ([]byte, uint64, bool) {
 		buf.Write(b)
 		buf.WriteByte('\n')
 	}
-	if dropped == 0 {
+	if dropped < 4 {
 		return nil, 0, false
 	}
 	return buf.Bytes(), seq, true
 }
 
-func rewriteCampaignFileInPlace(f *os.File, raw []byte) error {
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := f.Truncate(0); err != nil {
-		return err
-	}
-	n, err := f.Write(raw)
+// opusCrashHook is a fault-injection hook for testing crash-safety during campaign journal compaction.
+var opusCrashHook func(*os.File, []byte)
+
+func rewriteCampaignFileAtomic(statePath string, raw []byte) (*os.File, error) {
+	tmpPath := statePath + ".compact.tmp"
+	_ = os.Remove(tmpPath)
+	tf, _, err := openCampaignFileNoFollow(tmpPath)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	cleanupTmp := func() {
+		_ = tf.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if _, err := tf.Seek(0, io.SeekStart); err != nil {
+		cleanupTmp()
+		return nil, err
+	}
+	if err := tf.Truncate(0); err != nil {
+		cleanupTmp()
+		return nil, err
+	}
+	if opusCrashHook != nil {
+		opusCrashHook(tf, raw)
+	}
+	n, err := tf.Write(raw)
+	if err != nil {
+		cleanupTmp()
+		return nil, err
 	}
 	if n != len(raw) {
-		return io.ErrShortWrite
+		cleanupTmp()
+		return nil, io.ErrShortWrite
 	}
-	return f.Sync()
+	if err := tf.Sync(); err != nil {
+		cleanupTmp()
+		return nil, err
+	}
+	if err := tf.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return nil, err
+	}
+	if err := os.Rename(tmpPath, statePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return nil, err
+	}
+	if err := syncCampaignDir(filepath.Dir(statePath)); err != nil {
+		return nil, err
+	}
+	reopened, _, err := openCampaignFileNoFollow(statePath)
+	if err != nil {
+		return nil, err
+	}
+	return reopened, nil
 }
 
 func (ct *costTracker) syncFromSafetyJournalLocked() {
@@ -5255,6 +5325,30 @@ func (ct *costTracker) confirmUserpoolIntent(entry safety.JournalUserpoolEntry) 
 	return nil
 }
 
+func (ct *costTracker) hasPoolUserCleanup(endpoint, pool, username string) bool {
+	if ct == nil {
+		return false
+	}
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	sKey := scopedResKey(endpoint, pool+"/"+username)
+	if _, ok := ct.activePoolUsers[sKey]; ok {
+		return true
+	}
+	if ct.journal != nil {
+		st := ct.journal.State()
+		uKey := safety.KindPoolUser + "\x00" + endpoint + "\x00" + pool + "/" + username
+		uKeyUnscoped := safety.KindPoolUser + "\x00\x00" + pool + "/" + username
+		if _, ok := st.ActiveCleanup[uKey]; ok {
+			return true
+		}
+		if _, ok := st.ActiveCleanup[uKeyUnscoped]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expIncarnation, _ string, mutate func(curStateJSON string) string) *hostkit.CloudError {
 	if mutate == nil {
 		return nil
@@ -5267,6 +5361,10 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 	key := scopedResKey(endpoint, name)
 	staleErr := hostkit.ProviderError(hostkit.Conflict, 409, "AmbiguousUserpoolState",
 		fmt.Sprintf("userpool %q state changed concurrently during operation", name))
+	stateTooLargeErr := func(sz int) *hostkit.CloudError {
+		return hostkit.ProviderError(hostkit.InvalidArgument, 0, "UserpoolStateLimitExceeded",
+			fmt.Sprintf("userpool %q state size %d exceeds maximum 8 MiB", name, sz))
+	}
 
 	if ct.journal != nil {
 		if err := ct.journal.CheckHealth(); err != nil {
@@ -5279,7 +5377,7 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 		}
 		act, ok := ct.activeUserpoolEntries[key]
 		_, hasAmb := ct.ambiguousUserpools[key]
-		if !ok || hasAmb || len(ct.ambiguousUserpoolStack[key]) > 0 {
+		if !ok || ((hasAmb || len(ct.ambiguousUserpoolStack[key]) > 0) && !safety.OnlyDuplicateUserpoolCreateAmbiguity(act, ct.ambiguousUserpoolStack[key])) {
 			return staleErr
 		}
 		if act.OwnerToken != expOwnerToken || act.Incarnation != expIncarnation {
@@ -5288,6 +5386,9 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 		newState := mutate(act.StateJSON)
 		if newState == act.StateJSON {
 			return nil
+		}
+		if len(newState) > 8*1024*1024 {
+			return stateTooLargeErr(len(newState))
 		}
 		if err := ct.journal.RecordUserpoolState(act.Scope, act.Name, act.OwnerToken, act.Incarnation, act.Generation, newState); err != nil {
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
@@ -5302,7 +5403,7 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
 			act, ok := st.activeUserpoolEntries[key]
 			_, hasAmb := st.ambiguousUserpools[key]
-			if !ok || hasAmb || len(st.ambiguousUserpoolStack[key]) > 0 {
+			if !ok || ((hasAmb || len(st.ambiguousUserpoolStack[key]) > 0) && !safety.OnlyDuplicateUserpoolCreateAmbiguity(act, st.ambiguousUserpoolStack[key])) {
 				cerr = staleErr
 				return nil
 			}
@@ -5312,6 +5413,10 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 			}
 			newState := mutate(act.StateJSON)
 			if newState == act.StateJSON {
+				return nil
+			}
+			if len(newState) > 8*1024*1024 {
+				cerr = stateTooLargeErr(len(newState))
 				return nil
 			}
 			if err := appendRec(campaignJournalRecord{
@@ -5341,13 +5446,17 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 
 	act, ok := ct.activeUserpoolEntries[key]
 	_, hasAmb := ct.ambiguousUserpools[key]
-	if !ok || hasAmb || len(ct.ambiguousUserpoolStack[key]) > 0 {
+	if !ok || ((hasAmb || len(ct.ambiguousUserpoolStack[key]) > 0) && !safety.OnlyDuplicateUserpoolCreateAmbiguity(act, ct.ambiguousUserpoolStack[key])) {
 		return staleErr
 	}
 	if act.OwnerToken != expOwnerToken || act.Incarnation != expIncarnation {
 		return staleErr
 	}
-	act.StateJSON = mutate(act.StateJSON)
+	newState := mutate(act.StateJSON)
+	if len(newState) > 8*1024*1024 {
+		return stateTooLargeErr(len(newState))
+	}
+	act.StateJSON = newState
 	ct.activeUserpoolEntries[key] = act
 	return nil
 }

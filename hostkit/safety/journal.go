@@ -353,6 +353,18 @@ type JournalUserpoolEntry struct {
 	StateJSON   string `json:"state_json,omitempty"`
 }
 
+// OnlyDuplicateUserpoolCreateAmbiguity reports whether all unresolved intents for
+// an already-active userpool are idempotent duplicate "create" intents for the
+// same (OwnerToken, Incarnation) instance.
+func OnlyDuplicateUserpoolCreateAmbiguity(act JournalUserpoolEntry, stack []JournalUserpoolEntry) bool {
+	for _, e := range stack {
+		if e.IntentOp != "create" || e.OwnerToken != act.OwnerToken || (e.Incarnation != "" && act.Incarnation != "" && e.Incarnation != act.Incarnation) {
+			return false
+		}
+	}
+	return true
+}
+
 func scopedFunctionKey(scope, name string) string {
 	if scope == "" {
 		return name
@@ -2933,6 +2945,15 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 	}
 }
 
+func hasForbiddenCredentialFieldKey(m map[string]any) bool {
+	for _, k := range []string{"password", "password_hash", "password_salt", "private_key", "private_key_pem", "access_token"} {
+		if _, exists := m[k]; exists {
+			return true
+		}
+	}
+	return false
+}
+
 func validateJournalUserpoolState(raw string) error {
 	if len(raw) > 8*1024*1024 {
 		return errors.New("userpool_state exceeds maximum size")
@@ -2940,10 +2961,42 @@ func validateJournalUserpoolState(raw string) error {
 	if hasControlChars(raw) {
 		return errors.New("userpool_state contains control characters")
 	}
-	if strings.Contains(raw, `"password"`) || strings.Contains(raw, `"password_hash"`) ||
-		strings.Contains(raw, `"password_salt"`) || strings.Contains(raw, `"private_key"`) ||
-		strings.Contains(raw, `"access_token"`) {
+	if raw == "" {
+		return nil
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		return errors.New("userpool_state is not valid JSON")
+	}
+	if hasForbiddenCredentialFieldKey(doc) {
 		return errors.New("userpool_state contains forbidden secret or credential material")
+	}
+	if poolObj, ok := doc["pool"].(map[string]any); ok {
+		if hasForbiddenCredentialFieldKey(poolObj) {
+			return errors.New("userpool_state contains forbidden secret or credential material")
+		}
+	}
+	if usersObj, ok := doc["users"].(map[string]any); ok {
+		for _, uVal := range usersObj {
+			if uObj, ok := uVal.(map[string]any); ok {
+				if hasForbiddenCredentialFieldKey(uObj) {
+					return errors.New("userpool_state contains forbidden secret or credential material")
+				}
+			}
+		}
+	}
+	if tbObj, ok := doc["token_bindings"].(map[string]any); ok {
+		for _, bSlice := range tbObj {
+			if arr, ok := bSlice.([]any); ok {
+				for _, item := range arr {
+					if bObj, ok := item.(map[string]any); ok {
+						if hasForbiddenCredentialFieldKey(bObj) {
+							return errors.New("userpool_state contains forbidden secret or credential material")
+						}
+					}
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -3813,8 +3866,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 	if rec.Event == EventUserpoolState {
 		uKey := scopedUserpoolKey(rec.PolicyScope, rec.Name)
 		act, hasAct := state.ActiveUserpools[uKey]
-		_, hasAmb := state.AmbiguousUserpools[uKey]
-		if !hasAct || hasAmb || len(state.AmbiguousUserpoolStack[uKey]) > 0 {
+		if !hasAct || !OnlyDuplicateUserpoolCreateAmbiguity(act, state.AmbiguousUserpoolStack[uKey]) {
 			return nil
 		}
 		if act.OwnerToken != rec.CreateToken || act.Incarnation != rec.ETag {

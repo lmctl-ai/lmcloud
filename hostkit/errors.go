@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -198,7 +199,7 @@ type ErrorState struct {
 	retainedSecrets []string
 	retainedSet     map[string]struct{}
 	retainedBytes   int
-	pinnedSecrets   map[string][]string
+	pinnedSecrets   map[string]string
 	pinnedOrder     []string
 	pinnedBytes     int
 }
@@ -212,8 +213,8 @@ const (
 	maxRetainedRedactions     = 4096
 	maxRetainedRedactionBytes = 1 << 20
 	maxSingleRedactionBytes   = 8192
-	maxPinnedRedactionKeys    = 16384
-	maxPinnedRedactionBytes   = 4 << 20
+	maxPinnedRedactionKeys    = 262144
+	maxPinnedRedactionBytes   = 64 << 20
 )
 
 func expandSecretVariants(secret string) []string {
@@ -280,15 +281,30 @@ func (s *ErrorState) AddRedaction(secret string) {
 	}
 }
 
+func (s *ErrorState) compactPinnedOrderLocked() {
+	if len(s.pinnedSecrets) == 0 {
+		s.pinnedOrder = nil
+		s.pinnedBytes = 0
+		return
+	}
+	filtered := make([]string, 0, len(s.pinnedSecrets))
+	seen := make(map[string]struct{}, len(s.pinnedSecrets))
+	for _, k := range s.pinnedOrder {
+		if _, ok := s.pinnedSecrets[k]; ok {
+			if _, dup := seen[k]; !dup {
+				seen[k] = struct{}{}
+				filtered = append(filtered, k)
+			}
+		}
+	}
+	s.pinnedOrder = filtered
+}
+
 // PinActiveSecret pins an active credential (such as a user's current password
 // or an active session token) under lifecycle key so transient AddRedaction
 // churn cannot evict it while the credential remains active.
 func (s *ErrorState) PinActiveSecret(key, secret string) {
 	if key == "" || len(secret) < 8 || len(secret) > maxSingleRedactionBytes {
-		return
-	}
-	variants := expandSecretVariants(secret)
-	if len(variants) == 0 {
 		return
 	}
 	s.mu.Lock()
@@ -297,37 +313,43 @@ func (s *ErrorState) PinActiveSecret(key, secret string) {
 	if len(s.secrets) > maxRedactions {
 		s.secrets = s.secrets[len(s.secrets)-maxRedactions:]
 	}
-	for _, v := range variants {
+	for _, v := range expandSecretVariants(secret) {
 		s.addRetainedLocked(v)
 	}
 	if s.pinnedSecrets == nil {
-		s.pinnedSecrets = make(map[string][]string, 64)
+		s.pinnedSecrets = make(map[string]string, 64)
 	}
-	var addedBytes int
-	for _, v := range variants {
-		addedBytes += len(v)
-	}
+	addedBytes := len(secret)
 	if prev, exists := s.pinnedSecrets[key]; exists {
-		for _, pv := range prev {
-			s.pinnedBytes -= len(pv)
-		}
+		s.pinnedBytes -= len(prev)
 		if s.pinnedBytes < 0 {
 			s.pinnedBytes = 0
 		}
 	} else {
+		if len(s.pinnedSecrets) >= maxPinnedRedactionKeys || (s.pinnedBytes+addedBytes > maxPinnedRedactionBytes && len(s.pinnedSecrets) > 0) {
+			s.compactPinnedOrderLocked()
+		}
 		for (len(s.pinnedSecrets) >= maxPinnedRedactionKeys || (s.pinnedBytes+addedBytes > maxPinnedRedactionBytes && len(s.pinnedSecrets) > 0)) && len(s.pinnedOrder) > 0 {
-			evictKey := s.pinnedOrder[0]
-			s.pinnedOrder = s.pinnedOrder[1:]
-			if old, ok := s.pinnedSecrets[evictKey]; ok {
-				for _, ov := range old {
-					s.pinnedBytes -= len(ov)
+			evictIdx := 0
+			for idx, k := range s.pinnedOrder {
+				if strings.HasPrefix(k, "tok:") {
+					evictIdx = idx
+					break
 				}
+			}
+			evictKey := s.pinnedOrder[evictIdx]
+			s.pinnedOrder = append(s.pinnedOrder[:evictIdx], s.pinnedOrder[evictIdx+1:]...)
+			if old, ok := s.pinnedSecrets[evictKey]; ok {
+				s.pinnedBytes -= len(old)
 				delete(s.pinnedSecrets, evictKey)
 			}
 		}
 		s.pinnedOrder = append(s.pinnedOrder, key)
+		if len(s.pinnedOrder) > 2*len(s.pinnedSecrets)+1024 {
+			s.compactPinnedOrderLocked()
+		}
 	}
-	s.pinnedSecrets[key] = variants
+	s.pinnedSecrets[key] = secret
 	s.pinnedBytes += addedBytes
 }
 
@@ -339,13 +361,14 @@ func (s *ErrorState) UnpinActiveSecret(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if prev, ok := s.pinnedSecrets[key]; ok {
-		for _, pv := range prev {
-			s.pinnedBytes -= len(pv)
-		}
+		s.pinnedBytes -= len(prev)
 		if s.pinnedBytes < 0 {
 			s.pinnedBytes = 0
 		}
 		delete(s.pinnedSecrets, key)
+		if len(s.pinnedSecrets) == 0 || len(s.pinnedOrder) > 2*len(s.pinnedSecrets)+1024 {
+			s.compactPinnedOrderLocked()
+		}
 	}
 }
 
@@ -358,28 +381,63 @@ func (s *ErrorState) UnpinActiveSecretPrefix(prefix string) {
 	defer s.mu.Unlock()
 	for k, prev := range s.pinnedSecrets {
 		if strings.HasPrefix(k, prefix) {
-			for _, pv := range prev {
-				s.pinnedBytes -= len(pv)
-			}
+			s.pinnedBytes -= len(prev)
 			delete(s.pinnedSecrets, k)
 		}
 	}
 	if s.pinnedBytes < 0 {
 		s.pinnedBytes = 0
 	}
+	if len(s.pinnedSecrets) == 0 || len(s.pinnedOrder) > 2*len(s.pinnedSecrets)+1024 {
+		s.compactPinnedOrderLocked()
+	}
 }
 
-// scrubLocked replaces the registered exact strings, then applies RedactText.
+func needsEscapedVariantCheck(sec string) bool {
+	for i := 0; i < len(sec); i++ {
+		c := sec[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+			return true
+		}
+	}
+	return false
+}
+
+// scrubLocked replaces the registered exact strings (longest first), then applies RedactText.
 func (s *ErrorState) scrubLocked(text string) string {
-	for _, variants := range s.pinnedSecrets {
-		for _, sec := range variants {
-			text = strings.ReplaceAll(text, sec, CreateTokenMarker)
+	if text == "" {
+		return text
+	}
+	var matches []string
+	addIfPresent := func(sec string) {
+		if len(sec) >= 8 && strings.Contains(text, sec) {
+			matches = append(matches, sec)
+		}
+	}
+	for _, rawSec := range s.pinnedSecrets {
+		if strings.Contains(text, rawSec) {
+			matches = append(matches, rawSec)
+		}
+		if needsEscapedVariantCheck(rawSec) {
+			for _, v := range expandSecretVariants(rawSec) {
+				if v != rawSec {
+					addIfPresent(v)
+				}
+			}
 		}
 	}
 	for _, sec := range s.secrets {
-		text = strings.ReplaceAll(text, sec, CreateTokenMarker)
+		addIfPresent(sec)
 	}
 	for _, sec := range s.retainedSecrets {
+		addIfPresent(sec)
+	}
+	if len(matches) > 1 {
+		sort.Slice(matches, func(i, j int) bool {
+			return len(matches[i]) > len(matches[j])
+		})
+	}
+	for _, sec := range matches {
 		text = strings.ReplaceAll(text, sec, CreateTokenMarker)
 	}
 	return RedactText(text)
