@@ -37,11 +37,14 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let bad_sig = str_substr(sig, 0, str_len(sig) / 2) + flip + str_substr(sig, str_len(sig) / 2 + 1, str_len(sig) - str_len(sig) / 2 - 1);
   let bad_tok = parts.at(0) + "." + parts.at(1) + "." + bad_sig;
 
-  # Hand-crafted alg:none token (header.payload. with empty signature)
+  # Hand-crafted WELL-FORMED alg:none token (base64url, no padding, numeric iat/exp, valid iss/aud
+  # aimed at THIS pool): isolates algorithm rejection as a trust failure (UNAUTHENTICATED), not
+  # structural garbage and not a clock artifact.
   let h = str_base64_encode("{\"alg\":\"none\",\"typ\":\"JWT\"}");
-  let py = str_base64_encode("{\"iss\":\"attacker\",\"aud\":\"" + pa + "\",\"sub\":\"attacker\",\"username\":\"" + u + "\",\"iat\":\"9999900000\",\"exp\":\"9999999999\"}");
-  let h64 = str_replace(str_replace(h, "+", "-"), "/", "_");
-  let p64 = str_replace(str_replace(py, "+", "-"), "/", "_");
+  let h64 = str_replace(str_replace(str_replace(h, "+", "-"), "/", "_"), "=", "");
+  let iat_now = 1000;   # any integral reasonable iat; trust rejection must not depend on clock
+  let py = str_base64_encode("{\"iss\":\"sim-issuer\",\"aud\":\"" + pa + "\",\"sub\":\"attacker-sub\",\"username\":\"" + u + "\",\"iat\":" + str(iat_now) + ",\"exp\":9999999999}");
+  let p64 = str_replace(str_replace(str_replace(py, "+", "-"), "/", "_"), "=", "");
   let alg_none = h64 + "." + p64 + ".";
 
   cloud.set_abort_on_error(false);

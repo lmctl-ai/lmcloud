@@ -44,6 +44,8 @@ probe_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   lmcode_return_put("open_mode", open_mode);
   lmcode_return_put("unauth_ok", e.code() == ErrorCode.UNAUTHENTICATED);
 end _lmcode_
+expect_enforce = env("LMCLOUD_EXPECT_ENFORCE", "");
+
 r1 = run_lmcode(probe_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r1.ok, "11 probe host execution failed");
 
@@ -52,6 +54,10 @@ set_env("LMAWS_SIM_ACCESS_KEY_ID", seed_key);
 set_env("LMAWS_SIM_SECRET_ACCESS_KEY", seed_secret);
 
 if (r1.result.open_mode) {
+  if (expect_enforce == "1" || expect_enforce == "true") {
+    println("FAIL: bogus credentials were accepted although enforcement was expected (LMCLOUD_EXPECT_ENFORCE is set) — refusing to classify an auth bypass as open mode");
+    exit(1);
+  }
   println("SKIP: simulator is in --auth open mode; 11-userpool-auth-enforced-denial requires --auth enforce");
   exit(0);
 }

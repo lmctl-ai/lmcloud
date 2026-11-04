@@ -42,8 +42,16 @@ inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let e6 = cloud.last_error();
   cloud.user_sign_in(m, "u_any", "Aa1" + "zzzzzz");
   let e7 = cloud.last_error();
-  cloud.user_verify_token(m, "garbage.token.value");
+  # token verify precedence (design 17 §2.6): structure -> pool existence -> trust.
+  # syntactically VALID fixture token under a missing pool -> NOT_FOUND (existence precedes trust);
+  let good_hdr = str_replace(str_replace(str_replace(str_base64_encode("{\"alg\":\"RS256\",\"typ\":\"JWT\"}"), "+", "-"), "/", "_"), "=", "");
+  let good_pay = str_replace(str_replace(str_replace(str_base64_encode("{\"sub\":\"x\",\"iat\":1000,\"exp\":1}"), "+", "-"), "/", "_"), "=", "");
+  let valid_shape = good_hdr + "." + good_pay + ".c2ln";
+  cloud.user_verify_token(m, valid_shape);
   let e8 = cloud.last_error();
+  # structural garbage fails first even under a missing pool
+  cloud.user_verify_token(m, "garbage.token.value");
+  let e8b = cloud.last_error();
   cloud.group_create(m, "g_any");
   let e9 = cloud.last_error();
   cloud.group_list(m);
@@ -55,12 +63,15 @@ inspect_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
     && e5.code() == ErrorCode.NOT_FOUND && e6.code() == ErrorCode.NOT_FOUND
     && e7.code() == ErrorCode.NOT_FOUND && e8.code() == ErrorCode.NOT_FOUND
     && e9.code() == ErrorCode.NOT_FOUND && e10.code() == ErrorCode.NOT_FOUND;
+  let prec_ok = e8b.code() == ErrorCode.INVALID_ARGUMENT && e8b.http_status() == 0;
 
   lmcode_return_put("probes_ok", probes_ok);
   lmcode_return_put("all_nf", all_nf);
+  lmcode_return_put("prec_ok", prec_ok);
 end _lmcode_
 
 r = run_lmcode(inspect_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "12 inspection host execution failed");
 assert(r.result.probes_ok, "userpool_exists on missing pool is false with OK");
-assert(r.result.all_nf, "all 10 ops against a missing pool must be NOT_FOUND");
+assert(r.result.all_nf, "all 10 ops against a missing pool must be NOT_FOUND (incl. verify with syntactically-valid token)");
+assert(r.result.prec_ok, "structural token garbage precedes existence: INVALID_ARGUMENT even under a missing pool");

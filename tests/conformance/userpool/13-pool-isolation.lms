@@ -1,0 +1,62 @@
+# Requires: userpool
+# Scenario 13: Pool isolation — the SAME username exists in two pools with distinct passwords; sign-in
+# succeeds per pool with its own password and fails with the other pool's password; tokens verify only
+# under their issuing pool (cross-pool = UNAUTHENTICATED); deleting one pool leaves the other intact.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+pool_a = "lmu13" + run_id + "a";
+pool_b = "lmu13" + run_id + "b";
+user = "user13_" + run_id + "_sam";
+pw_a = "Aa1" + run_id + "zzzzpoolA";
+pw_b = "Bb2" + run_id + "yyyy_poolB";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("userpool", ep);
+  }
+  let pa = ${pool_a};
+  let pb = ${pool_b};
+  let u = ${user};
+  cloud.userpool_create(pa);
+  cloud.userpool_create(pb);
+  cloud.user_create(pa, u);
+  cloud.user_create(pb, u);
+  cloud.user_set_password(pa, u, ${pw_a});
+  cloud.user_set_password(pb, u, ${pw_b});
+
+  let sa = cloud.user_sign_in(pa, u, ${pw_a});
+  let sb = cloud.user_sign_in(pb, u, ${pw_b});
+  let both_ok = str_len(sa.access_token()) > 0 && str_len(sb.access_token()) > 0;
+
+  cloud.set_abort_on_error(false);
+  cloud.user_sign_in(pa, u, ${pw_b});            # pool-B password at pool A
+  let e_mix = cloud.last_error();
+  cloud.user_verify_token(pb, sa.access_token()); # pool-A token under pool B
+  let e_tok_ab = cloud.last_error();
+  cloud.user_verify_token(pa, sb.access_token()); # pool-B token under pool A
+  let e_tok_ba = cloud.last_error();
+  cloud.set_abort_on_error(true);
+
+  let mix_denied = e_mix.code() == ErrorCode.UNAUTHENTICATED;
+  let iso_ok = e_tok_ab.code() == ErrorCode.UNAUTHENTICATED && e_tok_ba.code() == ErrorCode.UNAUTHENTICATED;
+
+  # deleting pool A leaves pool B fully functional for the same username
+  cloud.userpool_delete(pa);
+  let sb2 = cloud.user_sign_in(pb, u, ${pw_b});
+  let b_survives = str_len(sb2.access_token()) > 0;
+
+  cloud.userpool_delete(pb);
+
+  lmcode_return_put("both_ok", both_ok);
+  lmcode_return_put("mix_denied", mix_denied);
+  lmcode_return_put("iso_ok", iso_ok);
+  lmcode_return_put("b_survives", b_survives);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "13-pool-isolation host execution failed");
+assert(r.result.both_ok, "same username signs in per pool with its own password");
+assert(r.result.mix_denied, "pool-B password must NOT sign in at pool A");
+assert(r.result.iso_ok, "tokens verify only under their issuing pool (both directions)");
+assert(r.result.b_survives, "deleting pool A leaves pool B (same username) fully functional");
