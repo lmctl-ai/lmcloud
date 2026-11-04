@@ -1,0 +1,19 @@
+# Requires: permissions
+# Scenario 04: principal_current returns a stable non-empty provider-shaped identity string.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+  }
+  let a = cloud.principal_current();
+  let b = cloud.principal_current();
+  lmcode_return_put("nonempty", str_len(a) > 0);
+  lmcode_return_put("stable", a == b);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "04-principal-current host execution failed");
+assert(r.result.nonempty, "principal_current must be non-empty");
+assert(r.result.stable, "principal_current must be stable within a run");

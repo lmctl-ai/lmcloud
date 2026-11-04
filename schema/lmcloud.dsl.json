@@ -609,6 +609,72 @@
         ]
       }
     },
+    "Policy": {
+      "methods": {
+        "statement": [
+          {
+            "params": ["string", "StrList", "StrList"],
+            "returns": "self"
+          }
+        ],
+        "document": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "len": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ]
+      }
+    },
+    "LintReport": {
+      "methods": {
+        "len": [
+          {
+            "params": [],
+            "returns": "int"
+          }
+        ],
+        "at": [
+          {
+            "params": ["int"],
+            "returns": "LintFinding"
+          }
+        ],
+        "ok": [
+          {
+            "params": [],
+            "returns": "bool"
+          }
+        ]
+      }
+    },
+    "LintFinding": {
+      "methods": {
+        "severity": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "code": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "message": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ]
+      }
+    },
     "Cloud": {
       "methods": {
         "provider": [
@@ -899,6 +965,60 @@
           {
             "params": ["string", "int", "string"],
             "returns": "TablePage"
+          }
+        ],
+        "principal_current": [
+          {
+            "params": [],
+            "returns": "string"
+          }
+        ],
+        "policy_new": [
+          {
+            "params": [],
+            "returns": "Policy"
+          }
+        ],
+        "policy_parse": [
+          {
+            "params": ["string"],
+            "returns": "Policy"
+          }
+        ],
+        "policy_lint": [
+          {
+            "params": ["Policy"],
+            "returns": "LintReport"
+          }
+        ],
+        "policy_attach": [
+          {
+            "params": ["string", "string", "Policy"],
+            "returns": "void"
+          }
+        ],
+        "policy_attach_principal": [
+          {
+            "params": ["string", "Policy"],
+            "returns": "void"
+          }
+        ],
+        "policy_detach": [
+          {
+            "params": ["string", "string"],
+            "returns": "void"
+          }
+        ],
+        "policy_detach_principal": [
+          {
+            "params": ["string"],
+            "returns": "void"
+          }
+        ],
+        "policy_check": [
+          {
+            "params": ["string", "string", "string"],
+            "returns": "bool"
           }
         ]
       }

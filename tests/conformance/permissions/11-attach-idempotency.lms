@@ -1,0 +1,53 @@
+# Requires: permissions
+# Scenario 11: Attach idempotency & replacement — identical re-attach is a no-op success; re-attaching a
+# CHANGED policy document replaces the old grant (check reflects the new effect); detach of a
+# never-attached pair is OK. (Journal correctness per design 15 §4.1 is asserted via these outcomes.)
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-p11-" + run_id + "-x";
+pr = "arn:aws:iam::000000000000:role/mut-" + run_id;
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+    cloud.set_endpoint("storage", ep);
+  }
+  let b = ${bucket};
+  cloud.bucket_create(b);
+
+  let pol_read = cloud.policy_new().statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/*"));
+  let pol_write = cloud.policy_new().statement("Allow", str_list().add("storage.object.write"), str_list().add("storage:object:" + b + "/*"));
+
+  cloud.policy_attach("storage:bucket:" + b, ${pr}, pol_read);
+  let read1 = cloud.policy_check(${pr}, "storage.object.read", "storage:object:" + b + "/k");
+
+  # identical re-attach: no error
+  cloud.policy_attach("storage:bucket:" + b, ${pr}, pol_read);
+  let re_ok = cloud.last_error().ok();
+
+  # changed document replaces the grant: read must disappear, write must appear
+  cloud.policy_attach("storage:bucket:" + b, ${pr}, pol_write);
+  let read2 = cloud.policy_check(${pr}, "storage.object.read", "storage:object:" + b + "/k");
+  let write2 = cloud.policy_check(${pr}, "storage.object.write", "storage:object:" + b + "/k");
+
+  # detach of a never-attached principal: idempotent OK
+  cloud.policy_detach("storage:bucket:" + b, "arn:aws:iam::000000000000:role/never-attached");
+  let d_ok = cloud.last_error().ok();
+
+  cloud.policy_detach("storage:bucket:" + b, ${pr});
+  cloud.bucket_delete(b);
+
+  lmcode_return_put("read1", read1);
+  lmcode_return_put("re_ok", re_ok);
+  lmcode_return_put("read2", read2);
+  lmcode_return_put("write2", write2);
+  lmcode_return_put("d_ok", d_ok);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "11-attach-idempotency host execution failed");
+assert(r.result.read1, "initial allow-read grant visible");
+assert(r.result.re_ok, "identical re-attach must succeed as a no-op");
+assert(!r.result.read2 && r.result.write2, "changed document must replace the grant (read gone, write present)");
+assert(r.result.d_ok, "detach of a never-attached pair must be idempotent OK");

@@ -1,0 +1,49 @@
+# Requires: permissions
+# Scenario 01: Policy builder basics — build statements, canonical document() JSON, parse round-trip
+# equality, statement count, and pre-flight rejection of invalid effect/action/resource inputs.
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+bucket = "lmcloud-p01-" + run_id + "-x";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+  }
+  let b = ${bucket};
+
+  let p = cloud.policy_new();
+  p = p.statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/*"));
+  p = p.statement("deny", str_list().add("storage.object.delete"), str_list().add("storage:object:" + b + "/secret/*"));
+
+  let doc = p.document();
+  let roundtrip = cloud.policy_parse(doc);
+  let rt_ok = roundtrip.document() == doc;
+  let len_ok = p.len() == 2;
+
+  cloud.set_abort_on_error(false);
+  cloud.policy_new().statement("Maybe", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/k"));
+  let e_effect = cloud.last_error();
+  cloud.policy_new().statement("Allow", str_list().add("bogus"), str_list().add("storage:object:" + b + "/k"));
+  let e_action = cloud.last_error();
+  cloud.policy_new().statement("Allow", str_list().add("storage.object.read"), str_list().add("not-a-resource"));
+  let e_res = cloud.last_error();
+  cloud.policy_parse("{not json");
+  let e_parse = cloud.last_error();
+  let guards_ok =
+    e_effect.code() == ErrorCode.INVALID_ARGUMENT && e_effect.http_status() == 0
+    && e_action.code() == ErrorCode.INVALID_ARGUMENT && e_action.http_status() == 0
+    && e_res.code() == ErrorCode.INVALID_ARGUMENT && e_res.http_status() == 0
+    && e_parse.code() == ErrorCode.INVALID_ARGUMENT && e_parse.http_status() == 0;
+  cloud.set_abort_on_error(true);
+
+  lmcode_return_put("rt_ok", rt_ok);
+  lmcode_return_put("len_ok", len_ok);
+  lmcode_return_put("guards_ok", guards_ok);
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+assert(r.ok, "01-policy-build-and-document host execution failed");
+assert(r.result.rt_ok, "policy document must round-trip: parse(document()).document() == document()");
+assert(r.result.len_ok, "policy should contain exactly 2 statements");
+assert(r.result.guards_ok, "invalid effect/action/resource/document must fail pre-flight INVALID_ARGUMENT (http_status 0)");

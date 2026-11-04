@@ -1,0 +1,45 @@
+# Requires: permissions
+# Scenario 03: policy_lint findings — unknown action (error), empty policy (error), wildcard scope
+# (warning), overbroad write+delete on wildcard (warning), management/escalation namespace (error).
+endpoint = len(ARGV) > 1 ? ARGV[1] : "";
+run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
+
+program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
+  let ep = ${endpoint};
+  if (str_len(ep) > 0) {
+    cloud.set_endpoint("permissions", ep);
+  }
+
+  # empty policy -> EMPTY_POLICY error
+  let e_rep = cloud.policy_lint(cloud.policy_new());
+  let empty_err = !e_rep.ok() && e_rep.len() == 1 && e_rep.at(0).code() == "EMPTY_POLICY" && e_rep.at(0).severity() == "error";
+
+  # one policy collecting the other four findings
+  let p = cloud.policy_new()
+    .statement("Allow", str_list().add("storage.object.bogusverb"), str_list().add("storage:object:b/k"))     # UNKNOWN_ACTION (error)
+    .statement("Allow", str_list().add("permissions.policy.write"), str_list().add("storage:bucket:admin"))      # ESCALATION_NAMESPACE (error)
+    .statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:bucket:*"))               # WILDCARD_SCOPE (warning)
+    .statement("Allow", str_list().add("storage.object.write").add("storage.object.delete"), str_list().add("storage:bucket:*"));  # +OVERBROAD_COMBINATION (warning)
+
+  let rep = cloud.policy_lint(p);
+  let codes = "";
+  let i = 0;
+  while (i < rep.len()) {
+    codes = codes + rep.at(i).code() + ";";
+    i = i + 1;
+  }
+  lmcode_return_put("codes", codes);
+  lmcode_return_put("empty_err", empty_err);
+  lmcode_return_put("not_ok", !rep.ok());
+  lmcode_return_put("n", rep.len());
+end _lmcode_
+
+r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
+code_str = r.result.codes;
+assert(r.ok, "03-policy-lint-findings host execution failed");
+assert(r.result.empty_err, "empty policy must produce EMPTY_POLICY error");
+assert(r.result.not_ok, "policy with error findings must have ok()==false");
+assert(contains(code_str, "UNKNOWN_ACTION;"), "expected UNKNOWN_ACTION finding, got: " + code_str);
+assert(contains(code_str, "ESCALATION_NAMESPACE;"), "expected ESCALATION_NAMESPACE finding, got: " + code_str);
+assert(contains(code_str, "WILDCARD_SCOPE;"), "expected WILDCARD_SCOPE finding, got: " + code_str);
+assert(contains(code_str, "OVERBROAD_COMBINATION;"), "expected OVERBROAD_COMBINATION finding, got: " + code_str);
