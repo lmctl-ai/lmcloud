@@ -35,7 +35,7 @@ Action = `<slice>.<type>.<op>`; ops are **per resource type** (not one global ve
 
 ### 2.3 Resource grammar
 
-`<slice>:<type>:<name>[/[prefix*]]`, with `<slice>:<type>` from the same matrix rows. `*` is a **trailing byte-prefix wildcard** allowed only after `/` and only inside `storage.object` scopes (`storage:object:<bucket>/logs/*`). Whole-class wildcards like `storage:bucket:*` are syntactically legal but raise lint `WILDCARD_SCOPE` and are **not attachable at identity side** (§4.3). Names follow the owning slice's portable naming rules (bucket rules for `storage:*`, queue rules, table rules). Matching is **literal byte** matching — no URL-decoding/normalization layer; resource keys containing literal `*`, control chars, or `%` sequences never alias; a literal `*` inside a key is not addressable by a policy resource (documented constraint).
+`<slice>:<type>` = `[a-z]+` each; `<name>` = the owning slice's portable name charset (buckets/queues/tables rules — e.g. bucket `[a-z0-9-]` 3..63); the `/...` suffix (object scopes only) uses the object-key charset from `02-object-storage-design.md` §4 rules. `*` is a **trailing byte-prefix wildcard** allowed only after `/` and only inside `storage.object` scopes (`storage:object:<bucket>/logs/*`). Whole-class wildcards like `storage:bucket:*` are syntactically legal but raise lint `WILDCARD_SCOPE` and are **not attachable at identity side** (§4.3). Names follow the owning slice's portable naming rules. Matching is **literal byte** matching — no URL-decoding/normalization layer; resource keys containing literal `*`, control chars, or `%` sequences never alias; a literal `*` inside a key is not addressable by a policy resource (documented constraint).
 Existence **anchors**: object-scoped references anchor on their parent bucket; queue/table references anchor on the entity itself. (Hypothetical children never gate checks or attaches.)
 
 ### 2.4 Statements, effects, evaluation
@@ -47,7 +47,8 @@ Existence **anchors**: object-scoped references anchor on their parent bucket; q
 ### 2.5 Principals
 
 - `principal_current() -> string`: the caller's identity string from credentials (provider-shaped); information-only accessor (may resolve locally; never used to infer auth mode).
-- Principals are referenced, not provisioned (identity provisioning out of scope; Slice 6). Scenario conformance uses configured test identities: scenarios read `LM<PROVIDER>_SIM_PRINCIPAL` (default `arn:aws:iam::000000000000:role/lmcloud-test`, a well-formed example) and never hard-code provider identities into shared logic.
+- Principal strings are Tier-1 validated: `^[A-Za-z0-9_+=,.@:/-]{1,256}$`; longer or out-of-charset → pre-flight `INVALID_ARGUMENT`.
+- Principals are referenced, not provisioned (identity provisioning out of scope; Slice 6). Conformance uses configured test identities: scenarios read `LMCLOUD_TEST_PRINCIPAL` or `LM<PROVIDER>_SIM_PRINCIPAL` (default `arn:aws:iam::000000000000:role/lmcloud-test`) and never hard-code provider identities into shared logic. Enforcement-fixture principals come from dedicated env pairs (`LMCLOUD_ENFORCE_GRANTED_PRINCIPAL` beside `LMCLOUD_ENFORCE_GRANTED_<P>_*` credentials) so grant targets are always *the identity the auth layer actually maps those credentials to* — never invented strings (scenario 13).
 
 ---
 
@@ -120,7 +121,7 @@ The journaled attachment store + reference evaluator + lint are identical everyw
 | …(each matrix row from Appendix A gets an exact native line before that row is live-certified) | AWS native Deny allowed | Azure native Deny refused (service-managed only) | GCP native Deny refused (org/folder scope) | OCI native Deny refused (no Deny) |
 | Deny effect (native attach) | allowed | **refused** | **refused** | **refused** (evaluate-only) |
 
-Attach on a native route with an unsupported mapping fails `INVALID_ARGUMENT` *before any network call* (fail-closed). The sim/loopback and offline routes implement the full portable model regardless; **native/live routes additionally require the row above to be certified** plus Slice-14's double opt-in gate.
+Attach on a native route with an unsupported mapping fails `INVALID_ARGUMENT` *before any network call* (fail-closed). Sim/loopback attach routes that exist but are **not yet mapped/implemented** fail the same way, and the canonical classification is `last_error().provider_code() == "UNSUPPORTED_MAPPING"` — this specific code is the only sanctioned "route unmapped" skip reason in conformance scenarios (everything else, including `INTERNAL`, fails the scenario). The sim/loopback and offline routes implement the full portable model regardless; **native/live routes additionally require the row above to be certified** plus Slice-14's double opt-in gate. Safe shared-document concurrency on providers lacking native conditional writes is a certification prerequisite (etag-free read/modify/write alone is not sufficient against concurrent foreign edits).
 
 ### 5.3 Simulator gaps (epics; evidence in 16 §3)
 - **A-P1 `awssim`:** `AuthFilter.SUPPORTED` has no `iam` key and the `s3` set lacks `PutBucketPolicy`/`GetBucketPolicy`/`DeleteBucketPolicy`; add both + enforce tests.
@@ -132,7 +133,7 @@ Attach on a native route with an unsupported mapping fails `INVALID_ARGUMENT` *b
 
 | `ErrorCode` | When |
 |---|---|
-| `INVALID_ARGUMENT` | Tier-1 grammar failures; lint-error policy at attach; scope-fence violations (foreign-scope wildcard expansion, out-of-target statements); unsupported native mapping; all pre-flight (`http_status()==0`) |
+| `INVALID_ARGUMENT` | Tier-1 grammar failures; lint-error policy at attach; scope-fence violations (foreign-scope wildcard expansion, out-of-target statements); unsupported native/sim mapping (with `provider_code() == "UNSUPPORTED_MAPPING"`); all pre-flight (`http_status()==0`) |
 | `NOT_FOUND` | attach/detach/check whose anchored target (§2.3) is missing |
 | `CONFLICT` | foreign collision/journal races (14-live-safety) |
 | `PRECONDITION_FAILED` | native etag mismatch on shared-document merge |

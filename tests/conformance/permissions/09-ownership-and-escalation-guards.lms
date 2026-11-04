@@ -40,12 +40,14 @@ program = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let e_missing2 = cloud.last_error();
   let missing2_nf = e_missing2.code() == ErrorCode.NOT_FOUND;
 
-  # foreign (pre-existing, not run-owned) fixture leg — only when provided
+  # foreign (pre-existing, not run-owned) fixture leg — only when LMCLOUD_FOREIGN_BUCKET is set.
+  # Uses a fb-scoped policy so the ONLY violated condition is ownership (scope fence stays satisfied).
   let foreign_skipped = true;
   let foreign_denied = true;
   if (str_len(fb) > 0) {
     foreign_skipped = false;
-    cloud.policy_attach("storage:bucket:" + fb, ${pr}, clean);
+    let fb_clean = cloud.policy_new().statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:object:" + fb + "/*"));
+    cloud.policy_attach("storage:bucket:" + fb, ${pr}, fb_clean);
     let e_for = cloud.last_error();
     foreign_denied = e_for.code() == ErrorCode.PERMISSION_DENIED;
   }
@@ -62,6 +64,9 @@ end _lmcode_
 
 r = run_lmcode(program, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r.ok, "09-ownership-and-escalation-guards host execution failed");
+if (r.result.foreign_skipped) {
+  println("NOTE: foreign-target leg not executed (set LMCLOUD_FOREIGN_BUCKET to an operator-provisioned bucket to enable it)");
+}
 assert(r.result.bad_lint_error, "management-namespace action must produce a lint error");
 assert(r.result.esc_invalid, "lint-error policy must be refused pre-flight at attach (INVALID_ARGUMENT, http_status 0)");
 assert(r.result.missing_nf && r.result.missing2_nf, "attach against a missing target must be NOT_FOUND (both attach forms)");

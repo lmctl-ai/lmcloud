@@ -7,7 +7,7 @@
 endpoint = len(ARGV) > 1 ? ARGV[1] : "";
 run_id = len(ARGV) > 2 && len(ARGV[2]) > 0 ? ARGV[2] : "r0";
 probe_bucket = "lmcloud-p12-" + run_id + "-probe";
-denied_bucket = "lmcloud-p12-" + run_id + "-deniedok";
+denied_bucket = "lmcloud-p12-" + run_id + "-targetok";
 pr = "arn:aws:iam::000000000000:role/restricted-" + run_id;
 host = ARGV[0];
 is_azure = contains(host, "lmazure");
@@ -89,8 +89,10 @@ denied_prog = _lmcode_ schema="../../../schema/lmcloud.dsl.json";
   let b = ${denied_bucket};
   cloud.set_abort_on_error(false);
 
-  # explicitly seeded target so existence/ownership are not confused with authorization
+  # explicitly seeded owned target by the restricted identity itself (fixture must allow data-plane
+  # creates on non-denied names); asserts seed success so authorization denial is isolated
   let seeded = cloud.bucket_create(b);
+  lmcode_return_put("seeded_ok", seeded);
 
   cloud.policy_attach("storage:bucket:" + b, ${pr},
     cloud.policy_new().statement("Allow", str_list().add("storage.object.read"), str_list().add("storage:object:" + b + "/*")));
@@ -109,5 +111,6 @@ end _lmcode_
 
 r_denied = run_lmcode(denied_prog, {command:[ARGV[0], "--lmcode", "$DSLFILE"]});
 assert(r_denied.ok, "12 policy-denied pass host execution failed");
+assert(r_denied.result.seeded_ok, "Pass 2: restricted identity must successfully seed its owned target (auth fixture allows data-plane creates on non-denied names)");
 assert(r_denied.result.attach_denied, "Pass 2 (restricted principal, owned target): policy_attach must be PERMISSION_DENIED");
 assert(r_denied.result.check_denied, "Pass 2 (restricted principal, owned target): policy_check must be PERMISSION_DENIED");
