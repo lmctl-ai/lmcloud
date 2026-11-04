@@ -29,7 +29,59 @@ var (
 	cachedPythonBin     string
 	cachedNodeBin       string
 	cachedNodeRoot      string
+	cachedCgroupParent  string
 )
+
+const maxScratchTmpBytes = 16 * 1024 * 1024 // 16 MiB
+
+func resolveCgroupParent() (string, error) {
+	var candidates []string
+	if raw, err := os.ReadFile("/proc/self/cgroup"); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			parts := strings.SplitN(line, ":", 3)
+			if len(parts) == 3 && parts[0] == "0" {
+				rel := strings.TrimSpace(parts[2])
+				cur := filepath.Clean(filepath.Join("/sys/fs/cgroup", rel))
+				for cur != "/sys/fs/cgroup" && cur != "/" && cur != "." {
+					candidates = append(candidates, cur)
+					cur = filepath.Dir(cur)
+				}
+			}
+		}
+	}
+	uid := os.Getuid()
+	candidates = append(candidates,
+		fmt.Sprintf("/sys/fs/cgroup/user.slice/user-%d.slice/user@%d.service", uid, uid),
+		fmt.Sprintf("/sys/fs/cgroup/user.slice/user-%d.slice", uid),
+	)
+	seen := map[string]bool{}
+	for _, dir := range candidates {
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		subRaw, err := os.ReadFile(filepath.Join(dir, "cgroup.subtree_control"))
+		if err != nil {
+			continue
+		}
+		sub := string(subRaw)
+		if !strings.Contains(sub, "memory") || !strings.Contains(sub, "pids") {
+			continue
+		}
+		probe, err := os.MkdirTemp(dir, "lmcloud-cgprobe-*.scope")
+		if err != nil {
+			continue
+		}
+		err1 := os.WriteFile(filepath.Join(probe, "memory.max"), []byte("134217728"), 0o600)
+		err2 := os.WriteFile(filepath.Join(probe, "memory.swap.max"), []byte("0"), 0o600)
+		err3 := os.WriteFile(filepath.Join(probe, "pids.max"), []byte("32"), 0o600)
+		_ = os.Remove(probe)
+		if err1 == nil && err2 == nil && err3 == nil {
+			return dir, nil
+		}
+	}
+	return "", fmt.Errorf("no writable cgroup v2 parent with memory and pids controllers found")
+}
 
 // Resolve runtime binaries once.
 func resolveRuntimeBins() (pyBin, nodeBin, nodeRoot string, err error) {
@@ -96,13 +148,33 @@ func (f *Fake) ensureSandboxReady() *hostkit.CloudError {
 		sandboxSelfTestErr = err
 		return hostkit.ProviderError(hostkit.Internal, 0, "SandboxSelfTestFailed", err.Error())
 	}
+	cgParent, err := resolveCgroupParent()
+	if err != nil {
+		sandboxSelfTestDone = true
+		sandboxSelfTestErr = err
+		return hostkit.ProviderError(hostkit.Internal, 0, "SandboxSelfTestFailed", err.Error())
+	}
 	cachedPythonBin = pyBin
 	cachedNodeBin = nodeBin
 	cachedNodeRoot = nodeRoot
+	cachedCgroupParent = cgParent
 
-	// Self-test both python3.12 and nodejs20.x at 128 MiB in the namespace + Landlock jail.
-	pyZip, _, cerr := hostkit.BuildDeterministicInlineZip(hostkit.RuntimePython312, "index.handler",
-		"def handler(event, context):\n    return {\"selftest\": True}\n")
+	// Self-test both python3.12 and nodejs20.x at 128 MiB in the namespace + cgroupv2 + Landlock jail,
+	// verifying PID 1, rlimits (NOFILE=64, NPROC=32, FSIZE=16MiB), and /etc isolation.
+	pyZip, _, cerr := hostkit.BuildDeterministicInlineZip(hostkit.RuntimePython312, "index.handler", `import os, resource
+def handler(event, context):
+    assert os.getpid() == 1, f"expected pid 1, got {os.getpid()}"
+    assert resource.getrlimit(resource.RLIMIT_NOFILE) == (64, 64), f"nofile={resource.getrlimit(resource.RLIMIT_NOFILE)}"
+    assert resource.getrlimit(resource.RLIMIT_NPROC) == (32, 32), f"nproc={resource.getrlimit(resource.RLIMIT_NPROC)}"
+    assert resource.getrlimit(resource.RLIMIT_FSIZE) == (16777216, 16777216), f"fsize={resource.getrlimit(resource.RLIMIT_FSIZE)}"
+    if os.path.isfile("/etc/machine-id"):
+        try:
+            open("/etc/machine-id").read()
+            raise AssertionError("/etc/machine-id should be blocked by Landlock")
+        except PermissionError:
+            pass
+    return {"selftest": True}
+`)
 	if cerr != nil {
 		sandboxSelfTestDone = true
 		sandboxSelfTestErr = cerr
@@ -128,8 +200,17 @@ func (f *Fake) ensureSandboxReady() *hostkit.CloudError {
 		return hostkit.ProviderError(hostkit.Internal, 0, "SandboxSelfTestFailed", sandboxSelfTestErr.Error())
 	}
 
-	jsZip, _, cerr := hostkit.BuildDeterministicInlineZip(hostkit.RuntimeNodeJS20x, "index.handler",
-		"exports.handler = async (event, context) => ({ selftest: true });\n")
+	jsZip, _, cerr := hostkit.BuildDeterministicInlineZip(hostkit.RuntimeNodeJS20x, "index.handler", `const fs = require("fs");
+exports.handler = async (event, context) => {
+  try {
+    fs.readFileSync("/etc/machine-id");
+    throw new Error("/etc/machine-id should be blocked by Landlock");
+  } catch (e) {
+    if (e.code !== "EACCES" && e.code !== "ENOENT") throw e;
+  }
+  return { selftest: true };
+};
+`)
 	if cerr != nil {
 		sandboxSelfTestDone = true
 		sandboxSelfTestErr = cerr
@@ -146,9 +227,9 @@ func (f *Fake) ensureSandboxReady() *hostkit.CloudError {
 	if jsErr != nil || jsOut.FunctionError != "" || !strings.Contains(jsOut.Payload, "true") {
 		sandboxSelfTestDone = true
 		if jsErr != nil {
-			sandboxSelfTestErr = fmt.Errorf("nodejs20.x sandbox self-test failed: %w", jsErr)
+			sandboxSelfTestErr = fmt.Errorf("nodejs20.x sandbox self-test failed: %w (logs=%q)", jsErr, jsOut.Logs)
 		} else {
-			sandboxSelfTestErr = fmt.Errorf("nodejs20.x sandbox self-test returned error=%q payload=%q", jsOut.FunctionError, jsOut.Payload)
+			sandboxSelfTestErr = fmt.Errorf("nodejs20.x sandbox self-test returned error=%q payload=%q logs=%q", jsOut.FunctionError, jsOut.Payload, jsOut.Logs)
 		}
 		return hostkit.ProviderError(hostkit.Internal, 0, "SandboxSelfTestFailed", sandboxSelfTestErr.Error())
 	}
@@ -189,17 +270,18 @@ func (b *boundedLogBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	origLen := len(p)
-	if b.seen >= b.totalCap {
+	if origLen == 0 {
+		return 0, nil
+	}
+	b.seen += origLen
+	keepCap := b.tailCap + 16
+	if origLen >= keepCap {
+		b.buf = append(b.buf[:0], p[origLen-keepCap:]...)
 		return origLen, nil
 	}
-	rem := b.totalCap - b.seen
-	if len(p) > rem {
-		p = p[:rem]
-	}
-	b.seen += len(p)
 	b.buf = append(b.buf, p...)
 	if len(b.buf) > b.tailCap*2 {
-		b.buf = append([]byte(nil), b.buf[len(b.buf)-(b.tailCap+16):]...)
+		b.buf = append([]byte(nil), b.buf[len(b.buf)-keepCap:]...)
 	}
 	return origLen, nil
 }
@@ -282,7 +364,7 @@ def apply_landlock(bundle_dir, scratch_tmp, extra_ro):
                 raise RuntimeError(f"landlock_add_rule({path}) failed: errno={ctypes.get_errno()}")
         finally:
             os.close(fd)
-    for p in ["/usr", "/lib", "/lib64", "/bin", "/etc", "/dev/null", "/dev/zero", "/dev/urandom", "/dev/random", bundle_dir]:
+    for p in ["/usr", "/lib", "/lib64", "/bin", "/dev/null", "/dev/zero", "/dev/urandom", "/dev/random", bundle_dir]:
         allow(p, False)
     if extra_ro:
         allow(extra_ro, False)
@@ -324,6 +406,15 @@ def main():
         write_outcome(out_fd, {"internalError": f"expected PID 1 in PID namespace, got {os.getpid()}"})
         os._exit(2)
 
+    cg_procs = spec.get("cgroup_procs_path", "")
+    if cg_procs:
+        try:
+            with open(cg_procs, "w") as f:
+                f.write("0")
+        except Exception as e:
+            write_outcome(out_fd, {"internalError": f"cgroup join failed: {e}"})
+            os._exit(2)
+
     bundle_dir = spec["bundle_dir"]
     scratch_tmp = spec["scratch_tmp"]
     runtime = spec["runtime"]
@@ -334,6 +425,21 @@ def main():
     node_bin = spec.get("node_bin", "")
     node_root = spec.get("node_root", "")
 
+    in_fd = -1
+    if runtime == "nodejs20.x":
+        try:
+            in_fd = os.memfd_create("lmcloud_payload", 0)
+            raw_pay = payload_json.encode("utf-8")
+            view = memoryview(raw_pay)
+            while len(view) > 0:
+                n = os.write(in_fd, view)
+                view = view[n:]
+            os.lseek(in_fd, 0, os.SEEK_SET)
+            os.set_inheritable(in_fd, True)
+        except Exception as e:
+            write_outcome(out_fd, {"internalError": f"payload memfd setup failed: {e}"})
+            os._exit(2)
+
     try:
         apply_landlock(bundle_dir, scratch_tmp, node_root if runtime == "nodejs20.x" else "")
     except Exception as e:
@@ -341,9 +447,12 @@ def main():
         os._exit(2)
 
     try:
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
         resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-    except Exception:
-        pass
+        resource.setrlimit(resource.RLIMIT_FSIZE, (16 * 1024 * 1024, 16 * 1024 * 1024))
+    except Exception as e:
+        write_outcome(out_fd, {"internalError": f"rlimit setup failed: {e}"})
+        os._exit(2)
 
     clean_env = {
         "PATH": "/usr/bin:/bin",
@@ -364,9 +473,11 @@ def main():
         sys.path[:] = [bundle_dir] + [p for p in sys.path if p.startswith("/usr") or p.startswith("/lib")]
         mem_bytes = mem_mb * 1024 * 1024
         try:
+            resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
             resource.setrlimit(resource.RLIMIT_DATA, (mem_bytes, mem_bytes))
-        except Exception:
-            pass
+        except Exception as e:
+            write_outcome(out_fd, {"internalError": f"python rlimit setup failed: {e}"})
+            os._exit(2)
         try:
             event_val = json.loads(payload_json)
             import importlib
@@ -420,15 +531,21 @@ const path = require("path");
 const v8 = require("v8");
 (async () => {
   const outFd = parseInt(process.env.__LMCLOUD_OUT_FD, 10);
+  const inFd = parseInt(process.env.__LMCLOUD_IN_FD, 10);
   const memMB = parseInt(process.env.__LMCLOUD_MEM_MB, 10);
   const modName = process.env.__LMCLOUD_MOD;
   const fnName = process.env.__LMCLOUD_FN;
-  const payloadRaw = process.env.__LMCLOUD_PAYLOAD;
+  if (process.env.__LMCLOUD_DROP_OPENSSL_CONF === "1") {
+    delete process.env.OPENSSL_CONF;
+  }
+  delete process.env.__LMCLOUD_DROP_OPENSSL_CONF;
   delete process.env.__LMCLOUD_OUT_FD;
+  delete process.env.__LMCLOUD_IN_FD;
   delete process.env.__LMCLOUD_MEM_MB;
   delete process.env.__LMCLOUD_MOD;
   delete process.env.__LMCLOUD_FN;
-  delete process.env.__LMCLOUD_PAYLOAD;
+  const payloadRaw = fs.readFileSync(inFd, "utf8");
+  try { fs.closeSync(inFd); } catch (_) {}
   const writeOut = (obj) => {
     fs.writeFileSync(outFd, Buffer.from(JSON.stringify(obj), "utf8"));
   };
@@ -489,11 +606,14 @@ const v8 = require("v8");
   }
 })();
 """
+        if "OPENSSL_CONF" not in user_env:
+            clean_env["OPENSSL_CONF"] = "/dev/null"
+            clean_env["__LMCLOUD_DROP_OPENSSL_CONF"] = "1"
         clean_env["__LMCLOUD_OUT_FD"] = str(out_fd)
+        clean_env["__LMCLOUD_IN_FD"] = str(in_fd)
         clean_env["__LMCLOUD_MEM_MB"] = str(mem_mb)
         clean_env["__LMCLOUD_MOD"] = mod_name
         clean_env["__LMCLOUD_FN"] = func_name
-        clean_env["__LMCLOUD_PAYLOAD"] = payload_json
         os.execve(node_bin, [node_bin, f"--max-old-space-size={heap_mb}", "-e", node_runner], clean_env)
     else:
         write_outcome(out_fd, {"internalError": f"unsupported runtime {runtime}"})
@@ -508,6 +628,55 @@ type sandboxOutcome struct {
 	FunctionError string `json:"functionError"`
 	Payload       string `json:"payload"`
 	InternalError string `json:"internalError"`
+}
+
+func scratchDirBytes(dir string) int64 {
+	var total int64
+	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		if info, ierr := d.Info(); ierr == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+func cgroupHadOOM(cgDir string) bool {
+	if cgDir == "" {
+		return false
+	}
+	raw, err := os.ReadFile(filepath.Join(cgDir, "memory.events"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && (fields[0] == "oom" || fields[0] == "oom_kill" || fields[0] == "oom_group_kill") {
+			if n, perr := strconv.ParseInt(fields[1], 10, 64); perr == nil && n > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func cleanupCgroupDir(cgDir string) {
+	if cgDir == "" {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o600)
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if os.Remove(cgDir) == nil {
+			return
+		}
+		_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o600)
+		time.Sleep(2 * time.Millisecond)
+	}
+	_ = os.Remove(cgDir)
 }
 
 // collectDescendantPIDs returns all host PIDs in the process tree rooted at rootPID
@@ -576,6 +745,35 @@ func waitForPIDsGone(pids []int, maxWait time.Duration) {
 }
 
 func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string, spec sandboxExecSpec) (hostkit.FunctionInvokeOutput, []int, *hostkit.CloudError) {
+	cgParent := cachedCgroupParent
+	if cgParent == "" {
+		var cgErr error
+		cgParent, cgErr = resolveCgroupParent()
+		if cgErr != nil {
+			return hostkit.FunctionInvokeOutput{}, nil, hostkit.ProviderError(hostkit.Internal, 0, "SandboxCgroupUnavailable", cgErr.Error())
+		}
+	}
+	cgDir, err := os.MkdirTemp(cgParent, "lmcloud-fn-*.scope")
+	if err != nil {
+		return hostkit.FunctionInvokeOutput{}, nil, hostkit.ProviderError(hostkit.Internal, 0, "SandboxCgroupFailed", err.Error())
+	}
+	defer cleanupCgroupDir(cgDir)
+
+	memLimitBytes := spec.MemoryMB * 1024 * 1024
+	if memLimitBytes <= 0 {
+		memLimitBytes = 128 * 1024 * 1024
+	}
+	if err := os.WriteFile(filepath.Join(cgDir, "memory.max"), []byte(strconv.FormatInt(memLimitBytes, 10)), 0o600); err != nil {
+		return hostkit.FunctionInvokeOutput{}, nil, hostkit.ProviderError(hostkit.Internal, 0, "SandboxCgroupFailed", err.Error())
+	}
+	if err := os.WriteFile(filepath.Join(cgDir, "memory.swap.max"), []byte("0"), 0o600); err != nil {
+		return hostkit.FunctionInvokeOutput{}, nil, hostkit.ProviderError(hostkit.Internal, 0, "SandboxCgroupFailed", err.Error())
+	}
+	_ = os.WriteFile(filepath.Join(cgDir, "memory.oom.group"), []byte("1"), 0o600)
+	if err := os.WriteFile(filepath.Join(cgDir, "pids.max"), []byte("32"), 0o600); err != nil {
+		return hostkit.FunctionInvokeOutput{}, nil, hostkit.ProviderError(hostkit.Internal, 0, "SandboxCgroupFailed", err.Error())
+	}
+
 	sandboxRoot, err := os.MkdirTemp("", "lmcloud-fn-*")
 	if err != nil {
 		return hostkit.FunctionInvokeOutput{}, nil, hostkit.ProviderError(hostkit.Internal, 0, "SandboxTempDirFailed", err.Error())
@@ -602,16 +800,17 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 	defer resR.Close()
 
 	launcherInput := map[string]any{
-		"function_name": spec.FunctionName,
-		"runtime":       spec.Runtime,
-		"handler":       spec.Handler,
-		"bundle_dir":    bundleDir,
-		"scratch_tmp":   scratchTmp,
-		"memory_mb":     spec.MemoryMB,
-		"env":           spec.Env,
-		"payload_json":  spec.PayloadJSON,
-		"node_bin":      nodeBin,
-		"node_root":     nodeRoot,
+		"function_name":     spec.FunctionName,
+		"runtime":           spec.Runtime,
+		"handler":           spec.Handler,
+		"bundle_dir":        bundleDir,
+		"scratch_tmp":       scratchTmp,
+		"memory_mb":         spec.MemoryMB,
+		"env":               spec.Env,
+		"payload_json":      spec.PayloadJSON,
+		"node_bin":          nodeBin,
+		"node_root":         nodeRoot,
+		"cgroup_procs_path": filepath.Join(cgDir, "cgroup.procs"),
 	}
 	inputBytes, _ := json.Marshal(launcherInput)
 
@@ -646,6 +845,7 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 		monMu           sync.Mutex
 		observedPIDs    = map[int]bool{rootPID: true}
 		killedForMemory bool
+		killedForDisk   bool
 		killedForTime   bool
 	)
 
@@ -665,7 +865,6 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 		waitCh <- cmd.Wait()
 	}()
 
-	memLimitBytes := spec.MemoryMB * 1024 * 1024
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -684,20 +883,33 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 				observedPIDs[p] = true
 			}
 			monMu.Unlock()
+			_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o600)
 			_ = syscall.Kill(-rootPID, syscall.SIGKILL)
 			_ = cmd.Process.Kill()
 			<-waitCh
 			done = true
 		case <-ticker.C:
 			pids, rss := collectProcessTreeAndRSS(rootPID)
+			diskBytes := scratchDirBytes(scratchTmp)
 			monMu.Lock()
 			for _, p := range pids {
 				observedPIDs[p] = true
 			}
+			if diskBytes > maxScratchTmpBytes {
+				killedForDisk = true
+				monMu.Unlock()
+				_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o600)
+				_ = syscall.Kill(-rootPID, syscall.SIGKILL)
+				_ = cmd.Process.Kill()
+				<-waitCh
+				done = true
+				continue
+			}
 			// Allow 36 MiB interpreter shared-library overhead on top of spec.MemoryMB for the outer+inner processes.
-			if rss > memLimitBytes+(36*1024*1024) {
+			if rss > memLimitBytes+(36*1024*1024) || cgroupHadOOM(cgDir) {
 				killedForMemory = true
 				monMu.Unlock()
+				_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o600)
 				_ = syscall.Kill(-rootPID, syscall.SIGKILL)
 				_ = cmd.Process.Kill()
 				<-waitCh
@@ -709,6 +921,7 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 	}
 
 	elapsed := time.Since(start)
+	_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o600)
 	_ = syscall.Kill(-rootPID, syscall.SIGKILL)
 
 	monMu.Lock()
@@ -717,7 +930,8 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 		allPIDs = append(allPIDs, p)
 	}
 	isTimeout := killedForTime
-	isOOM := killedForMemory
+	isOOM := killedForMemory || cgroupHadOOM(cgDir)
+	isDiskQuota := killedForDisk || scratchDirBytes(scratchTmp) > maxScratchTmpBytes
 	monMu.Unlock()
 
 	waitForPIDsGone(allPIDs, 500*time.Millisecond)
@@ -753,6 +967,19 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 		return hostkit.FunctionInvokeOutput{
 			StatusCode:      200,
 			Payload:         `{"errorType":"OutOfMemory","errorMessage":"function execution exceeded memory_mb limit"}`,
+			Logs:            logBuf.TailString(),
+			FunctionError:   "Unhandled",
+			ExecutedVersion: spec.ExecutedVersion,
+			BilledMS:        billedMS,
+			TimeoutSeconds:  spec.TimeoutSeconds,
+			MemoryMB:        spec.MemoryMB,
+		}, allPIDs, nil
+	}
+
+	if isDiskQuota {
+		return hostkit.FunctionInvokeOutput{
+			StatusCode:      200,
+			Payload:         `{"errorType":"DiskQuotaExceeded","errorMessage":"function scratch directory exceeded 16 MiB limit"}`,
 			Logs:            logBuf.TailString(),
 			FunctionError:   "Unhandled",
 			ExecutedVersion: spec.ExecutedVersion,

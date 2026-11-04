@@ -673,6 +673,53 @@ func (h *Host) checkOwnershipInScope(mctx context.Context, name, expectedOwnerTo
 	return true, nil
 }
 
+func resolveAuthoritativeTargetPinner(ctx context.Context, fn hostkit.Functions) hostkit.FunctionTargetPinner {
+	raw := unwrapGuardAdapter(fn)
+	switch r := raw.(type) {
+	case hostkit.Router:
+		if r.Pick == nil {
+			return nil
+		}
+		be, err := r.Pick(hostkit.WithForbidLiveRoute(ctx))
+		if err != nil || be == nil {
+			return nil
+		}
+		raw = unwrapGuardAdapter(be)
+	case *hostkit.Router:
+		if r == nil || r.Pick == nil {
+			return nil
+		}
+		be, err := r.Pick(hostkit.WithForbidLiveRoute(ctx))
+		if err != nil || be == nil {
+			return nil
+		}
+		raw = unwrapGuardAdapter(be)
+	}
+	p, ok := raw.(hostkit.FunctionTargetPinner)
+	if !ok {
+		return nil
+	}
+	v, ok := raw.(hostkit.AuthoritativeFunctionAdapter)
+	if !ok || v.AuthoritativeAdapterSelf() != raw {
+		return nil
+	}
+	return p
+}
+
+func functionFenceCtx(ctx context.Context, ownerToken, generationStr string) context.Context {
+	if ownerToken != "" {
+		ctx = hostkit.WithCreateToken(ctx, ownerToken)
+	}
+	genNum, _ := strconv.ParseUint(generationStr, 10, 64)
+	if ownerToken != "" || genNum > 0 {
+		ctx = hostkit.WithFunctionMutationFence(ctx, hostkit.FunctionMutationFence{
+			OwnerToken: ownerToken,
+			Generation: genNum,
+		})
+	}
+	return ctx
+}
+
 func (h *Host) dryResolveFunction(ctx context.Context, name string) (dryFunction, *hostkit.CloudError) {
 	if df, ok := h.ov(ctx).function(name); ok {
 		return df, nil
@@ -689,6 +736,23 @@ func (h *Host) dryResolveFunction(ctx context.Context, name string) (dryFunction
 		return dryFunction{}, hostkit.ProviderError(hostkit.Conflict, 409, "AmbiguousFunctionState",
 			fmt.Sprintf("function %q has an unresolved ambiguous operation and requires reconciliation", name))
 	}
+	if pinner := resolveAuthoritativeTargetPinner(ctx, h.cfg.Functions); pinner != nil {
+		snap, vers, order, aliases, found := pinner.PeekDryFunctionState(ctx, name)
+		if !found {
+			return dryFunction{exists: false}, nil
+		}
+		df := dryFunction{
+			exists:         true,
+			snap:           snap,
+			versions:       vers,
+			versionOrder:   order,
+			aliases:        aliases,
+			deletedAliases: map[string]bool{},
+			createdNow:     false,
+		}
+		h.ov(ctx).setFunction(name, df)
+		return df, nil
+	}
 	snap, err := h.cfg.Functions.GetFunction(ctx, name, "$LATEST")
 	if err != nil {
 		ce := hostkit.AsCloudError(err)
@@ -698,11 +762,12 @@ func (h *Host) dryResolveFunction(ctx context.Context, name string) (dryFunction
 		return dryFunction{}, ce
 	}
 	df := dryFunction{
-		exists:     true,
-		snap:       snap.Clone(),
-		versions:   map[string]hostkit.FunctionSnapshot{},
-		aliases:    map[string]string{},
-		createdNow: false,
+		exists:         true,
+		snap:           snap.Clone(),
+		versions:       map[string]hostkit.FunctionSnapshot{},
+		aliases:        map[string]string{},
+		deletedAliases: map[string]bool{},
+		createdNow:     false,
 	}
 	if vers, verr := h.cfg.Functions.ListFunctionVersions(ctx, name); verr == nil {
 		df.versionOrder = append([]string(nil), vers...)
@@ -714,6 +779,37 @@ func (h *Host) dryResolveFunction(ctx context.Context, name string) (dryFunction
 	}
 	h.ov(ctx).setFunction(name, df)
 	return df, nil
+}
+
+func (h *Host) dryResolveAlias(ctx context.Context, name, alias string, df *dryFunction) (string, bool, *hostkit.CloudError) {
+	if df.deletedAliases != nil && df.deletedAliases[alias] {
+		return "", false, nil
+	}
+	if df.aliases != nil {
+		if targetVer, ok := df.aliases[alias]; ok && targetVer != "" {
+			return targetVer, true, nil
+		}
+	}
+	if df.createdNow || h.cfg.Functions == nil {
+		return "", false, nil
+	}
+	ver, err := h.cfg.Functions.GetFunctionAlias(ctx, name, alias)
+	if err != nil {
+		ce := hostkit.AsCloudError(err)
+		if isNotFound(ce) {
+			return "", false, nil
+		}
+		return "", false, ce
+	}
+	if ver == "" {
+		return "", false, nil
+	}
+	if df.aliases == nil {
+		df.aliases = map[string]string{}
+	}
+	df.aliases[alias] = ver
+	h.ov(ctx).setFunction(name, *df)
+	return ver, true, nil
 }
 
 func (h *Host) functionExists(ctx context.Context, dry bool, name string) (bool, *hostkit.CloudError) {
@@ -1183,8 +1279,8 @@ func (h *Host) FunctionDelete(dry bool, name string) (bool, error) {
 	}
 	if ownerToken != "" {
 		h.errs.AddRedaction(ownerToken)
-		mctx = hostkit.WithCreateToken(mctx, ownerToken)
 	}
+	mctx = functionFenceCtx(mctx, ownerToken, entry.Generation)
 
 	existed, err := h.cfg.Functions.DeleteFunction(mctx, name)
 	ce := hostkit.AsCloudError(err)
@@ -1323,7 +1419,12 @@ func (h *Host) FunctionGet(dry bool, name, qualifier string, hasQualifier bool) 
 			h.ok()
 			return h.snapshotToFunctionConfig(vsnap, true, hostkit.FunctionStateActive), nil
 		}
-		if targetVer, ok := df.aliases[qualifier]; ok {
+		targetVer, ok, ce := h.dryResolveAlias(ctx, name, qualifier, &df)
+		if ce != nil {
+			failed = true
+			return h.missingFunctionConfig(name), h.fail(op, name, ce)
+		}
+		if ok {
 			if vsnap, vok := df.versions[targetVer]; vok {
 				h.ok()
 				return h.snapshotToFunctionConfig(vsnap, true, hostkit.FunctionStateActive), nil
@@ -1547,16 +1648,15 @@ func (h *Host) FunctionPublishVersion(dry bool, name, expectRevision string, has
 			fmt.Sprintf("function %q has an unresolved ambiguous operation (%s) and requires reconciliation", name, amb.IntentOp)))
 	}
 
-	verHint := fmt.Sprintf("v-%d", h.cfg.Now().UnixNano())
-	if peeker, ok := h.cfg.Functions.(hostkit.FunctionQuotaPeeker); ok {
-		if nextVer, perr := peeker.PeekFunctionVersionHeadroom(ctx, name, expectRevision); perr == nil && nextVer != "" {
-			verHint = nextVer
-		}
-	}
+	// Each publish attempt uses a unique durable reservation key under name+"/" so
+	// concurrent publishes never deduplicate each other's 30,000 nano-USD cleanup
+	// reserve in either campaign_journal or safety_journal, and function_delete
+	// releases all name+"/*" reserves on cascade teardown.
+	pubReserveKey := name + "/pub-" + safety.NewToken128()[:16]
 
 	mctx, scope, cerr := h.beginAttemptScope(ctx, op, safety.AttemptPricingInput{
 		Operation: op,
-	}, safety.KindFunctionVersion, name+"/"+verHint)
+	}, safety.KindFunctionVersion, pubReserveKey)
 	if cerr != nil {
 		failed = true
 		return "", h.fail(op, name, cerr)
@@ -1579,7 +1679,7 @@ func (h *Host) FunctionPublishVersion(dry bool, name, expectRevision string, has
 		return "", h.fail(op, name, notFound("FunctionNotFound", fmt.Sprintf("function %q does not exist", name)))
 	}
 
-	mctx = hostkit.WithCreateToken(mctx, act.OwnerToken)
+	mctx = functionFenceCtx(mctx, act.OwnerToken, act.Generation)
 	ver, err := h.cfg.Functions.PublishFunctionVersion(mctx, name, expectRevision)
 	ce := hostkit.AsCloudError(err)
 	definitiveRefusal := err != nil && isDefinitiveFunctionRefusal(ce)
@@ -1735,12 +1835,20 @@ func (h *Host) FunctionAliasSet(dry bool, name, alias, version string) error {
 		if df.aliases == nil {
 			df.aliases = map[string]string{}
 		}
-		if _, exists := df.aliases[alias]; !exists && len(df.aliases) >= hostkit.MaxFunctionAliases {
+		_, exists, ce := h.dryResolveAlias(ctx, name, alias, &df)
+		if ce != nil {
+			failed = true
+			return h.fail(op, name, ce)
+		}
+		if !exists && len(df.aliases) >= hostkit.MaxFunctionAliases {
 			failed = true
 			return h.fail(op, name, hostkit.ProviderError(hostkit.PreconditionFailed, 400, "ResourceLimitExceeded",
 				fmt.Sprintf("function %q alias count exceeds maximum (%d)", name, hostkit.MaxFunctionAliases)))
 		}
 		df.aliases[alias] = version
+		if df.deletedAliases != nil {
+			delete(df.deletedAliases, alias)
+		}
 		h.ov(ctx).setFunction(name, df)
 		h.ok()
 		return nil
@@ -1795,7 +1903,7 @@ func (h *Host) FunctionAliasSet(dry bool, name, alias, version string) error {
 		return h.fail(op, name, notFound("FunctionNotFound", fmt.Sprintf("function %q does not exist", name)))
 	}
 
-	mctx = hostkit.WithCreateToken(mctx, act.OwnerToken)
+	mctx = functionFenceCtx(mctx, act.OwnerToken, act.Generation)
 	created, err := h.cfg.Functions.SetFunctionAlias(mctx, name, alias, version)
 	ce := hostkit.AsCloudError(err)
 	definitiveRefusal := err != nil && isDefinitiveFunctionRefusal(ce)
@@ -1862,8 +1970,13 @@ func (h *Host) FunctionAliasGet(dry bool, name, alias string) (string, error) {
 			failed = true
 			return "", h.fail(op, name, notFound("FunctionNotFound", fmt.Sprintf("function %q does not exist (dry-run preview)", name)))
 		}
+		targetVer, _, ce := h.dryResolveAlias(ctx, name, alias, &df)
+		if ce != nil {
+			failed = true
+			return "", h.fail(op, name, ce)
+		}
 		h.ok()
-		return df.aliases[alias], nil
+		return targetVer, nil
 	}
 
 	if h.cfg.Functions == nil {
@@ -1949,9 +2062,17 @@ func (h *Host) FunctionAliasDelete(dry bool, name, alias string) (bool, error) {
 			failed = true
 			return false, h.fail(op, name, notFound("FunctionNotFound", fmt.Sprintf("function %q does not exist (dry-run preview)", name)))
 		}
-		_, existed := df.aliases[alias]
+		_, existed, ce := h.dryResolveAlias(ctx, name, alias, &df)
+		if ce != nil {
+			failed = true
+			return false, h.fail(op, name, ce)
+		}
 		if existed {
 			delete(df.aliases, alias)
+			if df.deletedAliases == nil {
+				df.deletedAliases = map[string]bool{}
+			}
+			df.deletedAliases[alias] = true
 			h.ov(ctx).setFunction(name, df)
 		}
 		h.ok()
@@ -2001,11 +2122,11 @@ func (h *Host) FunctionAliasDelete(dry bool, name, alias string) (bool, error) {
 		return false, h.fail(op, name, notFound("FunctionNotFound", fmt.Sprintf("function %q does not exist", name)))
 	}
 
-	mctx = hostkit.WithCreateToken(mctx, act.OwnerToken)
+	mctx = functionFenceCtx(mctx, act.OwnerToken, act.Generation)
 	existed, err := h.cfg.Functions.DeleteFunctionAlias(mctx, name, alias)
 	ce := hostkit.AsCloudError(err)
 	var abortErr *hostkit.CloudError
-	retries, throttles, abortErr = scope.finish(0, 0, ce == nil, ce == nil)
+	retries, throttles, abortErr = scope.finish(0, 0, ce == nil || isDefinitiveFunctionRefusal(ce), ce == nil)
 	if abortErr != nil {
 		failed = true
 		return false, h.fail(op, name, abortErr)
@@ -2081,17 +2202,24 @@ func (h *Host) FunctionInvoke(dry bool, name, qualifier, payloadJSON string, has
 			if vsnap, ok := df.versions[qualifier]; ok {
 				targetSnap = vsnap
 				execVer = qualifier
-			} else if targetVer, ok := df.aliases[qualifier]; ok {
-				if vsnap, vok := df.versions[targetVer]; vok {
-					targetSnap = vsnap
-					execVer = targetVer
+			} else {
+				targetVer, ok, ce := h.dryResolveAlias(ctx, name, qualifier, &df)
+				if ce != nil {
+					failed = true
+					return zeroRes, h.fail(op, name, ce)
+				}
+				if ok {
+					if vsnap, vok := df.versions[targetVer]; vok {
+						targetSnap = vsnap
+						execVer = targetVer
+					} else {
+						failed = true
+						return zeroRes, h.fail(op, name, notFound("VersionNotFound", fmt.Sprintf("function %q version %q does not exist (dry-run preview)", name, targetVer)))
+					}
 				} else {
 					failed = true
-					return zeroRes, h.fail(op, name, notFound("VersionNotFound", fmt.Sprintf("function %q version %q does not exist (dry-run preview)", name, targetVer)))
+					return zeroRes, h.fail(op, name, notFound("QualifierNotFound", fmt.Sprintf("function %q qualifier %q does not exist (dry-run preview)", name, qualifier)))
 				}
-			} else {
-				failed = true
-				return zeroRes, h.fail(op, name, notFound("QualifierNotFound", fmt.Sprintf("function %q qualifier %q does not exist (dry-run preview)", name, qualifier)))
 			}
 		}
 		if targetSnap.Concurrency == -1 {
@@ -2118,7 +2246,7 @@ func (h *Host) FunctionInvoke(dry bool, name, qualifier, payloadJSON string, has
 	}
 
 	ep := hostkit.EndpointFrom(ctx)
-	_, _, amb, hasAmb, cerr := h.cost.lookupFunctionEntry(ep, name)
+	act, hasAct, amb, hasAmb, cerr := h.cost.lookupFunctionEntry(ep, name)
 	if cerr != nil {
 		failed = true
 		return zeroRes, h.fail(op, name, cerr)
@@ -2129,14 +2257,36 @@ func (h *Host) FunctionInvoke(dry bool, name, qualifier, payloadJSON string, has
 			fmt.Sprintf("function %q has an unresolved ambiguous operation (%s) and requires reconciliation", name, amb.IntentOp)))
 	}
 
-	timeoutSec := int64(hostkit.DefaultFunctionTimeoutSeconds)
-	memMB := int64(hostkit.DefaultFunctionMemoryMB)
-	if peeker, ok := h.cfg.Functions.(hostkit.FunctionQuotaPeeker); ok {
-		if t, m, found := peeker.PeekFunctionQuota(ctx, name, qualifier); found && t > 0 && m >= 128 {
-			timeoutSec = t
-			memMB = m
-		}
+	invokeIn := hostkit.FunctionInvokeInput{
+		Name:        name,
+		Qualifier:   qualifier,
+		PayloadJSON: payloadJSON,
 	}
+	timeoutSec := int64(hostkit.MaxFunctionTimeoutSeconds)
+	memMB := int64(hostkit.MaxFunctionMemoryMB)
+	if pinner := resolveAuthoritativeTargetPinner(ctx, h.cfg.Functions); pinner != nil {
+		if snap, found := pinner.ResolveFunctionTarget(ctx, name, qualifier); found && snap.TimeoutSeconds > 0 && snap.MemoryMB >= 128 {
+			timeoutSec = snap.TimeoutSeconds
+			memMB = snap.MemoryMB
+			expOwner := snap.OwnerToken
+			if hasAct && act.OwnerToken != "" {
+				expOwner = act.OwnerToken
+			}
+			invokeIn.ExpectedOwnerToken = expOwner
+			invokeIn.ExpectedIncarnation = snap.IncarnationID
+			invokeIn.ExpectedRevisionID = snap.RevisionID
+			invokeIn.ExpectedVersion = snap.Version
+			invokeIn.ExpectedTimeoutSec = snap.TimeoutSeconds
+			invokeIn.ExpectedMemoryMB = snap.MemoryMB
+		} else {
+			timeoutSec = int64(hostkit.DefaultFunctionTimeoutSeconds)
+			memMB = int64(hostkit.DefaultFunctionMemoryMB)
+			invokeIn.RejectIfPresent = true
+		}
+	} else if hasAct && act.OwnerToken != "" {
+		invokeIn.ExpectedOwnerToken = act.OwnerToken
+	}
+
 	memShares := memMB / 128
 	if memShares < 1 {
 		memShares = 1
@@ -2156,11 +2306,7 @@ func (h *Host) FunctionInvoke(dry bool, name, qualifier, payloadJSON string, has
 	}
 
 	invStart := h.cfg.Now()
-	out, err := h.cfg.Functions.InvokeFunction(mctx, hostkit.FunctionInvokeInput{
-		Name:        name,
-		Qualifier:   qualifier,
-		PayloadJSON: payloadJSON,
-	})
+	out, err := h.cfg.Functions.InvokeFunction(mctx, invokeIn)
 	invDur := h.cfg.Now().Sub(invStart)
 	if invDur < 0 {
 		invDur = 0

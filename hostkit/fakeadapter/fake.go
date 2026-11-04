@@ -100,6 +100,9 @@ type Options struct {
 	// mutator (CreateFunction, UpdateFunction, DeleteFunction) commits its state mutation;
 	// if it returns a non-nil error, the mutator returns that error (simulating a lost reply).
 	FaultMutatorAfterCommit func(op string) error
+	// BeforeInvokeLock is an optional test hook called at the start of InvokeFunction
+	// before acquiring the state lock (used to test concurrent updates/alias retargets at dispatch).
+	BeforeInvokeLock func()
 }
 
 func (f *Fake) echoToken(ctx context.Context, kind string) error {

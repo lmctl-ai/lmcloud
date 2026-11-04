@@ -34,6 +34,7 @@ const (
 	MaxFunctionTimeoutSeconds     = 230
 	DefaultFunctionTimeoutSeconds = 3
 	DefaultFunctionMemoryMB       = 128
+	MaxFunctionMemoryMB           = 2048
 	DefaultFunctionConcurrency    = 0
 	MinFunctionConcurrency        = -1
 	MaxFunctionConcurrency        = 100
@@ -831,6 +832,33 @@ func (s FunctionSnapshot) SameCanonicalConfig(other FunctionSnapshot) bool {
 	return true
 }
 
+// FunctionMutationFence carries expected ownership, incarnation, and monotonic generation
+// fences for mutating function adapter operations (including version publish and alias mutations).
+type FunctionMutationFence struct {
+	OwnerToken    string
+	IncarnationID string
+	Generation    uint64
+	IntentID      string
+}
+
+type functionMutationFenceKey struct{}
+
+// WithFunctionMutationFence attaches a FunctionMutationFence to ctx.
+func WithFunctionMutationFence(ctx context.Context, fence FunctionMutationFence) context.Context {
+	return context.WithValue(ctx, functionMutationFenceKey{}, fence)
+}
+
+// FunctionMutationFenceFrom extracts a FunctionMutationFence from ctx, if present.
+func FunctionMutationFenceFrom(ctx context.Context) FunctionMutationFence {
+	if ctx == nil {
+		return FunctionMutationFence{}
+	}
+	if f, ok := ctx.Value(functionMutationFenceKey{}).(FunctionMutationFence); ok {
+		return f
+	}
+	return FunctionMutationFence{}
+}
+
 // FunctionUpdateInput carries parameters for CreateFunction and UpdateFunction.
 type FunctionUpdateInput struct {
 	Snapshot           FunctionSnapshot
@@ -841,11 +869,19 @@ type FunctionUpdateInput struct {
 	IntentID           string
 }
 
-// FunctionInvokeInput carries parameters for synchronous Function invocation.
+// FunctionInvokeInput carries parameters for synchronous Function invocation,
+// including optional pre-admission pinned target identity and quota expectations.
 type FunctionInvokeInput struct {
-	Name        string
-	Qualifier   string
-	PayloadJSON string
+	Name                string
+	Qualifier           string
+	PayloadJSON         string
+	ExpectedOwnerToken  string
+	ExpectedIncarnation string
+	ExpectedRevisionID  string
+	ExpectedVersion     string
+	ExpectedTimeoutSec  int64
+	ExpectedMemoryMB    int64
+	RejectIfPresent     bool
 }
 
 // FunctionInvokeOutput carries the result of a synchronous Function invocation.
@@ -883,6 +919,19 @@ type FunctionQuotaPeeker interface {
 	PeekFunctionQuota(ctx context.Context, name, qualifier string) (timeoutSeconds, memoryMB int64, found bool)
 	PeekFunctionVersionHeadroom(ctx context.Context, name, expectRevision string) (nextVersion string, err error)
 	PeekFunctionAliasHeadroom(ctx context.Context, name, alias, version string) (isNew bool, err error)
+}
+
+// Optional FunctionTargetPinner resolves the authoritative target snapshot before invocation admission
+// and provides coherent read-only state for dry-run overlays.
+type FunctionTargetPinner interface {
+	ResolveFunctionTarget(ctx context.Context, name, qualifier string) (snap FunctionSnapshot, found bool)
+	PeekDryFunctionState(ctx context.Context, name string) (latest FunctionSnapshot, versions map[string]FunctionSnapshot, versionOrder []string, aliases map[string]string, found bool)
+}
+
+// AuthoritativeFunctionAdapter reports the concrete adapter receiver implementing InvokeFunction
+// so cloudhost can detect when InvokeFunction has been wrapped/overridden by an outer struct.
+type AuthoritativeFunctionAdapter interface {
+	AuthoritativeAdapterSelf() any
 }
 
 // Optional FunctionOwnershipReader allows cloudhost to verify function ownership tokens.

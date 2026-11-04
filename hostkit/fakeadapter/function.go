@@ -176,17 +176,23 @@ func resolveFunctionSnapshot(fn *functionState, qualifier string) (hostkit.Funct
 	if qualifier == "" || qualifier == "$LATEST" {
 		snap := fn.Latest.Clone()
 		snap.Version = "$LATEST"
+		snap.OwnerToken = fn.OwnerToken
+		snap.IncarnationID = fn.IncarnationID
 		return snap, true
 	}
 	if vsnap, ok := fn.Versions[qualifier]; ok {
 		snap := vsnap.Clone()
 		snap.Version = qualifier
+		snap.OwnerToken = fn.OwnerToken
+		snap.IncarnationID = fn.IncarnationID
 		return snap, true
 	}
 	if targetVer, ok := fn.Aliases[qualifier]; ok {
 		if vsnap, vok := fn.Versions[targetVer]; vok {
 			snap := vsnap.Clone()
 			snap.Version = targetVer
+			snap.OwnerToken = fn.OwnerToken
+			snap.IncarnationID = fn.IncarnationID
 			return snap, true
 		}
 	}
@@ -195,6 +201,35 @@ func resolveFunctionSnapshot(fn *functionState, qualifier string) (hostkit.Funct
 
 func isFunctionVisible(fn *functionState) bool {
 	return fn != nil && fn.State != hostkit.FunctionStateCreating && fn.State != hostkit.FunctionStateDeleting
+}
+
+func verifyFunctionWriteFence(ctx context.Context, fn *functionState, name, expOwner string, gen uint64) error {
+	fence := hostkit.FunctionMutationFenceFrom(ctx)
+	if expOwner == "" {
+		expOwner = fence.OwnerToken
+	}
+	if expOwner == "" {
+		expOwner = hostkit.CreateToken(ctx)
+	}
+	if gen == 0 {
+		gen = fence.Generation
+	}
+	if !validOwnerToken(fn.OwnerToken) || !validOwnerToken(expOwner) || fn.OwnerToken != expOwner {
+		return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
+			fmt.Sprintf("function %q owner token mismatch", name))
+	}
+	if fence.IncarnationID != "" && fn.IncarnationID != "" && fn.IncarnationID != fence.IncarnationID {
+		return hostkit.ProviderError(hostkit.Conflict, 409, "StaleIncarnation",
+			fmt.Sprintf("function %q incarnation mismatch: got %q, want %q", name, fn.IncarnationID, fence.IncarnationID))
+	}
+	if gen > 0 && gen < fn.MaxGeneration {
+		return hostkit.ProviderError(hostkit.Conflict, 409, "StaleGeneration",
+			fmt.Sprintf("stale generation %d < %d for function %q", gen, fn.MaxGeneration, name))
+	}
+	if gen > fn.MaxGeneration {
+		fn.MaxGeneration = gen
+	}
+	return nil
 }
 
 // doSilent accesses or mutates state under the process mutex and file lock without
@@ -397,6 +432,76 @@ func (f *Fake) FunctionOwnerToken(_ context.Context, name string) (string, bool,
 	return tok, exists, err
 }
 
+// AuthoritativeAdapterSelf implements hostkit.AuthoritativeFunctionAdapter.
+func (f *Fake) AuthoritativeAdapterSelf() any {
+	return f
+}
+
+// SetBeforeInvokeLockForTesting sets an optional callback invoked at the start of InvokeFunction
+// before acquiring the state lock.
+func (f *Fake) SetBeforeInvokeLockForTesting(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.opts.BeforeInvokeLock = fn
+}
+
+// ResolveFunctionTarget implements hostkit.FunctionTargetPinner.
+func (f *Fake) ResolveFunctionTarget(_ context.Context, name, qualifier string) (hostkit.FunctionSnapshot, bool) {
+	var out hostkit.FunctionSnapshot
+	var found bool
+	_ = f.doSilent(false, func(s *state) error {
+		fn, ok := s.Functions[name]
+		if !ok || !isFunctionVisible(fn) {
+			return nil
+		}
+		snap, ok := resolveFunctionSnapshot(fn, qualifier)
+		if !ok {
+			return nil
+		}
+		out = snap
+		found = true
+		return nil
+	})
+	return out, found
+}
+
+// PeekDryFunctionState implements hostkit.FunctionTargetPinner.
+func (f *Fake) PeekDryFunctionState(_ context.Context, name string) (hostkit.FunctionSnapshot, map[string]hostkit.FunctionSnapshot, []string, map[string]string, bool) {
+	var (
+		latest       hostkit.FunctionSnapshot
+		versions     map[string]hostkit.FunctionSnapshot
+		versionOrder []string
+		aliases      map[string]string
+		found        bool
+	)
+	_ = f.doSilent(false, func(s *state) error {
+		fn, ok := s.Functions[name]
+		if !ok || !isFunctionVisible(fn) {
+			return nil
+		}
+		ensureFunctionMaps(fn)
+		latest = fn.Latest.Clone()
+		versions = make(map[string]hostkit.FunctionSnapshot, len(fn.Versions))
+		versionOrder = make([]string, 0, len(fn.Versions))
+		for k, v := range fn.Versions {
+			versions[k] = v.Clone()
+			versionOrder = append(versionOrder, k)
+		}
+		sort.Slice(versionOrder, func(i, j int) bool {
+			vi, _ := strconv.Atoi(versionOrder[i])
+			vj, _ := strconv.Atoi(versionOrder[j])
+			return vi < vj
+		})
+		aliases = make(map[string]string, len(fn.Aliases))
+		for k, v := range fn.Aliases {
+			aliases[k] = v
+		}
+		found = true
+		return nil
+	})
+	return latest, versions, versionOrder, aliases, found
+}
+
 // PeekFunctionQuota implements hostkit.FunctionQuotaPeeker.
 func (f *Fake) PeekFunctionQuota(_ context.Context, name, qualifier string) (int64, int64, bool) {
 	var timeoutSec, memMB int64
@@ -564,16 +669,8 @@ func (f *Fake) UpdateFunction(ctx context.Context, in hostkit.FunctionUpdateInpu
 		if expOwner == "" {
 			expOwner = in.OwnerToken
 		}
-		if expOwner == "" {
-			expOwner = hostkit.CreateToken(ctx)
-		}
-		if !validOwnerToken(fn.OwnerToken) || (expOwner != "" && fn.OwnerToken != expOwner) {
-			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
-				fmt.Sprintf("function %q owner token mismatch", name))
-		}
-		if in.Generation > 0 && in.Generation < fn.MaxGeneration {
-			return hostkit.ProviderError(hostkit.Conflict, 409, "StaleGeneration",
-				fmt.Sprintf("stale generation %d < %d for function %q", in.Generation, fn.MaxGeneration, name))
+		if err := verifyFunctionWriteFence(ctx, fn, name, expOwner, in.Generation); err != nil {
+			return err
 		}
 		if in.ExpectRevision != "" && fn.Latest.RevisionID != in.ExpectRevision {
 			return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "PreconditionFailedException",
@@ -659,10 +756,8 @@ func (f *Fake) DeleteFunction(ctx context.Context, name string) (bool, error) {
 			existed = false
 			return nil
 		}
-		tok := hostkit.CreateToken(ctx)
-		if !validOwnerToken(fn.OwnerToken) || (tok != "" && fn.OwnerToken != tok) {
-			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
-				fmt.Sprintf("function %q owner token mismatch", name))
+		if err := verifyFunctionWriteFence(ctx, fn, name, "", 0); err != nil {
+			return err
 		}
 		if fn.Candidate != nil && fn.Candidate.PendingOpID != "" && !fn.Candidate.OperationTerminal {
 			return hostkit.ProviderError(hostkit.Conflict, 409, "OperationInProgress",
@@ -739,7 +834,7 @@ func (f *Fake) ListFunctions(_ context.Context) ([]string, error) {
 }
 
 // PublishFunctionVersion implements hostkit.Functions.
-func (f *Fake) PublishFunctionVersion(_ context.Context, name, expectRevision string) (string, error) {
+func (f *Fake) PublishFunctionVersion(ctx context.Context, name, expectRevision string) (string, error) {
 	var version string
 	err := f.doTarget("PublishFunctionVersion", name, func(s *state) error {
 		fn, ok := s.Functions[name]
@@ -747,6 +842,9 @@ func (f *Fake) PublishFunctionVersion(_ context.Context, name, expectRevision st
 			return f.notFound("", "ResourceNotFoundException", fmt.Sprintf("function %q not found", name))
 		}
 		ensureFunctionMaps(fn)
+		if err := verifyFunctionWriteFence(ctx, fn, name, "", 0); err != nil {
+			return err
+		}
 		if expectRevision != "" && fn.Latest.RevisionID != expectRevision {
 			return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "PreconditionFailedException",
 				fmt.Sprintf("function %q revision_id mismatch: got %q, want %q", name, fn.Latest.RevisionID, expectRevision))
@@ -793,7 +891,7 @@ func (f *Fake) ListFunctionVersions(_ context.Context, name string) ([]string, e
 }
 
 // SetFunctionAlias implements hostkit.Functions.
-func (f *Fake) SetFunctionAlias(_ context.Context, name, alias, version string) (bool, error) {
+func (f *Fake) SetFunctionAlias(ctx context.Context, name, alias, version string) (bool, error) {
 	var created bool
 	err := f.doTarget("SetFunctionAlias", name, func(s *state) error {
 		fn, ok := s.Functions[name]
@@ -801,6 +899,9 @@ func (f *Fake) SetFunctionAlias(_ context.Context, name, alias, version string) 
 			return f.notFound("", "ResourceNotFoundException", fmt.Sprintf("function %q not found", name))
 		}
 		ensureFunctionMaps(fn)
+		if err := verifyFunctionWriteFence(ctx, fn, name, "", 0); err != nil {
+			return err
+		}
 		if _, vok := fn.Versions[version]; !vok {
 			return f.notFound("", "ResourceNotFoundException",
 				fmt.Sprintf("function %q published version %q not found", name, version))
@@ -833,7 +934,7 @@ func (f *Fake) GetFunctionAlias(_ context.Context, name, alias string) (string, 
 }
 
 // DeleteFunctionAlias implements hostkit.Functions.
-func (f *Fake) DeleteFunctionAlias(_ context.Context, name, alias string) (bool, error) {
+func (f *Fake) DeleteFunctionAlias(ctx context.Context, name, alias string) (bool, error) {
 	var existed bool
 	err := f.doTarget("DeleteFunctionAlias", name, func(s *state) error {
 		fn, ok := s.Functions[name]
@@ -841,6 +942,9 @@ func (f *Fake) DeleteFunctionAlias(_ context.Context, name, alias string) (bool,
 			return f.notFound("", "ResourceNotFoundException", fmt.Sprintf("function %q not found", name))
 		}
 		ensureFunctionMaps(fn)
+		if err := verifyFunctionWriteFence(ctx, fn, name, "", 0); err != nil {
+			return err
+		}
 		if _, ok := fn.Aliases[alias]; ok {
 			delete(fn.Aliases, alias)
 			existed = true
@@ -852,6 +956,13 @@ func (f *Fake) DeleteFunctionAlias(_ context.Context, name, alias string) (bool,
 
 // InvokeFunction implements hostkit.Functions.
 func (f *Fake) InvokeFunction(ctx context.Context, in hostkit.FunctionInvokeInput) (hostkit.FunctionInvokeOutput, error) {
+	f.mu.Lock()
+	beforeHook := f.opts.BeforeInvokeLock
+	f.mu.Unlock()
+	if beforeHook != nil {
+		beforeHook()
+	}
+
 	var (
 		targetSnap hostkit.FunctionSnapshot
 		bundleZip  []byte
@@ -859,17 +970,38 @@ func (f *Fake) InvokeFunction(ctx context.Context, in hostkit.FunctionInvokeInpu
 		slotKey    string
 	)
 
-	// Phase 1: Authorize, resolve qualifier, and acquire concurrency slot / active-invocation pin.
+	// Phase 1: Authorize, resolve qualifier, verify pinned target/owner/quota, and acquire concurrency slot / active-invocation pin.
 	err := f.doTarget("InvokeFunction", in.Name, func(s *state) error {
 		fn, ok := s.Functions[in.Name]
 		if !ok || !isFunctionVisible(fn) {
 			return f.notFound("", "ResourceNotFoundException", fmt.Sprintf("function %q not found", in.Name))
 		}
 		ensureFunctionMaps(fn)
+		if in.ExpectedOwnerToken != "" {
+			if !validOwnerToken(fn.OwnerToken) || fn.OwnerToken != in.ExpectedOwnerToken {
+				return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
+					fmt.Sprintf("function %q owner token mismatch", in.Name))
+			}
+		}
+		if in.ExpectedIncarnation != "" && fn.IncarnationID != "" && fn.IncarnationID != in.ExpectedIncarnation {
+			return hostkit.ProviderError(hostkit.Conflict, 409, "ConcurrentTargetModification",
+				fmt.Sprintf("function %q incarnation changed before invocation dispatch", in.Name))
+		}
 		snap, found := resolveFunctionSnapshot(fn, in.Qualifier)
 		if !found {
 			return f.notFound("", "ResourceNotFoundException",
 				fmt.Sprintf("function %q qualifier %q not found", in.Name, in.Qualifier))
+		}
+		if in.RejectIfPresent {
+			return hostkit.ProviderError(hostkit.Conflict, 409, "ConcurrentTargetModification",
+				fmt.Sprintf("function %q qualifier %q appeared after invocation admission", in.Name, in.Qualifier))
+		}
+		if (in.ExpectedRevisionID != "" && snap.RevisionID != in.ExpectedRevisionID) ||
+			(in.ExpectedVersion != "" && snap.Version != in.ExpectedVersion) ||
+			(in.ExpectedTimeoutSec > 0 && snap.TimeoutSeconds != in.ExpectedTimeoutSec) ||
+			(in.ExpectedMemoryMB > 0 && snap.MemoryMB != in.ExpectedMemoryMB) {
+			return hostkit.ProviderError(hostkit.Conflict, 409, "ConcurrentTargetModification",
+				fmt.Sprintf("function %q target %q changed between admission and execution dispatch", in.Name, in.Qualifier))
 		}
 
 		// Concurrency is enforced across the function (§4.3.5).
