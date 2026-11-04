@@ -170,22 +170,55 @@ func (h *Host) permissionsScope() (string, *hostkit.CloudError) {
 	return "perm=" + permEP + "|storage=" + stEP + "|queue=" + qEP + "|tables=" + tblEP, nil
 }
 
-func (h *Host) checkPermissionsRouteAllowed(ctx context.Context) *hostkit.CloudError {
-	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
-		return ce
+func unwrapGuardAdapter(a any) any {
+	for {
+		switch g := a.(type) {
+		case guardPermissions:
+			a = g.p
+		case guardStore:
+			a = g.s
+		case guardQueue:
+			a = g.q
+		case guardTables:
+			a = g.t
+		default:
+			return a
+		}
 	}
+}
+
+func checkAdapterLiveRouteAllowed(ctx context.Context, adapter any) *hostkit.CloudError {
 	if ep := hostkit.EndpointFrom(ctx); ep != "" && !hostkit.IsLoopbackEndpoint(ep) {
 		return hostkit.ProviderError(hostkit.PermissionDenied, 403, "LiveModeUnsupported",
 			"live mode refuses permissions operations: live permissions slice is not enabled")
 	}
-	if r, ok := h.cfg.Permissions.(hostkit.Router); ok && r.Pick != nil {
-		if _, err := r.Pick(hostkit.WithForbidLiveRoute(ctx)); err != nil {
-			if ce := hostkit.AsCloudError(err); ce != nil && ce.Code == hostkit.PermissionDenied {
-				return ce
+	unwrapped := unwrapGuardAdapter(adapter)
+	switch r := unwrapped.(type) {
+	case hostkit.Router:
+		if r.Pick != nil {
+			if _, err := r.Pick(hostkit.WithForbidLiveRoute(ctx)); err != nil {
+				if ce := hostkit.AsCloudError(err); ce != nil && ce.Code == hostkit.PermissionDenied {
+					return ce
+				}
+			}
+		}
+	case *hostkit.Router:
+		if r != nil && r.Pick != nil {
+			if _, err := r.Pick(hostkit.WithForbidLiveRoute(ctx)); err != nil {
+				if ce := hostkit.AsCloudError(err); ce != nil && ce.Code == hostkit.PermissionDenied {
+					return ce
+				}
 			}
 		}
 	}
 	return nil
+}
+
+func (h *Host) checkPermissionsRouteAllowed(ctx context.Context) *hostkit.CloudError {
+	if ce := h.cost.checkPermissionsAllowed(); ce != nil {
+		return ce
+	}
+	return checkAdapterLiveRouteAllowed(ctx, h.cfg.Permissions)
 }
 
 // PrincipalCurrent resolves the caller's active principal identifier.
@@ -269,11 +302,11 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 			return e
 		}
 		defer cancel()
-		ep := hostkit.EndpointFrom(sctx)
-		if ep != "" && !hostkit.IsLoopbackEndpoint(ep) {
-			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "LiveModeUnsupported",
-				"live mode refuses permissions operations: live permissions slice is not enabled")
+		sctx = hostkit.WithForbidLiveRoute(sctx)
+		if ce := checkAdapterLiveRouteAllowed(sctx, h.cfg.Store); ce != nil {
+			return ce
 		}
+		ep := hostkit.EndpointFrom(sctx)
 		if dry {
 			exists, e := h.bucketExists(sctx, true, target.Name)
 			if e != nil {
@@ -319,11 +352,11 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 			return e
 		}
 		defer cancel()
-		ep := hostkit.EndpointFrom(qctx)
-		if ep != "" && !hostkit.IsLoopbackEndpoint(ep) {
-			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "LiveModeUnsupported",
-				"live mode refuses permissions operations: live permissions slice is not enabled")
+		qctx = hostkit.WithForbidLiveRoute(qctx)
+		if ce := checkAdapterLiveRouteAllowed(qctx, h.cfg.Queue); ce != nil {
+			return ce
 		}
+		ep := hostkit.EndpointFrom(qctx)
 		if dry {
 			if e := h.requireQueue(qctx, true, target.Name); e != nil {
 				return e
@@ -367,11 +400,11 @@ func (h *Host) verifyTargetExistsAndOwned(dry bool, target hostkit.AnchoredTarge
 			return e
 		}
 		defer cancel()
-		ep := hostkit.EndpointFrom(tctx)
-		if ep != "" && !hostkit.IsLoopbackEndpoint(ep) {
-			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "LiveModeUnsupported",
-				"live mode refuses permissions operations: live permissions slice is not enabled")
+		tctx = hostkit.WithForbidLiveRoute(tctx)
+		if ce := checkAdapterLiveRouteAllowed(tctx, h.cfg.Tables); ce != nil {
+			return ce
 		}
+		ep := hostkit.EndpointFrom(tctx)
 		if dry {
 			if e := h.requireTable(tctx, true, target.Name); e != nil {
 				return e
@@ -557,16 +590,17 @@ func (h *Host) PolicyAttach(dry bool, target, principal string, policy *Policy) 
 
 	actx := hostkit.WithExpectedAttachment(hostkit.WithCreateToken(mctx, att.OwnerToken), att)
 	err := h.cfg.Permissions.AttachPolicy(actx, att)
+	ce = hostkit.AsCloudError(err)
+	definitiveRefusal := err != nil && isDefinitivePolicyRefusal(ce)
 	var abortErr *hostkit.CloudError
-	retries, throttles, abortErr = scope.finish(bytesIn, bytesIn, true, err == nil)
+	retries, throttles, abortErr = scope.finish(bytesIn, bytesIn, err == nil || definitiveRefusal, !definitiveRefusal)
 	if abortErr != nil {
 		failed = true
 		return h.fail(op, target, abortErr)
 	}
 	if err != nil {
 		failed = true
-		ce := hostkit.AsCloudError(err)
-		if isDefinitivePolicyRefusal(ce) {
+		if definitiveRefusal {
 			_ = h.cost.abortPolicyIntent(att)
 		}
 		return h.fail(op, target, ce)
@@ -685,16 +719,17 @@ func (h *Host) PolicyAttachPrincipal(dry bool, principal string, policy *Policy)
 
 	actx := hostkit.WithExpectedAttachment(hostkit.WithCreateToken(mctx, att.OwnerToken), att)
 	err := h.cfg.Permissions.AttachPolicy(actx, att)
+	ce = hostkit.AsCloudError(err)
+	definitiveRefusal := err != nil && isDefinitivePolicyRefusal(ce)
 	var abortErr *hostkit.CloudError
-	retries, throttles, abortErr = scope.finish(bytesIn, bytesIn, true, err == nil)
+	retries, throttles, abortErr = scope.finish(bytesIn, bytesIn, err == nil || definitiveRefusal, !definitiveRefusal)
 	if abortErr != nil {
 		failed = true
 		return h.fail(op, principal, abortErr)
 	}
 	if err != nil {
 		failed = true
-		ce := hostkit.AsCloudError(err)
-		if isDefinitivePolicyRefusal(ce) {
+		if definitiveRefusal {
 			_ = h.cost.abortPolicyIntent(att)
 		}
 		return h.fail(op, principal, ce)

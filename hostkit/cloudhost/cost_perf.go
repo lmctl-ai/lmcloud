@@ -789,7 +789,30 @@ func (ct *costTracker) defaultBillingUnits(op string, bytes int64) int64 {
 	return units
 }
 
-func deleteResourcePolicyAttachments(policies, ambiguous map[string]hostkit.PolicyAttachment, ambiguousStack map[string][]hostkit.PolicyAttachment, policyCleanup map[string]int64, resKind, resKey string) int64 {
+func policyScopeMatchesResourceEndpoint(policyScope, resKind, resEndpoint string) bool {
+	if strings.HasPrefix(policyScope, "perm=") && strings.Contains(policyScope, "|storage=") {
+		var wantPrefix string
+		switch resKind {
+		case safety.KindBucket:
+			wantPrefix = "storage="
+		case safety.KindQueue:
+			wantPrefix = "queue="
+		case safety.KindTable:
+			wantPrefix = "tables="
+		default:
+			return false
+		}
+		for _, part := range strings.Split(policyScope, "|") {
+			if strings.HasPrefix(part, wantPrefix) {
+				return strings.TrimPrefix(part, wantPrefix) == resEndpoint
+			}
+		}
+		return false
+	}
+	return policyScope == resEndpoint
+}
+
+func deleteResourcePolicyAttachments(policies, ambiguous map[string]hostkit.PolicyAttachment, ambiguousStack map[string][]hostkit.PolicyAttachment, policyCleanup map[string]int64, resKind, resEndpoint, resKey string) int64 {
 	if (len(policies) == 0 && len(ambiguous) == 0) || resKey == "" {
 		return 0
 	}
@@ -806,7 +829,7 @@ func deleteResourcePolicyAttachments(policies, ambiguous map[string]hostkit.Poli
 	}
 	var released int64
 	for k, pa := range policies {
-		if pa.Kind == hostkit.AttachmentResource && pa.Target == target {
+		if pa.Kind == hostkit.AttachmentResource && pa.Target == target && policyScopeMatchesResourceEndpoint(pa.Scope, resKind, resEndpoint) {
 			delete(policies, k)
 			if v, ok := policyCleanup[k]; ok {
 				released += v
@@ -815,7 +838,7 @@ func deleteResourcePolicyAttachments(policies, ambiguous map[string]hostkit.Poli
 		}
 	}
 	for k, pa := range ambiguous {
-		if pa.Kind == hostkit.AttachmentResource && pa.Target == target {
+		if pa.Kind == hostkit.AttachmentResource && pa.Target == target && policyScopeMatchesResourceEndpoint(pa.Scope, resKind, resEndpoint) {
 			delete(ambiguous, k)
 			if ambiguousStack != nil {
 				delete(ambiguousStack, k)
@@ -995,7 +1018,7 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 				}
 			}
 			if rec.ReleaseCleanup && p.ResKey != "" {
-				deleteResourcePolicyAttachments(st.activePolicies, st.ambiguousPolicies, st.ambiguousStack, st.policyCleanup, p.ResKind, p.ResKey)
+				deleteResourcePolicyAttachments(st.activePolicies, st.ambiguousPolicies, st.ambiguousStack, st.policyCleanup, p.ResKind, p.Endpoint, p.ResKey)
 				switch p.ResKind {
 				case safety.KindBucket:
 					delete(st.activeBuckets, sKey)
@@ -1833,11 +1856,11 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 					cleanupNano = res.Quote().CleanupReserveNanoUSD
 				}
 			case "bucket_delete", "object_delete", "queue_delete", "item_delete", "policy_detach", "policy_detach_principal":
-				if inActiveCleanup {
+				if inActiveCleanup || inEntries {
 					releaseCleanup = true
 				}
 			case "table_delete":
-				if inActiveCleanup || hasJournalTableChildItems(st.ActiveCleanup, endpoint, resKey) {
+				if inActiveCleanup || inEntries || hasJournalTableChildItems(st.ActiveCleanup, endpoint, resKey) {
 					releaseCleanup = true
 				}
 			}
@@ -1952,7 +1975,7 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 				st.resourceCleanupNanoUSD += res.Quote().CleanupReserveNanoUSD
 			}
 			if releaseCleanup {
-				releasedPol := deleteResourcePolicyAttachments(st.activePolicies, st.ambiguousPolicies, st.ambiguousStack, st.policyCleanup, resKind, resKey)
+				releasedPol := deleteResourcePolicyAttachments(st.activePolicies, st.ambiguousPolicies, st.ambiguousStack, st.policyCleanup, resKind, endpoint, resKey)
 				st.resourceCleanupNanoUSD -= releasedPol
 				switch resKind {
 				case safety.KindBucket:
@@ -2050,7 +2073,7 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 	if opSucceeded {
 		switch op {
 		case "bucket_delete":
-			if released := deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.ambiguousStack, ct.policyCleanup, safety.KindBucket, resKey); released > 0 {
+			if released := deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.ambiguousStack, ct.policyCleanup, safety.KindBucket, endpoint, resKey); released > 0 {
 				ct.meter.ReleaseResourceCleanup(released)
 			}
 			if v, exists := ct.activeBuckets[sKey]; exists {
@@ -2063,7 +2086,7 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 				ct.meter.ReleaseResourceCleanup(v)
 			}
 		case "queue_delete":
-			if released := deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.ambiguousStack, ct.policyCleanup, safety.KindQueue, resKey); released > 0 {
+			if released := deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.ambiguousStack, ct.policyCleanup, safety.KindQueue, endpoint, resKey); released > 0 {
 				ct.meter.ReleaseResourceCleanup(released)
 			}
 			if v, exists := ct.activeQueues[sKey]; exists {
@@ -2071,7 +2094,7 @@ func (ct *costTracker) settleAt(res *safety.AttemptReservation, attemptID, op, e
 				ct.meter.ReleaseResourceCleanup(v)
 			}
 		case "table_delete":
-			if released := deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.ambiguousStack, ct.policyCleanup, safety.KindTable, resKey); released > 0 {
+			if released := deleteResourcePolicyAttachments(ct.activePolicies, ct.ambiguousPolicies, ct.ambiguousStack, ct.policyCleanup, safety.KindTable, endpoint, resKey); released > 0 {
 				ct.meter.ReleaseResourceCleanup(released)
 			}
 			if v, exists := ct.activeTables[sKey]; exists {

@@ -356,6 +356,7 @@ func (f *Fake) DeleteBucket(_ context.Context, b string) error {
 		}
 		delete(s.Buckets, b)
 		delete(s.BucketTokens, b)
+		deleteTargetPolicies(s, "storage:bucket:"+b)
 		return nil
 	})
 }
@@ -558,6 +559,7 @@ func (f *Fake) DeleteQueue(_ context.Context, q string) error {
 		}
 		delete(s.Queues, q)
 		delete(s.QueueTokens, q)
+		deleteTargetPolicies(s, "queue:queue:"+q)
 		return nil
 	})
 }
@@ -790,6 +792,7 @@ func (f *Fake) DeleteTable(_ context.Context, name string) error {
 		}
 		delete(s.Tables, name)
 		delete(s.TableTokens, name)
+		deleteTargetPolicies(s, "tables:table:"+name)
 		return nil
 	})
 }
@@ -1070,6 +1073,30 @@ func (f *Fake) CurrentPrincipal(_ context.Context) (string, error) {
 	return out, err
 }
 
+func validOwnerToken(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for i := 0; i < 32; i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func deleteTargetPolicies(s *state, target string) {
+	if s == nil || len(s.Policies) == 0 {
+		return
+	}
+	for k, pa := range s.Policies {
+		if pa.Kind == hostkit.AttachmentResource && pa.Target == target {
+			delete(s.Policies, k)
+		}
+	}
+}
+
 func (f *Fake) AttachPolicy(ctx context.Context, att hostkit.PolicyAttachment) error {
 	if f.opts.EchoCreateToken {
 		f.mu.Lock()
@@ -1090,7 +1117,7 @@ func (f *Fake) AttachPolicy(ctx context.Context, att hostkit.PolicyAttachment) e
 		key := hostkit.AttachmentKey(att.Kind, att.Target, att.Principal)
 		attGen, _ := strconv.ParseUint(att.Generation, 10, 64)
 		if cur, exists := s.Policies[key]; exists {
-			if cur.OwnerToken != "" && cur.OwnerToken != att.OwnerToken {
+			if !validOwnerToken(cur.OwnerToken) || cur.OwnerToken != att.OwnerToken {
 				return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "OwnershipMismatch", "foreign policy attachment already exists for target and principal")
 			}
 			if exp, hasExp := hostkit.ExpectedAttachmentFrom(ctx); hasExp {
@@ -1133,7 +1160,7 @@ func (f *Fake) DetachPolicy(ctx context.Context, kind hostkit.AttachmentKind, ta
 		cur, exists := s.Policies[key]
 		if exp, hasExp := hostkit.ExpectedAttachmentFrom(ctx); hasExp {
 			if exists {
-				if exp.ExpectedOwnerToken != "" && cur.OwnerToken != exp.ExpectedOwnerToken {
+				if !validOwnerToken(cur.OwnerToken) || (exp.ExpectedOwnerToken != "" && cur.OwnerToken != exp.ExpectedOwnerToken) || (exp.OwnerToken != "" && cur.OwnerToken != exp.OwnerToken) {
 					return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "OwnershipMismatch", "policy attachment owner token mismatch")
 				}
 				if exp.ExpectedGeneration != "" {
@@ -1154,7 +1181,7 @@ func (f *Fake) DetachPolicy(ctx context.Context, kind hostkit.AttachmentKind, ta
 				s.PolicyOwners[key] = exp.OwnerToken
 			}
 		} else if exists {
-			if tok := hostkit.CreateToken(ctx); tok != "" && cur.OwnerToken != tok {
+			if tok := hostkit.CreateToken(ctx); tok != "" && (!validOwnerToken(cur.OwnerToken) || cur.OwnerToken != tok) {
 				return hostkit.ProviderError(hostkit.PreconditionFailed, 412, "OwnershipMismatch", "policy attachment owner token mismatch")
 			}
 		}

@@ -2413,13 +2413,13 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 					delete(state.AmbiguousStack, pKey)
 					delete(state.AmbiguousPolicies, pKey)
 					if _, inActive := state.PolicyAttachments[pKey]; !inActive {
-						delete(state.ActiveCleanup, "policy\x00"+pKey)
+						deletePolicyActiveCleanup(state, pKey)
 					}
 				}
 			} else if state.LatestPolicyIntent[pKey] == "" || state.LatestPolicyIntent[pKey] == rec.AttemptID {
 				delete(state.AmbiguousPolicies, pKey)
 				if _, inActive := state.PolicyAttachments[pKey]; !inActive {
-					delete(state.ActiveCleanup, "policy\x00"+pKey)
+					deletePolicyActiveCleanup(state, pKey)
 				}
 			}
 			return nil
@@ -2531,7 +2531,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		delete(state.AmbiguousStack, pKey)
 		delete(state.AmbiguousPolicies, pKey)
 		delete(state.PolicyAttachments, pKey)
-		delete(state.ActiveCleanup, "policy\x00"+pKey)
+		deletePolicyActiveCleanup(state, pKey)
 		return nil
 	}
 	if rec.Event == EventCost {
@@ -2596,7 +2596,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		}
 		if rec.ReleaseCleanup && att.Name != "" {
 			delete(state.ActiveCleanup, rKey)
-			removeResourcePolicyAttachments(state, att.Kind, att.Name)
+			removeResourcePolicyAttachments(state, att.Kind, att.Parent, att.Name)
 			if att.Kind == KindTable {
 				itemPrefix := resourceKey(KindTableItem, att.Parent, att.Name+"/")
 				itemPrefixUnscoped := resourceKey(KindTableItem, "", att.Name+"/")
@@ -2915,7 +2915,14 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		return nil
 
 	case EventDeleted:
-		removeResourcePolicyAttachments(state, rec.Kind, rec.Name)
+		resEP := rec.Location
+		if resEP == "" {
+			resEP = rec.Parent
+		}
+		if resEP == "" && exists {
+			resEP = state.Entries[idx].Location
+		}
+		removeResourcePolicyAttachments(state, rec.Kind, resEP, rec.Name)
 		if !exists {
 			return nil
 		}
@@ -2983,7 +2990,43 @@ func countPolicyAttachmentKeys(state *LedgerState) int {
 	return len(seen)
 }
 
-func removeResourcePolicyAttachments(state *LedgerState, kind, name string) {
+func deletePolicyActiveCleanup(state *LedgerState, pKey string) {
+	if state == nil {
+		return
+	}
+	delete(state.ActiveCleanup, "policy\x00"+pKey)
+	suffix := "\x00" + strings.ReplaceAll(pKey, "\x00", "|")
+	for ck := range state.ActiveCleanup {
+		if strings.HasPrefix(ck, KindPolicyAttachment+"\x00") && strings.HasSuffix(ck, suffix) {
+			delete(state.ActiveCleanup, ck)
+		}
+	}
+}
+
+func policyScopeMatchesResourceEndpoint(policyScope, resKind, resEndpoint string) bool {
+	if strings.HasPrefix(policyScope, "perm=") && strings.Contains(policyScope, "|storage=") {
+		var wantPrefix string
+		switch resKind {
+		case KindBucket:
+			wantPrefix = "storage="
+		case KindQueue:
+			wantPrefix = "queue="
+		case KindTable:
+			wantPrefix = "tables="
+		default:
+			return false
+		}
+		for _, part := range strings.Split(policyScope, "|") {
+			if strings.HasPrefix(part, wantPrefix) {
+				return strings.TrimPrefix(part, wantPrefix) == resEndpoint
+			}
+		}
+		return false
+	}
+	return policyScope == resEndpoint
+}
+
+func removeResourcePolicyAttachments(state *LedgerState, kind, resEndpoint, name string) {
 	if state == nil || (len(state.PolicyAttachments) == 0 && len(state.AmbiguousPolicies) == 0) || name == "" {
 		return
 	}
@@ -2999,28 +3042,16 @@ func removeResourcePolicyAttachments(state *LedgerState, kind, name string) {
 		return
 	}
 	for k, pa := range state.PolicyAttachments {
-		if pa.Kind == "resource" && pa.Target == target {
+		if pa.Kind == "resource" && pa.Target == target && policyScopeMatchesResourceEndpoint(pa.Scope, kind, resEndpoint) {
 			delete(state.PolicyAttachments, k)
-			delete(state.ActiveCleanup, "policy\x00"+k)
-			suffix := "\x00" + strings.ReplaceAll(k, "\x00", "|")
-			for ck := range state.ActiveCleanup {
-				if strings.HasPrefix(ck, KindPolicyAttachment+"\x00") && strings.HasSuffix(ck, suffix) {
-					delete(state.ActiveCleanup, ck)
-				}
-			}
+			deletePolicyActiveCleanup(state, k)
 		}
 	}
 	for k, pa := range state.AmbiguousPolicies {
-		if pa.Kind == "resource" && pa.Target == target {
+		if pa.Kind == "resource" && pa.Target == target && policyScopeMatchesResourceEndpoint(pa.Scope, kind, resEndpoint) {
 			delete(state.AmbiguousPolicies, k)
 			delete(state.AmbiguousStack, k)
-			delete(state.ActiveCleanup, "policy\x00"+k)
-			suffix := "\x00" + strings.ReplaceAll(k, "\x00", "|")
-			for ck := range state.ActiveCleanup {
-				if strings.HasPrefix(ck, KindPolicyAttachment+"\x00") && strings.HasSuffix(ck, suffix) {
-					delete(state.ActiveCleanup, ck)
-				}
-			}
+			deletePolicyActiveCleanup(state, k)
 		}
 	}
 }
