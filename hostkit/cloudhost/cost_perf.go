@@ -1504,6 +1504,24 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 			if rec.CleanupReserveNanoUSD > 0 {
 				st.activeFunctions[fKey] = rec.CleanupReserveNanoUSD
 			}
+		case safety.EventFunctionPreviewState:
+			if rec.ResKey == "" || len(rec.ResKey) > 64 || rec.Generation == "" {
+				return nil, errors.New("corrupt campaign journal function_preview_state missing name or generation")
+			}
+			if genNum, err := strconv.ParseUint(rec.Generation, 10, 64); err != nil || genNum == 0 {
+				return nil, fmt.Errorf("corrupt campaign journal function_preview_state generation %q", rec.Generation)
+			}
+			if err := safety.ValidateToken128(rec.OwnerToken); err != nil {
+				return nil, fmt.Errorf("corrupt campaign journal function_preview_state owner_token: %w", err)
+			}
+			fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			act, hasAct := st.activeFunctionEntries[fKey]
+			_, hasAmb := st.ambiguousFunctions[fKey]
+			if hasAct && !hasAmb && len(st.ambiguousFunctionStack[fKey]) == 0 &&
+				act.OwnerToken == rec.OwnerToken && act.Digest == rec.FunctionDigest && act.Generation == rec.Generation {
+				act.StateJSON = rec.FunctionState
+				st.activeFunctionEntries[fKey] = act
+			}
 		case safety.EventFunctionDelete:
 			if rec.ResKey == "" || len(rec.ResKey) > 64 {
 				return nil, errors.New("corrupt campaign journal function_delete missing name")
@@ -3842,7 +3860,7 @@ func (ct *costTracker) confirmFunctionIntent(entry safety.JournalFunctionEntry) 
 	return nil
 }
 
-func (ct *costTracker) updateFunctionDryState(endpoint, name string, mutate func(curStateJSON string) string) *hostkit.CloudError {
+func (ct *costTracker) updateFunctionDryState(endpoint, name, expOwnerToken, expDigest, expGeneration string, mutate func(curStateJSON string) string) *hostkit.CloudError {
 	if mutate == nil {
 		return nil
 	}
@@ -3863,22 +3881,18 @@ func (ct *costTracker) updateFunctionDryState(endpoint, name string, mutate func
 			return ct.poisoned
 		}
 		act, ok := ct.activeFunctionEntries[key]
-		if !ok {
+		_, hasAmb := ct.ambiguousFunctions[key]
+		if !ok || hasAmb || len(ct.ambiguousFunctionStack[key]) > 0 {
+			return nil
+		}
+		if act.OwnerToken != expOwnerToken || act.Digest != expDigest || act.Generation != expGeneration {
 			return nil
 		}
 		newState := mutate(act.StateJSON)
 		if newState == act.StateJSON {
 			return nil
 		}
-		genStr := act.Generation
-		if maxG := ct.maxFunctionGen[key]; maxG > 0 {
-			genStr = strconv.FormatUint(maxG, 10)
-		}
-		intentID := ct.latestFunctionIntent[key]
-		if intentID == "" {
-			intentID = act.IntentID
-		}
-		if err := ct.journal.RecordFunctionConfirmWithState(act.Scope, act.Name, act.Digest, act.OwnerToken, genStr, intentID, newState, 0); err != nil {
+		if err := ct.journal.RecordFunctionPreviewState(act.Scope, act.Name, act.OwnerToken, act.Digest, act.Generation, newState); err != nil {
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
 			return ct.poisoned
 		}
@@ -3889,35 +3903,28 @@ func (ct *costTracker) updateFunctionDryState(endpoint, name string, mutate func
 	if ct.statePath != "" {
 		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
 			act, ok := st.activeFunctionEntries[key]
-			if !ok {
+			_, hasAmb := st.ambiguousFunctions[key]
+			if !ok || hasAmb || len(st.ambiguousFunctionStack[key]) > 0 {
+				return nil
+			}
+			if act.OwnerToken != expOwnerToken || act.Digest != expDigest || act.Generation != expGeneration {
 				return nil
 			}
 			newState := mutate(act.StateJSON)
 			if newState == act.StateJSON {
 				return nil
 			}
-			genStr := act.Generation
-			if maxG := st.maxFunctionGen[key]; maxG > 0 {
-				genStr = strconv.FormatUint(maxG, 10)
-			}
-			intentID := st.latestFunctionIntent[key]
-			if intentID == "" {
-				intentID = act.IntentID
-			}
 			if err := appendRec(campaignJournalRecord{
-				Event:          safety.EventFunctionConfirm,
-				IntentID:       intentID,
+				Event:          safety.EventFunctionPreviewState,
 				Endpoint:       act.Scope,
 				ResKey:         act.Name,
 				FunctionDigest: act.Digest,
 				OwnerToken:     act.OwnerToken,
-				Generation:     genStr,
+				Generation:     act.Generation,
 				FunctionState:  newState,
 			}); err != nil {
 				return err
 			}
-			act.Generation = genStr
-			act.IntentID = intentID
 			act.StateJSON = newState
 			st.activeFunctionEntries[key] = act
 			ct.applyReplayedStateLocked(st)
@@ -3930,7 +3937,11 @@ func (ct *costTracker) updateFunctionDryState(endpoint, name string, mutate func
 	}
 
 	act, ok := ct.activeFunctionEntries[key]
-	if !ok {
+	_, hasAmb := ct.ambiguousFunctions[key]
+	if !ok || hasAmb || len(ct.ambiguousFunctionStack[key]) > 0 {
+		return nil
+	}
+	if act.OwnerToken != expOwnerToken || act.Digest != expDigest || act.Generation != expGeneration {
 		return nil
 	}
 	act.StateJSON = mutate(act.StateJSON)

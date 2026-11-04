@@ -161,8 +161,8 @@ func (f *Fake) ensureSandboxReady() *hostkit.CloudError {
 
 	// Self-test both python3.12 and nodejs20.x at 128 MiB in the namespace + cgroupv2 + Landlock + seccomp jail,
 	// verifying PID 1, rlimits (NOFILE=64, NPROC=32, FSIZE=16MiB), /etc isolation, and synchronous aggregate
-	// 16-MiB scratch quota across open-unlinked files.
-	pyZip, _, cerr := hostkit.BuildDeterministicInlineZip(hostkit.RuntimePython312, "index.handler", `import errno, os, resource
+	// 16-MiB scratch quota across open-unlinked files and mmap-retained unlinked files after close(fd).
+	pyZip, _, cerr := hostkit.BuildDeterministicInlineZip(hostkit.RuntimePython312, "index.handler", `import ctypes, errno, os, resource
 def handler(event, context):
     assert os.getpid() == 1, f"expected pid 1, got {os.getpid()}"
     assert resource.getrlimit(resource.RLIMIT_NOFILE) == (64, 64), f"nofile={resource.getrlimit(resource.RLIMIT_NOFILE)}"
@@ -198,6 +198,36 @@ def handler(event, context):
     finally:
         f1.close()
         f2.close()
+    lib = ctypes.CDLL(None, use_errno=True)
+    lib.mmap.restype = ctypes.c_void_p
+    lib.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+    lib.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    msz = 12 * 1024 * 1024
+    maps = []
+    try:
+        mblocked = False
+        for i in range(2):
+            mp = os.path.join(td, f"selftest_map_{i}")
+            mfd = os.open(mp, os.O_RDWR | os.O_CREAT, 0o600)
+            os.unlink(mp)
+            try:
+                os.ftruncate(mfd, msz)
+                addr = lib.mmap(None, msz, 3, 1, mfd, 0)
+                if addr == ctypes.c_void_p(-1).value:
+                    raise OSError(ctypes.get_errno(), "mmap")
+                maps.append(addr)
+            except OSError as e:
+                if e.errno in (errno.ENOSPC, errno.EFBIG, errno.EDQUOT, errno.EPERM):
+                    mblocked = True
+                    break
+                raise
+            finally:
+                os.close(mfd)
+            ctypes.memset(addr, 120, msz)
+        assert mblocked, "expected aggregate 16-MiB scratch quota to reject 24 MiB across mmap-retained unlinked files"
+    finally:
+        for addr in maps:
+            lib.munmap(addr, msz)
     return {"selftest": True}
 `)
 	if cerr != nil {
@@ -346,15 +376,20 @@ LANDLOCK_RULE_PATH_BENEATH  = 1
 MAX_SCRATCH_BYTES                  = 16 * 1024 * 1024
 SECCOMP_SET_MODE_FILTER            = 1
 SECCOMP_FILTER_FLAG_NEW_LISTENER   = (1 << 3)
+SECCOMP_RET_ERRNO                  = 0x00050000
 SECCOMP_RET_USER_NOTIF             = 0x7fc00000
 SECCOMP_RET_ALLOW                  = 0x7fff0000
 SECCOMP_IOCTL_NOTIF_RECV           = 0xc0502100
 SECCOMP_IOCTL_NOTIF_SEND           = 0xc0182101
 SECCOMP_USER_NOTIF_FLAG_CONTINUE   = 1
+MS_NOSUID                          = 2
+MS_NODEV                           = 4
 
 _ARCH = os.uname().machine
 if _ARCH in ("aarch64", "arm64"):
     SYS_seccomp         = 277
+    SYS_memfd_create    = 279
+    SYS_memfd_secret    = 447
     SYS_truncate        = 45
     SYS_ftruncate       = 46
     SYS_fallocate       = 47
@@ -368,6 +403,8 @@ if _ARCH in ("aarch64", "arm64"):
     SYS_pwritev2        = 287
 elif _ARCH in ("x86_64", "amd64"):
     SYS_seccomp         = 317
+    SYS_memfd_create    = 319
+    SYS_memfd_secret    = 447
     SYS_write           = 1
     SYS_pwrite64        = 18
     SYS_writev          = 20
@@ -485,6 +522,8 @@ def install_seccomp_quota_listener(out_fd):
     BPF_RET_K     = 0x06
     spec = [
         ("ENTRY",    BPF_LD_W_ABS,  0,  None,       None),
+        (None,       BPF_JMP_JEQ_K, SYS_memfd_create,    "DENY_SPC", None),
+        (None,       BPF_JMP_JEQ_K, SYS_memfd_secret,    "DENY_SPC", None),
         (None,       BPF_JMP_JEQ_K, SYS_write,           "CHECK_FD", None),
         (None,       BPF_JMP_JEQ_K, SYS_writev,          "CHECK_FD", None),
         (None,       BPF_JMP_JEQ_K, SYS_pwrite64,        "NOTIF",    None),
@@ -502,8 +541,9 @@ def install_seccomp_quota_listener(out_fd):
         (None,       BPF_JMP_JEQ_K, 1,  "ALLOW",    None),
         (None,       BPF_JMP_JEQ_K, 2,  "ALLOW",    None),
         (None,       BPF_JMP_JEQ_K, out_fd, "ALLOW", "NOTIF"),
-        ("ALLOW",    BPF_RET_K,     SECCOMP_RET_ALLOW,      None, None),
-        ("NOTIF",    BPF_RET_K,     SECCOMP_RET_USER_NOTIF, None, None),
+        ("ALLOW",    BPF_RET_K,     SECCOMP_RET_ALLOW,                  None, None),
+        ("DENY_SPC", BPF_RET_K,     SECCOMP_RET_ERRNO | errno.ENOSPC,   None, None),
+        ("NOTIF",    BPF_RET_K,     SECCOMP_RET_USER_NOTIF,             None, None),
     ]
     labels = {}
     for idx, item in enumerate(spec):
@@ -578,6 +618,33 @@ def run_seccomp_supervisor(nfd, child_pid, scratch_tmp, cg_procs):
                                 live[k] = st.st_size
                     except OSError:
                         pass
+            try:
+                with open(f"/proc/{p}/maps", "r") as mf:
+                    for line in mf:
+                        parts = line.split(None, 5)
+                        if len(parts) < 6:
+                            continue
+                        mpath = parts[5].strip()
+                        if mpath.endswith(" (deleted)"):
+                            mpath = mpath[:-10]
+                        if not is_scratch_link(mpath):
+                            continue
+                        try:
+                            maj_s, min_s = parts[3].split(":", 1)
+                            dev = os.makedev(int(maj_s, 16), int(min_s, 16))
+                            ino = int(parts[4])
+                            start_s, end_s = parts[0].split("-", 1)
+                            off = int(parts[2], 16)
+                            span_end = off + (int(end_s, 16) - int(start_s, 16))
+                            k = (dev, ino)
+                            ap = last_approved.get(k)
+                            est = max(span_end, ap[0] if ap else 0)
+                            if est > live.get(k, 0):
+                                live[k] = est
+                        except Exception:
+                            pass
+            except OSError:
+                pass
         now_ts = time.monotonic()
         for k in list(last_approved.keys()):
             if k not in live:
@@ -820,22 +887,15 @@ def main():
             os._exit(2)
         finally:
             notif_parent_sock.close()
-        if nfd < 0:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-            write_outcome(out_fd, {"internalError": "seccomp listener fd not established"})
-            os.close(out_fd)
-            os._exit(2)
         os.close(out_fd)
-        try:
-            run_seccomp_supervisor(nfd, pid, spec["scratch_tmp"], spec.get("cgroup_procs_path", ""))
-        finally:
+        if nfd >= 0:
             try:
-                os.close(nfd)
-            except OSError:
-                pass
+                run_seccomp_supervisor(nfd, pid, spec["scratch_tmp"], spec.get("cgroup_procs_path", ""))
+            finally:
+                try:
+                    os.close(nfd)
+                except OSError:
+                    pass
         try:
             os.waitpid(pid, 0)
         except OSError:
@@ -848,6 +908,35 @@ def main():
     if os.getpid() != 1:
         write_outcome(out_fd, {"internalError": f"expected PID 1 in PID namespace, got {os.getpid()}"})
         os._exit(2)
+
+    scratch_tmp = spec["scratch_tmp"]
+    if not spec.get("has_fuse_mount", False):
+        # Attempt unprivileged user+mount namespace tmpfs mount (size=16MiB, nr_inodes=4096).
+        # If neither userns tmpfs nor FUSE tmpfs is mounted, fail closed.
+        try:
+            uid = os.getuid()
+            gid = os.getgid()
+            with open("/proc/self/setgroups", "w") as f:
+                f.write("deny\n")
+            with open("/proc/self/uid_map", "w") as f:
+                f.write(f"{uid} {uid} 1\n")
+            with open("/proc/self/gid_map", "w") as f:
+                f.write(f"{gid} {gid} 1\n")
+        except Exception:
+            pass
+        mrc = libc.mount(
+            b"tmpfs",
+            scratch_tmp.encode("utf-8"),
+            b"tmpfs",
+            MS_NOSUID | MS_NODEV,
+            b"size=16777216,nr_inodes=4096,mode=0700",
+        )
+        if mrc != 0:
+            merr = ctypes.get_errno()
+            write_outcome(out_fd, {
+                "internalError": f"scratch quota backing filesystem unavailable: tmpfs mount errno={merr}, fuse={spec.get('fuse_error', 'unavailable')}"
+            })
+            os._exit(2)
 
     cg_procs = spec.get("cgroup_procs_path", "")
     if cg_procs:
@@ -1291,6 +1380,15 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 		return hostkit.FunctionInvokeOutput{}, nil, cerr
 	}
 
+	fuseFS, fuseErr := mountScratchFuseFS(scratchTmp, maxScratchTmpBytes, maxScratchTmpInodes)
+	if fuseFS != nil {
+		defer fuseFS.Close()
+	}
+	fuseErrMsg := ""
+	if fuseErr != nil {
+		fuseErrMsg = fuseErr.Error()
+	}
+
 	resR, resW, err := os.Pipe()
 	if err != nil {
 		return hostkit.FunctionInvokeOutput{}, nil, hostkit.ProviderError(hostkit.Internal, 0, "SandboxPipeFailed", err.Error())
@@ -1303,6 +1401,8 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 		"handler":           spec.Handler,
 		"bundle_dir":        bundleDir,
 		"scratch_tmp":       scratchTmp,
+		"has_fuse_mount":    fuseFS != nil,
+		"fuse_error":        fuseErrMsg,
 		"memory_mb":         spec.MemoryMB,
 		"env":               spec.Env,
 		"payload_json":      spec.PayloadJSON,
@@ -1388,7 +1488,12 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 			done = true
 		case <-ticker.C:
 			pids, rss := collectProcessTreeAndRSS(rootPID)
-			diskBytes := scratchDirBytes(scratchTmp, pids)
+			var diskBytes int64
+			if fuseFS != nil {
+				diskBytes = fuseFS.UsedBytes()
+			} else {
+				diskBytes = scratchDirBytes(scratchTmp, pids)
+			}
 			monMu.Lock()
 			for _, p := range pids {
 				observedPIDs[p] = true
@@ -1429,7 +1534,13 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 	}
 	isTimeout := killedForTime
 	isOOM := killedForMemory || cgroupHadOOM(cgDir)
-	isDiskQuota := killedForDisk || scratchDirBytes(scratchTmp, allPIDs) > maxScratchTmpBytes
+	var finalDiskBytes int64
+	if fuseFS != nil {
+		finalDiskBytes = fuseFS.UsedBytes()
+	} else {
+		finalDiskBytes = scratchDirBytes(scratchTmp, allPIDs)
+	}
+	isDiskQuota := killedForDisk || finalDiskBytes > maxScratchTmpBytes
 	monMu.Unlock()
 
 	waitForPIDsGone(allPIDs, 500*time.Millisecond)
@@ -1514,7 +1625,7 @@ func executeInNamespaceJail(ctx context.Context, pyBin, nodeBin, nodeRoot string
 	}
 
 	var outcome sandboxOutcome
-	if err := json.Unmarshal(rr.data, &outcome); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(rr.data)).Decode(&outcome); err != nil {
 		return hostkit.FunctionInvokeOutput{
 			StatusCode:      200,
 			Payload:         `{"errorType":"MalformedRuntimeOutput","errorMessage":"function returned invalid JSON envelope"}`,

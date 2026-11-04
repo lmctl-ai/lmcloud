@@ -897,4 +897,377 @@ func TestSolR2FnDryNoPinnerIOSafetyJournal(t *testing.T) {
 	}
 }
 
+func TestSolR3FnMappedUnlinkedQuota(t *testing.T) {
+	h, _, _, _ := newFuncHost(t)
+	cfg := solFnConfig(t, h, `import os,ctypes
+def handler(e,c):
+ lib=ctypes.CDLL(None,use_errno=True)
+ lib.mmap.restype=ctypes.c_void_p
+ lib.mmap.argtypes=[ctypes.c_void_p,ctypes.c_size_t,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_long]
+ lib.munmap.argtypes=[ctypes.c_void_p,ctypes.c_size_t]
+ n=12*1024*1024
+ maps=[]
+ try:
+  for i in range(2):
+   p=os.path.join(os.environ['TMPDIR'],'mapped'+str(i))
+   fd=os.open(p,os.O_RDWR|os.O_CREAT,0o600)
+   os.unlink(p)
+   try:
+    os.ftruncate(fd,n)
+    addr=lib.mmap(None,n,3,1,fd,0)
+    if addr==ctypes.c_void_p(-1).value: raise OSError(ctypes.get_errno(),'mmap')
+    maps.append(addr)
+   finally: os.close(fd)
+   ctypes.memset(addr,120,n)
+  return {'mapped_bytes':n*len(maps),'visible_names':os.listdir(os.environ['TMPDIR'])}
+ finally:
+  for addr in maps: lib.munmap(addr,n)
+`)
+	h.FunctionCreate(false, "mappedquota", cfg)
+	out, _ := h.FunctionInvoke(false, "mappedquota", "", "{}", false)
+	t.Logf("last=%+v function_error=%s payload=%s", h.LastError(), out.FunctionError(), out.Payload())
+	if h.LastError().Code != hostkit.OK {
+		t.Fatal(h.LastError())
+	}
+	var v map[string]any
+	_ = json.Unmarshal([]byte(out.Payload()), &v)
+	if n, ok := v["mapped_bytes"].(float64); ok && n > 16*1024*1024 {
+		t.Fatal("mmap retains 24 MiB of unlinked scratch inodes after all descriptors close; aggregate quota bypassed")
+	}
+}
+
+type solR3LatePublish struct {
+	*fakeadapter.Fake
+	entered, release chan struct{}
+}
+
+func (a *solR3LatePublish) PublishFunctionVersion(ctx context.Context, n, r string) (string, error) {
+	v, e := a.Fake.PublishFunctionVersion(ctx, n, r)
+	if e == nil {
+		close(a.entered)
+		<-a.release
+	}
+	return v, e
+}
+
+type solR3LateAlias struct {
+	*fakeadapter.Fake
+	entered, release chan struct{}
+}
+
+func (a *solR3LateAlias) SetFunctionAlias(ctx context.Context, n, alias, ver string) (bool, error) {
+	c, e := a.Fake.SetFunctionAlias(ctx, n, alias, ver)
+	if e == nil {
+		close(a.entered)
+		<-a.release
+	}
+	return c, e
+}
+
+func TestSolR3FnDryCacheMustNotConfirmAmbiguity(t *testing.T) {
+	for _, journalMode := range []bool{false, true} {
+		mode := "campaign"
+		if journalMode {
+			mode = "journal"
+		}
+		t.Run(mode, func(t *testing.T) {
+			h, f, _, campaign := newFuncHost(t)
+			base := Config{Provider: "aws", Functions: f, CampaignStatePath: campaign}
+			var j *safety.Journal
+			if journalMode {
+				_, j, _ = solJournal(t)
+				base.Journal = j
+				base.CampaignStatePath = ""
+				h = New(base)
+				h.SetAbortOnError(false)
+			}
+			c := solFnConfig(t, h, "def handler(e,c): return {'v':1}\n")
+			h.FunctionCreate(false, "cacheambfn", c)
+			slow := &solR3LatePublish{Fake: f, entered: make(chan struct{}), release: make(chan struct{})}
+			aCfg := base
+			aCfg.Functions = slow
+			a := New(aCfg)
+			a.SetAbortOnError(false)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				a.FunctionPublishVersion(false, "cacheambfn", "", false)
+			}()
+			<-slow.entered
+
+			b := New(base)
+			b.SetAbortOnError(false)
+			f.SetFaultMutatorAfterCommitForTesting(func(op string) error {
+				if op == "UpdateFunction" {
+					return hostkit.ProviderError(hostkit.Internal, 0, "LostReply", "synthetic update applied but reply lost")
+				}
+				return nil
+			})
+			c2 := solFnConfig(t, b, "def handler(e,c): return {'v':2}\n")
+			b.FunctionUpdate(false, "cacheambfn", c2, "", false)
+			f.SetFaultMutatorAfterCommitForTesting(nil)
+
+			_, _, before, beforeHas, e := b.cost.lookupFunctionEntry("", "cacheambfn")
+			if e != nil || !beforeHas || before.IntentOp != "update" {
+				close(slow.release)
+				<-done
+				t.Fatal("fixture must retain uncertain update", b.LastError(), beforeHas, before, e)
+			}
+			close(slow.release)
+			<-done
+
+			if journalMode {
+				jDir := filepath.Dir(j.Path())
+				jMeta := j.State().Meta
+				if err := j.Compact(); err != nil {
+					t.Fatalf("Compact: %v", err)
+				}
+				if err := j.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+				reopened, err := safety.OpenJournal(jDir, jMeta)
+				if err != nil {
+					t.Fatalf("Reopen: %v", err)
+				}
+				t.Cleanup(func() { _ = reopened.Close() })
+				base.Journal = reopened
+			}
+
+			replay := New(base)
+			_, _, after, afterHas, e := replay.cost.lookupFunctionEntry("", "cacheambfn")
+			t.Logf("publish_last=%+v update_last=%+v ambiguity_before=%v ambiguity_after=%v remaining=%+v", a.LastError(), b.LastError(), beforeHas, afterHas, after)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if !afterHas || after.IntentOp != "update" {
+				t.Fatal("older publish's dry-cache write confirmed the unrelated uncertain update")
+			}
+		})
+	}
+}
+
+func TestSolR3FnDryCacheDelayedAliasAcrossUncertainDeleteAndRecreate(t *testing.T) {
+	for _, journalMode := range []bool{false, true} {
+		mode := "campaign"
+		if journalMode {
+			mode = "journal"
+		}
+		t.Run(mode, func(t *testing.T) {
+			h, f, _, campaign := newFuncHost(t)
+			base := Config{Provider: "aws", Functions: f, CampaignStatePath: campaign}
+			var j *safety.Journal
+			if journalMode {
+				_, j, _ = solJournal(t)
+				base.Journal = j
+				base.CampaignStatePath = ""
+				h = New(base)
+				h.SetAbortOnError(false)
+			}
+			c := solFnConfig(t, h, "def handler(e,c): return {'v':1}\n")
+			h.FunctionCreate(false, "cachealiasfn", c)
+			ver, _ := h.FunctionPublishVersion(false, "cachealiasfn", "", false)
+			if ver != "1" {
+				t.Fatalf("publish ver=%q err=%+v", ver, h.LastError())
+			}
+
+			// Start delayed alias_set on generation 1, then trigger an uncertain delete.
+			slow := &solR3LateAlias{Fake: f, entered: make(chan struct{}), release: make(chan struct{})}
+			aCfg := base
+			aCfg.Functions = slow
+			a := New(aCfg)
+			a.SetAbortOnError(false)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_ = a.FunctionAliasSet(false, "cachealiasfn", "prod", "1")
+			}()
+			<-slow.entered
+
+			b := New(base)
+			b.SetAbortOnError(false)
+			f.SetFaultMutatorAfterCommitForTesting(func(op string) error {
+				if op == "DeleteFunction" {
+					return hostkit.ProviderError(hostkit.Internal, 0, "LostReply", "synthetic delete applied but reply lost")
+				}
+				return nil
+			})
+			_, _ = b.FunctionDelete(false, "cachealiasfn")
+			f.SetFaultMutatorAfterCommitForTesting(nil)
+
+			close(slow.release)
+			<-done
+
+			if journalMode {
+				jDir := filepath.Dir(j.Path())
+				jMeta := j.State().Meta
+				if err := j.Compact(); err != nil {
+					t.Fatalf("Compact: %v", err)
+				}
+				if err := j.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+				reopened, err := safety.OpenJournal(jDir, jMeta)
+				if err != nil {
+					t.Fatalf("Reopen: %v", err)
+				}
+				t.Cleanup(func() { _ = reopened.Close() })
+				base.Journal = reopened
+			}
+
+			replay := New(base)
+			_, _, after, afterHas, e := replay.cost.lookupFunctionEntry("", "cachealiasfn")
+			if e != nil || !afterHas || after.IntentOp != "delete" {
+				t.Fatalf("delayed alias_set cleared uncertain delete: err=%v afterHas=%v after=%+v", e, afterHas, after)
+			}
+		})
+		t.Run(mode+"_delete_recreate", func(t *testing.T) {
+			h, f, _, campaign := newFuncHost(t)
+			base := Config{Provider: "aws", Functions: f, CampaignStatePath: campaign}
+			var j *safety.Journal
+			if journalMode {
+				_, j, _ = solJournal(t)
+				base.Journal = j
+				base.CampaignStatePath = ""
+				h = New(base)
+				h.SetAbortOnError(false)
+			}
+			c1 := solFnConfig(t, h, "def handler(e,c): return {'v':1}\n")
+			c1.SetTimeoutSeconds(3)
+			c1.SetMemoryMB(128)
+			h.FunctionCreate(false, "cacherecreatefn", c1)
+
+			slow := &solR3LatePublish{Fake: f, entered: make(chan struct{}), release: make(chan struct{})}
+			aCfg := base
+			aCfg.Functions = slow
+			a := New(aCfg)
+			a.SetAbortOnError(false)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, _ = a.FunctionPublishVersion(false, "cacherecreatefn", "", false)
+			}()
+			<-slow.entered
+
+			b := New(base)
+			b.SetAbortOnError(false)
+			_, _ = b.FunctionDelete(false, "cacherecreatefn")
+			c2 := solFnConfig(t, b, "def handler(e,c): return {'v':2}\n")
+			c2.SetTimeoutSeconds(9)
+			c2.SetMemoryMB(256)
+			b.FunctionCreate(false, "cacherecreatefn", c2)
+			if b.LastError().Code != hostkit.OK {
+				close(slow.release)
+				<-done
+				t.Fatalf("delete+recreate failed: %+v", b.LastError())
+			}
+
+			close(slow.release)
+			<-done
+
+			if journalMode {
+				jDir := filepath.Dir(j.Path())
+				jMeta := j.State().Meta
+				if err := j.Compact(); err != nil {
+					t.Fatalf("Compact: %v", err)
+				}
+				if err := j.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+				reopened, err := safety.OpenJournal(jDir, jMeta)
+				if err != nil {
+					t.Fatalf("Reopen: %v", err)
+				}
+				t.Cleanup(func() { _ = reopened.Close() })
+				base.Journal = reopened
+			}
+
+			roCfg := base
+			roCfg.Functions = solR2FunctionsOnly{Functions: f}
+			replay := New(roCfg)
+			replay.SetAbortOnError(false)
+			before := f.Calls()
+			out, _ := replay.FunctionInvoke(true, "cacherecreatefn", "", "{}", false)
+			afterCalls := f.Calls()
+			reads := afterCalls["GetFunction"] - before["GetFunction"] + afterCalls["ListFunctionVersions"] - before["ListFunctionVersions"] + afterCalls["GetFunctionAlias"] - before["GetFunctionAlias"]
+			if replay.LastError().Code != hostkit.OK || reads != 0 {
+				t.Fatalf("dry invoke after recreate failed: last=%+v reads=%d", replay.LastError(), reads)
+			}
+			// Also verify dry preview did not inherit incarnation 1's published version "1".
+			_, _ = replay.FunctionInvoke(true, "cacherecreatefn", "1", "{}", true)
+			if replay.LastError().Code != hostkit.NotFound {
+				t.Fatalf("expected version 1 from stale incarnation to be absent in incarnation 2 preview; got %+v (out=%+v)", replay.LastError(), out)
+			}
+		})
+	}
+}
+
+func TestSolR3FnSanitizedCacheIsNotReadback(t *testing.T) {
+	for _, journalMode := range []bool{false, true} {
+		mode := "campaign"
+		if journalMode {
+			mode = "journal"
+		}
+		t.Run(mode, func(t *testing.T) {
+			_, f, _, campaign := newFuncHost(t)
+			base := Config{Provider: "aws", Functions: solR2FunctionsOnly{Functions: f}, CampaignStatePath: campaign}
+			if journalMode {
+				_, j, _ := solJournal(t)
+				base.Journal = j
+				base.CampaignStatePath = ""
+			}
+			h := New(base)
+			h.SetAbortOnError(false)
+			cfg := solFnConfig(t, h, "def handler(e,c): return {}\n")
+			cfg.SetEnv("APP_ENV", "test-fixture-value")
+			h.FunctionCreate(false, "readcachefn", cfg)
+
+			h2 := New(base)
+			h2.SetAbortOnError(false)
+			got, _ := h2.FunctionGet(true, "readcachefn", "", false)
+			t.Logf("last=%+v inline_bytes=%d has_env=%v", h2.LastError(), len(got.InlineCode()), got.HasEnv("APP_ENV"))
+			if got.InlineCode() == "" || !got.HasEnv("APP_ENV") {
+				t.Fatal("sanitized journal preview replaced complete readback configuration")
+			}
+		})
+	}
+}
+
+func TestSolR3FnManyDescriptorsAndSparseQuota(t *testing.T) {
+	for _, mode := range []string{"manyfds", "sparse"} {
+		t.Run(mode, func(t *testing.T) {
+			h, _, _, _ := newFuncHost(t)
+			cfg := solFnConfig(t, h, `import os
+def handler(e,c):
+ fds=[]
+ blocked=0
+ n=1048576 if e['mode']=='manyfds' else 8*1048576
+ try:
+  for i in range(20 if e['mode']=='manyfds' else 3):
+   p=os.path.join(os.environ['TMPDIR'],'fd'+str(i))
+   fd=os.open(p,os.O_RDWR|os.O_CREAT,0o600)
+   os.unlink(p)
+   fds.append(fd)
+   try:
+    if e['mode']=='manyfds': os.write(fd,b'x'*n)
+    else: os.ftruncate(fd,n)
+   except OSError as ex:
+    blocked=ex.errno
+    break
+  return {'held_bytes':sum(os.fstat(fd).st_size for fd in fds),'fds':len(fds),'blocked':blocked}
+ finally:
+  for fd in fds: os.close(fd)
+`)
+			h.FunctionCreate(false, "manyquota", cfg)
+			out, _ := h.FunctionInvoke(false, "manyquota", "", `{"mode":"`+mode+`"}`, false)
+			t.Logf("last=%+v function_error=%s payload=%s", h.LastError(), out.FunctionError(), out.Payload())
+			var v map[string]any
+			_ = json.Unmarshal([]byte(out.Payload()), &v)
+			n, ok := v["held_bytes"].(float64)
+			b, bok := v["blocked"].(float64)
+			if h.LastError().Code != hostkit.OK || !ok || !bok || n > 16*1048576 || b == 0 {
+				t.Fatal("aggregate fd/sparse bound not enforced", out.Payload())
+			}
+		})
+	}
+}
 

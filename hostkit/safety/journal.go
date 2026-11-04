@@ -56,9 +56,10 @@ const (
 	EventPolicyIntent    = "policy_intent"
 	EventPolicyAttach    = "policy_attach"
 	EventPolicyDetach    = "policy_detach"
-	EventFunctionIntent  = "function_intent"
-	EventFunctionConfirm = "function_confirm"
-	EventFunctionDelete  = "function_delete"
+	EventFunctionIntent       = "function_intent"
+	EventFunctionConfirm      = "function_confirm"
+	EventFunctionPreviewState = "function_preview_state"
+	EventFunctionDelete       = "function_delete"
 
 	// Resource lifecycle states after journal replay.
 	StatePending   = "pending"
@@ -1359,6 +1360,27 @@ func (j *Journal) RecordFunctionConfirmWithState(scope, name, digest, ownerToken
 	})
 }
 
+// RecordFunctionPreviewState durably appends a non-authoritative EventFunctionPreviewState record
+// updating the cached dry-invocation preview descriptor for a function only when the active
+// committed entry still matches (expOwnerToken, expDigest, expGeneration) and has no pending ambiguity.
+func (j *Journal) RecordFunctionPreviewState(scope, name, expOwnerToken, expDigest, expGeneration, stateJSON string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	return j.appendLocked(JournalRecord{
+		Event:         EventFunctionPreviewState,
+		Kind:          KindFunction,
+		PolicyScope:   scope,
+		Name:          name,
+		ETag:          expDigest,
+		CreateToken:   expOwnerToken,
+		Generation:    expGeneration,
+		FunctionState: stateJSON,
+	})
+}
+
 // RecordFunctionDelete durably appends an EventFunctionDelete record confirming function removal.
 func (j *Journal) RecordFunctionDelete(scope, name, ownerToken, generation, intentID string) error {
 	j.mu.Lock()
@@ -2424,6 +2446,27 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 			return errors.New("function_confirm function_state exceeds maximum size")
 		}
 		return nil
+	case EventFunctionPreviewState:
+		if rec.Kind != KindFunction {
+			return fmt.Errorf("function_preview_state record must have kind %q (got %q)", KindFunction, rec.Kind)
+		}
+		if hasControlChars(rec.PolicyScope) || rec.Name == "" || len(rec.Name) > 64 || hasControlChars(rec.Name) {
+			return fmt.Errorf("invalid function_preview_state scope/name %q/%q", rec.PolicyScope, rec.Name)
+		}
+		if err := ValidateToken128(rec.CreateToken); err != nil {
+			return fmt.Errorf("function_preview_state owner_token (create_token): %w", err)
+		}
+		genNum, err := strconv.ParseUint(rec.Generation, 10, 64)
+		if err != nil || genNum == 0 {
+			return fmt.Errorf("function_preview_state requires positive uint64 generation (got %q)", rec.Generation)
+		}
+		if hasControlChars(rec.ETag) || len(rec.ETag) > 512 {
+			return fmt.Errorf("invalid function_preview_state digest %q", rec.ETag)
+		}
+		if len(rec.FunctionState) > 256*1024 {
+			return errors.New("function_preview_state function_state exceeds maximum size")
+		}
+		return nil
 	case EventFunctionDelete:
 		if rec.Kind != KindFunction {
 			return fmt.Errorf("function_delete record must have kind %q (got %q)", KindFunction, rec.Kind)
@@ -3086,6 +3129,24 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		state.FunctionTombstones[fKey] = jfe
 		if rec.CleanupReserveNanoUSD > 0 {
 			state.ActiveCleanup[resourceKey(KindFunction, rec.PolicyScope, rec.Name)] = rec.CleanupReserveNanoUSD
+		}
+		return nil
+	}
+	if rec.Event == EventFunctionPreviewState {
+		fKey := scopedFunctionKey(rec.PolicyScope, rec.Name)
+		act, hasAct := state.ActiveFunctions[fKey]
+		_, hasAmb := state.AmbiguousFunctions[fKey]
+		if !hasAct || hasAmb || len(state.AmbiguousFunctionStack[fKey]) > 0 {
+			return nil
+		}
+		if act.OwnerToken != rec.CreateToken || act.Digest != rec.ETag || act.Generation != rec.Generation {
+			return nil
+		}
+		act.StateJSON = rec.FunctionState
+		state.ActiveFunctions[fKey] = act
+		if tb, hasTb := state.FunctionTombstones[fKey]; hasTb && tb.OwnerToken == act.OwnerToken && tb.Generation == act.Generation {
+			tb.StateJSON = rec.FunctionState
+			state.FunctionTombstones[fKey] = tb
 		}
 		return nil
 	}

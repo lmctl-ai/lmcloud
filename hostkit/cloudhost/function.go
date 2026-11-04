@@ -815,23 +815,21 @@ func (h *Host) dryResolveFunctionInternal(ctx context.Context, name string, allo
 		h.ov(ctx).setFunction(name, df)
 		return df, nil
 	}
-	if hasAct && act.StateJSON != "" {
-		if st, ok := decodePersistedDryFunctionState(act.StateJSON); ok {
-			df := dryFunction{
-				exists:          true,
-				completeAliases: true,
-				snap:            st.Snap,
-				versions:        st.Versions,
-				versionOrder:    st.VersionOrder,
-				aliases:         st.Aliases,
-				deletedAliases:  map[string]bool{},
-				createdNow:      false,
-			}
-			h.ov(ctx).setFunction(name, df)
-			return df, nil
-		}
-	}
 	if !allowAdapterRead {
+		if hasAct && act.StateJSON != "" {
+			if st, ok := decodePersistedDryFunctionState(act.StateJSON); ok {
+				return dryFunction{
+					exists:          true,
+					completeAliases: true,
+					snap:            st.Snap,
+					versions:        st.Versions,
+					versionOrder:    st.VersionOrder,
+					aliases:         st.Aliases,
+					deletedAliases:  map[string]bool{},
+					createdNow:      false,
+				}, nil
+			}
+		}
 		return dryFunction{exists: false, completeAliases: true}, nil
 	}
 	snap, err := h.cfg.Functions.GetFunction(ctx, name, "$LATEST")
@@ -849,6 +847,14 @@ func (h *Host) dryResolveFunctionInternal(ctx context.Context, name string, allo
 		aliases:        map[string]string{},
 		deletedAliases: map[string]bool{},
 		createdNow:     false,
+	}
+	if hasAct && act.StateJSON != "" {
+		if st, ok := decodePersistedDryFunctionState(act.StateJSON); ok {
+			for k, v := range st.Aliases {
+				df.aliases[k] = v
+			}
+			df.completeAliases = true
+		}
 	}
 	if vers, verr := h.cfg.Functions.ListFunctionVersions(ctx, name); verr == nil {
 		df.versionOrder = append([]string(nil), vers...)
@@ -1790,7 +1796,7 @@ func (h *Host) FunctionPublishVersion(dry bool, name, expectRevision string, has
 		failed = true
 		return "", h.fail(op, name, ce)
 	}
-	if cerr := h.cost.updateFunctionDryState(ep, name, func(cur string) string {
+	if cerr := h.cost.updateFunctionDryState(ep, name, act.OwnerToken, act.Digest, act.Generation, func(cur string) string {
 		st, ok := decodePersistedDryFunctionState(cur)
 		if !ok {
 			return cur
@@ -2043,7 +2049,7 @@ func (h *Host) FunctionAliasSet(dry bool, name, alias, version string) error {
 		failed = true
 		return h.fail(op, name, ce)
 	}
-	if cerr := h.cost.updateFunctionDryState(ep, name, func(cur string) string {
+	if cerr := h.cost.updateFunctionDryState(ep, name, act.OwnerToken, act.Digest, act.Generation, func(cur string) string {
 		st, ok := decodePersistedDryFunctionState(cur)
 		if !ok {
 			return cur
@@ -2266,7 +2272,7 @@ func (h *Host) FunctionAliasDelete(dry bool, name, alias string) (bool, error) {
 		failed = true
 		return false, h.fail(op, name, ce)
 	}
-	if cerr := h.cost.updateFunctionDryState(ep, name, func(cur string) string {
+	if cerr := h.cost.updateFunctionDryState(ep, name, act.OwnerToken, act.Digest, act.Generation, func(cur string) string {
 		st, ok := decodePersistedDryFunctionState(cur)
 		if !ok {
 			return cur
