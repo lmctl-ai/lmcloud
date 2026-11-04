@@ -169,4 +169,23 @@ func (g guardTables) DescribeTable(ctx context.Context, table string) (hostkit.T
 	return v, hostkit.NilIfTyped(err)
 }
 
+type guardPermissions struct{ p hostkit.Permissions }
+
+func (g guardPermissions) CurrentPrincipal(ctx context.Context) (string, error) {
+	v, err := g.p.CurrentPrincipal(ctx)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardPermissions) AttachPolicy(ctx context.Context, att hostkit.PolicyAttachment) error {
+	return hostkit.NilIfTyped(g.p.AttachPolicy(ctx, att))
+}
+
+func (g guardPermissions) DetachPolicy(ctx context.Context, kind hostkit.AttachmentKind, target, principal string) error {
+	return hostkit.NilIfTyped(g.p.DetachPolicy(ctx, kind, target, principal))
+}
+
+func (g guardPermissions) CheckPolicy(ctx context.Context, principal, action, resource string) error {
+	return hostkit.NilIfTyped(g.p.CheckPolicy(ctx, principal, action, resource))
+}
+
 var errNoToken = hostkit.ProviderError(hostkit.Internal, 0, "", "adapter does not store create tokens")

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -134,6 +135,8 @@ func serviceForOp(op string) string {
 		return "queue"
 	case strings.HasPrefix(op, "table_"), strings.HasPrefix(op, "item_"):
 		return "tables"
+	case op == "principal_current", strings.HasPrefix(op, "policy_"):
+		return "permissions"
 	default:
 		return "cloud"
 	}
@@ -207,6 +210,12 @@ type campaignJournalRecord struct {
 	LockCleanup              bool   `json:"lock_cleanup,omitempty"`
 	ReleaseCleanup           bool   `json:"release_cleanup,omitempty"`
 	WorkCapNanoUSD           int64  `json:"work_cap_nano_usd,omitempty"`
+	PolicyKind               string `json:"policy_kind,omitempty"`
+	PolicyTarget             string `json:"policy_target,omitempty"`
+	PolicyPrincipal          string `json:"policy_principal,omitempty"`
+	PolicyDocument           string `json:"policy_document,omitempty"`
+	OwnerToken               string `json:"owner_token,omitempty"`
+	Generation               string `json:"generation,omitempty"`
 }
 
 type replayedCampaignState struct {
@@ -222,6 +231,7 @@ type replayedCampaignState struct {
 	activeQueues           map[string]int64
 	activeTables           map[string]int64
 	activeItems            map[string]int64
+	activePolicies         map[string]hostkit.PolicyAttachment
 	pending                map[string]campaignJournalRecord
 }
 
@@ -312,6 +322,7 @@ type costTracker struct {
 	activeQueues     map[string]int64
 	activeTables     map[string]int64
 	activeItems      map[string]int64
+	activePolicies   map[string]hostkit.PolicyAttachment
 	inFlightAttempts map[string]bool
 }
 
@@ -320,6 +331,13 @@ func isTablesOp(op, resKind string) bool {
 		return true
 	}
 	return strings.HasPrefix(op, "table_") || strings.HasPrefix(op, "item_")
+}
+
+func isPermissionsOp(op, resKind string) bool {
+	if resKind == safety.KindPolicyAttachment {
+		return true
+	}
+	return op == "principal_current" || strings.HasPrefix(op, "policy_")
 }
 
 func hasTableChildItems(activeItems map[string]int64, table string) bool {
@@ -450,6 +468,7 @@ func newCostTracker(cfg Config) *costTracker {
 		activeQueues:     map[string]int64{},
 		activeTables:     map[string]int64{},
 		activeItems:      map[string]int64{},
+		activePolicies:   map[string]hostkit.PolicyAttachment{},
 		inFlightAttempts: map[string]bool{},
 	}
 
@@ -699,15 +718,38 @@ func (ct *costTracker) defaultBillingUnits(op string, bytes int64) int64 {
 	return units
 }
 
+func deleteResourcePolicyAttachments(policies map[string]hostkit.PolicyAttachment, resKind, resKey string) {
+	if len(policies) == 0 || resKey == "" {
+		return
+	}
+	var target string
+	switch resKind {
+	case safety.KindBucket:
+		target = "storage:bucket:" + resKey
+	case safety.KindQueue:
+		target = "queue:queue:" + resKey
+	case safety.KindTable:
+		target = "tables:table:" + resKey
+	default:
+		return
+	}
+	for k, pa := range policies {
+		if pa.Kind == hostkit.AttachmentResource && pa.Target == target {
+			delete(policies, k)
+		}
+	}
+}
+
 func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, error) {
 	st := &replayedCampaignState{
-		ops:           map[string]persistedOpCost{},
-		activeBuckets: map[string]int64{},
-		activeObjects: map[string]int64{},
-		activeQueues:  map[string]int64{},
-		activeTables:  map[string]int64{},
-		activeItems:   map[string]int64{},
-		pending:       map[string]campaignJournalRecord{},
+		ops:            map[string]persistedOpCost{},
+		activeBuckets:  map[string]int64{},
+		activeObjects:  map[string]int64{},
+		activeQueues:   map[string]int64{},
+		activeTables:   map[string]int64{},
+		activeItems:    map[string]int64{},
+		activePolicies: map[string]hostkit.PolicyAttachment{},
+		pending:        map[string]campaignJournalRecord{},
 	}
 	if len(raw) == 0 {
 		return st, nil
@@ -842,6 +884,7 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 				}
 			}
 			if rec.ReleaseCleanup && p.ResKey != "" {
+				deleteResourcePolicyAttachments(st.activePolicies, p.ResKind, p.ResKey)
 				switch p.ResKind {
 				case safety.KindBucket:
 					delete(st.activeBuckets, p.ResKey)
@@ -861,6 +904,60 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 					delete(st.activeItems, p.ResKey)
 				}
 			}
+		case safety.EventPolicyAttach:
+			pKind := hostkit.AttachmentKind(rec.PolicyKind)
+			if pKind != hostkit.AttachmentResource && pKind != hostkit.AttachmentPrincipal {
+				return nil, fmt.Errorf("corrupt campaign journal policy_attach kind %q", rec.PolicyKind)
+			}
+			if pKind == hostkit.AttachmentResource && rec.PolicyTarget == "" {
+				return nil, errors.New("corrupt campaign journal policy_attach missing target")
+			}
+			if pKind == hostkit.AttachmentPrincipal && rec.PolicyTarget != "" {
+				return nil, errors.New("corrupt campaign journal policy_attach unexpected target on principal attachment")
+			}
+			if rec.PolicyPrincipal == "" || rec.PolicyDocument == "" || rec.Generation == "" {
+				return nil, errors.New("corrupt campaign journal policy_attach missing principal, document, or generation")
+			}
+			if genNum, err := strconv.ParseUint(rec.Generation, 10, 64); err != nil || genNum == 0 {
+				return nil, fmt.Errorf("corrupt campaign journal policy_attach generation %q", rec.Generation)
+			}
+			if err := safety.ValidateToken128(rec.OwnerToken); err != nil {
+				return nil, fmt.Errorf("corrupt campaign journal policy_attach owner_token: %w", err)
+			}
+			stmts, canonical, cerr := hostkit.ParsePolicyDocument(rec.PolicyDocument, hostkit.Validator{})
+			if cerr != nil {
+				return nil, fmt.Errorf("corrupt campaign journal policy_attach document: %w", cerr)
+			}
+			pKey := hostkit.AttachmentKey(pKind, rec.PolicyTarget, rec.PolicyPrincipal)
+			if _, exists := st.activePolicies[pKey]; !exists && len(st.activePolicies) >= hostkit.MaxAttachmentsPerRun {
+				return nil, errors.New("corrupt campaign journal policy_attach exceeds MaxAttachmentsPerRun")
+			}
+			st.activePolicies[pKey] = hostkit.PolicyAttachment{
+				Key:        pKey,
+				Kind:       pKind,
+				Target:     rec.PolicyTarget,
+				Principal:  rec.PolicyPrincipal,
+				Document:   canonical,
+				Statements: stmts,
+				OwnerToken: rec.OwnerToken,
+				Generation: rec.Generation,
+			}
+		case safety.EventPolicyDetach:
+			pKind := hostkit.AttachmentKind(rec.PolicyKind)
+			if pKind != hostkit.AttachmentResource && pKind != hostkit.AttachmentPrincipal {
+				return nil, fmt.Errorf("corrupt campaign journal policy_detach kind %q", rec.PolicyKind)
+			}
+			if pKind == hostkit.AttachmentResource && rec.PolicyTarget == "" {
+				return nil, errors.New("corrupt campaign journal policy_detach missing target")
+			}
+			if pKind == hostkit.AttachmentPrincipal && rec.PolicyTarget != "" {
+				return nil, errors.New("corrupt campaign journal policy_detach unexpected target on principal detach")
+			}
+			if rec.PolicyPrincipal == "" {
+				return nil, errors.New("corrupt campaign journal policy_detach missing principal")
+			}
+			pKey := hostkit.AttachmentKey(pKind, rec.PolicyTarget, rec.PolicyPrincipal)
+			delete(st.activePolicies, pKey)
 		default:
 			return nil, fmt.Errorf("corrupt campaign journal: unknown event %q", rec.Event)
 		}
@@ -909,6 +1006,10 @@ func (ct *costTracker) applyReplayedStateLocked(st *replayedCampaignState) {
 	ct.activeItems = make(map[string]int64, len(st.activeItems))
 	for k, v := range st.activeItems {
 		ct.activeItems[k] = v
+	}
+	ct.activePolicies = make(map[string]hostkit.PolicyAttachment, len(st.activePolicies))
+	for k, v := range st.activePolicies {
+		ct.activePolicies[k] = v
 	}
 
 	charged := st.chargedNanoUSD
@@ -1097,6 +1198,28 @@ func (ct *costTracker) syncFromSafetyJournalLocked() {
 			ChargedNanoUSD: stat.ChargedNanoUSD,
 		}
 	}
+	ct.activePolicies = make(map[string]hostkit.PolicyAttachment, len(st.PolicyAttachments))
+	for k, pa := range st.PolicyAttachments {
+		stmts, canonical, cerr := hostkit.ParsePolicyDocument(pa.Document, hostkit.Validator{})
+		if cerr != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalCorrupt", cerr.Error())
+			return
+		}
+		genStr := pa.Generation
+		if genStr == "" {
+			genStr = "1"
+		}
+		ct.activePolicies[k] = hostkit.PolicyAttachment{
+			Key:        k,
+			Kind:       hostkit.AttachmentKind(pa.Kind),
+			Target:     pa.Target,
+			Principal:  pa.Principal,
+			Document:   canonical,
+			Statements: stmts,
+			OwnerToken: pa.OwnerToken,
+			Generation: genStr,
+		}
+	}
 }
 
 func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey string) (*safety.AttemptReservation, string, *hostkit.CloudError) {
@@ -1123,6 +1246,9 @@ func (ct *costTracker) reserveForOp(recordOp string, in safety.AttemptPricingInp
 			return nil, "", ct.poisoned
 		}
 		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return nil, "", ct.poisoned
+		}
 		res, err := ct.meter.ReserveAttempt(in)
 		if err != nil {
 			if errors.Is(err, safety.ErrCostCapExceeded) {
@@ -1135,7 +1261,7 @@ func (ct *costTracker) reserveForOp(recordOp string, in safety.AttemptPricingInp
 			}
 			return nil, "", hostkit.ProviderError(hostkit.Internal, 0, "PricingFailure", err.Error())
 		}
-		if ct.liveGuard != nil || (ct.liveMode && isTablesOp(in.Operation, resKind)) {
+		if ct.liveGuard != nil || (ct.liveMode && (isTablesOp(in.Operation, resKind) || isPermissionsOp(in.Operation, resKind))) {
 			res.Release()
 			return nil, "", hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveGuardRequired",
 				fmt.Sprintf("live mode refuses unguarded adapter for %s (%s): LiveGuard ownership and recovery enforcement is required", in.Operation, resKind))
@@ -1155,7 +1281,7 @@ func (ct *costTracker) reserveForOp(recordOp string, in safety.AttemptPricingInp
 		return res, attID, nil
 	}
 
-	if ct.liveGuard != nil || (ct.liveMode && isTablesOp(in.Operation, resKind)) {
+	if ct.liveGuard != nil || (ct.liveMode && (isTablesOp(in.Operation, resKind) || isPermissionsOp(in.Operation, resKind))) {
 		return nil, "", hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveGuardRequired",
 			fmt.Sprintf("live mode refuses unguarded adapter for %s (%s): LiveGuard ownership and recovery enforcement is required", in.Operation, resKind))
 	}
@@ -1442,6 +1568,7 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 				st.resourceCleanupNanoUSD += res.Quote().CleanupReserveNanoUSD
 			}
 			if releaseCleanup {
+				deleteResourcePolicyAttachments(st.activePolicies, resKind, resKey)
 				switch resKind {
 				case safety.KindBucket:
 					if v, ok := st.activeBuckets[resKey]; ok {
@@ -1528,6 +1655,7 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 	if opSucceeded {
 		switch op {
 		case "bucket_delete":
+			deleteResourcePolicyAttachments(ct.activePolicies, safety.KindBucket, resKey)
 			if v, exists := ct.activeBuckets[resKey]; exists {
 				delete(ct.activeBuckets, resKey)
 				ct.meter.ReleaseResourceCleanup(v)
@@ -1538,11 +1666,13 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 				ct.meter.ReleaseResourceCleanup(v)
 			}
 		case "queue_delete":
+			deleteResourcePolicyAttachments(ct.activePolicies, safety.KindQueue, resKey)
 			if v, exists := ct.activeQueues[resKey]; exists {
 				delete(ct.activeQueues, resKey)
 				ct.meter.ReleaseResourceCleanup(v)
 			}
 		case "table_delete":
+			deleteResourcePolicyAttachments(ct.activePolicies, safety.KindTable, resKey)
 			if v, exists := ct.activeTables[resKey]; exists {
 				delete(ct.activeTables, resKey)
 				ct.meter.ReleaseResourceCleanup(v)
@@ -1573,6 +1703,273 @@ func (ct *costTracker) settle(res *safety.AttemptReservation, attemptID, op stri
 		return excessErr
 	}
 	return nil
+}
+
+func (ct *costTracker) refreshStateLocked() *hostkit.CloudError {
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		return ct.poisoned
+	}
+	if ct.statePath != "" {
+		if err := ct.withLockedCampaignJournal(false, nil); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalCorrupt", err.Error())
+			return ct.poisoned
+		}
+	}
+	return nil
+}
+
+func (ct *costTracker) isOwnedResource(resKind, resKey string) (bool, *hostkit.CloudError) {
+	if resKey == "" {
+		return false, nil
+	}
+	if resKind == safety.KindBucket {
+		if fb := strings.TrimSpace(os.Getenv("LMCLOUD_FOREIGN_BUCKET")); fb != "" && resKey == fb {
+			return false, nil
+		}
+	}
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if cerr := ct.refreshStateLocked(); cerr != nil {
+		return false, cerr
+	}
+	if ct.journal != nil {
+		st := ct.journal.State()
+		if e, ok := st.Lookup(resKind, "", resKey); ok && e.State != safety.StateDeleted {
+			return true, nil
+		}
+		if _, ok := st.ActiveCleanup[resKind+"\x00\x00"+resKey]; ok {
+			return true, nil
+		}
+		return false, nil
+	}
+	switch resKind {
+	case safety.KindBucket:
+		_, ok := ct.activeBuckets[resKey]
+		return ok, nil
+	case safety.KindQueue:
+		_, ok := ct.activeQueues[resKey]
+		return ok, nil
+	case safety.KindTable:
+		_, ok := ct.activeTables[resKey]
+		return ok, nil
+	default:
+		return false, nil
+	}
+}
+
+func nextGenerationString(prev string) string {
+	n, err := strconv.ParseUint(prev, 10, 64)
+	if err != nil || n == 0 {
+		return "1"
+	}
+	return strconv.FormatUint(n+1, 10)
+}
+
+func (ct *costTracker) checkPolicyAttachHeadroom(kind hostkit.AttachmentKind, target, principal string) *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if cerr := ct.refreshStateLocked(); cerr != nil {
+		return cerr
+	}
+	key := hostkit.AttachmentKey(kind, target, principal)
+	if _, exists := ct.activePolicies[key]; !exists && len(ct.activePolicies) >= hostkit.MaxAttachmentsPerRun {
+		return hostkit.ProviderError(hostkit.InvalidArgument, 0, "AttachmentLimitExceeded",
+			fmt.Sprintf("run attachment count exceeds maximum (%d)", hostkit.MaxAttachmentsPerRun))
+	}
+	return nil
+}
+
+func (ct *costTracker) preparePolicyAttachment(kind hostkit.AttachmentKind, target, principal string, stmts []hostkit.PolicyStatement, rawDoc string) (hostkit.PolicyAttachment, *hostkit.CloudError) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if cerr := ct.refreshStateLocked(); cerr != nil {
+		return hostkit.PolicyAttachment{}, cerr
+	}
+	key := hostkit.AttachmentKey(kind, target, principal)
+	existing, exists := ct.activePolicies[key]
+	if !exists && len(ct.activePolicies) >= hostkit.MaxAttachmentsPerRun {
+		return hostkit.PolicyAttachment{}, hostkit.ProviderError(hostkit.InvalidArgument, 0, "AttachmentLimitExceeded",
+			fmt.Sprintf("run attachment count exceeds maximum (%d)", hostkit.MaxAttachmentsPerRun))
+	}
+	ownerToken := existing.OwnerToken
+	gen := existing.Generation
+	if !exists || ownerToken == "" {
+		ownerToken = safety.NewToken128()
+		gen = "1"
+	} else if existing.Document != rawDoc {
+		gen = nextGenerationString(existing.Generation)
+	}
+	if gen == "" {
+		gen = "1"
+	}
+	clonedStmts := make([]hostkit.PolicyStatement, len(stmts))
+	for i, s := range stmts {
+		clonedStmts[i] = s.Clone()
+	}
+	return hostkit.PolicyAttachment{
+		Key:        key,
+		Kind:       kind,
+		Target:     target,
+		Principal:  principal,
+		Document:   rawDoc,
+		Statements: clonedStmts,
+		OwnerToken: ownerToken,
+		Generation: gen,
+	}, nil
+}
+
+func (ct *costTracker) recordPolicyAttach(att hostkit.PolicyAttachment) *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	key := hostkit.AttachmentKey(att.Kind, att.Target, att.Principal)
+	att.Key = key
+
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return ct.poisoned
+		}
+		if _, exists := ct.activePolicies[key]; !exists && len(ct.activePolicies) >= hostkit.MaxAttachmentsPerRun {
+			return hostkit.ProviderError(hostkit.InvalidArgument, 0, "AttachmentLimitExceeded",
+				fmt.Sprintf("run attachment count exceeds maximum (%d)", hostkit.MaxAttachmentsPerRun))
+		}
+		genStr := att.Generation
+		if genStr == "" {
+			genStr = "1"
+		}
+		if err := ct.journal.RecordPolicyAttach(string(att.Kind), att.Target, att.Principal, att.Document, att.OwnerToken, genStr); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		return ct.poisoned
+	}
+
+	if ct.statePath != "" {
+		var cerr *hostkit.CloudError
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			existing, exists := st.activePolicies[key]
+			if !exists && len(st.activePolicies) >= hostkit.MaxAttachmentsPerRun {
+				cerr = hostkit.ProviderError(hostkit.InvalidArgument, 0, "AttachmentLimitExceeded",
+					fmt.Sprintf("run attachment count exceeds maximum (%d)", hostkit.MaxAttachmentsPerRun))
+				return nil
+			}
+			if exists && existing.OwnerToken != "" {
+				att.OwnerToken = existing.OwnerToken
+				if existing.Document == att.Document {
+					att.Generation = existing.Generation
+				} else {
+					att.Generation = nextGenerationString(existing.Generation)
+				}
+			}
+			if att.Generation == "" {
+				att.Generation = "1"
+			}
+			if err := appendRec(campaignJournalRecord{
+				Event:           safety.EventPolicyAttach,
+				PolicyKind:      string(att.Kind),
+				PolicyTarget:    att.Target,
+				PolicyPrincipal: att.Principal,
+				PolicyDocument:  att.Document,
+				OwnerToken:      att.OwnerToken,
+				Generation:      att.Generation,
+			}); err != nil {
+				return err
+			}
+			st.activePolicies[key] = att.Clone()
+			ct.applyReplayedStateLocked(st)
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		return cerr
+	}
+
+	if _, exists := ct.activePolicies[key]; !exists && len(ct.activePolicies) >= hostkit.MaxAttachmentsPerRun {
+		return hostkit.ProviderError(hostkit.InvalidArgument, 0, "AttachmentLimitExceeded",
+			fmt.Sprintf("run attachment count exceeds maximum (%d)", hostkit.MaxAttachmentsPerRun))
+	}
+	ct.activePolicies[key] = att.Clone()
+	return nil
+}
+
+func (ct *costTracker) recordPolicyDetach(kind hostkit.AttachmentKind, target, principal string) *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	key := hostkit.AttachmentKey(kind, target, principal)
+
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		if err := ct.journal.RecordPolicyDetach(string(kind), target, principal); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		return ct.poisoned
+	}
+
+	if ct.statePath != "" {
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			if err := appendRec(campaignJournalRecord{
+				Event:           safety.EventPolicyDetach,
+				PolicyKind:      string(kind),
+				PolicyTarget:    target,
+				PolicyPrincipal: principal,
+			}); err != nil {
+				return err
+			}
+			delete(st.activePolicies, key)
+			ct.applyReplayedStateLocked(st)
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		return nil
+	}
+
+	delete(ct.activePolicies, key)
+	return nil
+}
+
+func (ct *costTracker) listPolicyAttachments() ([]hostkit.PolicyAttachment, *hostkit.CloudError) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if cerr := ct.refreshStateLocked(); cerr != nil {
+		return nil, cerr
+	}
+	keys := make([]string, 0, len(ct.activePolicies))
+	for k := range ct.activePolicies {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]hostkit.PolicyAttachment, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, ct.activePolicies[k].Clone())
+	}
+	return out, nil
 }
 
 func (ct *costTracker) lockResourceCleanupIfNeeded(op, resKind, resKey string) {

@@ -54,8 +54,22 @@ func TestConformanceOpenMode(t *testing.T) {
 	bin := lmscript(t)
 	ref := buildRef(t)
 	out := runConformance(t, ref, []string{"LMSCRIPT_BIN=" + bin, "LMCLOUD_REF_STATE=" + filepath.Join(t.TempDir(), "s.json")})
-	if !strings.Contains(out, "# pass 49 / 49, skip 3, fail 0") && !strings.Contains(out, "# pass 35 / 49, skip 16, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 2, fail 0") {
+	if !strings.Contains(out, "# pass 62 / 75, skip 18, fail 0") && !strings.Contains(out, "# pass 75 / 75, skip 18, fail 0") && !strings.Contains(out, "# pass 49 / 49, skip 3, fail 0") && !strings.Contains(out, "# pass 35 / 49, skip 16, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 2, fail 0") {
 		t.Fatalf("unexpected summary:\n%s", out)
+	}
+}
+
+func TestConformancePermissionsSlice(t *testing.T) {
+	bin := lmscript(t)
+	ref := buildRef(t)
+	cmd := exec.Command(filepath.Join(repoRoot(t), "tests", "run-conformance.sh"), ref, "", "permissions")
+	cmd.Env = append(os.Environ(), "LMSCRIPT_BIN="+bin, "LMCLOUD_REF_STATE="+filepath.Join(t.TempDir(), "s.json"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("permissions conformance failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "# pass 13 / 13, skip 2, fail 0") {
+		t.Fatalf("unexpected permissions summary:\n%s", out)
 	}
 }
 
@@ -115,7 +129,7 @@ func TestConformanceEnforcedMode(t *testing.T) {
 		"LMGCP_SIM_TOKEN=allow-token",
 		"LMCLOUD_ENFORCE_DENIED_GCP_TOKEN=deny-token",
 	})
-	if !strings.Contains(out, "# pass 49 / 49, skip 0, fail 0") && !strings.Contains(out, "# pass 35 / 49, skip 14, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 0, fail 0") {
+	if !strings.Contains(out, "# pass 62 / 75, skip 14, fail 0") && !strings.Contains(out, "# pass 75 / 75, skip 14, fail 0") && !strings.Contains(out, "# pass 49 / 49, skip 0, fail 0") && !strings.Contains(out, "# pass 35 / 49, skip 14, fail 0") && !strings.Contains(out, "# pass 25 / 25, skip 0, fail 0") {
 		t.Fatalf("unexpected summary:\n%s", out)
 	}
 }
@@ -136,6 +150,10 @@ func TestDryRunThroughCompilerMakesNoMutations(t *testing.T) {
 		"tables/01-table-lifecycle.lms",
 		"tables/03-item-put-get-delete.lms",
 		"tables/05-item-update-partial.lms",
+		"permissions/05-attach-resource-grants-check.lms",
+		"permissions/06-deny-overrides-allow.lms",
+		"permissions/07-attach-principal-identity.lms",
+		"permissions/08-detach-revokes.lms",
 	}
 	calls := regexp.MustCompile(`mutator_calls=(\d+)`)
 	for _, s := range scenarios {
@@ -180,6 +198,18 @@ func TestSchemaAndSignatureParity(t *testing.T) {
 				strings.HasPrefix(line, "method TablePage.") ||
 				strings.HasPrefix(line, "method Cloud.table_") ||
 				strings.HasPrefix(line, "method Cloud.item_") {
+				continue
+			}
+			filtered = append(filtered, line)
+		}
+		want = strings.Join(filtered, "\n")
+	}
+	if strings.Contains(string(capsRaw), "lmcloud-ref:function=pending(") {
+		var filtered []string
+		for _, line := range strings.Split(want, "\n") {
+			if strings.HasPrefix(line, "method FunctionConfig.") ||
+				strings.HasPrefix(line, "method FunctionInvokeResult.") ||
+				strings.HasPrefix(line, "method Cloud.function_") {
 				continue
 			}
 			filtered = append(filtered, line)

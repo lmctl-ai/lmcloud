@@ -120,6 +120,17 @@ func strMapArg(v lmcode.Value) (map[string]string, error) {
 	return out, nil
 }
 
+func strListArg(v lmcode.Value) ([]string, error) {
+	if v.Obj == nil {
+		return nil, nil
+	}
+	sl, ok := v.Obj.(*lmcode.StrList)
+	if !ok {
+		return nil, lmcode.NewHostError(fmt.Sprintf("expected StrList, got %T", v.Obj))
+	}
+	return sl.Values(), nil
+}
+
 // Register binds the shared schema: testing helpers, the `cloud` context and
 // every method, each with an explicit dry slot. out receives print output.
 func Register(reg *lmcode.Registry, out io.Writer) error {
@@ -393,6 +404,69 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 		return tablePageVal(h.ItemScan(dry, a[0].Str, a[1].Int, a[2].Str))
 	})
 
+	// Permissions.
+	policyVal := func(p *Policy, err error) (lmcode.Value, error) {
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return lmcode.Object("Policy", p), nil
+	}
+	policyArg := func(v lmcode.Value) (*Policy, error) {
+		if v.Obj == nil {
+			return nil, lmcode.NewHostError("expected Policy, got nil")
+		}
+		p, ok := v.Obj.(*Policy)
+		if !ok {
+			return nil, lmcode.NewHostError(fmt.Sprintf("expected Policy, got %T", v.Obj))
+		}
+		return p, nil
+	}
+	r.op("principal_current", nil, "string", func(h *Host, dry bool, _ []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.PrincipalCurrent(dry)
+		return lmcode.String(v), hostErr(err)
+	})
+	r.pure("Cloud", "policy_new", nil, "Policy", func(self any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Object("Policy", self.(*Host).PolicyNew()), nil
+	})
+	r.pure("Cloud", "policy_parse", []string{"string"}, "Policy", func(self any, a []lmcode.Value) (lmcode.Value, error) {
+		return policyVal(self.(*Host).PolicyParse(a[0].Str))
+	})
+	r.pure("Cloud", "policy_lint", []string{"Policy"}, "LintReport", func(self any, a []lmcode.Value) (lmcode.Value, error) {
+		p, err := policyArg(a[0])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		rep, err := self.(*Host).PolicyLint(p)
+		if err != nil {
+			return lmcode.None(), hostErr(err)
+		}
+		return lmcode.Object("LintReport", rep), nil
+	})
+	r.op("policy_attach", []string{"string", "string", "Policy"}, "void", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		p, err := policyArg(a[2])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		return lmcode.None(), hostErr(h.PolicyAttach(dry, a[0].Str, a[1].Str, p))
+	})
+	r.op("policy_attach_principal", []string{"string", "Policy"}, "void", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		p, err := policyArg(a[1])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		return lmcode.None(), hostErr(h.PolicyAttachPrincipal(dry, a[0].Str, p))
+	})
+	r.op("policy_detach", []string{"string", "string"}, "void", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.None(), hostErr(h.PolicyDetach(dry, a[0].Str, a[1].Str))
+	})
+	r.op("policy_detach_principal", []string{"string"}, "void", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.None(), hostErr(h.PolicyDetachPrincipal(dry, a[0].Str))
+	})
+	r.op("policy_check", []string{"string", "string", "string"}, "bool", func(h *Host, dry bool, a []lmcode.Value) (lmcode.Value, error) {
+		v, err := h.PolicyCheck(dry, a[0].Str, a[1].Str, a[2].Str)
+		return lmcode.Bool(v), hostErr(err)
+	})
+
 	// Cost & Performance.
 	r.pure("Cloud", "cost_cap_usd", nil, "float", func(self any, _ []lmcode.Value) (lmcode.Value, error) {
 		return lmcode.Float(self.(*Host).CostCapUSD()), nil
@@ -619,6 +693,53 @@ func Register(reg *lmcode.Registry, out io.Writer) error {
 	r.pure("TablePage", "next_token", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
 		return lmcode.String(tp(s).NextToken), nil
 	})
+
+	pol := func(self any) *Policy { return self.(*Policy) }
+	r.pure("Policy", "statement", []string{"string", "StrList", "StrList"}, "Policy", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		actions, err := strListArg(a[1])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		resources, err := strListArg(a[2])
+		if err != nil {
+			return lmcode.None(), err
+		}
+		return policyVal(pol(s).Statement(a[0].Str, actions, resources))
+	})
+	r.pure("Policy", "document", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		v, err := pol(s).Document()
+		return lmcode.String(v), hostErr(err)
+	})
+	r.pure("Policy", "len", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(pol(s).Len()), nil
+	})
+
+	lr := func(self any) *LintReport { return self.(*LintReport) }
+	r.pure("LintReport", "ok", nil, "bool", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Bool(lr(s).OK()), nil
+	})
+	r.pure("LintReport", "len", nil, "int", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.Int(lr(s).Len()), nil
+	})
+	r.pure("LintReport", "at", []string{"int"}, "LintFinding", func(s any, a []lmcode.Value) (lmcode.Value, error) {
+		f, err := lr(s).At(a[0].Int)
+		if err != nil {
+			return lmcode.None(), lmcode.NewHostError(err.Error())
+		}
+		return lmcode.Object("LintFinding", f), nil
+	})
+
+	lf := func(self any) *LintFinding { return self.(*LintFinding) }
+	r.pure("LintFinding", "code", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(lf(s).Code()), nil
+	})
+	r.pure("LintFinding", "severity", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(lf(s).Severity()), nil
+	})
+	r.pure("LintFinding", "message", nil, "string", func(s any, _ []lmcode.Value) (lmcode.Value, error) {
+		return lmcode.String(lf(s).Message()), nil
+	})
+
 	return r.first
 }
 

@@ -399,6 +399,52 @@ func (r Router) Scan(ctx context.Context, table string, max int, token string) (
 	return t.Scan(ctx, table, max, token)
 }
 
+var errNoPermissions = ProviderError(Internal, 0, "", "backend does not support permissions")
+
+func (r Router) pickPermissions(ctx context.Context) (Permissions, error) {
+	be, err := r.pick(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if p, ok := be.(Permissions); ok && !isNilPointer(p) {
+		return p, nil
+	}
+	return nil, errNoPermissions
+}
+
+func (r Router) CurrentPrincipal(ctx context.Context) (string, error) {
+	p, err := r.pickPermissions(ctx)
+	if err != nil {
+		return "", err
+	}
+	return p.CurrentPrincipal(ctx)
+}
+
+func (r Router) AttachPolicy(ctx context.Context, att PolicyAttachment) error {
+	p, err := r.pickPermissions(ctx)
+	if err != nil {
+		return err
+	}
+	return p.AttachPolicy(ctx, att)
+}
+
+func (r Router) DetachPolicy(ctx context.Context, kind AttachmentKind, target, principal string) error {
+	p, err := r.pickPermissions(ctx)
+	if err != nil {
+		return err
+	}
+	return p.DetachPolicy(ctx, kind, target, principal)
+}
+
+func (r Router) CheckPolicy(ctx context.Context, principal, action, resource string) error {
+	p, err := r.pickPermissions(ctx)
+	if err != nil {
+		return err
+	}
+	return p.CheckPolicy(ctx, principal, action, resource)
+}
+
+
 // isNilPointer catches a typed-nil backend (e.g. a nil *Client stored in a
 // Backend), which would otherwise panic on the first method call.
 func isNilPointer(v any) bool {

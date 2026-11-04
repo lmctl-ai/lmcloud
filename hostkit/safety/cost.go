@@ -303,6 +303,24 @@ func SyntheticSimPriceTable(provider string) *PriceTable {
 				RequestNanoUSD: 250,
 				ChunkBytes:     4096,
 			},
+			"principal_current": {
+				RequestNanoUSD: 0,
+			},
+			"policy_attach": {
+				RequestNanoUSD: 0,
+			},
+			"policy_attach_principal": {
+				RequestNanoUSD: 0,
+			},
+			"policy_detach": {
+				RequestNanoUSD: 0,
+			},
+			"policy_detach_principal": {
+				RequestNanoUSD: 0,
+			},
+			"policy_check": {
+				RequestNanoUSD: 0,
+			},
 		},
 	}
 }

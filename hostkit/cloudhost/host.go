@@ -25,12 +25,13 @@ import (
 // Config wires a provider into the shared host.
 type Config struct {
 	// Provider is the identifier returned by cloud.provider().
-	Provider  string
-	Store     hostkit.ObjectStore
-	Queue     hostkit.Queue
-	Tables    hostkit.Tables
-	Endpoints *hostkit.EndpointResolver
-	Validator *hostkit.Validator
+	Provider    string
+	Store       hostkit.ObjectStore
+	Queue       hostkit.Queue
+	Tables      hostkit.Tables
+	Permissions hostkit.Permissions
+	Endpoints   *hostkit.EndpointResolver
+	Validator   *hostkit.Validator
 	// OpTimeout bounds one operation (default 2m); ListTimeout bounds exhaustive lists (default 10m).
 	OpTimeout   time.Duration
 	ListTimeout time.Duration
@@ -91,6 +92,9 @@ func New(cfg Config) *Host {
 	}
 	if cfg.Tables != nil {
 		cfg.Tables = guardTables{cfg.Tables}
+	}
+	if cfg.Permissions != nil {
+		cfg.Permissions = guardPermissions{cfg.Permissions}
 	}
 	return &Host{
 		cfg:     cfg,
@@ -1929,24 +1933,26 @@ type dryTableItem struct {
 // same dry run see the previewed state instead of aborting. It never reaches
 // the provider.
 type overlay struct {
-	mu      sync.Mutex
-	buckets map[string]bool // true created, false deleted
-	created map[string]bool // bucket did not exist before this dry run
-	objects map[string]map[string]dryObject
-	queues  map[string]bool
-	tables  map[string]dryTable
-	items   map[string]map[string]dryTableItem
-	drySeq  int64
+	mu       sync.Mutex
+	buckets  map[string]bool // true created, false deleted
+	created  map[string]bool // bucket did not exist before this dry run
+	objects  map[string]map[string]dryObject
+	queues   map[string]bool
+	tables   map[string]dryTable
+	items    map[string]map[string]dryTableItem
+	policies map[string]*hostkit.PolicyAttachment // nil = detached in this dry run
+	drySeq   int64
 }
 
 func newOverlay() *overlay {
 	return &overlay{
-		buckets: map[string]bool{},
-		created: map[string]bool{},
-		objects: map[string]map[string]dryObject{},
-		queues:  map[string]bool{},
-		tables:  map[string]dryTable{},
-		items:   map[string]map[string]dryTableItem{},
+		buckets:  map[string]bool{},
+		created:  map[string]bool{},
+		objects:  map[string]map[string]dryObject{},
+		queues:   map[string]bool{},
+		tables:   map[string]dryTable{},
+		items:    map[string]map[string]dryTableItem{},
+		policies: map[string]*hostkit.PolicyAttachment{},
 	}
 }
 
@@ -2195,6 +2201,49 @@ func (o *overlay) mergeTableItems(t string, real []hostkit.Item, match func(host
 	}
 	sort.Strings(keys)
 	out := make([]hostkit.Item, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, byKey[k])
+	}
+	return out
+}
+
+func (o *overlay) attachPolicy(att hostkit.PolicyAttachment) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	cp := att.Clone()
+	key := hostkit.AttachmentKey(att.Kind, att.Target, att.Principal)
+	cp.Key = key
+	o.policies[key] = &cp
+}
+
+func (o *overlay) detachPolicy(kind hostkit.AttachmentKind, target, principal string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	key := hostkit.AttachmentKey(kind, target, principal)
+	o.policies[key] = nil
+}
+
+func (o *overlay) mergePolicies(real []hostkit.PolicyAttachment) []hostkit.PolicyAttachment {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	byKey := make(map[string]hostkit.PolicyAttachment, len(real))
+	for _, att := range real {
+		key := hostkit.AttachmentKey(att.Kind, att.Target, att.Principal)
+		byKey[key] = att.Clone()
+	}
+	for k, p := range o.policies {
+		if p == nil {
+			delete(byKey, k)
+		} else {
+			byKey[k] = p.Clone()
+		}
+	}
+	keys := make([]string, 0, len(byKey))
+	for k := range byKey {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]hostkit.PolicyAttachment, 0, len(keys))
 	for _, k := range keys {
 		out = append(out, byKey[k])
 	}

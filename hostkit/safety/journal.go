@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,25 +26,28 @@ const (
 	JournalVersion = 1
 
 	// Resource kinds tracked in the recovery journal.
-	KindBucket       = "bucket"
-	KindObject       = "object"
-	KindQueue        = "queue"
-	KindQueueMessage = "queue_message"
-	KindTable        = "table"
-	KindTableItem    = "table_item"
+	KindBucket           = "bucket"
+	KindObject           = "object"
+	KindQueue            = "queue"
+	KindQueueMessage     = "queue_message"
+	KindTable            = "table"
+	KindTableItem        = "table_item"
+	KindPolicyAttachment = "policy_attachment"
 
 	// Journal event types.
-	EventMeta      = "meta"
-	EventIntent    = "intent"
-	EventConfirmed = "confirmed"
-	EventFailed    = "failed"
-	EventRetained  = "retained"
-	EventDeleted   = "deleted"
-	EventCost      = "cost"
-	EventReserve     = "reserve"
-	EventSettle      = "settle"
-	EventWorkCap     = "work_cap"
-	EventCapExceeded = "cap_exceeded"
+	EventMeta         = "meta"
+	EventIntent       = "intent"
+	EventConfirmed    = "confirmed"
+	EventFailed       = "failed"
+	EventRetained     = "retained"
+	EventDeleted      = "deleted"
+	EventCost         = "cost"
+	EventReserve      = "reserve"
+	EventSettle       = "settle"
+	EventWorkCap      = "work_cap"
+	EventCapExceeded  = "cap_exceeded"
+	EventPolicyAttach = "policy_attach"
+	EventPolicyDetach = "policy_detach"
 
 	// Resource lifecycle states after journal replay.
 	StatePending   = "pending"
@@ -213,6 +217,10 @@ type JournalRecord struct {
 	MessagesSent        int    `json:"messages_sent,omitempty"`
 	Reason              string `json:"reason,omitempty"`
 	Retain              bool   `json:"retain,omitempty"`
+	PolicyKind          string `json:"policy_kind,omitempty"`
+	PolicyTarget        string `json:"policy_target,omitempty"`
+	PolicyPrincipal     string `json:"policy_principal,omitempty"`
+	PolicyDocument      string `json:"policy_document,omitempty"`
 }
 
 func (r JournalRecord) meta() JournalMeta {
@@ -273,6 +281,18 @@ type OpLedgerStat struct {
 	ChargedNanoUSD int64 `json:"charged_nano_usd"`
 }
 
+// JournalPolicyAttachment is a durable replace-per-key policy attachment entry
+// replayed from EventPolicyAttach / EventPolicyDetach records.
+type JournalPolicyAttachment struct {
+	Key        string `json:"key"`
+	Kind       string `json:"kind"`
+	Target     string `json:"target,omitempty"`
+	Principal  string `json:"principal"`
+	Document   string `json:"document"`
+	OwnerToken string `json:"owner_token,omitempty"`
+	Generation string `json:"generation,omitempty"`
+}
+
 func resourceKey(kind, parent, name string) string {
 	return kind + "\x00" + parent + "\x00" + name
 }
@@ -290,6 +310,7 @@ type LedgerState struct {
 	CapExceededCount  int64
 	OpStats           map[string]OpLedgerStat
 	ActiveCleanup     map[string]int64
+	PolicyAttachments map[string]JournalPolicyAttachment
 	BucketsCreated    int
 	QueuesCreated     int
 	ObjectsCreated    int
@@ -524,12 +545,13 @@ func OpenJournal(dir string, meta JournalMeta) (*Journal, error) {
 		}
 		j.meta.StartedAtUnix = startedUnix
 		j.state = &LedgerState{
-			Meta:          j.meta,
-			StartedAtUnix: startedUnix,
-			OpStats:       make(map[string]OpLedgerStat),
-			ActiveCleanup: make(map[string]int64),
-			byKey:         make(map[string]int),
-			byAttemptID:   make(map[string]int),
+			Meta:              j.meta,
+			StartedAtUnix:     startedUnix,
+			OpStats:           make(map[string]OpLedgerStat),
+			ActiveCleanup:     make(map[string]int64),
+			PolicyAttachments: make(map[string]JournalPolicyAttachment),
+			byKey:             make(map[string]int),
+			byAttemptID:       make(map[string]int),
 		}
 		if err := j.appendLocked(JournalRecord{
 			Event:         EventMeta,
@@ -633,6 +655,10 @@ func (j *Journal) State() LedgerState {
 	cp.ActiveCleanup = make(map[string]int64, len(j.state.ActiveCleanup))
 	for k, v := range j.state.ActiveCleanup {
 		cp.ActiveCleanup[k] = v
+	}
+	cp.PolicyAttachments = make(map[string]JournalPolicyAttachment, len(j.state.PolicyAttachments))
+	for k, v := range j.state.PolicyAttachments {
+		cp.PolicyAttachments[k] = v
 	}
 	cp.byKey = make(map[string]int, len(j.state.byKey))
 	for k, v := range j.state.byKey {
@@ -1079,6 +1105,43 @@ func (j *Journal) RecordCapExceeded(operation string) error {
 	})
 }
 
+// RecordPolicyAttach durably appends an EventPolicyAttach record (replace-per-key)
+// with the full canonical policy document before returning.
+func (j *Journal) RecordPolicyAttach(kind, target, principal, document, ownerToken, generation string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	return j.appendLocked(JournalRecord{
+		Event:           EventPolicyAttach,
+		Kind:            KindPolicyAttachment,
+		PolicyKind:      kind,
+		PolicyTarget:    target,
+		PolicyPrincipal: principal,
+		PolicyDocument:  document,
+		CreateToken:     ownerToken,
+		Generation:      generation,
+	})
+}
+
+// RecordPolicyDetach durably appends an EventPolicyDetach record removing the
+// attachment key's contribution.
+func (j *Journal) RecordPolicyDetach(kind, target, principal string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.poisoned != nil {
+		return j.poisoned
+	}
+	return j.appendLocked(JournalRecord{
+		Event:           EventPolicyDetach,
+		Kind:            KindPolicyAttachment,
+		PolicyKind:      kind,
+		PolicyTarget:    target,
+		PolicyPrincipal: principal,
+	})
+}
+
 func (j *Journal) rollbackAndPoisonLocked(prevOffset int64, cause error) {
 	if j.f != nil {
 		_ = j.f.Truncate(prevOffset)
@@ -1323,6 +1386,40 @@ func (j *Journal) Compact() error {
 		})
 	}
 
+	if len(j.state.PolicyAttachments) > 0 {
+		attKeys := make([]string, 0, len(j.state.PolicyAttachments))
+		for k := range j.state.PolicyAttachments {
+			attKeys = append(attKeys, k)
+		}
+		sort.Strings(attKeys)
+		for _, k := range attKeys {
+			pa := j.state.PolicyAttachments[k]
+			seq++
+			compacted = append(compacted, JournalRecord{
+				Version:         JournalVersion,
+				Seq:             seq,
+				Time:            nowStr,
+				Event:           EventPolicyAttach,
+				RunID:           j.meta.RunID,
+				SessionID:       j.meta.SessionID,
+				PolicyHash:      j.meta.PolicyHash,
+				Provider:        j.meta.Provider,
+				Account:         j.meta.Account,
+				Tenant:          j.meta.Tenant,
+				Scope:           j.meta.Scope,
+				Region:          j.meta.Region,
+				Endpoint:        j.meta.Endpoint,
+				Kind:            KindPolicyAttachment,
+				PolicyKind:      pa.Kind,
+				PolicyTarget:    pa.Target,
+				PolicyPrincipal: pa.Principal,
+				PolicyDocument:  pa.Document,
+				CreateToken:     pa.OwnerToken,
+				Generation:      pa.Generation,
+			})
+		}
+	}
+
 	newState, err := ReplayJournal(compacted)
 	if err != nil {
 		return fmt.Errorf("validate compacted journal: %w", err)
@@ -1500,12 +1597,13 @@ func ReplayJournal(records []JournalRecord) (*LedgerState, error) {
 		return nil, fmt.Errorf("meta record: %w", err)
 	}
 	state := &LedgerState{
-		Meta:          meta,
-		StartedAtUnix: meta.StartedAtUnix,
-		OpStats:       make(map[string]OpLedgerStat),
-		ActiveCleanup: make(map[string]int64),
-		byKey:         make(map[string]int),
-		byAttemptID:   make(map[string]int),
+		Meta:              meta,
+		StartedAtUnix:     meta.StartedAtUnix,
+		OpStats:           make(map[string]OpLedgerStat),
+		ActiveCleanup:     make(map[string]int64),
+		PolicyAttachments: make(map[string]JournalPolicyAttachment),
+		byKey:             make(map[string]int),
+		byAttemptID:       make(map[string]int),
 	}
 	for i, rec := range records {
 		wantSeq := uint64(i + 1)
@@ -1577,6 +1675,43 @@ func validateRecord(rec JournalRecord, meta JournalMeta, wantSeq uint64) error {
 			if err := ValidateToken128(rec.CreateToken); err != nil {
 				return fmt.Errorf("create_token: %w", err)
 			}
+		}
+		return nil
+	case EventPolicyAttach:
+		if rec.Kind != KindPolicyAttachment {
+			return fmt.Errorf("policy_attach record must have kind %q (got %q)", KindPolicyAttachment, rec.Kind)
+		}
+		if rec.PolicyKind != "resource" && rec.PolicyKind != "principal" {
+			return fmt.Errorf("invalid policy_kind %q", rec.PolicyKind)
+		}
+		if rec.PolicyKind == "resource" && (rec.PolicyTarget == "" || len(rec.PolicyTarget) > 512 || hasControlChars(rec.PolicyTarget)) {
+			return fmt.Errorf("invalid policy_target %q for resource attachment", rec.PolicyTarget)
+		}
+		if rec.PolicyKind == "principal" && rec.PolicyTarget != "" {
+			return fmt.Errorf("principal attachment must have empty policy_target (got %q)", rec.PolicyTarget)
+		}
+		if rec.PolicyPrincipal == "" || len(rec.PolicyPrincipal) > 256 || hasControlChars(rec.PolicyPrincipal) {
+			return fmt.Errorf("invalid policy_principal %q", rec.PolicyPrincipal)
+		}
+		if len(rec.PolicyDocument) == 0 || len(rec.PolicyDocument) > 8192 || !strings.HasPrefix(rec.PolicyDocument, `{"v":1,"statements":[`) {
+			return errors.New("corrupt or oversized policy_document in journal")
+		}
+		return nil
+	case EventPolicyDetach:
+		if rec.Kind != KindPolicyAttachment {
+			return fmt.Errorf("policy_detach record must have kind %q (got %q)", KindPolicyAttachment, rec.Kind)
+		}
+		if rec.PolicyKind != "resource" && rec.PolicyKind != "principal" {
+			return fmt.Errorf("invalid policy_kind %q", rec.PolicyKind)
+		}
+		if rec.PolicyKind == "resource" && (rec.PolicyTarget == "" || len(rec.PolicyTarget) > 512 || hasControlChars(rec.PolicyTarget)) {
+			return fmt.Errorf("invalid policy_target %q for resource detach", rec.PolicyTarget)
+		}
+		if rec.PolicyKind == "principal" && rec.PolicyTarget != "" {
+			return fmt.Errorf("principal detach must have empty policy_target (got %q)", rec.PolicyTarget)
+		}
+		if rec.PolicyPrincipal == "" || len(rec.PolicyPrincipal) > 256 || hasControlChars(rec.PolicyPrincipal) {
+			return fmt.Errorf("invalid policy_principal %q", rec.PolicyPrincipal)
 		}
 		return nil
 	default:
@@ -1771,6 +1906,18 @@ func inferJournalOp(rec JournalRecord, att AttemptLedgerEntry) string {
 		return "item_query"
 	case "item_scan":
 		return "item_scan"
+	case "principal_current":
+		return "principal_current"
+	case "policy_attach":
+		return "policy_attach"
+	case "policy_attach_principal":
+		return "policy_attach_principal"
+	case "policy_detach":
+		return "policy_detach"
+	case "policy_detach_principal":
+		return "policy_detach_principal"
+	case "policy_check":
+		return "policy_check"
 	case "verify_parent_ownership":
 		if rec.Kind == KindQueue || att.Kind == KindQueue {
 			return "queue_read_ownership"
@@ -1841,6 +1988,9 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 	if state.ActiveCleanup == nil {
 		state.ActiveCleanup = make(map[string]int64)
 	}
+	if state.PolicyAttachments == nil {
+		state.PolicyAttachments = make(map[string]JournalPolicyAttachment)
+	}
 	state.LastSeq = rec.Seq
 	if rec.Event != EventSettle {
 		state.ChargedNanoUSD += rec.ChargedNanoUSD
@@ -1890,6 +2040,27 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		if rec.WorkCapNanoUSD > 0 && (state.WorkCapNanoUSD == 0 || rec.WorkCapNanoUSD < state.WorkCapNanoUSD) {
 			state.WorkCapNanoUSD = rec.WorkCapNanoUSD
 		}
+		return nil
+	}
+	if rec.Event == EventPolicyAttach {
+		pKey := rec.PolicyKind + "\x00" + rec.PolicyTarget + "\x00" + rec.PolicyPrincipal
+		if _, exists := state.PolicyAttachments[pKey]; !exists && len(state.PolicyAttachments) >= 128 {
+			return errors.New("policy attachment count in journal exceeds maximum of 128 per run")
+		}
+		state.PolicyAttachments[pKey] = JournalPolicyAttachment{
+			Key:        pKey,
+			Kind:       rec.PolicyKind,
+			Target:     rec.PolicyTarget,
+			Principal:  rec.PolicyPrincipal,
+			Document:   rec.PolicyDocument,
+			OwnerToken: rec.CreateToken,
+			Generation: rec.Generation,
+		}
+		return nil
+	}
+	if rec.Event == EventPolicyDetach {
+		pKey := rec.PolicyKind + "\x00" + rec.PolicyTarget + "\x00" + rec.PolicyPrincipal
+		delete(state.PolicyAttachments, pKey)
 		return nil
 	}
 	if rec.Event == EventCost {
@@ -1954,6 +2125,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		}
 		if rec.ReleaseCleanup && att.Name != "" {
 			delete(state.ActiveCleanup, rKey)
+			removeResourcePolicyAttachments(state, att.Kind, att.Name)
 			if att.Kind == KindTable {
 				itemPrefix := resourceKey(KindTableItem, "", att.Name+"/")
 				parentPrefix := resourceKey(KindTableItem, att.Name, "")
@@ -2271,6 +2443,7 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		return nil
 
 	case EventDeleted:
+		removeResourcePolicyAttachments(state, rec.Kind, rec.Name)
 		if !exists {
 			return nil
 		}
@@ -2289,6 +2462,28 @@ func applyRecordToState(state *LedgerState, rec JournalRecord) error {
 		return nil
 	}
 	return nil
+}
+
+func removeResourcePolicyAttachments(state *LedgerState, kind, name string) {
+	if state == nil || len(state.PolicyAttachments) == 0 || name == "" {
+		return
+	}
+	var target string
+	switch kind {
+	case KindBucket:
+		target = "storage:bucket:" + name
+	case KindQueue:
+		target = "queue:queue:" + name
+	case KindTable:
+		target = "tables:table:" + name
+	default:
+		return
+	}
+	for k, pa := range state.PolicyAttachments {
+		if pa.Kind == "resource" && pa.Target == target {
+			delete(state.PolicyAttachments, k)
+		}
+	}
 }
 
 func removeEntryAt(state *LedgerState, idx int) {

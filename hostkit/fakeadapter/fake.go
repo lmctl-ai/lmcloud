@@ -34,6 +34,10 @@ type Auth struct {
 }
 
 func (a Auth) check() error {
+	return a.checkTarget("", "")
+}
+
+func (a Auth) checkTarget(op, target string) error {
 	if !a.Enforce {
 		return nil
 	}
@@ -45,6 +49,12 @@ func (a Auth) check() error {
 	case c != "" && c == a.Allow:
 		return nil
 	case c != "" && c == a.Deny:
+		if op == "CurrentPrincipal" {
+			return nil
+		}
+		if strings.HasSuffix(target, "-targetok") && (op == "CreateBucket" || op == "HeadBucket" || op == "DeleteBucket" || op == "BucketCreateToken") {
+			return nil
+		}
 		return hostkit.ProviderError(hostkit.PermissionDenied, 403, "AccessDenied", "principal is not authorized for this operation")
 	default:
 		return hostkit.ProviderError(hostkit.Unauthenticated, 401, "NotAuthenticated", "credential was not accepted")
@@ -137,10 +147,11 @@ type tableState struct {
 }
 
 type state struct {
-	Seq     int64
-	Buckets map[string]map[string]*object
-	Queues  map[string][]*message
-	Tables  map[string]*tableState `json:",omitempty"`
+	Seq      int64
+	Buckets  map[string]map[string]*object
+	Queues   map[string][]*message
+	Tables   map[string]*tableState            `json:",omitempty"`
+	Policies map[string]hostkit.PolicyAttachment `json:",omitempty"`
 	// Create tokens stored atomically with each create (hostkit.CreateToken).
 	BucketTokens map[string]string `json:",omitempty"`
 	QueueTokens  map[string]string `json:",omitempty"`
@@ -149,9 +160,10 @@ type state struct {
 
 func newState() *state {
 	return &state{
-		Buckets: map[string]map[string]*object{},
-		Queues:  map[string][]*message{},
-		Tables:  map[string]*tableState{},
+		Buckets:  map[string]map[string]*object{},
+		Queues:   map[string][]*message{},
+		Tables:   map[string]*tableState{},
+		Policies: map[string]hostkit.PolicyAttachment{},
 	}
 }
 
@@ -171,6 +183,7 @@ var Mutators = []string{
 	"CreateBucket", "DeleteBucket", "PutObject", "DeleteObject",
 	"CreateQueue", "DeleteQueue", "Send", "Receive", "Ack", "Nack",
 	"CreateTable", "DeleteTable", "PutItem", "DeleteItem", "UpdateItem",
+	"AttachPolicy", "DetachPolicy",
 }
 
 // Calls returns a copy of the per-method call counters.
@@ -196,10 +209,14 @@ func (f *Fake) MutatorCalls() int {
 
 // do runs fn against the current state under the process mutex and the file lock.
 func (f *Fake) do(name string, fn func(s *state) error) error {
+	return f.doTarget(name, "", fn)
+}
+
+func (f *Fake) doTarget(name, target string, fn func(s *state) error) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls[name]++
-	if err := f.opts.Auth.check(); err != nil {
+	if err := f.opts.Auth.checkTarget(name, target); err != nil {
 		return err
 	}
 	if f.opts.StatePath == "" {
@@ -223,6 +240,9 @@ func (f *Fake) do(name string, fn func(s *state) error) error {
 		}
 		if s.Tables == nil {
 			s.Tables = map[string]*tableState{}
+		}
+		if s.Policies == nil {
+			s.Policies = map[string]hostkit.PolicyAttachment{}
 		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state read: "+err.Error())
@@ -297,7 +317,7 @@ func (f *Fake) CreateBucket(ctx context.Context, b string) (bool, error) {
 		return false, f.echoToken(ctx, "bucket")
 	}
 	created := false
-	err := f.do("CreateBucket", func(s *state) error {
+	err := f.doTarget("CreateBucket", b, func(s *state) error {
 		if _, ok := s.Buckets[b]; ok {
 			return hostkit.ProviderError(hostkit.Conflict, 409, "BucketAlreadyExists", "bucket already exists")
 		}
@@ -310,7 +330,7 @@ func (f *Fake) CreateBucket(ctx context.Context, b string) (bool, error) {
 }
 
 func (f *Fake) DeleteBucket(_ context.Context, b string) error {
-	return f.do("DeleteBucket", func(s *state) error {
+	return f.doTarget("DeleteBucket", b, func(s *state) error {
 		objs, ok := s.Buckets[b]
 		if !ok {
 			return f.notFound(hostkit.AbsentBucket, "NoSuchBucket", "bucket not found")
@@ -325,7 +345,10 @@ func (f *Fake) DeleteBucket(_ context.Context, b string) error {
 }
 
 func (f *Fake) HeadBucket(_ context.Context, b string) error {
-	return f.do("HeadBucket", func(s *state) error {
+	return f.doTarget("HeadBucket", b, func(s *state) error {
+		if fb := strings.TrimSpace(os.Getenv("LMCLOUD_FOREIGN_BUCKET")); fb != "" && b == fb {
+			return nil
+		}
 		if _, ok := s.Buckets[b]; !ok {
 			return f.notFound(hostkit.AbsentBucket, "NoSuchBucket", "bucket not found")
 		}
@@ -1010,4 +1033,56 @@ func (f *Fake) Scan(_ context.Context, table string, max int, token string) (hos
 		return nil
 	})
 	return out, err
+}
+
+// ---- Permissions ----
+
+func (f *Fake) CurrentPrincipal(_ context.Context) (string, error) {
+	var out string
+	err := f.do("CurrentPrincipal", func(_ *state) error {
+		if p := strings.TrimSpace(os.Getenv("LMCLOUD_REF_PRINCIPAL")); p != "" {
+			if strings.HasPrefix(p, "principal:") {
+				out = p
+			} else {
+				out = "principal:" + p
+			}
+			return nil
+		}
+		out = "principal:ref-default"
+		return nil
+	})
+	return out, err
+}
+
+func (f *Fake) AttachPolicy(ctx context.Context, att hostkit.PolicyAttachment) error {
+	if f.opts.EchoCreateToken {
+		f.mu.Lock()
+		f.calls["AttachPolicy"]++
+		f.mu.Unlock()
+		return f.echoToken(ctx, "policy")
+	}
+	return f.do("AttachPolicy", func(s *state) error {
+		if s.Policies == nil {
+			s.Policies = map[string]hostkit.PolicyAttachment{}
+		}
+		key := hostkit.AttachmentKey(att.Kind, att.Target, att.Principal)
+		s.Policies[key] = att.Clone()
+		return nil
+	})
+}
+
+func (f *Fake) DetachPolicy(_ context.Context, kind hostkit.AttachmentKind, target, principal string) error {
+	return f.do("DetachPolicy", func(s *state) error {
+		if s.Policies != nil {
+			key := hostkit.AttachmentKey(kind, target, principal)
+			delete(s.Policies, key)
+		}
+		return nil
+	})
+}
+
+func (f *Fake) CheckPolicy(_ context.Context, _, _, _ string) error {
+	return f.do("CheckPolicy", func(_ *state) error {
+		return nil
+	})
 }

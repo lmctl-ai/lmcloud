@@ -61,11 +61,12 @@ func main() {
 		NewConfig: func(dry bool) (cloudhost.Config, error) {
 			fake = newFake()
 			return cloudhost.Config{
-				Provider:  "ref",
-				Store:     fake,
-				Queue:     fake,
-				Tables:    fake,
-				Endpoints: &hostkit.EndpointResolver{Prefix: "LMCLOUD_REF"},
+				Provider:    "ref",
+				Store:       fake,
+				Queue:       fake,
+				Tables:      fake,
+				Permissions: fake,
+				Endpoints:   &hostkit.EndpointResolver{Prefix: "LMCLOUD_REF"},
 			}, nil
 		},
 	}
