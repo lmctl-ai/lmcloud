@@ -193,49 +193,49 @@ type persistedOpCost struct {
 }
 
 type campaignJournalRecord struct {
-	Version                  int    `json:"v"`
-	Seq                      uint64 `json:"seq"`
-	Event                    string `json:"event"`
-	Provider                 string `json:"provider,omitempty"`
-	Region                   string `json:"region,omitempty"`
-	Scope                    string `json:"scope,omitempty"`
-	Endpoint                 string `json:"endpoint,omitempty"`
-	PriceTableVersion        string `json:"price_table_version,omitempty"`
-	PriceTableHash           string `json:"price_table_hash,omitempty"`
-	PolicyHash               string `json:"policy_hash,omitempty"`
-	CapNanoUSD               int64  `json:"cap_nano_usd,omitempty"`
-	CeilingNanoUSD           int64  `json:"ceiling_nano_usd,omitempty"`
-	MaxCleanupReserveNanoUSD int64  `json:"max_cleanup_reserve_nano_usd,omitempty"`
-	AttemptID                string `json:"attempt_id,omitempty"`
-	Operation                string `json:"operation,omitempty"`
-	ResKind                  string `json:"res_kind,omitempty"`
-	ResKey                   string `json:"res_key,omitempty"`
-	IsCleanup                bool   `json:"is_cleanup,omitempty"`
-	AttemptNanoUSD           int64  `json:"attempt_nano_usd,omitempty"`
-	CleanupReserveNanoUSD    int64  `json:"cleanup_reserve_nano_usd,omitempty"`
-	ReservedBytes            int64  `json:"reserved_bytes,omitempty"`
+	Version                  int                        `json:"v"`
+	Seq                      uint64                     `json:"seq"`
+	Event                    string                     `json:"event"`
+	Provider                 string                     `json:"provider,omitempty"`
+	Region                   string                     `json:"region,omitempty"`
+	Scope                    string                     `json:"scope,omitempty"`
+	Endpoint                 string                     `json:"endpoint,omitempty"`
+	PriceTableVersion        string                     `json:"price_table_version,omitempty"`
+	PriceTableHash           string                     `json:"price_table_hash,omitempty"`
+	PolicyHash               string                     `json:"policy_hash,omitempty"`
+	CapNanoUSD               int64                      `json:"cap_nano_usd,omitempty"`
+	CeilingNanoUSD           int64                      `json:"ceiling_nano_usd,omitempty"`
+	MaxCleanupReserveNanoUSD int64                      `json:"max_cleanup_reserve_nano_usd,omitempty"`
+	AttemptID                string                     `json:"attempt_id,omitempty"`
+	Operation                string                     `json:"operation,omitempty"`
+	ResKind                  string                     `json:"res_kind,omitempty"`
+	ResKey                   string                     `json:"res_key,omitempty"`
+	IsCleanup                bool                       `json:"is_cleanup,omitempty"`
+	AttemptNanoUSD           int64                      `json:"attempt_nano_usd,omitempty"`
+	CleanupReserveNanoUSD    int64                      `json:"cleanup_reserve_nano_usd,omitempty"`
+	ReservedBytes            int64                      `json:"reserved_bytes,omitempty"`
 	ChargedNanoUSD           int64                      `json:"charged_nano_usd,omitempty"`
 	OpStats                  map[string]persistedOpCost `json:"op_stats,omitempty"`
 	SettledBytes             int64                      `json:"settled_bytes,omitempty"`
-	BillingUnits             int64  `json:"billing_units,omitempty"`
-	LockCleanup              bool   `json:"lock_cleanup,omitempty"`
-	ReleaseCleanup           bool   `json:"release_cleanup,omitempty"`
-	WorkCapNanoUSD           int64  `json:"work_cap_nano_usd,omitempty"`
-	PolicyScope              string `json:"policy_scope,omitempty"`
-	PolicyKind               string `json:"policy_kind,omitempty"`
-	PolicyTarget             string `json:"policy_target,omitempty"`
-	PolicyPrincipal          string `json:"policy_principal,omitempty"`
-	PolicyDocument           string `json:"policy_document,omitempty"`
-	PolicyIntentOp           string `json:"policy_intent_op,omitempty"`
-	OwnerToken               string `json:"owner_token,omitempty"`
-	Generation               string `json:"generation,omitempty"`
-	IntentID                 string `json:"intent_id,omitempty"`
-	ExpectedOwnerToken       string `json:"expected_owner_token,omitempty"`
-	ExpectedGeneration       string `json:"expected_generation,omitempty"`
-	FunctionDigest           string `json:"function_digest,omitempty"`
-	FunctionState            string `json:"function_state,omitempty"`
-	UserpoolIncarnation      string `json:"userpool_incarnation,omitempty"`
-	UserpoolState            string `json:"userpool_state,omitempty"`
+	BillingUnits             int64                      `json:"billing_units,omitempty"`
+	LockCleanup              bool                       `json:"lock_cleanup,omitempty"`
+	ReleaseCleanup           bool                       `json:"release_cleanup,omitempty"`
+	WorkCapNanoUSD           int64                      `json:"work_cap_nano_usd,omitempty"`
+	PolicyScope              string                     `json:"policy_scope,omitempty"`
+	PolicyKind               string                     `json:"policy_kind,omitempty"`
+	PolicyTarget             string                     `json:"policy_target,omitempty"`
+	PolicyPrincipal          string                     `json:"policy_principal,omitempty"`
+	PolicyDocument           string                     `json:"policy_document,omitempty"`
+	PolicyIntentOp           string                     `json:"policy_intent_op,omitempty"`
+	OwnerToken               string                     `json:"owner_token,omitempty"`
+	Generation               string                     `json:"generation,omitempty"`
+	IntentID                 string                     `json:"intent_id,omitempty"`
+	ExpectedOwnerToken       string                     `json:"expected_owner_token,omitempty"`
+	ExpectedGeneration       string                     `json:"expected_generation,omitempty"`
+	FunctionDigest           string                     `json:"function_digest,omitempty"`
+	FunctionState            string                     `json:"function_state,omitempty"`
+	UserpoolIncarnation      string                     `json:"userpool_incarnation,omitempty"`
+	UserpoolState            string                     `json:"userpool_state,omitempty"`
 }
 
 type replayedCampaignState struct {
@@ -2430,6 +2430,25 @@ func compactSupersededCampaignStates(raw []byte, cachedRecs []campaignJournalRec
 					}
 					if rec.ReleaseCleanup {
 						activeChild[cKey] = false
+						switch rRec.ResKind {
+						case safety.KindPoolUser:
+							if slash := strings.IndexByte(rRec.ResKey, '/'); slash > 0 && slash < len(rRec.ResKey)-1 {
+								memPrefix := safety.KindPoolMembership + "\x00" + scopedResKey(rRec.Endpoint, rRec.ResKey[:slash]+"/")
+								userSuffix := "/" + rRec.ResKey[slash+1:]
+								for k := range activeChild {
+									if strings.HasPrefix(k, memPrefix) && strings.HasSuffix(k, userSuffix) {
+										activeChild[k] = false
+									}
+								}
+							}
+						case safety.KindPoolGroup:
+							grpPrefix := safety.KindPoolMembership + "\x00" + scopedResKey(rRec.Endpoint, rRec.ResKey) + "/"
+							for k := range activeChild {
+								if strings.HasPrefix(k, grpPrefix) {
+									activeChild[k] = false
+								}
+							}
+						}
 					}
 					childPairs[cKey] = append(childPairs[cKey], idxPair{rIdx, idx})
 				}

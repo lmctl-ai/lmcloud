@@ -93,6 +93,9 @@ func TestR5HelperChildReset(t *testing.T) {
 	h := New(Config{Provider: "aws", Store: f, Userpools: a, CampaignStatePath: os.Getenv("R5_CAMPAIGN")})
 	h.SetAbortOnError(false)
 	h.UserSetPassword(false, "xpool", "alice", "Changed456")
+	if ent := os.Getenv("R5_ENTERED"); ent != "" {
+		_ = os.WriteFile(ent, []byte("x"), 0o600)
+	}
 	fmt.Printf("CHILD reset=%s\n", h.LastError().Code)
 }
 func TestR5ProcessLocalInFlight(t *testing.T) {

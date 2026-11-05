@@ -5,7 +5,9 @@ package fakeadapter
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -735,5 +738,369 @@ func TestSolR5IsolatedFuseHelperCgroupAndClose(t *testing.T) {
 		if _, e := os.Stat(cgPath); !os.IsNotExist(e) {
 			t.Fatalf("helper cgroup directory %s still exists after Close: %v", cgPath, e)
 		}
+	}
+}
+
+func solR6Helper(t *testing.T) *scratchFuseHelper {
+	t.Helper()
+	cg, e := resolveCgroupParent()
+	if e != nil {
+		t.Fatal(e)
+	}
+	d := filepath.Join(t.TempDir(), "mnt")
+	if e = os.Mkdir(d, 0o700); e != nil {
+		t.Fatal(e)
+	}
+	h, e := mountScratchFuseHelper(d, 16<<20, 4096, cg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	t.Cleanup(h.Close)
+	return h
+}
+
+func solR6ReadInt(t *testing.T, p string) int64 {
+	t.Helper()
+	b, e := os.ReadFile(p)
+	if e != nil {
+		t.Fatal(e)
+	}
+	v, e := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return v
+}
+
+func TestSolR6HelperMemoryAndOOM(t *testing.T) {
+	h := solR6Helper(t)
+	pid := h.cmd.Process.Pid
+	procs, e := os.ReadFile(filepath.Join(h.cgDir, "cgroup.procs"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !strings.Contains("\n"+string(procs), fmt.Sprintf("\n%d\n", pid)) {
+		t.Fatal("server not in bounded cgroup", string(procs), pid)
+	}
+	max := solR6ReadInt(t, filepath.Join(h.cgDir, "memory.max"))
+	before := solR6ReadInt(t, filepath.Join(h.cgDir, "memory.current"))
+	if max <= 0 || max > 600<<20 {
+		t.Fatal("no plausible finite cap", max)
+	}
+	if e = os.WriteFile(filepath.Join(h.mountDir, "data"), bytes.Repeat([]byte("x"), 8<<20), 0o600); e != nil {
+		t.Fatal(e)
+	}
+	after := solR6ReadInt(t, filepath.Join(h.cgDir, "memory.current"))
+	used := h.UsedBytes()
+	t.Logf("server=%d max=%d current-before=%d current-after=%d used=%d", pid, max, before, after, used)
+	if after-before < 4<<20 {
+		t.Fatal("server data allocation not charged to bounded cgroup")
+	}
+	if used != 8<<20 {
+		t.Fatal("incorrect control response", used)
+	}
+	if e = os.WriteFile(filepath.Join(h.cgDir, "memory.max"), []byte("1048576"), 0o600); e != nil {
+		t.Fatal(e)
+	}
+	t.Logf("effective lowered memory.max=%d", solR6ReadInt(t, filepath.Join(h.cgDir, "memory.max")))
+	pressure := make(chan error, 1)
+	go func() {
+		pressure <- os.WriteFile(filepath.Join(h.mountDir, "pressure"), bytes.Repeat([]byte("y"), 8<<20), 0o600)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cgroupHadOOM(h.cgDir) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	events, _ := os.ReadFile(filepath.Join(h.cgDir, "memory.events"))
+	t.Logf("forced OOM events: %s", events)
+	if !cgroupHadOOM(h.cgDir) {
+		t.Fatal("lowered real memory.max did not constrain helper")
+	}
+	select {
+	case e := <-pressure:
+		t.Logf("pressure syscall released: %v", e)
+	case <-time.After(5 * time.Second):
+		t.Fatal("pressure write blocked after helper OOM")
+	}
+	if got := h.UsedBytes(); got <= 16<<20 {
+		t.Fatal("helper OOM not signaled to invocation monitor", got)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for solR5Mounted(h.mountDir) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if solR5Mounted(h.mountDir) {
+		t.Fatal("helper OOM left mount connected")
+	}
+}
+
+func TestSolR6UnavailableAndParentFence(t *testing.T) {
+	for _, cg := range []string{"", filepath.Join(t.TempDir(), "missing")} {
+		dir := t.TempDir()
+		h, e := mountScratchFuseHelper(dir, 16<<20, 4096, cg)
+		if h != nil {
+			h.Close()
+			t.Fatal("unavailable cgroup accepted")
+		}
+		if e == nil {
+			t.Fatal("unavailable cgroup succeeded")
+		}
+		if solR5Mounted(dir) {
+			t.Fatal("failed startup left mount")
+		}
+	}
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "LMCLOUD_SCRATCH_FUSE_HELPER=1", "LMCLOUD_SCRATCH_FUSE_PPID=2147483647"}
+	start := time.Now()
+	out, e := cmd.CombinedOutput()
+	if e == nil || time.Since(start) > 2*time.Second {
+		t.Fatal("mismatched parent accepted or hung", e, string(out))
+	}
+}
+
+func TestSolR6OwnerKill(t *testing.T) {
+	if os.Getenv("SOL_R6_OWNER") == "1" {
+		cg, e := resolveCgroupParent()
+		if e != nil {
+			t.Fatal(e)
+		}
+		h, e := mountScratchFuseHelper(os.Getenv("SOL_R6_MOUNT"), 16<<20, 4096, cg)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if os.Getenv("SOL_R6_BOTH") == "1" {
+			_ = h.cmd.Process.Kill()
+		}
+		b, _ := json.Marshal([]string{h.cgDir, strconv.Itoa(h.cmd.Process.Pid)})
+		fmt.Println("SOL_R6_READY " + string(b))
+		time.Sleep(time.Minute)
+		return
+	}
+	for _, both := range []bool{false, true} {
+		t.Run(fmt.Sprint(both), func(t *testing.T) {
+			dir := t.TempDir()
+			fm, _ := resolveFusermountBin()
+			defer exec.Command(fm, "-u", "-z", "--", dir).Run()
+			cmd := exec.Command(os.Args[0], "-test.run=^TestSolR6OwnerKill$", "-test.timeout=75s")
+			cmd.Env = append(os.Environ(), "SOL_R6_OWNER=1", "SOL_R6_MOUNT="+dir)
+			if both {
+				cmd.Env = append(cmd.Env, "SOL_R6_BOTH=1")
+			}
+			pipe, e := cmd.StdoutPipe()
+			if e != nil {
+				t.Fatal(e)
+			}
+			cmd.Stderr = cmd.Stdout
+			if e = cmd.Start(); e != nil {
+				t.Fatal(e)
+			}
+			defer func() {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}()
+			ready := make(chan []string, 1)
+			go func() {
+				s := bufio.NewScanner(pipe)
+				for s.Scan() {
+					if strings.HasPrefix(s.Text(), "SOL_R6_READY ") {
+						var v []string
+						_ = json.Unmarshal([]byte(strings.TrimPrefix(s.Text(), "SOL_R6_READY ")), &v)
+						ready <- v
+						return
+					}
+				}
+				ready <- nil
+			}()
+			var v []string
+			select {
+			case v = <-ready:
+			case <-time.After(10 * time.Second):
+				t.Fatal("owner start timeout")
+			}
+			if len(v) != 2 {
+				t.Fatal("owner startup failed")
+			}
+			defer func() {
+				_ = os.WriteFile(filepath.Join(v[0], "cgroup.kill"), []byte("1"), 0o600)
+				_ = os.Remove(v[0])
+			}()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				_, statErr := os.Stat(v[0])
+				if !solR5Mounted(dir) && os.IsNotExist(statErr) {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if solR5Mounted(dir) {
+				t.Fatal("owner/helper death left mounted filesystem")
+			}
+			procs, _ := os.ReadFile(filepath.Join(v[0], "cgroup.procs"))
+			if strings.TrimSpace(string(procs)) != "" {
+				t.Fatal("helper survived owner death", string(procs))
+			}
+			_, e = os.Stat(v[0])
+			t.Logf("both=%v: mount detached, helper cgroup empty; directory remains=%v", both, e == nil)
+			if !os.IsNotExist(e) {
+				t.Fatalf("owner/helper death left empty cgroup directory %s: %v", v[0], e)
+			}
+		})
+	}
+}
+
+func TestSolR6InvocationHelperOOM(t *testing.T) {
+	f := New(Options{})
+	if ce := f.ensureSandboxReady(); ce != nil {
+		t.Fatal(ce)
+	}
+	old, _ := filepath.Glob(filepath.Join(cachedCgroupParent, "lmcloud-fuse-*.scope"))
+	known := map[string]bool{}
+	for _, p := range old {
+		known[p] = true
+	}
+	code := "import os,time\ndef handler(e,c):\n time.sleep(1)\n try: open('/tmp/data','wb').write(b'x'*(8*1024*1024))\n except OSError: pass\n time.sleep(20)\n return {}\n"
+	zip, _, ce := hostkit.BuildDeterministicInlineZip(hostkit.RuntimePython312, "index.handler", code)
+	if ce != nil {
+		t.Fatal(ce)
+	}
+	type result struct {
+		out hostkit.FunctionInvokeOutput
+		err *hostkit.CloudError
+	}
+	done := make(chan result, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	start := time.Now()
+	go func() {
+		out, _, err := executeInNamespaceJail(ctx, cachedPythonBin, cachedNodeBin, cachedNodeRoot, sandboxExecSpec{
+			Runtime:        hostkit.RuntimePython312,
+			Handler:        "index.handler",
+			BundleZip:      zip,
+			TimeoutSeconds: 25,
+			MemoryMB:       128,
+			PayloadJSON:    "{}",
+		})
+		done <- result{out, err}
+	}()
+	var target string
+	deadline := time.Now().Add(4 * time.Second)
+	for target == "" && time.Now().Before(deadline) {
+		paths, _ := filepath.Glob(filepath.Join(cachedCgroupParent, "lmcloud-fuse-*.scope"))
+		for _, p := range paths {
+			if !known[p] {
+				b, _ := os.ReadFile(filepath.Join(p, "memory.max"))
+				n, _ := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+				procs, _ := os.ReadFile(filepath.Join(p, "cgroup.procs"))
+				if n > 0 && n < 600<<20 && n != 268435456 && n != 536870912 && len(procs) > 0 {
+					pid, _ := strconv.Atoi(strings.TrimSpace(string(procs)))
+					raw, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+					isOurs := false
+					for _, line := range strings.Split(string(raw), "\n") {
+						if strings.HasPrefix(line, "PPid:") {
+							fields := strings.Fields(line)
+							isOurs = len(fields) == 2 && fields[1] == strconv.Itoa(os.Getpid())
+						}
+					}
+					if isOurs {
+						target = p
+						break
+					}
+				}
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if target == "" {
+		cancel()
+		r := <-done
+		t.Fatal("invocation helper did not become ready", r.err, r.out.FunctionError, r.out.Payload)
+	}
+	t.Logf("invocation helper cgroup=%s", target)
+	time.Sleep(50 * time.Millisecond)
+	procs, _ := os.ReadFile(filepath.Join(target, "cgroup.procs"))
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(procs)))
+	env, _ := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	mount := ""
+	for _, part := range strings.Split(string(env), "\x00") {
+		if strings.HasPrefix(part, "LMCLOUD_SCRATCH_FUSE_MOUNT_DIR=") {
+			mount = strings.TrimPrefix(part, "LMCLOUD_SCRATCH_FUSE_MOUNT_DIR=")
+		}
+	}
+	if mount == "" {
+		t.Fatal("owned helper mount unknown")
+	}
+	if e := os.WriteFile(filepath.Join(mount, "oom-fixture"), bytes.Repeat([]byte("x"), 8<<20), 0o600); e != nil {
+		t.Fatal(e)
+	}
+	t.Logf("before forced OOM current=%d", solR6ReadInt(t, filepath.Join(target, "memory.current")))
+	if e := os.WriteFile(filepath.Join(target, "memory.max"), []byte("1048576"), 0o600); e != nil {
+		t.Fatal(e)
+	}
+	select {
+	case r := <-done:
+		t.Logf("helper OOM invocation elapsed=%s error=%+v function-error=%s payload=%s", time.Since(start), r.err, r.out.FunctionError, r.out.Payload)
+		if r.err != nil || r.out.FunctionError != "Unhandled" || !strings.Contains(r.out.Payload, "DiskQuotaExceeded") {
+			t.Fatal("helper OOM was not a clean invocation failure")
+		}
+		if time.Since(start) > 8*time.Second {
+			t.Fatal("helper OOM handler hung until timeout")
+		}
+	case <-time.After(10 * time.Second):
+		events, _ := os.ReadFile(filepath.Join(target, "memory.events"))
+		procs, _ := os.ReadFile(filepath.Join(target, "cgroup.procs"))
+		t.Logf("late events=%s procs=%s", events, procs)
+		cancel()
+		select {
+		case r := <-done:
+			t.Logf("after cancel: err=%+v out=%+v", r.err, r.out)
+		case <-time.After(7 * time.Second):
+			t.Log("still blocked after cancellation")
+		}
+		t.Fatal("helper OOM hung invocation")
+	}
+}
+
+func TestSolR6HelperKilledWhileHostAlive(t *testing.T) {
+	h := solR6Helper(t)
+	f, e := os.Create(filepath.Join(h.mountDir, "open"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer f.Close()
+	if e = h.cmd.Process.Kill(); e != nil {
+		t.Fatal(e)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for solR5Mounted(h.mountDir) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if solR5Mounted(h.mountDir) {
+		t.Fatal("SIGKILLed helper left mount")
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, e := f.Write([]byte("after-kill"))
+		done <- e
+	}()
+	select {
+	case e := <-done:
+		if e == nil {
+			t.Fatal("write on disconnected mount succeeded")
+		}
+		t.Logf("post-helper-kill write promptly failed: %v", e)
+	case <-time.After(time.Second):
+		t.Fatal("helper death blocked handler filesystem syscall")
+	}
+	start := time.Now()
+	_ = h.UsedBytes()
+	if time.Since(start) > time.Second {
+		t.Fatal("control read blocked after helper death")
+	}
+	cg := h.cgDir
+	h.Close()
+	if _, e = os.Stat(cg); !os.IsNotExist(e) {
+		t.Fatal("normal Close after helper kill retained cgroup", e)
 	}
 }

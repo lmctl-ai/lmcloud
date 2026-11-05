@@ -96,7 +96,7 @@ method is registered with an explicit Dry slot:
 
 ## Verification
 
-`scripts/test-hostkit.sh` = gofmt + `go vet ./...` + `go test -race -count=3 ./...` with
+`scripts/test-hostkit.sh` = gofmt + `go vet ./...` + `go test -race -timeout 30m -count=3 ./...` with
 `LMSCRIPT_BIN` set, which includes the reference-host e2e: conformance open mode 25/25 (2 auth
 SKIP), enforce mode 25/25 (0 SKIP, allow/deny credentials via `LMCLOUD_REF_*`), dry-run zero
 mutations, and schema/signature parity with `lmscript`.
@@ -254,7 +254,7 @@ boundary via `NilIfTyped`).
 `Router` rejects a typed-nil backend from `Pick` (error instead of a panic).
 
 ### Verification (v3)
-`scripts/test-hostkit.sh` (gofmt, vet, `go test -race -count=3 ./...` incl. reference-host conformance
+`scripts/test-hostkit.sh` (gofmt, vet, `go test -race -timeout 30m -count=3 ./...` incl. reference-host conformance
 25/25 open + 25/25 enforce and a compiler dry run evaluating `last_error().code()`), plus a four-host
 proof on scratch copies of each host's `hostkit-port` branch with only the two replace lines changed
 (lmcloud → hostkit-v3 worktree, lmcode-go → lmcode-go-patched): build, vet, `go test -race`, and an

@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -263,24 +264,28 @@ func revokeLockFilePath(profileDir, id string) string {
 	return filepath.Join(profileDir+".revokes", id+".lock")
 }
 
-func markRevokeInFlight(profileDir, id string) {
+func markRevokeInFlight(profileDir, id string) error {
 	if id == "" {
-		return
+		return errors.New("empty revocation intent id")
 	}
 	inFlightRevokesMu.Lock()
 	defer inFlightRevokesMu.Unlock()
-	inFlightRevokeIDs[id] = true
 	if lockPath := revokeLockFilePath(profileDir, id); lockPath != "" {
-		if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err == nil {
-			if lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600); err == nil {
-				if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
-					inFlightRevokeFiles[id] = lf
-				} else {
-					_ = lf.Close()
-				}
-			}
+		if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+			return err
 		}
+		lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+		if err != nil {
+			return err
+		}
+		if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			_ = lf.Close()
+			return err
+		}
+		inFlightRevokeFiles[id] = lf
 	}
+	inFlightRevokeIDs[id] = true
+	return nil
 }
 
 func unmarkRevokeInFlight(profileDir, id string) {
@@ -317,7 +322,7 @@ func isRevokeInFlight(profileDir, id string) bool {
 	}
 	lf, err := os.OpenFile(lockPath, os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
-		return false
+		return !errors.Is(err, os.ErrNotExist)
 	}
 	defer lf.Close()
 	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
@@ -1700,7 +1705,7 @@ func (h *Host) checkCatalogMutationHeadroom(pool string, act safety.JournalUserp
 func (h *Host) beginUserRevocationIntent(ep, pool, username string, act safety.JournalUserpoolEntry, isCleanup bool) (string, uint64, uint64, uint64, bool, *hostkit.CloudError) {
 	revokeID := safety.NewToken128()
 	profDir := h.userpoolProfileDir()
-	markRevokeInFlight(profDir, revokeID)
+	lockErr := markRevokeInFlight(profDir, revokeID)
 	var intentGen uint64
 	var prevRevokedGen uint64
 	var prevUserGen uint64
@@ -1733,6 +1738,10 @@ func (h *Host) beginUserRevocationIntent(ep, pool, username string, act safety.J
 	if cerr != nil {
 		unmarkRevokeInFlight(profDir, revokeID)
 		return "", 0, 0, 0, false, cerr
+	}
+	if lockErr != nil {
+		return "", 0, 0, 0, false, hostkit.ProviderError(hostkit.Internal, 0, "RevokeLockFailed",
+			fmt.Sprintf("failed to acquire cross-process revocation lock for userpool %q user %q: %v", pool, username, lockErr))
 	}
 	return revokeID, intentGen, prevRevokedGen, prevUserGen, hadUser, nil
 }

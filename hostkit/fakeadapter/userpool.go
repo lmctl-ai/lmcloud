@@ -986,14 +986,14 @@ func (f *Fake) SignIn(ctx context.Context, in hostkit.UserSignInInput) (hostkit.
 			sgen = 1
 		}
 		claimsPayload := map[string]any{
-			"sub":        u.UID,
-			"username":   u.Username,
-			"iss":        up.Issuer,
-			"client_id":  up.ClientID,
-			"token_use":  "access",
-			"jti":        randomHex16(),
-			"iat":        nowUnix,
-			"exp":        expUnix,
+			"sub":       u.UID,
+			"username":  u.Username,
+			"iss":       up.Issuer,
+			"client_id": up.ClientID,
+			"token_use": "access",
+			"jti":       randomHex16(),
+			"iat":       nowUnix,
+			"exp":       expUnix,
 		}
 		token, err := hostkit.MintRS256JWT(up.PrivateKeyPEM, up.KeyID, claimsPayload)
 		if err != nil {

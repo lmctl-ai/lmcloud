@@ -226,15 +226,19 @@ func createExitDelayFD() int {
 	return fd
 }
 
-func startFuseUnmountWatchdog(fmBin, mountDir string, watchR *os.File) (*exec.Cmd, error) {
+func startFuseUnmountWatchdog(fmBin, mountDir, cgDir string, watchR, ownerR *os.File) (*exec.Cmd, error) {
 	readyR, readyW, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("create watchdog readiness pipe: %w", err)
 	}
-	script := `echo ok >&3; exec 3>&-; read -r _ || true; exec "$1" -u -z -q -- "$2"`
-	cmd := exec.Command("/bin/sh", "-c", script, "lmcloud-fuse-watchdog", fmBin, mountDir)
+	script := `echo ok >&3; exec 3>&-; read -r _ || true; if [ -z "$3" ]; then exec "$1" -u -z -q -- "$2"; fi; "$1" -u -z -q -- "$2" || true; read -r _ <&4 || true; echo 1 > "$3/cgroup.kill" 2>/dev/null || true; rmdir "$3" 2>/dev/null || true`
+	cmd := exec.Command("/bin/sh", "-c", script, "lmcloud-fuse-watchdog", fmBin, mountDir, cgDir)
 	cmd.Stdin = watchR
-	cmd.ExtraFiles = []*os.File{readyW}
+	if ownerR != nil {
+		cmd.ExtraFiles = []*os.File{readyW, ownerR}
+	} else {
+		cmd.ExtraFiles = []*os.File{readyW}
+	}
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
@@ -369,7 +373,7 @@ func mountScratchFuseFS(mountDir string, maxBytes int64, maxInodes int) (*scratc
 	}
 	watchWFD := dupAboveCloexec(wpipe[1], minWatchFD)
 
-	watchCmd, err := startFuseUnmountWatchdog(fmBin, mountDir, watchR)
+	watchCmd, err := startFuseUnmountWatchdog(fmBin, mountDir, "", watchR, nil)
 	_ = watchR.Close()
 	if err != nil {
 		_ = syscall.Close(fuseFD)
@@ -1437,6 +1441,7 @@ func (fs *scratchFuseFS) handleRequest(fd int, opcode uint32, unique uint64, nod
 type scratchFuseHelper struct {
 	mu         sync.Mutex
 	ctrlFD     int
+	ownerWFD   int
 	cmd        *exec.Cmd
 	watchCmd   *exec.Cmd
 	cgDir      string
@@ -1467,26 +1472,7 @@ func waitBoundedCmd(cmd *exec.Cmd, timeout time.Duration) {
 }
 
 func isRaceEnabledProcess() bool {
-	if bi, ok := debug.ReadBuildInfo(); ok && bi != nil {
-		for _, s := range bi.Settings {
-			if s.Key == "-race" && s.Value == "true" {
-				return true
-			}
-		}
-	}
-	raw, err := os.ReadFile("/proc/self/statm")
-	if err != nil {
-		return false
-	}
-	fields := strings.Fields(string(raw))
-	if len(fields) == 0 {
-		return false
-	}
-	pages, err := strconv.ParseInt(fields[0], 10, 64)
-	if err != nil {
-		return false
-	}
-	return pages > 200_000
+	return raceEnabledProcess
 }
 
 func runScratchFuseHelperMain() {
@@ -1753,11 +1739,25 @@ func mountScratchFuseHelper(mountDir string, maxBytes int64, maxInodes int, cgPa
 	watchR := os.NewFile(uintptr(wpipe[0]), "fuse-watch-r")
 	watchWFD := wpipe[1]
 
-	watchCmd, err := startFuseUnmountWatchdog(fmBin, mountDir, watchR)
+	var opipe [2]int
+	if err := syscall.Pipe2(opipe[:], syscall.O_CLOEXEC); err != nil {
+		_ = syscall.Close(fuseFD)
+		_ = watchR.Close()
+		_ = syscall.Close(watchWFD)
+		unmountDir()
+		cleanupCg()
+		return nil, fmt.Errorf("create fuse owner pipe: %w", err)
+	}
+	ownerR := os.NewFile(uintptr(opipe[0]), "fuse-owner-r")
+	ownerWFD := opipe[1]
+
+	watchCmd, err := startFuseUnmountWatchdog(fmBin, mountDir, cgDir, watchR, ownerR)
 	_ = watchR.Close()
+	_ = ownerR.Close()
 	if err != nil {
 		_ = syscall.Close(fuseFD)
 		_ = syscall.Close(watchWFD)
+		_ = syscall.Close(ownerWFD)
 		unmountDir()
 		cleanupCg()
 		return nil, err
@@ -1767,6 +1767,7 @@ func mountScratchFuseHelper(mountDir string, maxBytes int64, maxInodes int, cgPa
 	if err != nil {
 		_ = syscall.Close(fuseFD)
 		_ = syscall.Close(watchWFD)
+		_ = syscall.Close(ownerWFD)
 		waitBoundedCmd(watchCmd, fuseHelperTimeout)
 		unmountDir()
 		cleanupCg()
@@ -1801,6 +1802,7 @@ func mountScratchFuseHelper(mountDir string, maxBytes int64, maxInodes int, cgPa
 	_ = ctrlChildFile.Close()
 	if startErr != nil {
 		_ = syscall.Close(ctrlParent)
+		_ = syscall.Close(ownerWFD)
 		waitBoundedCmd(watchCmd, fuseHelperTimeout)
 		unmountDir()
 		cleanupCg()
@@ -1813,6 +1815,7 @@ func mountScratchFuseHelper(mountDir string, maxBytes int64, maxInodes int, cgPa
 			_ = helperCmd.Process.Kill()
 		}
 		waitBoundedCmd(helperCmd, fuseHelperTimeout)
+		_ = syscall.Close(ownerWFD)
 		waitBoundedCmd(watchCmd, fuseHelperTimeout)
 		unmountDir()
 		cleanupCg()
@@ -1861,6 +1864,7 @@ func mountScratchFuseHelper(mountDir string, maxBytes int64, maxInodes int, cgPa
 
 	return &scratchFuseHelper{
 		ctrlFD:     ctrlParent,
+		ownerWFD:   ownerWFD,
 		cmd:        helperCmd,
 		watchCmd:   watchCmd,
 		cgDir:      cgDir,
@@ -1911,6 +1915,8 @@ func (h *scratchFuseHelper) Close() {
 	h.closed = true
 	ctrlFD := h.ctrlFD
 	h.ctrlFD = -1
+	ownerWFD := h.ownerWFD
+	h.ownerWFD = -1
 	cmd := h.cmd
 	h.cmd = nil
 	watchCmd := h.watchCmd
@@ -1930,6 +1936,9 @@ func (h *scratchFuseHelper) Close() {
 		_ = os.WriteFile(filepath.Join(cgDir, "cgroup.kill"), []byte("1"), 0o600)
 	}
 	waitBoundedCmd(cmd, fuseHelperTimeout)
+	if ownerWFD >= 0 {
+		_ = syscall.Close(ownerWFD)
+	}
 	waitBoundedCmd(watchCmd, fuseHelperTimeout)
 	if syscall.Unmount(h.mountDir, syscall.MNT_DETACH) != nil && h.fusermount != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), fuseHelperTimeout)
