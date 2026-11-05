@@ -67,6 +67,7 @@ func main() {
 				Tables:      fake,
 				Permissions: fake,
 				Functions:   fake,
+				Userpools:   fake,
 				Endpoints:   &hostkit.EndpointResolver{Prefix: "LMCLOUD_REF"},
 			}, nil
 		},

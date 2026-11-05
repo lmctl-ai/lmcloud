@@ -623,6 +623,174 @@ func (r Router) FunctionOwnerToken(ctx context.Context, name string) (string, bo
 	return "", false, errNoToken
 }
 
+var errNoUserpools = ProviderError(Internal, 0, "", "backend does not support userpools")
+
+func (r Router) pickUserpools(ctx context.Context) (Userpools, error) {
+	be, err := r.pick(WithForbidLiveRoute(ctx))
+	if err != nil {
+		return nil, err
+	}
+	if up, ok := be.(Userpools); ok && !isNilPointer(up) {
+		return up, nil
+	}
+	return nil, errNoUserpools
+}
+
+func (r Router) CreateUserPool(ctx context.Context, in UserpoolCreateInput) (bool, UserpoolInfo, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return false, UserpoolInfo{}, err
+	}
+	return up.CreateUserPool(ctx, in)
+}
+
+func (r Router) DeleteUserPool(ctx context.Context, pool string) (bool, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return false, err
+	}
+	return up.DeleteUserPool(ctx, pool)
+}
+
+func (r Router) UserPoolExists(ctx context.Context, pool string) (bool, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return false, err
+	}
+	return up.UserPoolExists(ctx, pool)
+}
+
+func (r Router) DescribeUserPool(ctx context.Context, pool string) (UserpoolInfo, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return UserpoolInfo{}, err
+	}
+	return up.DescribeUserPool(ctx, pool)
+}
+
+func (r Router) ListUserPools(ctx context.Context) ([]string, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return up.ListUserPools(ctx)
+}
+
+func (r Router) CreateUser(ctx context.Context, in UserCreateInput) (UserSnapshot, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return UserSnapshot{}, err
+	}
+	return up.CreateUser(ctx, in)
+}
+
+func (r Router) GetUser(ctx context.Context, pool, username string) (UserSnapshot, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return UserSnapshot{}, err
+	}
+	return up.GetUser(ctx, pool, username)
+}
+
+func (r Router) DeleteUser(ctx context.Context, pool, username string) error {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return err
+	}
+	return up.DeleteUser(ctx, pool, username)
+}
+
+func (r Router) SetUserEnabled(ctx context.Context, pool, username string, enabled bool) (UserSnapshot, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return UserSnapshot{}, err
+	}
+	return up.SetUserEnabled(ctx, pool, username, enabled)
+}
+
+func (r Router) SetUserPassword(ctx context.Context, pool, username, password string) (UserSnapshot, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return UserSnapshot{}, err
+	}
+	return up.SetUserPassword(ctx, pool, username, password)
+}
+
+func (r Router) ListUserIndex(ctx context.Context, pool, afterUsername string, maxItems int) (UserIndexPage, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return UserIndexPage{}, err
+	}
+	return up.ListUserIndex(ctx, pool, afterUsername, maxItems)
+}
+
+func (r Router) SignIn(ctx context.Context, in UserSignInInput) (SessionSnapshot, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return SessionSnapshot{}, err
+	}
+	return up.SignIn(ctx, in)
+}
+
+func (r Router) CreateGroup(ctx context.Context, in GroupCreateInput) (bool, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return false, err
+	}
+	return up.CreateGroup(ctx, in)
+}
+
+func (r Router) DeleteGroup(ctx context.Context, pool, group string) (bool, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return false, err
+	}
+	return up.DeleteGroup(ctx, pool, group)
+}
+
+func (r Router) ListGroups(ctx context.Context, pool string) ([]string, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return up.ListGroups(ctx, pool)
+}
+
+func (r Router) AddUserToGroup(ctx context.Context, pool, group, username string) (bool, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return false, err
+	}
+	return up.AddUserToGroup(ctx, pool, group, username)
+}
+
+func (r Router) RemoveUserFromGroup(ctx context.Context, pool, group, username string) error {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return err
+	}
+	return up.RemoveUserFromGroup(ctx, pool, group, username)
+}
+
+func (r Router) ListUserGroups(ctx context.Context, pool, username string) ([]string, error) {
+	up, err := r.pickUserpools(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return up.ListUserGroups(ctx, pool, username)
+}
+
+func (r Router) UserpoolOwnerToken(ctx context.Context, pool string) (string, bool, error) {
+	be, err := r.pick(WithForbidLiveRoute(ctx))
+	if err != nil {
+		return "", false, err
+	}
+	if or, ok := be.(UserpoolOwnershipReader); ok && !isNilPointer(or) {
+		return or.UserpoolOwnerToken(ctx, pool)
+	}
+	return "", false, errNoToken
+}
+
 // isNilPointer catches a typed-nil backend (e.g. a nil *Client stored in a
 // Backend), which would otherwise panic on the first method call.
 func isNilPointer(v any) bool {

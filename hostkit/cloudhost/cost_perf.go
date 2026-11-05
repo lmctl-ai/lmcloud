@@ -35,6 +35,11 @@ const (
 	bytesPerGiB     = 1024 * 1024 * 1024
 
 	campaignJournalVersion = 1
+
+	// maxNonCleanupJournalBytes reserves 4 MiB of journal file headroom below
+	// safety.MaxJournalFileBytes (64 MiB) so cleanup/delete and settlement
+	// records can always be appended even after non-cleanup work is refused.
+	maxNonCleanupJournalBytes = safety.MaxJournalFileBytes - (4 << 20)
 )
 
 // CostLineItem is the immutable snapshot for a single operation in CostReport.
@@ -139,6 +144,8 @@ func serviceForOp(op string) string {
 		return "permissions"
 	case strings.HasPrefix(op, "function_"):
 		return "function"
+	case strings.HasPrefix(op, "userpool_"), strings.HasPrefix(op, "user_"), strings.HasPrefix(op, "group_"):
+		return "userpool"
 	default:
 		return "cloud"
 	}
@@ -207,8 +214,9 @@ type campaignJournalRecord struct {
 	AttemptNanoUSD           int64  `json:"attempt_nano_usd,omitempty"`
 	CleanupReserveNanoUSD    int64  `json:"cleanup_reserve_nano_usd,omitempty"`
 	ReservedBytes            int64  `json:"reserved_bytes,omitempty"`
-	ChargedNanoUSD           int64  `json:"charged_nano_usd,omitempty"`
-	SettledBytes             int64  `json:"settled_bytes,omitempty"`
+	ChargedNanoUSD           int64                      `json:"charged_nano_usd,omitempty"`
+	OpStats                  map[string]persistedOpCost `json:"op_stats,omitempty"`
+	SettledBytes             int64                      `json:"settled_bytes,omitempty"`
 	BillingUnits             int64  `json:"billing_units,omitempty"`
 	LockCleanup              bool   `json:"lock_cleanup,omitempty"`
 	ReleaseCleanup           bool   `json:"release_cleanup,omitempty"`
@@ -226,10 +234,13 @@ type campaignJournalRecord struct {
 	ExpectedGeneration       string `json:"expected_generation,omitempty"`
 	FunctionDigest           string `json:"function_digest,omitempty"`
 	FunctionState            string `json:"function_state,omitempty"`
+	UserpoolIncarnation      string `json:"userpool_incarnation,omitempty"`
+	UserpoolState            string `json:"userpool_state,omitempty"`
 }
 
 type replayedCampaignState struct {
 	lastSeq                uint64
+	journalFileBytes       int
 	chargedNanoUSD         int64
 	resourceCleanupNanoUSD int64
 	workCapNanoUSD         int64
@@ -257,6 +268,16 @@ type replayedCampaignState struct {
 	functionOwnerTokens    map[string]string
 	maxFunctionGen         map[string]uint64
 	latestFunctionIntent   map[string]string
+	activeUserpools        map[string]int64
+	activePoolUsers        map[string]int64
+	activePoolGroups       map[string]int64
+	activePoolMemberships  map[string]int64
+	activeUserpoolEntries  map[string]safety.JournalUserpoolEntry
+	ambiguousUserpools     map[string]safety.JournalUserpoolEntry
+	ambiguousUserpoolStack map[string][]safety.JournalUserpoolEntry
+	userpoolOwnerTokens    map[string]string
+	maxUserpoolGen         map[string]uint64
+	latestUserpoolIntent   map[string]string
 	pending                map[string]campaignJournalRecord
 }
 
@@ -364,7 +385,19 @@ type costTracker struct {
 	functionOwnerTokens    map[string]string
 	maxFunctionGen         map[string]uint64
 	latestFunctionIntent   map[string]string
+	activeUserpools        map[string]int64
+	activePoolUsers        map[string]int64
+	activePoolGroups       map[string]int64
+	activePoolMemberships  map[string]int64
+	activeUserpoolEntries  map[string]safety.JournalUserpoolEntry
+	ambiguousUserpools     map[string]safety.JournalUserpoolEntry
+	ambiguousUserpoolStack map[string][]safety.JournalUserpoolEntry
+	userpoolOwnerTokens    map[string]string
+	maxUserpoolGen         map[string]uint64
+	latestUserpoolIntent   map[string]string
 	inFlightAttempts       map[string]bool
+	verifiedCampaignRaw    []byte
+	verifiedCampaignRecs   []campaignJournalRecord
 }
 
 func scopedResKey(endpoint, resKey string) string {
@@ -411,6 +444,13 @@ func isFunctionOp(op, resKind string) bool {
 	return strings.HasPrefix(op, "function_")
 }
 
+func isUserpoolOp(op, resKind string) bool {
+	if resKind == safety.KindUserpool || resKind == safety.KindPoolUser || resKind == safety.KindPoolGroup || resKind == safety.KindPoolMembership {
+		return true
+	}
+	return strings.HasPrefix(op, "userpool_") || strings.HasPrefix(op, "user_") || strings.HasPrefix(op, "group_")
+}
+
 func hasFunctionChildren(activeVersions, activeAliases map[string]int64, scopedFunc string) bool {
 	if scopedFunc == "" {
 		return false
@@ -423,6 +463,52 @@ func hasFunctionChildren(activeVersions, activeAliases map[string]int64, scopedF
 	}
 	for k := range activeAliases {
 		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasUserpoolChildren(activeUsers, activeGroups, activeMemberships map[string]int64, scopedPool string) bool {
+	if scopedPool == "" {
+		return false
+	}
+	prefix := scopedPool + "/"
+	for k := range activeUsers {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	for k := range activeGroups {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	for k := range activeMemberships {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasJournalUserpoolChildren(activeCleanup map[string]int64, endpoint, pool string) bool {
+	if pool == "" || len(activeCleanup) == 0 {
+		return false
+	}
+	uPref := safety.KindPoolUser + "\x00" + endpoint + "\x00" + pool + "/"
+	uPrefUnscoped := safety.KindPoolUser + "\x00\x00" + pool + "/"
+	uParent := safety.KindPoolUser + "\x00" + pool + "\x00"
+	gPref := safety.KindPoolGroup + "\x00" + endpoint + "\x00" + pool + "/"
+	gPrefUnscoped := safety.KindPoolGroup + "\x00\x00" + pool + "/"
+	gParent := safety.KindPoolGroup + "\x00" + pool + "\x00"
+	mPref := safety.KindPoolMembership + "\x00" + endpoint + "\x00" + pool + "/"
+	mPrefUnscoped := safety.KindPoolMembership + "\x00\x00" + pool + "/"
+	mParent := safety.KindPoolMembership + "\x00" + pool + "\x00"
+	for k := range activeCleanup {
+		if strings.HasPrefix(k, uPref) || strings.HasPrefix(k, uPrefUnscoped) || strings.HasPrefix(k, uParent) ||
+			strings.HasPrefix(k, gPref) || strings.HasPrefix(k, gPrefUnscoped) || strings.HasPrefix(k, gParent) ||
+			strings.HasPrefix(k, mPref) || strings.HasPrefix(k, mPrefUnscoped) || strings.HasPrefix(k, mParent) {
 			return true
 		}
 	}
@@ -477,7 +563,7 @@ func hasJournalTableChildItems(activeCleanup map[string]int64, endpoint, table s
 }
 
 func (ct *costTracker) isServiceDelegated(op, resKind string) bool {
-	if isPermissionsOp(op, resKind) || isFunctionOp(op, resKind) {
+	if isPermissionsOp(op, resKind) || isFunctionOp(op, resKind) || isUserpoolOp(op, resKind) {
 		return false
 	}
 	switch resKind {
@@ -521,6 +607,19 @@ func (ct *costTracker) checkFunctionAllowed() *hostkit.CloudError {
 	if ct.liveGuard != nil || ct.liveMode || ct.unconfiguredLive {
 		return hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveFunctionNotCertified",
 			"live mode refuses function operations: live function slice is not certified")
+	}
+	return nil
+}
+
+func (ct *costTracker) checkUserpoolAllowed() *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	if ct.liveGuard != nil || ct.liveMode || ct.unconfiguredLive {
+		return hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveUserpoolNotCertified",
+			"live mode refuses userpool operations: live userpool slice is not certified")
 	}
 	return nil
 }
@@ -622,6 +721,16 @@ func newCostTracker(cfg Config) *costTracker {
 		functionOwnerTokens:    map[string]string{},
 		maxFunctionGen:         map[string]uint64{},
 		latestFunctionIntent:   map[string]string{},
+		activeUserpools:        map[string]int64{},
+		activePoolUsers:        map[string]int64{},
+		activePoolGroups:       map[string]int64{},
+		activePoolMemberships:  map[string]int64{},
+		activeUserpoolEntries:  map[string]safety.JournalUserpoolEntry{},
+		ambiguousUserpools:     map[string]safety.JournalUserpoolEntry{},
+		ambiguousUserpoolStack: map[string][]safety.JournalUserpoolEntry{},
+		userpoolOwnerTokens:    map[string]string{},
+		maxUserpoolGen:         map[string]uint64{},
+		latestUserpoolIntent:   map[string]string{},
 		inFlightAttempts:       map[string]bool{},
 	}
 
@@ -981,6 +1090,37 @@ func deleteCampaignFunctionCleanup(st *replayedCampaignState, sKey string) {
 	}
 }
 
+func countCampaignUserpoolKeys(st *replayedCampaignState) int {
+	seen := make(map[string]struct{}, len(st.activeUserpoolEntries)+len(st.ambiguousUserpools))
+	for k := range st.activeUserpoolEntries {
+		seen[k] = struct{}{}
+	}
+	for k := range st.ambiguousUserpools {
+		seen[k] = struct{}{}
+	}
+	return len(seen)
+}
+
+func deleteCampaignUserpoolCleanup(st *replayedCampaignState, sKey string) {
+	delete(st.activeUserpools, sKey)
+	prefix := sKey + "/"
+	for k := range st.activePoolUsers {
+		if strings.HasPrefix(k, prefix) {
+			delete(st.activePoolUsers, k)
+		}
+	}
+	for k := range st.activePoolGroups {
+		if strings.HasPrefix(k, prefix) {
+			delete(st.activePoolGroups, k)
+		}
+	}
+	for k := range st.activePoolMemberships {
+		if strings.HasPrefix(k, prefix) {
+			delete(st.activePoolMemberships, k)
+		}
+	}
+}
+
 func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, error) {
 	st := &replayedCampaignState{
 		ops:                    map[string]persistedOpCost{},
@@ -1005,6 +1145,16 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 		functionOwnerTokens:    map[string]string{},
 		maxFunctionGen:         map[string]uint64{},
 		latestFunctionIntent:   map[string]string{},
+		activeUserpools:        map[string]int64{},
+		activePoolUsers:        map[string]int64{},
+		activePoolGroups:       map[string]int64{},
+		activePoolMemberships:  map[string]int64{},
+		activeUserpoolEntries:  map[string]safety.JournalUserpoolEntry{},
+		ambiguousUserpools:     map[string]safety.JournalUserpoolEntry{},
+		ambiguousUserpoolStack: map[string][]safety.JournalUserpoolEntry{},
+		userpoolOwnerTokens:    map[string]string{},
+		maxUserpoolGen:         map[string]uint64{},
+		latestUserpoolIntent:   map[string]string{},
 		pending:                map[string]campaignJournalRecord{},
 	}
 	if len(raw) == 0 {
@@ -1013,11 +1163,30 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 	if raw[len(raw)-1] != '\n' {
 		return nil, errors.New("corrupt campaign journal: incomplete trailing line")
 	}
-	lines := bytes.Split(raw, []byte{'\n'})
-	for i, line := range lines {
-		if i == len(lines)-1 && len(line) == 0 {
-			continue
+	cachedCount := 0
+	var tailLines [][]byte
+	if len(ct.verifiedCampaignRaw) > 0 && len(raw) >= len(ct.verifiedCampaignRaw) &&
+		bytes.Equal(raw[:len(ct.verifiedCampaignRaw)], ct.verifiedCampaignRaw) {
+		cachedCount = len(ct.verifiedCampaignRecs)
+		if tail := raw[len(ct.verifiedCampaignRaw):]; len(tail) > 0 {
+			tailLines = bytes.Split(tail, []byte{'\n'})
+			if len(tailLines) > 0 && len(tailLines[len(tailLines)-1]) == 0 {
+				tailLines = tailLines[:len(tailLines)-1]
+			}
 		}
+	} else {
+		tailLines = bytes.Split(raw, []byte{'\n'})
+		if len(tailLines) > 0 && len(tailLines[len(tailLines)-1]) == 0 {
+			tailLines = tailLines[:len(tailLines)-1]
+		}
+	}
+	totalLines := cachedCount + len(tailLines)
+	newRecs := make([]campaignJournalRecord, 0, totalLines)
+	if cachedCount > 0 {
+		newRecs = append(newRecs, ct.verifiedCampaignRecs[:cachedCount]...)
+	}
+	for idx, line := range tailLines {
+		i := cachedCount + idx
 		if len(bytes.TrimSpace(line)) == 0 {
 			return nil, fmt.Errorf("corrupt campaign journal line %d: empty line", i+1)
 		}
@@ -1039,38 +1208,58 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 		if i == 0 && rec.Event != safety.EventMeta {
 			return nil, fmt.Errorf("corrupt campaign journal: first record must be %q, got %q", safety.EventMeta, rec.Event)
 		}
+		newRecs = append(newRecs, rec)
+	}
+	for i, rec := range newRecs {
 		st.lastSeq = rec.Seq
 		switch rec.Event {
 		case safety.EventMeta:
 			if i != 0 {
 				return nil, errors.New("corrupt campaign journal: duplicate meta record")
 			}
-			wantMeta := ct.campaignMetaRecord()
-			if rec.Provider == "" || rec.PriceTableVersion == "" || rec.PriceTableHash == "" || rec.PolicyHash == "" || rec.CapNanoUSD <= 0 || rec.CeilingNanoUSD <= 0 {
-				return nil, errors.New("corrupt campaign journal: incomplete authority metadata in meta record")
+			if i >= cachedCount {
+				wantMeta := ct.campaignMetaRecord()
+				if rec.Provider == "" || rec.PriceTableVersion == "" || rec.PriceTableHash == "" || rec.PolicyHash == "" || rec.CapNanoUSD <= 0 || rec.CeilingNanoUSD <= 0 {
+					return nil, errors.New("corrupt campaign journal: incomplete authority metadata in meta record")
+				}
+				if rec.Provider != wantMeta.Provider {
+					return nil, fmt.Errorf("campaign journal provider mismatch: journal has %q, tracker has %q", rec.Provider, wantMeta.Provider)
+				}
+				if rec.Region != wantMeta.Region {
+					return nil, fmt.Errorf("campaign journal region mismatch: journal has %q, tracker has %q", rec.Region, wantMeta.Region)
+				}
+				if rec.Scope != wantMeta.Scope {
+					return nil, fmt.Errorf("campaign journal scope mismatch: journal has %q, tracker has %q", rec.Scope, wantMeta.Scope)
+				}
+				if rec.PriceTableVersion != wantMeta.PriceTableVersion {
+					return nil, fmt.Errorf("campaign journal price_table_version mismatch: journal has %q, tracker has %q", rec.PriceTableVersion, wantMeta.PriceTableVersion)
+				}
+				if rec.PriceTableHash != wantMeta.PriceTableHash {
+					return nil, fmt.Errorf("campaign journal price_table_hash mismatch: journal has %q, tracker has %q", rec.PriceTableHash, wantMeta.PriceTableHash)
+				}
+				if rec.CapNanoUSD != wantMeta.CapNanoUSD || rec.CeilingNanoUSD != wantMeta.CeilingNanoUSD || rec.MaxCleanupReserveNanoUSD != wantMeta.MaxCleanupReserveNanoUSD {
+					return nil, fmt.Errorf("campaign journal policy cap/ceiling/cleanup mismatch: journal has (%d/%d/%d), tracker has (%d/%d/%d)",
+						rec.CapNanoUSD, rec.CeilingNanoUSD, rec.MaxCleanupReserveNanoUSD,
+						wantMeta.CapNanoUSD, wantMeta.CeilingNanoUSD, wantMeta.MaxCleanupReserveNanoUSD)
+				}
+				if rec.PolicyHash != wantMeta.PolicyHash {
+					return nil, fmt.Errorf("campaign journal policy_hash mismatch: journal has %q, tracker has %q", rec.PolicyHash, wantMeta.PolicyHash)
+				}
 			}
-			if rec.Provider != wantMeta.Provider {
-				return nil, fmt.Errorf("campaign journal provider mismatch: journal has %q, tracker has %q", rec.Provider, wantMeta.Provider)
+			if rec.ChargedNanoUSD < 0 {
+				return nil, errors.New("corrupt campaign journal: negative meta charged_nano_usd")
 			}
-			if rec.Region != wantMeta.Region {
-				return nil, fmt.Errorf("campaign journal region mismatch: journal has %q, tracker has %q", rec.Region, wantMeta.Region)
-			}
-			if rec.Scope != wantMeta.Scope {
-				return nil, fmt.Errorf("campaign journal scope mismatch: journal has %q, tracker has %q", rec.Scope, wantMeta.Scope)
-			}
-			if rec.PriceTableVersion != wantMeta.PriceTableVersion {
-				return nil, fmt.Errorf("campaign journal price_table_version mismatch: journal has %q, tracker has %q", rec.PriceTableVersion, wantMeta.PriceTableVersion)
-			}
-			if rec.PriceTableHash != wantMeta.PriceTableHash {
-				return nil, fmt.Errorf("campaign journal price_table_hash mismatch: journal has %q, tracker has %q", rec.PriceTableHash, wantMeta.PriceTableHash)
-			}
-			if rec.CapNanoUSD != wantMeta.CapNanoUSD || rec.CeilingNanoUSD != wantMeta.CeilingNanoUSD || rec.MaxCleanupReserveNanoUSD != wantMeta.MaxCleanupReserveNanoUSD {
-				return nil, fmt.Errorf("campaign journal policy cap/ceiling/cleanup mismatch: journal has (%d/%d/%d), tracker has (%d/%d/%d)",
-					rec.CapNanoUSD, rec.CeilingNanoUSD, rec.MaxCleanupReserveNanoUSD,
-					wantMeta.CapNanoUSD, wantMeta.CeilingNanoUSD, wantMeta.MaxCleanupReserveNanoUSD)
-			}
-			if rec.PolicyHash != wantMeta.PolicyHash {
-				return nil, fmt.Errorf("campaign journal policy_hash mismatch: journal has %q, tracker has %q", rec.PolicyHash, wantMeta.PolicyHash)
+			st.chargedNanoUSD += rec.ChargedNanoUSD
+			for op, stat := range rec.OpStats {
+				if op == "" || stat.Requests < 0 || stat.BillingUnits < 0 || stat.Bytes < 0 || stat.ChargedNanoUSD < 0 {
+					return nil, errors.New("corrupt campaign journal: invalid meta op_stats")
+				}
+				cur := st.ops[op]
+				cur.Requests += stat.Requests
+				cur.BillingUnits += stat.BillingUnits
+				cur.Bytes += stat.Bytes
+				cur.ChargedNanoUSD += stat.ChargedNanoUSD
+				st.ops[op] = cur
 			}
 		case safety.EventWorkCap:
 			if rec.WorkCapNanoUSD <= 0 {
@@ -1154,6 +1343,22 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 					if _, exists := st.activeFunctionAliases[sKey]; !exists {
 						st.activeFunctionAliases[sKey] = p.CleanupReserveNanoUSD
 					}
+				case safety.KindUserpool:
+					if _, exists := st.activeUserpools[sKey]; !exists {
+						st.activeUserpools[sKey] = p.CleanupReserveNanoUSD
+					}
+				case safety.KindPoolUser:
+					if _, exists := st.activePoolUsers[sKey]; !exists {
+						st.activePoolUsers[sKey] = p.CleanupReserveNanoUSD
+					}
+				case safety.KindPoolGroup:
+					if _, exists := st.activePoolGroups[sKey]; !exists {
+						st.activePoolGroups[sKey] = p.CleanupReserveNanoUSD
+					}
+				case safety.KindPoolMembership:
+					if _, exists := st.activePoolMemberships[sKey]; !exists {
+						st.activePoolMemberships[sKey] = p.CleanupReserveNanoUSD
+					}
 				}
 			}
 			if rec.ReleaseCleanup && p.ResKey != "" {
@@ -1181,6 +1386,29 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 					deleteCampaignFunctionCleanup(st, sKey)
 				case safety.KindFunctionAlias:
 					delete(st.activeFunctionAliases, sKey)
+				case safety.KindUserpool:
+					deleteCampaignUserpoolCleanup(st, sKey)
+				case safety.KindPoolUser:
+					delete(st.activePoolUsers, sKey)
+					if slash := strings.IndexByte(p.ResKey, '/'); slash > 0 && slash < len(p.ResKey)-1 {
+						poolPrefix := scopedResKey(p.Endpoint, p.ResKey[:slash]+"/")
+						userSuffix := "/" + p.ResKey[slash+1:]
+						for k := range st.activePoolMemberships {
+							if strings.HasPrefix(k, poolPrefix) && strings.HasSuffix(k, userSuffix) {
+								delete(st.activePoolMemberships, k)
+							}
+						}
+					}
+				case safety.KindPoolGroup:
+					delete(st.activePoolGroups, sKey)
+					grpPrefix := sKey + "/"
+					for k := range st.activePoolMemberships {
+						if strings.HasPrefix(k, grpPrefix) {
+							delete(st.activePoolMemberships, k)
+						}
+					}
+				case safety.KindPoolMembership:
+					delete(st.activePoolMemberships, sKey)
 				}
 			}
 		case safety.EventPolicyIntent:
@@ -1548,6 +1776,174 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 			delete(st.activeFunctionEntries, fKey)
 			deleteCampaignFunctionCleanup(st, fKey)
 			deleteResourcePolicyAttachments(st.activePolicies, st.ambiguousPolicies, st.ambiguousStack, st.policyCleanup, safety.KindFunction, rec.Endpoint, rec.ResKey)
+		case safety.EventUserpoolIntent:
+			if rec.ResKey == "" || len(rec.ResKey) > 32 || rec.Generation == "" {
+				return nil, errors.New("corrupt campaign journal userpool_intent missing name or generation")
+			}
+			if rec.PolicyIntentOp != "create" && rec.PolicyIntentOp != "mutate" && rec.PolicyIntentOp != "delete" && rec.PolicyIntentOp != "abort" {
+				return nil, fmt.Errorf("corrupt campaign journal userpool_intent invalid op %q", rec.PolicyIntentOp)
+			}
+			genNum, err := strconv.ParseUint(rec.Generation, 10, 64)
+			if err != nil || genNum == 0 {
+				return nil, fmt.Errorf("corrupt campaign journal userpool_intent generation %q", rec.Generation)
+			}
+			if err := safety.ValidateToken128(rec.OwnerToken); err != nil {
+				return nil, fmt.Errorf("corrupt campaign journal userpool_intent owner_token: %w", err)
+			}
+			if err := safety.ValidateToken128(rec.IntentID); err != nil {
+				return nil, fmt.Errorf("corrupt campaign journal userpool_intent intent_id: %w", err)
+			}
+			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			if rec.PolicyIntentOp == "abort" {
+				stack := st.ambiguousUserpoolStack[uKey]
+				if len(stack) > 0 {
+					filtered := stack[:0]
+					for _, item := range stack {
+						if item.IntentID != rec.IntentID {
+							filtered = append(filtered, item)
+						}
+					}
+					if len(filtered) > 0 {
+						st.ambiguousUserpoolStack[uKey] = filtered
+						st.ambiguousUserpools[uKey] = filtered[len(filtered)-1]
+					} else {
+						delete(st.ambiguousUserpoolStack, uKey)
+						delete(st.ambiguousUserpools, uKey)
+						if _, inActive := st.activeUserpoolEntries[uKey]; !inActive {
+							deleteCampaignUserpoolCleanup(st, uKey)
+						}
+					}
+				} else if st.latestUserpoolIntent[uKey] == "" || st.latestUserpoolIntent[uKey] == rec.IntentID {
+					delete(st.ambiguousUserpools, uKey)
+					if _, inActive := st.activeUserpoolEntries[uKey]; !inActive {
+						deleteCampaignUserpoolCleanup(st, uKey)
+					}
+				}
+				continue
+			}
+			if genNum <= st.maxUserpoolGen[uKey] {
+				return nil, fmt.Errorf("corrupt campaign journal userpool_intent non-monotonic generation %d (max %d)", genNum, st.maxUserpoolGen[uKey])
+			}
+			if rec.PolicyIntentOp == "create" {
+				if _, inActive := st.activeUserpoolEntries[uKey]; !inActive {
+					if _, inAmb := st.ambiguousUserpools[uKey]; !inAmb && countCampaignUserpoolKeys(st) >= hostkit.MaxUserpoolsPerRun {
+						return nil, errors.New("corrupt campaign journal userpool_intent exceeds MaxUserpoolsPerRun")
+					}
+				}
+			}
+			st.maxUserpoolGen[uKey] = genNum
+			st.latestUserpoolIntent[uKey] = rec.IntentID
+			st.userpoolOwnerTokens[uKey] = rec.OwnerToken
+			jue := safety.JournalUserpoolEntry{
+				Key:         uKey,
+				Scope:       rec.Endpoint,
+				Name:        rec.ResKey,
+				Incarnation: rec.UserpoolIncarnation,
+				OwnerToken:  rec.OwnerToken,
+				Generation:  rec.Generation,
+				IntentID:    rec.IntentID,
+				Ambiguous:   true,
+				IntentOp:    rec.PolicyIntentOp,
+			}
+			st.ambiguousUserpoolStack[uKey] = append(st.ambiguousUserpoolStack[uKey], jue)
+			st.ambiguousUserpools[uKey] = jue
+			if rec.CleanupReserveNanoUSD > 0 {
+				st.activeUserpools[uKey] = rec.CleanupReserveNanoUSD
+			}
+		case safety.EventUserpoolConfirm:
+			if rec.ResKey == "" || len(rec.ResKey) > 32 || rec.Generation == "" {
+				return nil, errors.New("corrupt campaign journal userpool_confirm missing name or generation")
+			}
+			genNum, err := strconv.ParseUint(rec.Generation, 10, 64)
+			if err != nil || genNum == 0 {
+				return nil, fmt.Errorf("corrupt campaign journal userpool_confirm generation %q", rec.Generation)
+			}
+			if err := safety.ValidateToken128(rec.OwnerToken); err != nil {
+				return nil, fmt.Errorf("corrupt campaign journal userpool_confirm owner_token: %w", err)
+			}
+			if rec.IntentID != "" {
+				if err := safety.ValidateToken128(rec.IntentID); err != nil {
+					return nil, fmt.Errorf("corrupt campaign journal userpool_confirm intent_id: %w", err)
+				}
+			}
+			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			if genNum < st.maxUserpoolGen[uKey] {
+				return nil, fmt.Errorf("corrupt campaign journal stale userpool_confirm generation %d (max %d)", genNum, st.maxUserpoolGen[uKey])
+			}
+			if rec.IntentID != "" && st.latestUserpoolIntent[uKey] != "" && rec.IntentID != st.latestUserpoolIntent[uKey] {
+				return nil, fmt.Errorf("corrupt campaign journal stale userpool_confirm intent_id %q (latest %q)", rec.IntentID, st.latestUserpoolIntent[uKey])
+			}
+			if _, inActive := st.activeUserpoolEntries[uKey]; !inActive {
+				if _, inAmb := st.ambiguousUserpools[uKey]; !inAmb && countCampaignUserpoolKeys(st) >= hostkit.MaxUserpoolsPerRun {
+					return nil, errors.New("corrupt campaign journal userpool_confirm exceeds MaxUserpoolsPerRun")
+				}
+			}
+			st.maxUserpoolGen[uKey] = genNum
+			if rec.IntentID != "" {
+				st.latestUserpoolIntent[uKey] = rec.IntentID
+			}
+			st.userpoolOwnerTokens[uKey] = rec.OwnerToken
+			delete(st.ambiguousUserpoolStack, uKey)
+			delete(st.ambiguousUserpools, uKey)
+			stateJSON := rec.UserpoolState
+			if stateJSON == "" {
+				stateJSON = st.activeUserpoolEntries[uKey].StateJSON
+			}
+			st.activeUserpoolEntries[uKey] = safety.JournalUserpoolEntry{
+				Key:         uKey,
+				Scope:       rec.Endpoint,
+				Name:        rec.ResKey,
+				Incarnation: rec.UserpoolIncarnation,
+				OwnerToken:  rec.OwnerToken,
+				Generation:  rec.Generation,
+				IntentID:    rec.IntentID,
+				StateJSON:   stateJSON,
+			}
+			if rec.CleanupReserveNanoUSD > 0 {
+				st.activeUserpools[uKey] = rec.CleanupReserveNanoUSD
+			}
+		case safety.EventUserpoolState:
+			if rec.ResKey == "" || len(rec.ResKey) > 32 || rec.Generation == "" {
+				return nil, errors.New("corrupt campaign journal userpool_state missing name or generation")
+			}
+			if genNum, err := strconv.ParseUint(rec.Generation, 10, 64); err != nil || genNum == 0 {
+				return nil, fmt.Errorf("corrupt campaign journal userpool_state generation %q", rec.Generation)
+			}
+			if err := safety.ValidateToken128(rec.OwnerToken); err != nil {
+				return nil, fmt.Errorf("corrupt campaign journal userpool_state owner_token: %w", err)
+			}
+			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			act, hasAct := st.activeUserpoolEntries[uKey]
+			if hasAct && safety.OnlyDuplicateUserpoolCreateAmbiguity(act, st.ambiguousUserpoolStack[uKey]) &&
+				act.OwnerToken == rec.OwnerToken && act.Incarnation == rec.UserpoolIncarnation {
+				act.StateJSON = rec.UserpoolState
+				st.activeUserpoolEntries[uKey] = act
+			}
+		case safety.EventUserpoolDelete:
+			if rec.ResKey == "" || len(rec.ResKey) > 32 {
+				return nil, errors.New("corrupt campaign journal userpool_delete missing name")
+			}
+			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			if rec.Generation != "" {
+				genNum, err := strconv.ParseUint(rec.Generation, 10, 64)
+				if err != nil || genNum == 0 || genNum < st.maxUserpoolGen[uKey] {
+					return nil, fmt.Errorf("corrupt campaign journal stale userpool_delete generation %q", rec.Generation)
+				}
+				st.maxUserpoolGen[uKey] = genNum
+			}
+			if rec.IntentID != "" && st.latestUserpoolIntent[uKey] != "" && rec.IntentID != st.latestUserpoolIntent[uKey] {
+				return nil, fmt.Errorf("corrupt campaign journal stale userpool_delete intent_id %q", rec.IntentID)
+			}
+			if rec.IntentID != "" {
+				st.latestUserpoolIntent[uKey] = rec.IntentID
+			}
+			if rec.OwnerToken != "" {
+				st.userpoolOwnerTokens[uKey] = rec.OwnerToken
+			}
+			delete(st.ambiguousUserpoolStack, uKey)
+			delete(st.ambiguousUserpools, uKey)
+			delete(st.activeUserpoolEntries, uKey)
+			deleteCampaignUserpoolCleanup(st, uKey)
 		default:
 			return nil, fmt.Errorf("corrupt campaign journal: unknown event %q", rec.Event)
 		}
@@ -1580,6 +1976,26 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 	for _, v := range st.activeFunctionAliases {
 		st.resourceCleanupNanoUSD += v
 	}
+	for _, v := range st.activeUserpools {
+		st.resourceCleanupNanoUSD += v
+	}
+	for _, v := range st.activePoolUsers {
+		st.resourceCleanupNanoUSD += v
+	}
+	for _, v := range st.activePoolGroups {
+		st.resourceCleanupNanoUSD += v
+	}
+	for _, v := range st.activePoolMemberships {
+		st.resourceCleanupNanoUSD += v
+	}
+	if cachedCount > 0 {
+		if len(raw) > len(ct.verifiedCampaignRaw) {
+			ct.verifiedCampaignRaw = append(ct.verifiedCampaignRaw, raw[len(ct.verifiedCampaignRaw):]...)
+		}
+	} else {
+		ct.verifiedCampaignRaw = append(ct.verifiedCampaignRaw[:0], raw...)
+	}
+	ct.verifiedCampaignRecs = newRecs
 	return st, nil
 }
 
@@ -1691,6 +2107,54 @@ func (ct *costTracker) applyReplayedStateLocked(st *replayedCampaignState) {
 	for k, v := range st.latestFunctionIntent {
 		ct.latestFunctionIntent[k] = v
 	}
+	ct.activeUserpools = make(map[string]int64, len(st.activeUserpools))
+	for k, v := range st.activeUserpools {
+		ct.activeUserpools[k] = v
+	}
+	ct.activePoolUsers = make(map[string]int64, len(st.activePoolUsers))
+	for k, v := range st.activePoolUsers {
+		ct.activePoolUsers[k] = v
+	}
+	ct.activePoolGroups = make(map[string]int64, len(st.activePoolGroups))
+	for k, v := range st.activePoolGroups {
+		ct.activePoolGroups[k] = v
+	}
+	ct.activePoolMemberships = make(map[string]int64, len(st.activePoolMemberships))
+	for k, v := range st.activePoolMemberships {
+		ct.activePoolMemberships[k] = v
+	}
+	ct.activeUserpoolEntries = make(map[string]safety.JournalUserpoolEntry, len(st.activeUserpoolEntries))
+	for k, v := range st.activeUserpoolEntries {
+		ct.activeUserpoolEntries[k] = v
+		if ct.onToken != nil && v.OwnerToken != "" {
+			ct.onToken(v.OwnerToken)
+		}
+	}
+	ct.ambiguousUserpools = make(map[string]safety.JournalUserpoolEntry, len(st.ambiguousUserpools))
+	for k, v := range st.ambiguousUserpools {
+		ct.ambiguousUserpools[k] = v
+		if ct.onToken != nil && v.OwnerToken != "" {
+			ct.onToken(v.OwnerToken)
+		}
+	}
+	ct.ambiguousUserpoolStack = make(map[string][]safety.JournalUserpoolEntry, len(st.ambiguousUserpoolStack))
+	for k, stack := range st.ambiguousUserpoolStack {
+		cp := make([]safety.JournalUserpoolEntry, len(stack))
+		copy(cp, stack)
+		ct.ambiguousUserpoolStack[k] = cp
+	}
+	ct.userpoolOwnerTokens = make(map[string]string, len(st.userpoolOwnerTokens))
+	for k, v := range st.userpoolOwnerTokens {
+		ct.userpoolOwnerTokens[k] = v
+	}
+	ct.maxUserpoolGen = make(map[string]uint64, len(st.maxUserpoolGen))
+	for k, v := range st.maxUserpoolGen {
+		ct.maxUserpoolGen[k] = v
+	}
+	ct.latestUserpoolIntent = make(map[string]string, len(st.latestUserpoolIntent))
+	for k, v := range st.latestUserpoolIntent {
+		ct.latestUserpoolIntent[k] = v
+	}
 
 	charged := st.chargedNanoUSD
 	cleanup := st.resourceCleanupNanoUSD
@@ -1725,32 +2189,32 @@ func (ct *costTracker) applyReplayedStateLocked(st *replayedCampaignState) {
 	ct.meter.SyncLedgerState(charged, cleanup, workCap)
 }
 
-func appendCampaignRecord(f *os.File, seq uint64, rec campaignJournalRecord) error {
+func appendCampaignRecord(f *os.File, seq uint64, rec campaignJournalRecord) ([]byte, campaignJournalRecord, error) {
 	rec.Version = campaignJournalVersion
 	rec.Seq = seq
 	line, err := json.Marshal(rec)
 	if err != nil {
-		return err
+		return nil, rec, err
 	}
 	line = append(line, '\n')
 	off, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
-		return err
+		return nil, rec, err
 	}
 	n, err := f.Write(line)
 	if err != nil {
 		_ = f.Truncate(off)
-		return err
+		return nil, rec, err
 	}
 	if n != len(line) {
 		_ = f.Truncate(off)
-		return io.ErrShortWrite
+		return nil, rec, io.ErrShortWrite
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Truncate(off)
-		return err
+		return nil, rec, err
 	}
-	return nil
+	return line, rec, nil
 }
 
 func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error) error {
@@ -1783,38 +2247,76 @@ func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(s
 		_ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
 	}()
 
+	_ = os.Remove(ct.statePath + ".compact.tmp")
+
 	f, fileCreated, err := openCampaignFileNoFollow(ct.statePath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if f != nil {
+			_ = f.Close()
+		}
+	}()
 
-	raw, err := io.ReadAll(io.LimitReader(f, safety.MaxJournalFileBytes+1))
+	fi, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("read campaign %s: %w", ct.statePath, err)
+		return fmt.Errorf("stat campaign %s: %w", ct.statePath, err)
 	}
-	if len(raw) > safety.MaxJournalFileBytes {
+	if fi.Size() > safety.MaxJournalFileBytes {
 		return fmt.Errorf("campaign %s exceeds maximum size of %d bytes", ct.statePath, safety.MaxJournalFileBytes)
+	}
+	var raw []byte
+	if fi.Size() > 0 {
+		raw = make([]byte, fi.Size())
+		if _, err := io.ReadFull(f, raw); err != nil {
+			return fmt.Errorf("read campaign %s: %w", ct.statePath, err)
+		}
 	}
 	st, err := ct.replayCampaignBytes(raw)
 	if err != nil {
 		return err
+	}
+	st.journalFileBytes = len(raw)
+	if createIfMissing && fn != nil && len(raw) > 310<<10 {
+		if compactedRaw, compactedRecs, compactedSeq, ok := compactSupersededCampaignStates(raw, ct.verifiedCampaignRecs); ok && len(compactedRaw) < len(raw) {
+			newF, _ := rewriteCampaignFileAtomic(ct.statePath, compactedRaw)
+			if newF != nil {
+				_ = f.Close()
+				f = newF
+				st.lastSeq = compactedSeq
+				st.journalFileBytes = len(compactedRaw)
+				raw = compactedRaw
+				ct.verifiedCampaignRaw = append(ct.verifiedCampaignRaw[:0], compactedRaw...)
+				ct.verifiedCampaignRecs = compactedRecs
+			}
+		}
 	}
 	ct.applyReplayedStateLocked(st)
 
 	if fn != nil {
 		appendFn := func(rec campaignJournalRecord) error {
 			if st.lastSeq == 0 {
-				if err := appendCampaignRecord(f, 1, ct.campaignMetaRecord()); err != nil {
+				metaLine, metaRec, err := appendCampaignRecord(f, 1, ct.campaignMetaRecord())
+				if err != nil {
 					return err
 				}
 				st.lastSeq = 1
+				st.journalFileBytes += len(metaLine)
+				ct.verifiedCampaignRaw = append(ct.verifiedCampaignRaw[:0], metaLine...)
+				ct.verifiedCampaignRecs = []campaignJournalRecord{metaRec}
 			}
 			nextSeq := st.lastSeq + 1
-			if err := appendCampaignRecord(f, nextSeq, rec); err != nil {
+			line, savedRec, err := appendCampaignRecord(f, nextSeq, rec)
+			if err != nil {
 				return err
 			}
 			st.lastSeq = nextSeq
+			st.journalFileBytes += len(line)
+			if len(ct.verifiedCampaignRecs) == int(nextSeq-1) {
+				ct.verifiedCampaignRaw = append(ct.verifiedCampaignRaw, line...)
+				ct.verifiedCampaignRecs = append(ct.verifiedCampaignRecs, savedRec)
+			}
 			if fileCreated || lockCreated {
 				if err := syncCampaignDir(filepath.Dir(ct.statePath)); err != nil {
 					return err
@@ -1829,6 +2331,270 @@ func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(s
 		}
 	}
 	return nil
+}
+
+func compactSupersededCampaignStates(raw []byte, cachedRecs []campaignJournalRecord) ([]byte, []campaignJournalRecord, uint64, bool) {
+	recs := cachedRecs
+	if len(recs) == 0 {
+		lines := bytes.Split(raw, []byte{'\n'})
+		recs = make([]campaignJournalRecord, 0, len(lines))
+		for i, line := range lines {
+			if i == len(lines)-1 && len(line) == 0 {
+				continue
+			}
+			var rec campaignJournalRecord
+			if err := json.Unmarshal(line, &rec); err != nil {
+				return nil, nil, 0, false
+			}
+			recs = append(recs, rec)
+		}
+	}
+	lastUserpoolState := make(map[string]int)
+	lastFunctionState := make(map[string]int)
+	for idx, rec := range recs {
+		switch rec.Event {
+		case safety.EventUserpoolState:
+			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			lastUserpoolState[uKey] = idx
+		case safety.EventUserpoolConfirm:
+			if rec.UserpoolState != "" {
+				uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+				delete(lastUserpoolState, uKey)
+			}
+		case safety.EventUserpoolDelete:
+			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			delete(lastUserpoolState, uKey)
+		case safety.EventFunctionPreviewState:
+			fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			lastFunctionState[fKey] = idx
+		case safety.EventFunctionConfirm:
+			if rec.FunctionState != "" {
+				fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+				delete(lastFunctionState, fKey)
+			}
+		case safety.EventFunctionDelete:
+			fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			delete(lastFunctionState, fKey)
+		}
+	}
+	dropped := 0
+	droppedBytes := 0
+	for idx, rec := range recs {
+		if rec.Event == safety.EventUserpoolState {
+			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			if lastIdx, ok := lastUserpoolState[uKey]; !ok || lastIdx != idx {
+				dropped++
+				droppedBytes += len(rec.UserpoolState) + 128
+			}
+		} else if rec.Event == safety.EventFunctionPreviewState {
+			fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			if lastIdx, ok := lastFunctionState[fKey]; !ok || lastIdx != idx {
+				dropped++
+				droppedBytes += len(rec.FunctionState) + 128
+			}
+		}
+	}
+	var foldDrop map[int]bool
+	var foldedMeta campaignJournalRecord
+	foldedAny := false
+	nearHardLimit := int64(len(raw))+1024 > safety.MaxJournalFileBytes
+	if nearHardLimit && len(recs) > 0 && recs[0].Event == safety.EventMeta {
+		foldDrop = make(map[int]bool)
+		foldedMeta = recs[0]
+		metaOps := make(map[string]persistedOpCost, len(foldedMeta.OpStats))
+		for k, v := range foldedMeta.OpStats {
+			metaOps[k] = v
+		}
+		type idxPair struct{ rIdx, sIdx int }
+		pendingRes := make(map[string]int)
+		activeChild := make(map[string]bool)
+		childPairs := make(map[string][]idxPair)
+		var foldablePairs []idxPair
+		for idx, rec := range recs {
+			switch rec.Event {
+			case safety.EventReserve:
+				pendingRes[rec.AttemptID] = idx
+			case safety.EventSettle:
+				rIdx, ok := pendingRes[rec.AttemptID]
+				if !ok {
+					continue
+				}
+				delete(pendingRes, rec.AttemptID)
+				rRec := recs[rIdx]
+				if !rec.LockCleanup && !rec.ReleaseCleanup {
+					foldablePairs = append(foldablePairs, idxPair{rIdx, idx})
+				} else if rRec.ResKind == safety.KindPoolUser || rRec.ResKind == safety.KindPoolGroup || rRec.ResKind == safety.KindPoolMembership {
+					cKey := rRec.ResKind + "\x00" + scopedResKey(rRec.Endpoint, rRec.ResKey)
+					if rec.LockCleanup {
+						activeChild[cKey] = true
+					}
+					if rec.ReleaseCleanup {
+						activeChild[cKey] = false
+					}
+					childPairs[cKey] = append(childPairs[cKey], idxPair{rIdx, idx})
+				}
+			case safety.EventUserpoolDelete:
+				prefix := scopedResKey(rec.Endpoint, rec.ResKey) + "/"
+				for cKey := range activeChild {
+					if sep := strings.IndexByte(cKey, '\x00'); sep >= 0 && strings.HasPrefix(cKey[sep+1:], prefix) {
+						activeChild[cKey] = false
+					}
+				}
+			}
+		}
+		for cKey, pairs := range childPairs {
+			if !activeChild[cKey] {
+				foldablePairs = append(foldablePairs, pairs...)
+			}
+		}
+		for _, pair := range foldablePairs {
+			foldDrop[pair.rIdx] = true
+			foldDrop[pair.sIdx] = true
+			dropped += 2
+			droppedBytes += 400
+			foldedAny = true
+			p := recs[pair.rIdx]
+			s := recs[pair.sIdx]
+			if s.BillingUnits == 0 && s.ChargedNanoUSD == 0 && !s.LockCleanup && !s.ReleaseCleanup {
+				continue
+			}
+			charge := s.ChargedNanoUSD
+			foldedMeta.ChargedNanoUSD += charge
+			cur := metaOps[p.Operation]
+			cur.Requests++
+			cur.BillingUnits += s.BillingUnits
+			cur.Bytes += s.SettledBytes
+			cur.ChargedNanoUSD += charge
+			metaOps[p.Operation] = cur
+		}
+		if len(metaOps) > 0 {
+			foldedMeta.OpStats = metaOps
+		}
+	}
+	if !nearHardLimit {
+		if (dropped < 4 && droppedBytes <= 256<<10) || (len(raw) > 2<<20 && droppedBytes <= 256<<10) {
+			return nil, nil, 0, false
+		}
+	} else if dropped == 0 {
+		return nil, nil, 0, false
+	}
+	rawLines := bytes.Split(raw, []byte{'\n'})
+	var buf bytes.Buffer
+	compactedRecs := make([]campaignJournalRecord, 0, len(recs)-dropped)
+	var seq uint64
+	for idx, rec := range recs {
+		if foldDrop[idx] {
+			continue
+		}
+		if idx == 0 && foldedAny {
+			rec = foldedMeta
+		}
+		if rec.Event == safety.EventUserpoolState {
+			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			if lastIdx, ok := lastUserpoolState[uKey]; !ok || lastIdx != idx {
+				continue
+			}
+		}
+		if rec.Event == safety.EventFunctionPreviewState {
+			fKey := scopedResKey(rec.Endpoint, rec.ResKey)
+			if lastIdx, ok := lastFunctionState[fKey]; !ok || lastIdx != idx {
+				continue
+			}
+		}
+		seq++
+		origSeq := rec.Seq
+		rec.Seq = seq
+		compactedRecs = append(compactedRecs, rec)
+		if !(idx == 0 && foldedAny) && idx < len(rawLines) && len(rawLines[idx]) > 0 {
+			if origSeq == seq {
+				buf.Write(rawLines[idx])
+				buf.WriteByte('\n')
+				continue
+			}
+			oldPrefix := fmt.Sprintf(`{"v":%d,"seq":%d,`, rec.Version, origSeq)
+			if bytes.HasPrefix(rawLines[idx], []byte(oldPrefix)) {
+				newPrefix := fmt.Sprintf(`{"v":%d,"seq":%d,`, rec.Version, seq)
+				buf.WriteString(newPrefix)
+				buf.Write(rawLines[idx][len(oldPrefix):])
+				buf.WriteByte('\n')
+				continue
+			}
+		}
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return nil, nil, 0, false
+		}
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+	return buf.Bytes(), compactedRecs, seq, true
+}
+
+// opusCrashHook, opusStepHook, and opusDirSyncFail are fault-injection hooks for testing crash-safety during campaign journal compaction.
+var (
+	opusCrashHook   func(*os.File, []byte)
+	opusStepHook    func(string)
+	opusDirSyncFail func() bool
+)
+
+func opusStep(s string) {
+	if opusStepHook != nil {
+		opusStepHook(s)
+	}
+}
+
+func rewriteCampaignFileAtomic(statePath string, raw []byte) (*os.File, error) {
+	tmpPath := statePath + ".compact.tmp"
+	_ = os.Remove(tmpPath)
+	tf, _, err := openCampaignFileNoFollow(tmpPath)
+	if err != nil {
+		return nil, err
+	}
+	cleanupTmp := func() {
+		_ = tf.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if _, err := tf.Seek(0, io.SeekStart); err != nil {
+		cleanupTmp()
+		return nil, err
+	}
+	if err := tf.Truncate(0); err != nil {
+		cleanupTmp()
+		return nil, err
+	}
+	if opusCrashHook != nil {
+		opusCrashHook(tf, raw)
+	}
+	opusStep("tmp_open")
+	n, err := tf.Write(raw)
+	if err != nil {
+		cleanupTmp()
+		return nil, err
+	}
+	if n != len(raw) {
+		cleanupTmp()
+		return nil, io.ErrShortWrite
+	}
+	opusStep("tmp_written")
+	if err := tf.Sync(); err != nil {
+		cleanupTmp()
+		return nil, err
+	}
+	opusStep("tmp_synced")
+	if err := os.Rename(tmpPath, statePath); err != nil {
+		cleanupTmp()
+		return nil, err
+	}
+	opusStep("renamed")
+	var syncErr error
+	if opusDirSyncFail != nil && opusDirSyncFail() {
+		syncErr = errors.New("injected dir fsync failure")
+	} else if err := syncCampaignDir(filepath.Dir(statePath)); err != nil {
+		syncErr = err
+	} else {
+		opusStep("dir_synced")
+	}
+	return tf, syncErr
 }
 
 func (ct *costTracker) syncFromSafetyJournalLocked() {
@@ -1862,6 +2628,14 @@ func (ct *costTracker) syncFromSafetyJournalLocked() {
 				activeCleanup += pt.Operations["function_publish_version"].CleanupReserveNanoUSD
 			case safety.KindFunctionAlias:
 				activeCleanup += pt.Operations["function_alias_set"].CleanupReserveNanoUSD
+			case safety.KindUserpool:
+				activeCleanup += pt.Operations["userpool_create"].CleanupReserveNanoUSD
+			case safety.KindPoolUser:
+				activeCleanup += pt.Operations["user_create"].CleanupReserveNanoUSD
+			case safety.KindPoolGroup:
+				activeCleanup += pt.Operations["group_create"].CleanupReserveNanoUSD
+			case safety.KindPoolMembership:
+				activeCleanup += pt.Operations["group_add_user"].CleanupReserveNanoUSD
 			}
 		}
 	}
@@ -2019,6 +2793,40 @@ func (ct *costTracker) syncFromSafetyJournalLocked() {
 	for k, v := range st.LatestFunctionIntent {
 		ct.latestFunctionIntent[k] = v
 	}
+	ct.activeUserpoolEntries = make(map[string]safety.JournalUserpoolEntry, len(st.ActiveUserpools))
+	for k, ue := range st.ActiveUserpools {
+		ct.activeUserpoolEntries[k] = ue
+		if ct.onToken != nil && ue.OwnerToken != "" {
+			ct.onToken(ue.OwnerToken)
+		}
+	}
+	ct.ambiguousUserpools = make(map[string]safety.JournalUserpoolEntry, len(st.AmbiguousUserpools))
+	for k, ue := range st.AmbiguousUserpools {
+		ct.ambiguousUserpools[k] = ue
+		if ct.onToken != nil && ue.OwnerToken != "" {
+			ct.onToken(ue.OwnerToken)
+		}
+	}
+	ct.ambiguousUserpoolStack = make(map[string][]safety.JournalUserpoolEntry, len(st.AmbiguousUserpoolStack))
+	for k, stack := range st.AmbiguousUserpoolStack {
+		cp := make([]safety.JournalUserpoolEntry, len(stack))
+		copy(cp, stack)
+		ct.ambiguousUserpoolStack[k] = cp
+	}
+	ct.userpoolOwnerTokens = make(map[string]string, len(st.UserpoolTombstones))
+	for k, tb := range st.UserpoolTombstones {
+		if tb.OwnerToken != "" {
+			ct.userpoolOwnerTokens[k] = tb.OwnerToken
+		}
+	}
+	ct.maxUserpoolGen = make(map[string]uint64, len(st.MaxUserpoolGen))
+	for k, v := range st.MaxUserpoolGen {
+		ct.maxUserpoolGen[k] = v
+	}
+	ct.latestUserpoolIntent = make(map[string]string, len(st.LatestUserpoolIntent))
+	for k, v := range st.LatestUserpoolIntent {
+		ct.latestUserpoolIntent[k] = v
+	}
 }
 
 func (ct *costTracker) reserve(in safety.AttemptPricingInput, resKind, resKey string) (*safety.AttemptReservation, string, *hostkit.CloudError) {
@@ -2060,10 +2868,26 @@ func (ct *costTracker) reserveForOp(recordOp, endpoint string, in safety.Attempt
 			}
 			return nil, "", hostkit.ProviderError(hostkit.Internal, 0, "PricingFailure", err.Error())
 		}
-		if ct.liveGuard != nil || (ct.liveMode && (isTablesOp(in.Operation, resKind) || isPermissionsOp(in.Operation, resKind) || isFunctionOp(in.Operation, resKind))) {
+		if ct.liveGuard != nil || (ct.liveMode && (isTablesOp(in.Operation, resKind) || isPermissionsOp(in.Operation, resKind) || isFunctionOp(in.Operation, resKind) || isUserpoolOp(in.Operation, resKind))) {
 			res.Release()
 			return nil, "", hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveGuardRequired",
 				fmt.Sprintf("live mode refuses unguarded adapter for %s (%s): LiveGuard ownership and recovery enforcement is required", in.Operation, resKind))
+		}
+		if !in.IsCleanup && ct.journal.FileSize()+4096 > maxNonCleanupJournalBytes {
+			_ = ct.journal.Compact()
+			if ct.journal.FileSize()+4096 > maxNonCleanupJournalBytes {
+				res.Release()
+				return nil, "", hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+					fmt.Sprintf("journal size exceeds non-cleanup headroom limit (%d bytes); only cleanup operations are permitted", maxNonCleanupJournalBytes))
+			}
+		}
+		if in.IsCleanup && ct.journal.FileSize()+512 > safety.MaxJournalFileBytes {
+			_ = ct.journal.Compact()
+			if ct.journal.FileSize()+512 > safety.MaxJournalFileBytes {
+				res.Release()
+				return nil, "", hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+					fmt.Sprintf("journal size exceeds hard limit (%d bytes)", safety.MaxJournalFileBytes))
+			}
 		}
 		reservedBytes := in.PayloadSize
 		if in.Operation == "object_get" {
@@ -2082,7 +2906,7 @@ func (ct *costTracker) reserveForOp(recordOp, endpoint string, in safety.Attempt
 		return res, attID, nil
 	}
 
-	if ct.liveGuard != nil || (ct.liveMode && (isTablesOp(in.Operation, resKind) || isPermissionsOp(in.Operation, resKind) || isFunctionOp(in.Operation, resKind))) {
+	if ct.liveGuard != nil || (ct.liveMode && (isTablesOp(in.Operation, resKind) || isPermissionsOp(in.Operation, resKind) || isFunctionOp(in.Operation, resKind) || isUserpoolOp(in.Operation, resKind))) {
 		return nil, "", hostkit.ProviderError(hostkit.PermissionDenied, 0, "LiveGuardRequired",
 			fmt.Sprintf("live mode refuses unguarded adapter for %s (%s): LiveGuard ownership and recovery enforcement is required", in.Operation, resKind))
 	}
@@ -2093,7 +2917,17 @@ func (ct *costTracker) reserveForOp(recordOp, endpoint string, in safety.Attempt
 			attID string
 			cerr  *hostkit.CloudError
 		)
-		jerr := ct.withLockedCampaignJournal(true, func(_ *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+		jerr := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			if !in.IsCleanup && st.journalFileBytes+4096 > maxNonCleanupJournalBytes {
+				cerr = hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+					fmt.Sprintf("campaign journal size exceeds non-cleanup headroom limit (%d bytes); only cleanup operations are permitted", maxNonCleanupJournalBytes))
+				return nil
+			}
+			if in.IsCleanup && int64(st.journalFileBytes)+512 > safety.MaxJournalFileBytes {
+				cerr = hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+					fmt.Sprintf("campaign journal size exceeds hard limit (%d bytes)", safety.MaxJournalFileBytes))
+				return nil
+			}
 			var rerr error
 			res, rerr = ct.meter.ReserveAttempt(in)
 			if rerr != nil {
@@ -2276,12 +3110,12 @@ func (ct *costTracker) settleAtWithUnits(res *safety.AttemptReservation, attempt
 		var cleanupNano int64
 		if opSucceeded {
 			switch op {
-			case "bucket_create", "object_put", "queue_create", "table_create", "item_put", "policy_attach", "policy_attach_principal", "function_create", "function_publish_version", "function_alias_set":
+			case "bucket_create", "object_put", "queue_create", "table_create", "item_put", "policy_attach", "policy_attach_principal", "function_create", "function_publish_version", "function_alias_set", "userpool_create", "user_create", "group_create", "group_add_user":
 				if !inEntries && !inActiveCleanup && res.Quote().CleanupReserveNanoUSD > 0 {
 					lockCleanup = true
 					cleanupNano = res.Quote().CleanupReserveNanoUSD
 				}
-			case "bucket_delete", "object_delete", "queue_delete", "item_delete", "policy_detach", "policy_detach_principal", "function_alias_delete":
+			case "bucket_delete", "object_delete", "queue_delete", "item_delete", "policy_detach", "policy_detach_principal", "function_alias_delete", "user_delete", "group_delete", "group_remove_user":
 				if inActiveCleanup || inEntries {
 					releaseCleanup = true
 				}
@@ -2291,6 +3125,10 @@ func (ct *costTracker) settleAtWithUnits(res *safety.AttemptReservation, attempt
 				}
 			case "function_delete":
 				if inActiveCleanup || inEntries || hasJournalFunctionChildren(st.ActiveCleanup, endpoint, resKey) {
+					releaseCleanup = true
+				}
+			case "userpool_delete":
+				if inActiveCleanup || inEntries || hasJournalUserpoolChildren(st.ActiveCleanup, endpoint, resKey) {
 					releaseCleanup = true
 				}
 			}
@@ -2351,6 +3189,22 @@ func (ct *costTracker) settleAtWithUnits(res *safety.AttemptReservation, attempt
 					if _, exists := st.activeFunctionAliases[sKey]; !exists {
 						lockCleanup = true
 					}
+				case "userpool_create":
+					if _, exists := st.activeUserpools[sKey]; !exists {
+						lockCleanup = true
+					}
+				case "user_create":
+					if _, exists := st.activePoolUsers[sKey]; !exists {
+						lockCleanup = true
+					}
+				case "group_create":
+					if _, exists := st.activePoolGroups[sKey]; !exists {
+						lockCleanup = true
+					}
+				case "group_add_user":
+					if _, exists := st.activePoolMemberships[sKey]; !exists {
+						lockCleanup = true
+					}
 				case "bucket_delete":
 					if _, exists := st.activeBuckets[sKey]; exists {
 						releaseCleanup = true
@@ -2381,6 +3235,22 @@ func (ct *costTracker) settleAtWithUnits(res *safety.AttemptReservation, attempt
 					}
 				case "function_alias_delete":
 					if _, exists := st.activeFunctionAliases[sKey]; exists {
+						releaseCleanup = true
+					}
+				case "userpool_delete":
+					if _, exists := st.activeUserpools[sKey]; exists || hasUserpoolChildren(st.activePoolUsers, st.activePoolGroups, st.activePoolMemberships, sKey) {
+						releaseCleanup = true
+					}
+				case "user_delete":
+					if _, exists := st.activePoolUsers[sKey]; exists {
+						releaseCleanup = true
+					}
+				case "group_delete":
+					if _, exists := st.activePoolGroups[sKey]; exists {
+						releaseCleanup = true
+					}
+				case "group_remove_user":
+					if _, exists := st.activePoolMemberships[sKey]; exists {
 						releaseCleanup = true
 					}
 				}
@@ -2427,6 +3297,14 @@ func (ct *costTracker) settleAtWithUnits(res *safety.AttemptReservation, attempt
 					st.activeFunctionVersions[sKey] = res.Quote().CleanupReserveNanoUSD
 				case safety.KindFunctionAlias:
 					st.activeFunctionAliases[sKey] = res.Quote().CleanupReserveNanoUSD
+				case safety.KindUserpool:
+					st.activeUserpools[sKey] = res.Quote().CleanupReserveNanoUSD
+				case safety.KindPoolUser:
+					st.activePoolUsers[sKey] = res.Quote().CleanupReserveNanoUSD
+				case safety.KindPoolGroup:
+					st.activePoolGroups[sKey] = res.Quote().CleanupReserveNanoUSD
+				case safety.KindPoolMembership:
+					st.activePoolMemberships[sKey] = res.Quote().CleanupReserveNanoUSD
 				}
 				st.resourceCleanupNanoUSD += res.Quote().CleanupReserveNanoUSD
 			}
@@ -2494,6 +3372,62 @@ func (ct *costTracker) settleAtWithUnits(res *safety.AttemptReservation, attempt
 						delete(st.activeFunctionAliases, sKey)
 						st.resourceCleanupNanoUSD -= v
 					}
+				case safety.KindUserpool:
+					if v, ok := st.activeUserpools[sKey]; ok {
+						delete(st.activeUserpools, sKey)
+						st.resourceCleanupNanoUSD -= v
+					}
+					prefix := sKey + "/"
+					for k, v := range st.activePoolUsers {
+						if strings.HasPrefix(k, prefix) {
+							delete(st.activePoolUsers, k)
+							st.resourceCleanupNanoUSD -= v
+						}
+					}
+					for k, v := range st.activePoolGroups {
+						if strings.HasPrefix(k, prefix) {
+							delete(st.activePoolGroups, k)
+							st.resourceCleanupNanoUSD -= v
+						}
+					}
+					for k, v := range st.activePoolMemberships {
+						if strings.HasPrefix(k, prefix) {
+							delete(st.activePoolMemberships, k)
+							st.resourceCleanupNanoUSD -= v
+						}
+					}
+				case safety.KindPoolUser:
+					if v, ok := st.activePoolUsers[sKey]; ok {
+						delete(st.activePoolUsers, sKey)
+						st.resourceCleanupNanoUSD -= v
+					}
+					if slash := strings.IndexByte(resKey, '/'); slash > 0 && slash < len(resKey)-1 {
+						poolPrefix := scopedResKey(endpoint, resKey[:slash]+"/")
+						userSuffix := "/" + resKey[slash+1:]
+						for k, v := range st.activePoolMemberships {
+							if strings.HasPrefix(k, poolPrefix) && strings.HasSuffix(k, userSuffix) {
+								delete(st.activePoolMemberships, k)
+								st.resourceCleanupNanoUSD -= v
+							}
+						}
+					}
+				case safety.KindPoolGroup:
+					if v, ok := st.activePoolGroups[sKey]; ok {
+						delete(st.activePoolGroups, sKey)
+						st.resourceCleanupNanoUSD -= v
+					}
+					grpPrefix := sKey + "/"
+					for k, v := range st.activePoolMemberships {
+						if strings.HasPrefix(k, grpPrefix) {
+							delete(st.activePoolMemberships, k)
+							st.resourceCleanupNanoUSD -= v
+						}
+					}
+				case safety.KindPoolMembership:
+					if v, ok := st.activePoolMemberships[sKey]; ok {
+						delete(st.activePoolMemberships, sKey)
+						st.resourceCleanupNanoUSD -= v
+					}
 				}
 			}
 			ct.applyReplayedStateLocked(st)
@@ -2557,6 +3491,26 @@ func (ct *costTracker) settleAtWithUnits(res *safety.AttemptReservation, attempt
 		case "function_alias_set":
 			if _, exists := ct.activeFunctionAliases[sKey]; !exists && res.Quote().CleanupReserveNanoUSD > 0 {
 				ct.activeFunctionAliases[sKey] = res.Quote().CleanupReserveNanoUSD
+				lockCleanup = true
+			}
+		case "userpool_create":
+			if _, exists := ct.activeUserpools[sKey]; !exists && res.Quote().CleanupReserveNanoUSD > 0 {
+				ct.activeUserpools[sKey] = res.Quote().CleanupReserveNanoUSD
+				lockCleanup = true
+			}
+		case "user_create":
+			if _, exists := ct.activePoolUsers[sKey]; !exists && res.Quote().CleanupReserveNanoUSD > 0 {
+				ct.activePoolUsers[sKey] = res.Quote().CleanupReserveNanoUSD
+				lockCleanup = true
+			}
+		case "group_create":
+			if _, exists := ct.activePoolGroups[sKey]; !exists && res.Quote().CleanupReserveNanoUSD > 0 {
+				ct.activePoolGroups[sKey] = res.Quote().CleanupReserveNanoUSD
+				lockCleanup = true
+			}
+		case "group_add_user":
+			if _, exists := ct.activePoolMemberships[sKey]; !exists && res.Quote().CleanupReserveNanoUSD > 0 {
+				ct.activePoolMemberships[sKey] = res.Quote().CleanupReserveNanoUSD
 				lockCleanup = true
 			}
 		}
@@ -2636,6 +3590,62 @@ func (ct *costTracker) settleAtWithUnits(res *safety.AttemptReservation, attempt
 		case "function_alias_delete":
 			if v, exists := ct.activeFunctionAliases[sKey]; exists {
 				delete(ct.activeFunctionAliases, sKey)
+				ct.meter.ReleaseResourceCleanup(v)
+			}
+		case "userpool_delete":
+			if v, exists := ct.activeUserpools[sKey]; exists {
+				delete(ct.activeUserpools, sKey)
+				ct.meter.ReleaseResourceCleanup(v)
+			}
+			prefix := sKey + "/"
+			for k, v := range ct.activePoolUsers {
+				if strings.HasPrefix(k, prefix) {
+					delete(ct.activePoolUsers, k)
+					ct.meter.ReleaseResourceCleanup(v)
+				}
+			}
+			for k, v := range ct.activePoolGroups {
+				if strings.HasPrefix(k, prefix) {
+					delete(ct.activePoolGroups, k)
+					ct.meter.ReleaseResourceCleanup(v)
+				}
+			}
+			for k, v := range ct.activePoolMemberships {
+				if strings.HasPrefix(k, prefix) {
+					delete(ct.activePoolMemberships, k)
+					ct.meter.ReleaseResourceCleanup(v)
+				}
+			}
+		case "user_delete":
+			if v, exists := ct.activePoolUsers[sKey]; exists {
+				delete(ct.activePoolUsers, sKey)
+				ct.meter.ReleaseResourceCleanup(v)
+			}
+			if slash := strings.IndexByte(resKey, '/'); slash > 0 && slash < len(resKey)-1 {
+				poolPrefix := scopedResKey(endpoint, resKey[:slash]+"/")
+				userSuffix := "/" + resKey[slash+1:]
+				for k, v := range ct.activePoolMemberships {
+					if strings.HasPrefix(k, poolPrefix) && strings.HasSuffix(k, userSuffix) {
+						delete(ct.activePoolMemberships, k)
+						ct.meter.ReleaseResourceCleanup(v)
+					}
+				}
+			}
+		case "group_delete":
+			if v, exists := ct.activePoolGroups[sKey]; exists {
+				delete(ct.activePoolGroups, sKey)
+				ct.meter.ReleaseResourceCleanup(v)
+			}
+			grpPrefix := sKey + "/"
+			for k, v := range ct.activePoolMemberships {
+				if strings.HasPrefix(k, grpPrefix) {
+					delete(ct.activePoolMemberships, k)
+					ct.meter.ReleaseResourceCleanup(v)
+				}
+			}
+		case "group_remove_user":
+			if v, exists := ct.activePoolMemberships[sKey]; exists {
+				delete(ct.activePoolMemberships, sKey)
 				ct.meter.ReleaseResourceCleanup(v)
 			}
 		}
@@ -2718,6 +3728,15 @@ func (ct *costTracker) isOwnedResourceAt(resKind, endpoint, resKey string) (bool
 				return true, nil
 			}
 		}
+		if resKind == safety.KindUserpool {
+			uKey := scopedResKey(endpoint, resKey)
+			if _, ok := st.ActiveUserpools[uKey]; ok {
+				return true, nil
+			}
+			if _, ok := st.AmbiguousUserpools[uKey]; ok {
+				return true, nil
+			}
+		}
 		return false, nil
 	}
 	sKey := scopedResKey(endpoint, resKey)
@@ -2742,6 +3761,26 @@ func (ct *costTracker) isOwnedResourceAt(resKind, endpoint, resKey string) (bool
 			return true, nil
 		}
 		return false, nil
+	case safety.KindUserpool:
+		if _, ok := ct.activeUserpools[sKey]; ok {
+			return true, nil
+		}
+		if _, ok := ct.activeUserpoolEntries[sKey]; ok {
+			return true, nil
+		}
+		if _, ok := ct.ambiguousUserpools[sKey]; ok {
+			return true, nil
+		}
+		return false, nil
+	case safety.KindPoolUser:
+		_, ok := ct.activePoolUsers[sKey]
+		return ok, nil
+	case safety.KindPoolGroup:
+		_, ok := ct.activePoolGroups[sKey]
+		return ok, nil
+	case safety.KindPoolMembership:
+		_, ok := ct.activePoolMemberships[sKey]
+		return ok, nil
 	default:
 		return false, nil
 	}
@@ -3483,6 +4522,10 @@ func (ct *costTracker) lockResourceCleanupIfNeeded(endpoint, op, resKind, resKey
 				if _, ok := st.activeFunctions[sKey]; ok {
 					return nil
 				}
+			case safety.KindUserpool:
+				if _, ok := st.activeUserpools[sKey]; ok {
+					return nil
+				}
 			default:
 				return nil
 			}
@@ -3527,6 +4570,11 @@ func (ct *costTracker) lockResourceCleanupIfNeeded(endpoint, op, resKind, resKey
 	case safety.KindFunction:
 		if _, exists := ct.activeFunctions[sKey]; !exists {
 			ct.activeFunctions[sKey] = resNano
+			ct.meter.RestoreCharged(0, ct.meter.Snapshot().ResourceCleanupNanoUSD+resNano)
+		}
+	case safety.KindUserpool:
+		if _, exists := ct.activeUserpools[sKey]; !exists {
+			ct.activeUserpools[sKey] = resNano
 			ct.meter.RestoreCharged(0, ct.meter.Snapshot().ResourceCleanupNanoUSD+resNano)
 		}
 	}
@@ -4126,6 +5174,797 @@ func (ct *costTracker) abortFunctionIntent(entry safety.JournalFunctionEntry) *h
 	if _, inActive := ct.activeFunctionEntries[key]; !inActive {
 		if releaseNano, ok := ct.activeFunctions[key]; ok {
 			delete(ct.activeFunctions, key)
+			if ct.meter != nil && releaseNano > 0 {
+				ct.meter.ReleaseResourceCleanup(releaseNano)
+			}
+		}
+	}
+	return nil
+}
+
+func countDistinctUserpoolKeys(active, ambiguous map[string]safety.JournalUserpoolEntry, excludeKey string) int {
+	seen := make(map[string]struct{}, len(active)+len(ambiguous))
+	for k := range active {
+		if k != excludeKey {
+			seen[k] = struct{}{}
+		}
+	}
+	for k := range ambiguous {
+		if k != excludeKey {
+			seen[k] = struct{}{}
+		}
+	}
+	return len(seen)
+}
+
+func hasPendingUserpoolIntent(stack []safety.JournalUserpoolEntry, amb map[string]safety.JournalUserpoolEntry, key, intentID string) bool {
+	if intentID == "" {
+		return false
+	}
+	for _, item := range stack {
+		if item.IntentID == intentID {
+			return true
+		}
+	}
+	if cur, ok := amb[key]; ok && cur.IntentID == intentID {
+		return true
+	}
+	return false
+}
+
+func (ct *costTracker) checkUserpoolCreateHeadroom(endpoint, name string) *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if cerr := ct.refreshStateLocked(); cerr != nil {
+		return cerr
+	}
+	key := scopedResKey(endpoint, name)
+	if countDistinctUserpoolKeys(ct.activeUserpoolEntries, ct.ambiguousUserpools, key) >= hostkit.MaxUserpoolsPerRun {
+		return hostkit.ProviderError(hostkit.InvalidArgument, 0, "UserpoolLimitExceeded",
+			fmt.Sprintf("run userpool count exceeds maximum (%d)", hostkit.MaxUserpoolsPerRun))
+	}
+	return nil
+}
+
+func (ct *costTracker) lookupUserpoolEntry(endpoint, name string) (safety.JournalUserpoolEntry, bool, safety.JournalUserpoolEntry, bool, *hostkit.CloudError) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if cerr := ct.refreshStateLocked(); cerr != nil {
+		return safety.JournalUserpoolEntry{}, false, safety.JournalUserpoolEntry{}, false, cerr
+	}
+	key := scopedResKey(endpoint, name)
+	act, hasAct := ct.activeUserpoolEntries[key]
+	amb, hasAmb := ct.ambiguousUserpools[key]
+	return act, hasAct, amb, hasAmb, nil
+}
+
+func (ct *costTracker) listAmbiguousUserpoolsForEndpoint(endpoint string) ([]safety.JournalUserpoolEntry, *hostkit.CloudError) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if cerr := ct.refreshStateLocked(); cerr != nil {
+		return nil, cerr
+	}
+	var out []safety.JournalUserpoolEntry
+	for _, amb := range ct.ambiguousUserpools {
+		if amb.Scope != "" && endpoint != "" && amb.Scope != endpoint {
+			continue
+		}
+		if amb.Scope == "" && endpoint != "" {
+			continue
+		}
+		out = append(out, amb)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (ct *costTracker) beginUserpoolIntent(endpoint, name, intentOp, incarnation string) (safety.JournalUserpoolEntry, *hostkit.CloudError) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if cerr := ct.refreshStateLocked(); cerr != nil {
+		return safety.JournalUserpoolEntry{}, cerr
+	}
+	key := scopedResKey(endpoint, name)
+	if intentOp == "create" {
+		if countDistinctUserpoolKeys(ct.activeUserpoolEntries, ct.ambiguousUserpools, key) >= hostkit.MaxUserpoolsPerRun {
+			return safety.JournalUserpoolEntry{}, hostkit.ProviderError(hostkit.InvalidArgument, 0, "UserpoolLimitExceeded",
+				fmt.Sprintf("run userpool count exceeds maximum (%d)", hostkit.MaxUserpoolsPerRun))
+		}
+	}
+
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return safety.JournalUserpoolEntry{}, ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return safety.JournalUserpoolEntry{}, ct.poisoned
+		}
+		if intentOp == "create" && countDistinctUserpoolKeys(ct.activeUserpoolEntries, ct.ambiguousUserpools, key) >= hostkit.MaxUserpoolsPerRun {
+			return safety.JournalUserpoolEntry{}, hostkit.ProviderError(hostkit.InvalidArgument, 0, "UserpoolLimitExceeded",
+				fmt.Sprintf("run userpool count exceeds maximum (%d)", hostkit.MaxUserpoolsPerRun))
+		}
+		ownerToken := ""
+		if existing, ok := ct.activeUserpoolEntries[key]; ok && existing.OwnerToken != "" {
+			ownerToken = existing.OwnerToken
+		} else if amb, ok := ct.ambiguousUserpools[key]; ok && amb.OwnerToken != "" {
+			ownerToken = amb.OwnerToken
+		} else if tok := ct.userpoolOwnerTokens[key]; tok != "" && intentOp != "create" {
+			ownerToken = tok
+		} else {
+			ownerToken = safety.NewToken128()
+		}
+		inc := incarnation
+		if inc == "" {
+			if existing, ok := ct.activeUserpoolEntries[key]; ok && existing.Incarnation != "" {
+				inc = existing.Incarnation
+			} else if amb, ok := ct.ambiguousUserpools[key]; ok && amb.Incarnation != "" {
+				inc = amb.Incarnation
+			} else if intentOp == "create" {
+				inc = safety.NewToken128()
+			}
+		}
+		nextGen := ct.maxUserpoolGen[key] + 1
+		genStr := strconv.FormatUint(nextGen, 10)
+		intentID := safety.NewToken128()
+		if intentOp == "delete" && ct.journal.FileSize()+512 > safety.MaxJournalFileBytes {
+			_ = ct.journal.Compact()
+			if ct.journal.FileSize()+512 > safety.MaxJournalFileBytes {
+				return safety.JournalUserpoolEntry{}, hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+					fmt.Sprintf("journal size exceeds hard limit (%d bytes)", safety.MaxJournalFileBytes))
+			}
+		}
+		if err := ct.journal.RecordUserpoolIntent(endpoint, name, intentOp, inc, ownerToken, genStr, intentID, "", "", 0); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return safety.JournalUserpoolEntry{}, ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return safety.JournalUserpoolEntry{}, ct.poisoned
+		}
+		if ct.onToken != nil {
+			ct.onToken(ownerToken)
+		}
+		return safety.JournalUserpoolEntry{
+			Key:         key,
+			Scope:       endpoint,
+			Name:        name,
+			Incarnation: inc,
+			OwnerToken:  ownerToken,
+			Generation:  genStr,
+			IntentID:    intentID,
+			Ambiguous:   true,
+			IntentOp:    intentOp,
+		}, nil
+	}
+
+	if ct.statePath != "" {
+		var outEntry safety.JournalUserpoolEntry
+		var cerr *hostkit.CloudError
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			if intentOp == "create" && countDistinctUserpoolKeys(st.activeUserpoolEntries, st.ambiguousUserpools, key) >= hostkit.MaxUserpoolsPerRun {
+				cerr = hostkit.ProviderError(hostkit.InvalidArgument, 0, "UserpoolLimitExceeded",
+					fmt.Sprintf("run userpool count exceeds maximum (%d)", hostkit.MaxUserpoolsPerRun))
+				return nil
+			}
+			ownerToken := ""
+			if existing, ok := st.activeUserpoolEntries[key]; ok && existing.OwnerToken != "" {
+				ownerToken = existing.OwnerToken
+			} else if amb, ok := st.ambiguousUserpools[key]; ok && amb.OwnerToken != "" {
+				ownerToken = amb.OwnerToken
+			} else if tok := st.userpoolOwnerTokens[key]; tok != "" && intentOp != "create" {
+				ownerToken = tok
+			} else {
+				ownerToken = safety.NewToken128()
+			}
+			inc := incarnation
+			if inc == "" {
+				if existing, ok := st.activeUserpoolEntries[key]; ok && existing.Incarnation != "" {
+					inc = existing.Incarnation
+				} else if amb, ok := st.ambiguousUserpools[key]; ok && amb.Incarnation != "" {
+					inc = amb.Incarnation
+				} else if intentOp == "create" {
+					inc = safety.NewToken128()
+				}
+			}
+			nextGen := st.maxUserpoolGen[key] + 1
+			genStr := strconv.FormatUint(nextGen, 10)
+			intentID := safety.NewToken128()
+			if intentOp == "delete" && int64(st.journalFileBytes)+512 > safety.MaxJournalFileBytes {
+				cerr = hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+					fmt.Sprintf("campaign journal size exceeds hard limit (%d bytes)", safety.MaxJournalFileBytes))
+				return nil
+			}
+			if err := appendRec(campaignJournalRecord{
+				Event:               safety.EventUserpoolIntent,
+				IntentID:            intentID,
+				Endpoint:            endpoint,
+				ResKey:              name,
+				PolicyIntentOp:      intentOp,
+				UserpoolIncarnation: inc,
+				OwnerToken:          ownerToken,
+				Generation:          genStr,
+			}); err != nil {
+				return err
+			}
+			outEntry = safety.JournalUserpoolEntry{
+				Key:         key,
+				Scope:       endpoint,
+				Name:        name,
+				Incarnation: inc,
+				OwnerToken:  ownerToken,
+				Generation:  genStr,
+				IntentID:    intentID,
+				Ambiguous:   true,
+				IntentOp:    intentOp,
+			}
+			st.ambiguousUserpoolStack[key] = append(st.ambiguousUserpoolStack[key], outEntry)
+			st.ambiguousUserpools[key] = outEntry
+			st.userpoolOwnerTokens[key] = ownerToken
+			st.maxUserpoolGen[key] = nextGen
+			st.latestUserpoolIntent[key] = intentID
+			ct.applyReplayedStateLocked(st)
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return safety.JournalUserpoolEntry{}, ct.poisoned
+		}
+		if cerr != nil {
+			return safety.JournalUserpoolEntry{}, cerr
+		}
+		if ct.onToken != nil {
+			ct.onToken(outEntry.OwnerToken)
+		}
+		return outEntry, nil
+	}
+
+	ownerToken := ""
+	if existing, ok := ct.activeUserpoolEntries[key]; ok && existing.OwnerToken != "" && intentOp != "create" {
+		ownerToken = existing.OwnerToken
+	} else if amb, ok := ct.ambiguousUserpools[key]; ok && amb.OwnerToken != "" && intentOp != "create" {
+		ownerToken = amb.OwnerToken
+	} else if tok := ct.userpoolOwnerTokens[key]; tok != "" && intentOp != "create" {
+		ownerToken = tok
+	} else {
+		ownerToken = safety.NewToken128()
+	}
+	inc := incarnation
+	if inc == "" {
+		if existing, ok := ct.activeUserpoolEntries[key]; ok && existing.Incarnation != "" && intentOp != "create" {
+			inc = existing.Incarnation
+		} else if amb, ok := ct.ambiguousUserpools[key]; ok && amb.Incarnation != "" && intentOp != "create" {
+			inc = amb.Incarnation
+		} else if intentOp == "create" {
+			inc = safety.NewToken128()
+		}
+	}
+	nextGen := ct.maxUserpoolGen[key] + 1
+	genStr := strconv.FormatUint(nextGen, 10)
+	intentID := safety.NewToken128()
+	outEntry := safety.JournalUserpoolEntry{
+		Key:         key,
+		Scope:       endpoint,
+		Name:        name,
+		Incarnation: inc,
+		OwnerToken:  ownerToken,
+		Generation:  genStr,
+		IntentID:    intentID,
+		Ambiguous:   true,
+		IntentOp:    intentOp,
+	}
+	ct.ambiguousUserpoolStack[key] = append(ct.ambiguousUserpoolStack[key], outEntry)
+	ct.ambiguousUserpools[key] = outEntry
+	ct.userpoolOwnerTokens[key] = ownerToken
+	ct.maxUserpoolGen[key] = nextGen
+	ct.latestUserpoolIntent[key] = intentID
+	if ct.onToken != nil {
+		ct.onToken(ownerToken)
+	}
+	return outEntry, nil
+}
+
+func (ct *costTracker) confirmUserpoolIntent(entry safety.JournalUserpoolEntry) *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	key := entry.Key
+	if key == "" {
+		key = scopedResKey(entry.Scope, entry.Name)
+		entry.Key = key
+	}
+	entryGen, _ := strconv.ParseUint(entry.Generation, 10, 64)
+
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return ct.poisoned
+		}
+		if !hasPendingUserpoolIntent(ct.ambiguousUserpoolStack[key], ct.ambiguousUserpools, key, entry.IntentID) ||
+			ct.latestUserpoolIntent[key] != entry.IntentID || entryGen < ct.maxUserpoolGen[key] {
+			return nil
+		}
+		if err := ct.journal.RecordUserpoolConfirmWithState(entry.Scope, entry.Name, entry.Incarnation, entry.OwnerToken, entry.Generation, entry.IntentID, entry.StateJSON, 0); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		return ct.poisoned
+	}
+
+	if ct.statePath != "" {
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			if !hasPendingUserpoolIntent(st.ambiguousUserpoolStack[key], st.ambiguousUserpools, key, entry.IntentID) ||
+				st.latestUserpoolIntent[key] != entry.IntentID || entryGen < st.maxUserpoolGen[key] {
+				return nil
+			}
+			if err := appendRec(campaignJournalRecord{
+				Event:               safety.EventUserpoolConfirm,
+				IntentID:            entry.IntentID,
+				Endpoint:            entry.Scope,
+				ResKey:              entry.Name,
+				UserpoolIncarnation: entry.Incarnation,
+				OwnerToken:          entry.OwnerToken,
+				Generation:          entry.Generation,
+				UserpoolState:       entry.StateJSON,
+			}); err != nil {
+				return err
+			}
+			confirmed := entry
+			confirmed.Ambiguous = false
+			confirmed.IntentOp = ""
+			if confirmed.StateJSON == "" {
+				confirmed.StateJSON = st.activeUserpoolEntries[key].StateJSON
+			}
+			st.activeUserpoolEntries[key] = confirmed
+			st.userpoolOwnerTokens[key] = entry.OwnerToken
+			delete(st.ambiguousUserpoolStack, key)
+			delete(st.ambiguousUserpools, key)
+			ct.applyReplayedStateLocked(st)
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		return nil
+	}
+
+	if !hasPendingUserpoolIntent(ct.ambiguousUserpoolStack[key], ct.ambiguousUserpools, key, entry.IntentID) ||
+		ct.latestUserpoolIntent[key] != entry.IntentID || entryGen < ct.maxUserpoolGen[key] {
+		return nil
+	}
+	confirmed := entry
+	confirmed.Ambiguous = false
+	confirmed.IntentOp = ""
+	if confirmed.StateJSON == "" {
+		confirmed.StateJSON = ct.activeUserpoolEntries[key].StateJSON
+	}
+	ct.activeUserpoolEntries[key] = confirmed
+	ct.userpoolOwnerTokens[key] = entry.OwnerToken
+	delete(ct.ambiguousUserpoolStack, key)
+	delete(ct.ambiguousUserpools, key)
+	return nil
+}
+
+func (ct *costTracker) hasPoolUserCleanup(endpoint, pool, username string) bool {
+	if ct == nil {
+		return false
+	}
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	sKey := scopedResKey(endpoint, pool+"/"+username)
+	if _, ok := ct.activePoolUsers[sKey]; ok {
+		return true
+	}
+	if ct.journal != nil {
+		st := ct.journal.State()
+		uKey := safety.KindPoolUser + "\x00" + endpoint + "\x00" + pool + "/" + username
+		uKeyUnscoped := safety.KindPoolUser + "\x00\x00" + pool + "/" + username
+		if _, ok := st.ActiveCleanup[uKey]; ok {
+			return true
+		}
+		if _, ok := st.ActiveCleanup[uKeyUnscoped]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (ct *costTracker) hasPoolGroupCleanup(endpoint, pool, group string) bool {
+	if ct == nil {
+		return false
+	}
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	sKey := scopedResKey(endpoint, pool+"/"+group)
+	if _, ok := ct.activePoolGroups[sKey]; ok {
+		return true
+	}
+	if ct.journal != nil {
+		st := ct.journal.State()
+		gKey := safety.KindPoolGroup + "\x00" + endpoint + "\x00" + pool + "/" + group
+		gKeyUnscoped := safety.KindPoolGroup + "\x00\x00" + pool + "/" + group
+		if _, ok := st.ActiveCleanup[gKey]; ok {
+			return true
+		}
+		if _, ok := st.ActiveCleanup[gKeyUnscoped]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (ct *costTracker) hasAnyPoolMembershipCleanup(endpoint, pool string) bool {
+	if ct == nil {
+		return false
+	}
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	prefix := scopedResKey(endpoint, pool+"/")
+	for k := range ct.activePoolMemberships {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	if ct.journal != nil {
+		st := ct.journal.State()
+		p1 := safety.KindPoolMembership + "\x00" + endpoint + "\x00" + pool + "/"
+		p2 := safety.KindPoolMembership + "\x00\x00" + pool + "/"
+		for k := range st.ActiveCleanup {
+			if strings.HasPrefix(k, p1) || strings.HasPrefix(k, p2) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (ct *costTracker) hasPoolMembershipCleanup(endpoint, pool, group, username string) bool {
+	if ct == nil {
+		return false
+	}
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	sKey := scopedResKey(endpoint, pool+"/"+group+"/"+username)
+	if _, ok := ct.activePoolMemberships[sKey]; ok {
+		return true
+	}
+	if ct.journal != nil {
+		st := ct.journal.State()
+		mKey := safety.KindPoolMembership + "\x00" + endpoint + "\x00" + pool + "/" + group + "/" + username
+		mKeyUnscoped := safety.KindPoolMembership + "\x00\x00" + pool + "/" + group + "/" + username
+		if _, ok := st.ActiveCleanup[mKey]; ok {
+			return true
+		}
+		if _, ok := st.ActiveCleanup[mKeyUnscoped]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expIncarnation, expGen string, mutate func(curStateJSON string) string) *hostkit.CloudError {
+	return ct.updateUserpoolStateOpts(endpoint, name, expOwnerToken, expIncarnation, expGen, false, false, mutate)
+}
+
+func (ct *costTracker) updateUserpoolStateOpts(endpoint, name, expOwnerToken, expIncarnation, _ string, isCleanup, allowRevokeHeadroom bool, mutate func(curStateJSON string) string) *hostkit.CloudError {
+	if mutate == nil {
+		return nil
+	}
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	key := scopedResKey(endpoint, name)
+	staleErr := hostkit.ProviderError(hostkit.Conflict, 409, "AmbiguousUserpoolState",
+		fmt.Sprintf("userpool %q state changed concurrently during operation", name))
+	maxStateBytes := 8 * 1024 * 1024
+	if isCleanup || allowRevokeHeadroom {
+		maxStateBytes = 8*1024*1024 + 64*1024
+	}
+	maxJournalBytes := int64(maxNonCleanupJournalBytes)
+	if isCleanup {
+		maxJournalBytes = safety.MaxJournalFileBytes
+	}
+	stateTooLargeErr := func(sz int) *hostkit.CloudError {
+		return hostkit.ProviderError(hostkit.InvalidArgument, 0, "UserpoolStateLimitExceeded",
+			fmt.Sprintf("userpool %q state size %d exceeds maximum 8 MiB", name, sz))
+	}
+
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return ct.poisoned
+		}
+		act, ok := ct.activeUserpoolEntries[key]
+		_, hasAmb := ct.ambiguousUserpools[key]
+		if !ok || ((hasAmb || len(ct.ambiguousUserpoolStack[key]) > 0) && !safety.OnlyDuplicateUserpoolCreateAmbiguity(act, ct.ambiguousUserpoolStack[key])) {
+			return staleErr
+		}
+		if act.OwnerToken != expOwnerToken || act.Incarnation != expIncarnation {
+			return staleErr
+		}
+		newState := mutate(act.StateJSON)
+		if newState == act.StateJSON {
+			return nil
+		}
+		if len(newState) > maxStateBytes {
+			return stateTooLargeErr(len(newState))
+		}
+		if ct.journal.FileSize()+int64(len(newState))+1024 > maxJournalBytes {
+			_ = ct.journal.Compact()
+		}
+		if ct.journal.FileSize()+int64(len(newState))+1024 > maxJournalBytes {
+			return hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+				fmt.Sprintf("journal size would exceed headroom limit (%d bytes)", maxJournalBytes))
+		}
+		if err := ct.journal.RecordUserpoolState(act.Scope, act.Name, act.OwnerToken, act.Incarnation, act.Generation, newState); err != nil {
+			if ct.journal.CheckHealth() == nil {
+				return hostkit.ProviderError(hostkit.InvalidArgument, 0, "InvalidUserpoolState", err.Error())
+			}
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		return ct.poisoned
+	}
+
+	if ct.statePath != "" {
+		var cerr *hostkit.CloudError
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			act, ok := st.activeUserpoolEntries[key]
+			_, hasAmb := st.ambiguousUserpools[key]
+			if !ok || ((hasAmb || len(st.ambiguousUserpoolStack[key]) > 0) && !safety.OnlyDuplicateUserpoolCreateAmbiguity(act, st.ambiguousUserpoolStack[key])) {
+				cerr = staleErr
+				return nil
+			}
+			if act.OwnerToken != expOwnerToken || act.Incarnation != expIncarnation {
+				cerr = staleErr
+				return nil
+			}
+			newState := mutate(act.StateJSON)
+			if newState == act.StateJSON {
+				return nil
+			}
+			if len(newState) > maxStateBytes {
+				cerr = stateTooLargeErr(len(newState))
+				return nil
+			}
+			if int64(st.journalFileBytes)+int64(len(newState))+1024 > maxJournalBytes {
+				cerr = hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+					fmt.Sprintf("campaign journal size would exceed headroom limit (%d bytes)", maxJournalBytes))
+				return nil
+			}
+			if err := appendRec(campaignJournalRecord{
+				Event:               safety.EventUserpoolState,
+				Endpoint:            act.Scope,
+				ResKey:              act.Name,
+				UserpoolIncarnation: act.Incarnation,
+				OwnerToken:          act.OwnerToken,
+				Generation:          act.Generation,
+				UserpoolState:       newState,
+			}); err != nil {
+				return err
+			}
+			act.StateJSON = newState
+			st.activeUserpoolEntries[key] = act
+			ct.applyReplayedStateLocked(st)
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		if cerr != nil {
+			return cerr
+		}
+		return nil
+	}
+
+	act, ok := ct.activeUserpoolEntries[key]
+	_, hasAmb := ct.ambiguousUserpools[key]
+	if !ok || ((hasAmb || len(ct.ambiguousUserpoolStack[key]) > 0) && !safety.OnlyDuplicateUserpoolCreateAmbiguity(act, ct.ambiguousUserpoolStack[key])) {
+		return staleErr
+	}
+	if act.OwnerToken != expOwnerToken || act.Incarnation != expIncarnation {
+		return staleErr
+	}
+	newState := mutate(act.StateJSON)
+	if len(newState) > maxStateBytes {
+		return stateTooLargeErr(len(newState))
+	}
+	act.StateJSON = newState
+	ct.activeUserpoolEntries[key] = act
+	return nil
+}
+
+func (ct *costTracker) confirmUserpoolDelete(entry safety.JournalUserpoolEntry) *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	key := entry.Key
+	if key == "" {
+		key = scopedResKey(entry.Scope, entry.Name)
+		entry.Key = key
+	}
+	entryGen, _ := strconv.ParseUint(entry.Generation, 10, 64)
+
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return ct.poisoned
+		}
+		if !hasPendingUserpoolIntent(ct.ambiguousUserpoolStack[key], ct.ambiguousUserpools, key, entry.IntentID) ||
+			ct.latestUserpoolIntent[key] != entry.IntentID || entryGen < ct.maxUserpoolGen[key] {
+			return nil
+		}
+		if err := ct.journal.RecordUserpoolDelete(entry.Scope, entry.Name, entry.OwnerToken, entry.Generation, entry.IntentID); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		return ct.poisoned
+	}
+
+	if ct.statePath != "" {
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			if !hasPendingUserpoolIntent(st.ambiguousUserpoolStack[key], st.ambiguousUserpools, key, entry.IntentID) ||
+				st.latestUserpoolIntent[key] != entry.IntentID || entryGen < st.maxUserpoolGen[key] {
+				return nil
+			}
+			if err := appendRec(campaignJournalRecord{
+				Event:      safety.EventUserpoolDelete,
+				IntentID:   entry.IntentID,
+				Endpoint:   entry.Scope,
+				ResKey:     entry.Name,
+				OwnerToken: entry.OwnerToken,
+				Generation: entry.Generation,
+			}); err != nil {
+				return err
+			}
+			delete(st.activeUserpoolEntries, key)
+			delete(st.ambiguousUserpoolStack, key)
+			delete(st.ambiguousUserpools, key)
+			deleteCampaignUserpoolCleanup(st, key)
+			deleteResourcePolicyAttachments(st.activePolicies, st.ambiguousPolicies, st.ambiguousStack, st.policyCleanup, safety.KindUserpool, entry.Scope, entry.Name)
+			ct.applyReplayedStateLocked(st)
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		return nil
+	}
+
+	if !hasPendingUserpoolIntent(ct.ambiguousUserpoolStack[key], ct.ambiguousUserpools, key, entry.IntentID) ||
+		ct.latestUserpoolIntent[key] != entry.IntentID || entryGen < ct.maxUserpoolGen[key] {
+		return nil
+	}
+	delete(ct.activeUserpoolEntries, key)
+	delete(ct.ambiguousUserpoolStack, key)
+	delete(ct.ambiguousUserpools, key)
+	return nil
+}
+
+func (ct *costTracker) abortUserpoolIntent(entry safety.JournalUserpoolEntry) *hostkit.CloudError {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.poisoned != nil {
+		return ct.poisoned
+	}
+	key := entry.Key
+	if key == "" {
+		key = scopedResKey(entry.Scope, entry.Name)
+		entry.Key = key
+	}
+
+	if ct.journal != nil {
+		if err := ct.journal.CheckHealth(); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		if ct.poisoned != nil {
+			return ct.poisoned
+		}
+		if !hasPendingUserpoolIntent(ct.ambiguousUserpoolStack[key], ct.ambiguousUserpools, key, entry.IntentID) {
+			return nil
+		}
+		if err := ct.journal.RecordUserpoolIntent(entry.Scope, entry.Name, "abort", "", entry.OwnerToken, entry.Generation, entry.IntentID, "", "", 0); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		ct.syncFromSafetyJournalLocked()
+		return ct.poisoned
+	}
+
+	if ct.statePath != "" {
+		if err := ct.withLockedCampaignJournal(true, func(st *replayedCampaignState, appendRec func(campaignJournalRecord) error) error {
+			if !hasPendingUserpoolIntent(st.ambiguousUserpoolStack[key], st.ambiguousUserpools, key, entry.IntentID) {
+				return nil
+			}
+			if err := appendRec(campaignJournalRecord{
+				Event:          safety.EventUserpoolIntent,
+				IntentID:       entry.IntentID,
+				Endpoint:       entry.Scope,
+				ResKey:         entry.Name,
+				PolicyIntentOp: "abort",
+				OwnerToken:     entry.OwnerToken,
+				Generation:     entry.Generation,
+			}); err != nil {
+				return err
+			}
+			stack := st.ambiguousUserpoolStack[key]
+			if len(stack) > 0 {
+				filtered := stack[:0]
+				for _, item := range stack {
+					if item.IntentID != entry.IntentID {
+						filtered = append(filtered, item)
+					}
+				}
+				if len(filtered) > 0 {
+					st.ambiguousUserpoolStack[key] = filtered
+					st.ambiguousUserpools[key] = filtered[len(filtered)-1]
+				} else {
+					delete(st.ambiguousUserpoolStack, key)
+					delete(st.ambiguousUserpools, key)
+					if _, inActive := st.activeUserpoolEntries[key]; !inActive {
+						deleteCampaignUserpoolCleanup(st, key)
+					}
+				}
+			} else {
+				delete(st.ambiguousUserpools, key)
+				if _, inActive := st.activeUserpoolEntries[key]; !inActive {
+					deleteCampaignUserpoolCleanup(st, key)
+				}
+			}
+			ct.applyReplayedStateLocked(st)
+			return nil
+		}); err != nil {
+			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "CampaignJournalWriteFailed", err.Error())
+			return ct.poisoned
+		}
+		return nil
+	}
+
+	if !hasPendingUserpoolIntent(ct.ambiguousUserpoolStack[key], ct.ambiguousUserpools, key, entry.IntentID) {
+		return nil
+	}
+	stack := ct.ambiguousUserpoolStack[key]
+	if len(stack) > 0 {
+		filtered := stack[:0]
+		for _, item := range stack {
+			if item.IntentID != entry.IntentID {
+				filtered = append(filtered, item)
+			}
+		}
+		if len(filtered) > 0 {
+			ct.ambiguousUserpoolStack[key] = filtered
+			ct.ambiguousUserpools[key] = filtered[len(filtered)-1]
+			return nil
+		}
+		delete(ct.ambiguousUserpoolStack, key)
+	}
+	delete(ct.ambiguousUserpools, key)
+	if _, inActive := ct.activeUserpoolEntries[key]; !inActive {
+		if releaseNano, ok := ct.activeUserpools[key]; ok {
+			delete(ct.activeUserpools, key)
 			if ct.meter != nil && releaseNano > 0 {
 				ct.meter.ReleaseResourceCleanup(releaseNano)
 			}

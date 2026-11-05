@@ -100,6 +100,9 @@ type Options struct {
 	// mutator (CreateFunction, UpdateFunction, DeleteFunction) commits its state mutation;
 	// if it returns a non-nil error, the mutator returns that error (simulating a lost reply).
 	FaultMutatorAfterCommit func(op string) error
+	// FaultUserpoolMutatorAfterCommit, if non-nil, is called after a userpool mutator
+	// commits its state mutation; if it returns a non-nil error, the mutator returns that error.
+	FaultUserpoolMutatorAfterCommit func(op string) error
 	// BeforeInvokeLock is an optional test hook called at the start of InvokeFunction
 	// before acquiring the state lock (used to test concurrent updates/alias retargets at dispatch).
 	BeforeInvokeLock func()
@@ -117,11 +120,13 @@ func (f *Fake) echoToken(ctx context.Context, kind string) error {
 
 // Fake implements hostkit.ObjectStore and hostkit.Queue.
 type Fake struct {
-	opts            Options
-	mu              sync.Mutex
-	mem             *state
-	calls           map[string]int
-	lastSandboxPIDs []int
+	opts               Options
+	mu                 sync.Mutex
+	mem                *state
+	cachedStateHash    [32]byte
+	hasCachedStateHash bool
+	calls              map[string]int
+	lastSandboxPIDs    []int
 }
 
 type object struct {
@@ -171,6 +176,7 @@ type state struct {
 	Tables    map[string]*tableState              `json:",omitempty"`
 	Policies  map[string]hostkit.PolicyAttachment `json:",omitempty"`
 	Functions map[string]*functionState           `json:",omitempty"`
+	Userpools map[string]*userpoolState           `json:",omitempty"`
 	// Create tokens stored atomically with each create (hostkit.CreateToken).
 	BucketTokens      map[string]string `json:",omitempty"`
 	QueueTokens       map[string]string `json:",omitempty"`
@@ -186,6 +192,7 @@ func newState() *state {
 		Tables:            map[string]*tableState{},
 		Policies:          map[string]hostkit.PolicyAttachment{},
 		Functions:         map[string]*functionState{},
+		Userpools:         map[string]*userpoolState{},
 		PolicyGenerations: map[string]uint64{},
 		PolicyOwners:      map[string]string{},
 	}
@@ -210,6 +217,9 @@ var Mutators = []string{
 	"AttachPolicy", "DetachPolicy",
 	"CreateFunction", "UpdateFunction", "DeleteFunction",
 	"PublishFunctionVersion", "SetFunctionAlias", "DeleteFunctionAlias", "InvokeFunction",
+	"CreateUserPool", "DeleteUserPool",
+	"CreateUser", "DeleteUser", "SetUserEnabled", "SetUserPassword", "SignIn",
+	"CreateGroup", "DeleteGroup", "AddUserToGroup", "RemoveUserFromGroup",
 }
 
 // Calls returns a copy of the per-method call counters.
@@ -238,6 +248,16 @@ func (f *Fake) do(name string, fn func(s *state) error) error {
 	return f.doTarget(name, "", fn)
 }
 
+func isReadOnlyFakeOp(name string) bool {
+	switch name {
+	case "UserpoolOwnerToken", "DescribeUserPool", "UserPoolExists", "ListUserPools",
+		"GetUser", "ListUserIndex", "ListGroups", "ListUserGroups", "PeekDryUserpoolState":
+		return true
+	default:
+		return false
+	}
+}
+
 func (f *Fake) doTarget(name, target string, fn func(s *state) error) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -253,7 +273,6 @@ func (f *Fake) doTarget(name, target string, fn func(s *state) error) error {
 		return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state lock: "+err.Error())
 	}
 	defer lock.unlock()
-	s := newState()
 	if info, statErr := os.Stat(f.opts.StatePath); statErr == nil && info.Size() > 64<<20 {
 		return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state exceeds 64 MiB limit")
 	}
@@ -261,35 +280,51 @@ func (f *Fake) doTarget(name, target string, fn func(s *state) error) error {
 		if len(raw) > 64<<20 {
 			return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state exceeds 64 MiB limit")
 		}
-		if err := json.Unmarshal(raw, s); err != nil {
-			return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state is corrupt: "+err.Error())
-		}
-		if s.Buckets == nil {
-			s.Buckets = map[string]map[string]*object{}
-		}
-		if s.Queues == nil {
-			s.Queues = map[string][]*message{}
-		}
-		if s.Tables == nil {
-			s.Tables = map[string]*tableState{}
-		}
-		if s.Policies == nil {
-			s.Policies = map[string]hostkit.PolicyAttachment{}
-		}
-		if s.PolicyGenerations == nil {
-			s.PolicyGenerations = map[string]uint64{}
-		}
-		if s.PolicyOwners == nil {
-			s.PolicyOwners = map[string]string{}
-		}
-		if s.Functions == nil {
-			s.Functions = map[string]*functionState{}
+		sum := sha256.Sum256(raw)
+		if !f.hasCachedStateHash || sum != f.cachedStateHash || f.mem == nil {
+			s := newState()
+			if err := json.Unmarshal(raw, s); err != nil {
+				return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state is corrupt: "+err.Error())
+			}
+			if s.Buckets == nil {
+				s.Buckets = map[string]map[string]*object{}
+			}
+			if s.Queues == nil {
+				s.Queues = map[string][]*message{}
+			}
+			if s.Tables == nil {
+				s.Tables = map[string]*tableState{}
+			}
+			if s.Policies == nil {
+				s.Policies = map[string]hostkit.PolicyAttachment{}
+			}
+			if s.PolicyGenerations == nil {
+				s.PolicyGenerations = map[string]uint64{}
+			}
+			if s.PolicyOwners == nil {
+				s.PolicyOwners = map[string]string{}
+			}
+			if s.Functions == nil {
+				s.Functions = map[string]*functionState{}
+			}
+			if s.Userpools == nil {
+				s.Userpools = map[string]*userpoolState{}
+			}
+			f.mem = s
+			f.cachedStateHash = sum
+			f.hasCachedStateHash = true
 		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state read: "+err.Error())
+	} else {
+		f.mem = newState()
+		f.hasCachedStateHash = false
 	}
-	ferr := fn(s)
-	raw, err := json.Marshal(s)
+	ferr := fn(f.mem)
+	if isReadOnlyFakeOp(name) {
+		return ferr
+	}
+	raw, err := json.Marshal(f.mem)
 	if err != nil {
 		return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state encode: "+err.Error())
 	}
@@ -300,6 +335,8 @@ func (f *Fake) doTarget(name, target string, fn func(s *state) error) error {
 	if err := os.Rename(tmp, f.opts.StatePath); err != nil {
 		return hostkit.ProviderError(hostkit.Internal, 0, "", "fake state rename: "+err.Error())
 	}
+	f.cachedStateHash = sha256.Sum256(raw)
+	f.hasCachedStateHash = true
 	return ferr
 }
 

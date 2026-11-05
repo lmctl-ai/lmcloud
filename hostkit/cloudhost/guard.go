@@ -281,4 +281,102 @@ func (g guardFunctions) FunctionOwnerToken(ctx context.Context, name string) (st
 	return "", false, errNoToken
 }
 
+type guardUserpools struct{ u hostkit.Userpools }
+
+func (g guardUserpools) CreateUserPool(ctx context.Context, in hostkit.UserpoolCreateInput) (bool, hostkit.UserpoolInfo, error) {
+	created, info, err := g.u.CreateUserPool(ctx, in)
+	return created, info, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) DeleteUserPool(ctx context.Context, pool string) (bool, error) {
+	existed, err := g.u.DeleteUserPool(ctx, pool)
+	return existed, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) UserPoolExists(ctx context.Context, pool string) (bool, error) {
+	v, err := g.u.UserPoolExists(ctx, pool)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) DescribeUserPool(ctx context.Context, pool string) (hostkit.UserpoolInfo, error) {
+	v, err := g.u.DescribeUserPool(ctx, pool)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) ListUserPools(ctx context.Context) ([]string, error) {
+	v, err := g.u.ListUserPools(ctx)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) CreateUser(ctx context.Context, in hostkit.UserCreateInput) (hostkit.UserSnapshot, error) {
+	v, err := g.u.CreateUser(ctx, in)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) GetUser(ctx context.Context, pool, username string) (hostkit.UserSnapshot, error) {
+	v, err := g.u.GetUser(ctx, pool, username)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) DeleteUser(ctx context.Context, pool, username string) error {
+	return hostkit.NilIfTyped(g.u.DeleteUser(ctx, pool, username))
+}
+
+func (g guardUserpools) SetUserEnabled(ctx context.Context, pool, username string, enabled bool) (hostkit.UserSnapshot, error) {
+	v, err := g.u.SetUserEnabled(ctx, pool, username, enabled)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) SetUserPassword(ctx context.Context, pool, username, password string) (hostkit.UserSnapshot, error) {
+	v, err := g.u.SetUserPassword(ctx, pool, username, password)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) ListUserIndex(ctx context.Context, pool, afterUsername string, maxItems int) (hostkit.UserIndexPage, error) {
+	v, err := g.u.ListUserIndex(ctx, pool, afterUsername, maxItems)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) SignIn(ctx context.Context, in hostkit.UserSignInInput) (hostkit.SessionSnapshot, error) {
+	v, err := g.u.SignIn(ctx, in)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) CreateGroup(ctx context.Context, in hostkit.GroupCreateInput) (bool, error) {
+	created, err := g.u.CreateGroup(ctx, in)
+	return created, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) DeleteGroup(ctx context.Context, pool, group string) (bool, error) {
+	existed, err := g.u.DeleteGroup(ctx, pool, group)
+	return existed, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) ListGroups(ctx context.Context, pool string) ([]string, error) {
+	v, err := g.u.ListGroups(ctx, pool)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) AddUserToGroup(ctx context.Context, pool, group, username string) (bool, error) {
+	added, err := g.u.AddUserToGroup(ctx, pool, group, username)
+	return added, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) RemoveUserFromGroup(ctx context.Context, pool, group, username string) error {
+	return hostkit.NilIfTyped(g.u.RemoveUserFromGroup(ctx, pool, group, username))
+}
+
+func (g guardUserpools) ListUserGroups(ctx context.Context, pool, username string) ([]string, error) {
+	v, err := g.u.ListUserGroups(ctx, pool, username)
+	return v, hostkit.NilIfTyped(err)
+}
+
+func (g guardUserpools) UserpoolOwnerToken(ctx context.Context, pool string) (string, bool, error) {
+	if r, ok := g.u.(hostkit.UserpoolOwnershipReader); ok {
+		v, ex, err := r.UserpoolOwnerToken(ctx, pool)
+		return v, ex, hostkit.NilIfTyped(err)
+	}
+	return "", false, errNoToken
+}
+
 var errNoToken = hostkit.ProviderError(hostkit.Internal, 0, "", "adapter does not store create tokens")
