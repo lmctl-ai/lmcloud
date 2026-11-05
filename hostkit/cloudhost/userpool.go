@@ -251,36 +251,81 @@ var (
 	userpoolProfileCache      = make(map[string]map[string]string, 64)
 	userpoolProfileCacheBytes int
 
-	inFlightRevokesMu sync.Mutex
-	inFlightRevokeIDs = make(map[string]bool, 64)
+	inFlightRevokesMu   sync.Mutex
+	inFlightRevokeIDs   = make(map[string]bool, 64)
+	inFlightRevokeFiles = make(map[string]*os.File, 64)
 )
 
-func markRevokeInFlight(id string) {
+func revokeLockFilePath(profileDir, id string) string {
+	if profileDir == "" || id == "" {
+		return ""
+	}
+	return filepath.Join(profileDir+".revokes", id+".lock")
+}
+
+func markRevokeInFlight(profileDir, id string) {
 	if id == "" {
 		return
 	}
 	inFlightRevokesMu.Lock()
+	defer inFlightRevokesMu.Unlock()
 	inFlightRevokeIDs[id] = true
-	inFlightRevokesMu.Unlock()
+	if lockPath := revokeLockFilePath(profileDir, id); lockPath != "" {
+		if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err == nil {
+			if lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600); err == nil {
+				if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+					inFlightRevokeFiles[id] = lf
+				} else {
+					_ = lf.Close()
+				}
+			}
+		}
+	}
 }
 
-func unmarkRevokeInFlight(id string) {
+func unmarkRevokeInFlight(profileDir, id string) {
 	if id == "" {
 		return
 	}
 	inFlightRevokesMu.Lock()
 	delete(inFlightRevokeIDs, id)
+	lf := inFlightRevokeFiles[id]
+	delete(inFlightRevokeFiles, id)
 	inFlightRevokesMu.Unlock()
+	if lockPath := revokeLockFilePath(profileDir, id); lockPath != "" {
+		_ = os.Remove(lockPath)
+	}
+	if lf != nil {
+		_ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+		_ = lf.Close()
+	}
 }
 
-func isRevokeInFlight(id string) bool {
+func isRevokeInFlight(profileDir, id string) bool {
 	if id == "" {
 		return false
 	}
 	inFlightRevokesMu.Lock()
 	ok := inFlightRevokeIDs[id]
 	inFlightRevokesMu.Unlock()
-	return ok
+	if ok {
+		return true
+	}
+	lockPath := revokeLockFilePath(profileDir, id)
+	if lockPath == "" {
+		return false
+	}
+	lf, err := os.OpenFile(lockPath, os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return false
+	}
+	defer lf.Close()
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return true
+	}
+	_ = os.Remove(lockPath)
+	_ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+	return false
 }
 
 func syncPendingUserRevokeSummary(st *persistedUserpoolCatalogState, username string) {
@@ -376,39 +421,52 @@ func reconcileAbandonedUserRevokes(st *persistedUserpoolCatalogState, username s
 		return
 	}
 	for _, id := range candidateIDs {
-		if id != "" && !isRevokeInFlight(id) {
+		if id != "" && !isRevokeInFlight(st.UserProfileDir, id) {
 			removePendingUserRevoke(st, username, id)
 		}
 	}
 }
 
+// evictOldestTokenBindingsToFit acts as early session revocation when a userpool's
+// persisted state approaches the 8 MiB limit (analogous to the 128-binding-per-user
+// cap), failing closed on evicted tokens so revocation intents always fit.
 func evictOldestTokenBindingsToFit(st *persistedUserpoolCatalogState, maxBytes int) {
 	if st == nil || len(st.TokenBindings) == 0 {
 		return
 	}
-	for len(encodePersistedUserpoolState(*st)) > maxBytes && len(st.TokenBindings) > 0 {
-		var oldestUser string
-		var oldestIssued int64
-		hasCandidate := false
-		for u, list := range st.TokenBindings {
-			if len(list) == 0 {
-				delete(st.TokenBindings, u)
-				continue
-			}
-			if !hasCandidate || list[0].IssuedAt < oldestIssued || (list[0].IssuedAt == oldestIssued && u < oldestUser) {
-				oldestUser = u
-				oldestIssued = list[0].IssuedAt
-				hasCandidate = true
-			}
-		}
-		if !hasCandidate {
+	for len(st.TokenBindings) > 0 {
+		curBytes := len(encodePersistedUserpoolState(*st))
+		if curBytes <= maxBytes {
 			break
 		}
-		list := st.TokenBindings[oldestUser]
-		if len(list) <= 1 {
-			delete(st.TokenBindings, oldestUser)
-		} else {
-			st.TokenBindings[oldestUser] = list[1:]
+		needEvict := (curBytes - maxBytes + 255) / 256
+		if needEvict < 1 {
+			needEvict = 1
+		}
+		for i := 0; i < needEvict && len(st.TokenBindings) > 0; i++ {
+			var oldestUser string
+			var oldestIssued int64
+			hasCandidate := false
+			for u, list := range st.TokenBindings {
+				if len(list) == 0 {
+					delete(st.TokenBindings, u)
+					continue
+				}
+				if !hasCandidate || list[0].IssuedAt < oldestIssued || (list[0].IssuedAt == oldestIssued && u < oldestUser) {
+					oldestUser = u
+					oldestIssued = list[0].IssuedAt
+					hasCandidate = true
+				}
+			}
+			if !hasCandidate {
+				return
+			}
+			list := st.TokenBindings[oldestUser]
+			if len(list) <= 1 {
+				delete(st.TokenBindings, oldestUser)
+			} else {
+				st.TokenBindings[oldestUser] = list[1:]
+			}
 		}
 	}
 }
@@ -1641,6 +1699,8 @@ func (h *Host) checkCatalogMutationHeadroom(pool string, act safety.JournalUserp
 // fails closed (UNAUTHENTICATED) until reconciled.
 func (h *Host) beginUserRevocationIntent(ep, pool, username string, act safety.JournalUserpoolEntry, isCleanup bool) (string, uint64, uint64, uint64, bool, *hostkit.CloudError) {
 	revokeID := safety.NewToken128()
+	profDir := h.userpoolProfileDir()
+	markRevokeInFlight(profDir, revokeID)
 	var intentGen uint64
 	var prevRevokedGen uint64
 	var prevUserGen uint64
@@ -1650,7 +1710,7 @@ func (h *Host) beginUserRevocationIntent(ep, pool, username string, act safety.J
 		if !ok {
 			st.Pool = hostkit.UserpoolInfo{Name: pool, IncarnationID: act.Incarnation, OwnerToken: act.OwnerToken}
 		}
-		st.UserProfileDir = h.userpoolProfileDir()
+		st.UserProfileDir = profDir
 		prevRevokedGen = st.RevokedSessionGen[username]
 		baseGen := journaledUserSessionGen(&st, username)
 		if u, uok := st.Users[username]; uok {
@@ -1670,14 +1730,19 @@ func (h *Host) beginUserRevocationIntent(ep, pool, username string, act safety.J
 		}
 		return encodePersistedUserpoolState(st)
 	})
-	return revokeID, intentGen, prevRevokedGen, prevUserGen, hadUser, cerr
+	if cerr != nil {
+		unmarkRevokeInFlight(profDir, revokeID)
+		return "", 0, 0, 0, false, cerr
+	}
+	return revokeID, intentGen, prevRevokedGen, prevUserGen, hadUser, nil
 }
 
 // rollbackUserRevocationIntent clears a pre-dispatch pending revocation intent
 // when the native adapter returned a definitive refusal (e.g., NotFound or PermissionDenied).
 // It restores prevRevokedGen only when restoreGen is true (authoritative proof that no
-// physical mutation committed); otherwise RevokedSessionGen remains monotonic.
-func (h *Host) rollbackUserRevocationIntent(ep, pool, username string, act safety.JournalUserpoolEntry, revokeID string, prevRevokedGen, prevUserGen uint64, hadUser, restoreGen, isCleanup bool) {
+// physical mutation committed) and no other operation moved the user's generation;
+// otherwise RevokedSessionGen remains monotonic.
+func (h *Host) rollbackUserRevocationIntent(ep, pool, username string, act safety.JournalUserpoolEntry, revokeID string, intentGen, prevRevokedGen, prevUserGen uint64, hadUser, restoreGen, isCleanup bool) {
 	_ = h.cost.updateUserpoolStateOpts(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, isCleanup, true, func(cur string) string {
 		st, ok := decodePersistedUserpoolState(cur)
 		if !ok {
@@ -1687,7 +1752,8 @@ func (h *Host) rollbackUserRevocationIntent(ep, pool, username string, act safet
 		if !removePendingUserRevoke(&st, username, revokeID) {
 			return cur
 		}
-		if restoreGen && !hasPendingUserRevoke(&st, username) {
+		if restoreGen && !hasPendingUserRevoke(&st, username) &&
+			intentGen > 0 && st.RevokedSessionGen[username] == intentGen && journaledUserSessionGen(&st, username) == intentGen {
 			if prevRevokedGen == 0 {
 				delete(st.RevokedSessionGen, username)
 			} else {
@@ -2349,8 +2415,7 @@ func (h *Host) UserDelete(dry bool, pool, username string) error {
 			failed = true
 			return h.fail(op, pool, rcerr)
 		}
-		markRevokeInFlight(revokeID)
-		defer unmarkRevokeInFlight(revokeID)
+		defer unmarkRevokeInFlight(h.userpoolProfileDir(), revokeID)
 	}
 
 	var childSeq uint64
@@ -2369,7 +2434,7 @@ func (h *Host) UserDelete(dry bool, pool, username string) error {
 		if revokeID != "" && definitiveRefusal && childSeq == 0 {
 			recSnap, recOK := h.reconcileUserForCatalog(ctx, pool, username, true)
 			restoreGen := (isNotFound(ce) && !hadUser && prevRevGen == 0) || (recOK && recSnap.Exists)
-			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser, restoreGen, true)
+			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, intentGen, prevRevGen, prevUserGen, hadUser, restoreGen, true)
 		}
 		failed = true
 		return h.fail(op, pool, ce)
@@ -2592,8 +2657,12 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 			failed = true
 			return h.fail(op, pool, rcerr)
 		}
-		markRevokeInFlight(revokeID)
-		defer unmarkRevokeInFlight(revokeID)
+		defer unmarkRevokeInFlight(h.userpoolProfileDir(), revokeID)
+	} else if enabled && hasAct && len(act.StateJSON) > 8*1024*1024+64*1024-512 {
+		_ = scope.releaseNotSent()
+		failed = true
+		return h.fail(op, pool, hostkit.ProviderError(hostkit.InvalidArgument, 0, "UserpoolStateLimitExceeded",
+			fmt.Sprintf("userpool %q state size %d exceeds maximum 8 MiB", pool, len(act.StateJSON))))
 	}
 
 	var childSeq uint64
@@ -2611,7 +2680,7 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 	if ce != nil {
 		if revokeID != "" && definitiveRefusal && childSeq == 0 {
 			restoreGen := isNotFound(ce) && !hadUser && prevRevGen == 0
-			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser, restoreGen, false)
+			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, intentGen, prevRevGen, prevUserGen, hadUser, restoreGen, false)
 		}
 		failed = true
 		return h.fail(op, pool, ce)
@@ -2625,7 +2694,7 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 		}
 	}
 
-	if cerr := h.cost.updateUserpoolStateOpts(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, false, !enabled, func(cur string) string {
+	if cerr := h.cost.updateUserpoolStateOpts(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, false, true, func(cur string) string {
 		st, ok := decodePersistedUserpoolState(cur)
 		if !ok {
 			return cur
@@ -2829,8 +2898,7 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 			failed = true
 			return h.fail(op, pool, rcerr)
 		}
-		markRevokeInFlight(revokeID)
-		defer unmarkRevokeInFlight(revokeID)
+		defer unmarkRevokeInFlight(h.userpoolProfileDir(), revokeID)
 	}
 
 	var childSeq uint64
@@ -2848,7 +2916,7 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 	if ce != nil {
 		if revokeID != "" && definitiveRefusal && childSeq == 0 {
 			restoreGen := isNotFound(ce) && !hadUser && prevRevGen == 0
-			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser, restoreGen, false)
+			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, intentGen, prevRevGen, prevUserGen, hadUser, restoreGen, false)
 		}
 		failed = true
 		return h.fail(op, pool, ce)

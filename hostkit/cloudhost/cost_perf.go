@@ -214,8 +214,9 @@ type campaignJournalRecord struct {
 	AttemptNanoUSD           int64  `json:"attempt_nano_usd,omitempty"`
 	CleanupReserveNanoUSD    int64  `json:"cleanup_reserve_nano_usd,omitempty"`
 	ReservedBytes            int64  `json:"reserved_bytes,omitempty"`
-	ChargedNanoUSD           int64  `json:"charged_nano_usd,omitempty"`
-	SettledBytes             int64  `json:"settled_bytes,omitempty"`
+	ChargedNanoUSD           int64                      `json:"charged_nano_usd,omitempty"`
+	OpStats                  map[string]persistedOpCost `json:"op_stats,omitempty"`
+	SettledBytes             int64                      `json:"settled_bytes,omitempty"`
 	BillingUnits             int64  `json:"billing_units,omitempty"`
 	LockCleanup              bool   `json:"lock_cleanup,omitempty"`
 	ReleaseCleanup           bool   `json:"release_cleanup,omitempty"`
@@ -1244,6 +1245,21 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 				if rec.PolicyHash != wantMeta.PolicyHash {
 					return nil, fmt.Errorf("campaign journal policy_hash mismatch: journal has %q, tracker has %q", rec.PolicyHash, wantMeta.PolicyHash)
 				}
+			}
+			if rec.ChargedNanoUSD < 0 {
+				return nil, errors.New("corrupt campaign journal: negative meta charged_nano_usd")
+			}
+			st.chargedNanoUSD += rec.ChargedNanoUSD
+			for op, stat := range rec.OpStats {
+				if op == "" || stat.Requests < 0 || stat.BillingUnits < 0 || stat.Bytes < 0 || stat.ChargedNanoUSD < 0 {
+					return nil, errors.New("corrupt campaign journal: invalid meta op_stats")
+				}
+				cur := st.ops[op]
+				cur.Requests += stat.Requests
+				cur.BillingUnits += stat.BillingUnits
+				cur.Bytes += stat.Bytes
+				cur.ChargedNanoUSD += stat.ChargedNanoUSD
+				st.ops[op] = cur
 			}
 		case safety.EventWorkCap:
 			if rec.WorkCapNanoUSD <= 0 {
@@ -2378,7 +2394,88 @@ func compactSupersededCampaignStates(raw []byte, cachedRecs []campaignJournalRec
 			}
 		}
 	}
-	if (dropped < 4 && droppedBytes <= 256<<10) || (len(raw) > 2<<20 && droppedBytes <= 256<<10) {
+	var foldDrop map[int]bool
+	var foldedMeta campaignJournalRecord
+	foldedAny := false
+	nearHardLimit := int64(len(raw))+1024 > safety.MaxJournalFileBytes
+	if nearHardLimit && len(recs) > 0 && recs[0].Event == safety.EventMeta {
+		foldDrop = make(map[int]bool)
+		foldedMeta = recs[0]
+		metaOps := make(map[string]persistedOpCost, len(foldedMeta.OpStats))
+		for k, v := range foldedMeta.OpStats {
+			metaOps[k] = v
+		}
+		type idxPair struct{ rIdx, sIdx int }
+		pendingRes := make(map[string]int)
+		activeChild := make(map[string]bool)
+		childPairs := make(map[string][]idxPair)
+		var foldablePairs []idxPair
+		for idx, rec := range recs {
+			switch rec.Event {
+			case safety.EventReserve:
+				pendingRes[rec.AttemptID] = idx
+			case safety.EventSettle:
+				rIdx, ok := pendingRes[rec.AttemptID]
+				if !ok {
+					continue
+				}
+				delete(pendingRes, rec.AttemptID)
+				rRec := recs[rIdx]
+				if !rec.LockCleanup && !rec.ReleaseCleanup {
+					foldablePairs = append(foldablePairs, idxPair{rIdx, idx})
+				} else if rRec.ResKind == safety.KindPoolUser || rRec.ResKind == safety.KindPoolGroup || rRec.ResKind == safety.KindPoolMembership {
+					cKey := rRec.ResKind + "\x00" + scopedResKey(rRec.Endpoint, rRec.ResKey)
+					if rec.LockCleanup {
+						activeChild[cKey] = true
+					}
+					if rec.ReleaseCleanup {
+						activeChild[cKey] = false
+					}
+					childPairs[cKey] = append(childPairs[cKey], idxPair{rIdx, idx})
+				}
+			case safety.EventUserpoolDelete:
+				prefix := scopedResKey(rec.Endpoint, rec.ResKey) + "/"
+				for cKey := range activeChild {
+					if sep := strings.IndexByte(cKey, '\x00'); sep >= 0 && strings.HasPrefix(cKey[sep+1:], prefix) {
+						activeChild[cKey] = false
+					}
+				}
+			}
+		}
+		for cKey, pairs := range childPairs {
+			if !activeChild[cKey] {
+				foldablePairs = append(foldablePairs, pairs...)
+			}
+		}
+		for _, pair := range foldablePairs {
+			foldDrop[pair.rIdx] = true
+			foldDrop[pair.sIdx] = true
+			dropped += 2
+			droppedBytes += 400
+			foldedAny = true
+			p := recs[pair.rIdx]
+			s := recs[pair.sIdx]
+			if s.BillingUnits == 0 && s.ChargedNanoUSD == 0 && !s.LockCleanup && !s.ReleaseCleanup {
+				continue
+			}
+			charge := s.ChargedNanoUSD
+			foldedMeta.ChargedNanoUSD += charge
+			cur := metaOps[p.Operation]
+			cur.Requests++
+			cur.BillingUnits += s.BillingUnits
+			cur.Bytes += s.SettledBytes
+			cur.ChargedNanoUSD += charge
+			metaOps[p.Operation] = cur
+		}
+		if len(metaOps) > 0 {
+			foldedMeta.OpStats = metaOps
+		}
+	}
+	if !nearHardLimit {
+		if (dropped < 4 && droppedBytes <= 256<<10) || (len(raw) > 2<<20 && droppedBytes <= 256<<10) {
+			return nil, nil, 0, false
+		}
+	} else if dropped == 0 {
 		return nil, nil, 0, false
 	}
 	rawLines := bytes.Split(raw, []byte{'\n'})
@@ -2386,6 +2483,12 @@ func compactSupersededCampaignStates(raw []byte, cachedRecs []campaignJournalRec
 	compactedRecs := make([]campaignJournalRecord, 0, len(recs)-dropped)
 	var seq uint64
 	for idx, rec := range recs {
+		if foldDrop[idx] {
+			continue
+		}
+		if idx == 0 && foldedAny {
+			rec = foldedMeta
+		}
 		if rec.Event == safety.EventUserpoolState {
 			uKey := scopedResKey(rec.Endpoint, rec.ResKey)
 			if lastIdx, ok := lastUserpoolState[uKey]; !ok || lastIdx != idx {
@@ -2402,7 +2505,7 @@ func compactSupersededCampaignStates(raw []byte, cachedRecs []campaignJournalRec
 		origSeq := rec.Seq
 		rec.Seq = seq
 		compactedRecs = append(compactedRecs, rec)
-		if idx < len(rawLines) && len(rawLines[idx]) > 0 {
+		if !(idx == 0 && foldedAny) && idx < len(rawLines) && len(rawLines[idx]) > 0 {
 			if origSeq == seq {
 				buf.Write(rawLines[idx])
 				buf.WriteByte('\n')
@@ -2778,6 +2881,14 @@ func (ct *costTracker) reserveForOp(recordOp, endpoint string, in safety.Attempt
 					fmt.Sprintf("journal size exceeds non-cleanup headroom limit (%d bytes); only cleanup operations are permitted", maxNonCleanupJournalBytes))
 			}
 		}
+		if in.IsCleanup && ct.journal.FileSize()+512 > safety.MaxJournalFileBytes {
+			_ = ct.journal.Compact()
+			if ct.journal.FileSize()+512 > safety.MaxJournalFileBytes {
+				res.Release()
+				return nil, "", hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+					fmt.Sprintf("journal size exceeds hard limit (%d bytes)", safety.MaxJournalFileBytes))
+			}
+		}
 		reservedBytes := in.PayloadSize
 		if in.Operation == "object_get" {
 			reservedBytes = in.EgressBytes
@@ -2810,6 +2921,11 @@ func (ct *costTracker) reserveForOp(recordOp, endpoint string, in safety.Attempt
 			if !in.IsCleanup && st.journalFileBytes+4096 > maxNonCleanupJournalBytes {
 				cerr = hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
 					fmt.Sprintf("campaign journal size exceeds non-cleanup headroom limit (%d bytes); only cleanup operations are permitted", maxNonCleanupJournalBytes))
+				return nil
+			}
+			if in.IsCleanup && int64(st.journalFileBytes)+512 > safety.MaxJournalFileBytes {
+				cerr = hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+					fmt.Sprintf("campaign journal size exceeds hard limit (%d bytes)", safety.MaxJournalFileBytes))
 				return nil
 			}
 			var rerr error
@@ -5192,6 +5308,13 @@ func (ct *costTracker) beginUserpoolIntent(endpoint, name, intentOp, incarnation
 		nextGen := ct.maxUserpoolGen[key] + 1
 		genStr := strconv.FormatUint(nextGen, 10)
 		intentID := safety.NewToken128()
+		if intentOp == "delete" && ct.journal.FileSize()+512 > safety.MaxJournalFileBytes {
+			_ = ct.journal.Compact()
+			if ct.journal.FileSize()+512 > safety.MaxJournalFileBytes {
+				return safety.JournalUserpoolEntry{}, hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+					fmt.Sprintf("journal size exceeds hard limit (%d bytes)", safety.MaxJournalFileBytes))
+			}
+		}
 		if err := ct.journal.RecordUserpoolIntent(endpoint, name, intentOp, inc, ownerToken, genStr, intentID, "", "", 0); err != nil {
 			ct.poisoned = hostkit.ProviderError(hostkit.Internal, 0, "JournalWriteFailed", err.Error())
 			return safety.JournalUserpoolEntry{}, ct.poisoned
@@ -5248,6 +5371,11 @@ func (ct *costTracker) beginUserpoolIntent(endpoint, name, intentOp, incarnation
 			nextGen := st.maxUserpoolGen[key] + 1
 			genStr := strconv.FormatUint(nextGen, 10)
 			intentID := safety.NewToken128()
+			if intentOp == "delete" && int64(st.journalFileBytes)+512 > safety.MaxJournalFileBytes {
+				cerr = hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+					fmt.Sprintf("campaign journal size exceeds hard limit (%d bytes)", safety.MaxJournalFileBytes))
+				return nil
+			}
 			if err := appendRec(campaignJournalRecord{
 				Event:               safety.EventUserpoolIntent,
 				IntentID:            intentID,
@@ -5574,7 +5702,7 @@ func (ct *costTracker) updateUserpoolStateOpts(endpoint, name, expOwnerToken, ex
 		if len(newState) > maxStateBytes {
 			return stateTooLargeErr(len(newState))
 		}
-		if ct.journal.FileSize()+int64(len(newState))+1024 > maxNonCleanupJournalBytes {
+		if ct.journal.FileSize()+int64(len(newState))+1024 > maxJournalBytes {
 			_ = ct.journal.Compact()
 		}
 		if ct.journal.FileSize()+int64(len(newState))+1024 > maxJournalBytes {
