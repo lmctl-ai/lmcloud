@@ -845,12 +845,8 @@ func (f *Fake) SetUserEnabled(ctx context.Context, pool, username string, enable
 
 // SetUserPassword implements hostkit.Userpools.
 func (f *Fake) SetUserPassword(ctx context.Context, pool, username, password string) (hostkit.UserSnapshot, error) {
-	saltHex, derivedHex, err := hostkit.DerivePasswordPBKDF2(password)
-	if err != nil {
-		return hostkit.UserSnapshot{}, hostkit.ProviderError(hostkit.Internal, 500, "PasswordKDFError", "failed to derive password key")
-	}
 	var out hostkit.UserSnapshot
-	err = f.doTarget("SetUserPassword", pool+"/"+username, func(s *state) error {
+	err := f.doTarget("SetUserPassword", pool+"/"+username, func(s *state) error {
 		up, ok := s.Userpools[pool]
 		if !ok || up == nil {
 			return f.notFound(hostkit.AbsentUserpool, "ResourceNotFoundException", fmt.Sprintf("userpool %q not found", pool))
@@ -866,6 +862,10 @@ func (f *Fake) SetUserPassword(ctx context.Context, pool, username, password str
 		if isForeignPoolUser(up, username, u) {
 			return hostkit.ProviderError(hostkit.PermissionDenied, 403, "ForeignResource",
 				fmt.Sprintf("user %q in pool %q belongs to another owner", username, pool))
+		}
+		saltHex, derivedHex, kerr := hostkit.DerivePasswordPBKDF2(password)
+		if kerr != nil {
+			return hostkit.ProviderError(hostkit.Internal, 500, "PasswordKDFError", "failed to derive password key")
 		}
 		u.PasswordSaltHex = saltHex
 		u.PasswordDerivedHex = derivedHex

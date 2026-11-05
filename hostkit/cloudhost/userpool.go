@@ -224,34 +224,194 @@ type tokenBindingRecord struct {
 }
 
 type persistedUserpoolCatalogState struct {
-	Pool               hostkit.UserpoolInfo            `json:"pool"`
-	Users              map[string]hostkit.UserSnapshot `json:"users,omitempty"`
-	UserProfileHashes  map[string]string               `json:"user_profile_hashes,omitempty"`
-	UserProfileDir     string                          `json:"user_profile_dir,omitempty"`
-	RevokedSessionGen  map[string]uint64               `json:"revoked_session_gen,omitempty"`
-	PendingUserRevoke  map[string]string               `json:"pending_user_revoke,omitempty"`
-	Groups             map[string]bool                 `json:"groups,omitempty"`
-	Memberships        map[string][]string             `json:"memberships,omitempty"`
-	TokenBindings      map[string][]tokenBindingRecord `json:"token_bindings,omitempty"`
-	TokenBindingHashes map[string]string               `json:"token_binding_hashes,omitempty"`
-	ChildSeq           uint64                          `json:"child_seq,omitempty"`
-	UserSeq            map[string]uint64               `json:"user_seq,omitempty"`
-	GroupSeq           map[string]uint64               `json:"group_seq,omitempty"`
-	MembershipSeq      map[string]uint64               `json:"membership_seq,omitempty"`
+	Pool                 hostkit.UserpoolInfo            `json:"pool"`
+	Users                map[string]hostkit.UserSnapshot `json:"users,omitempty"`
+	UserProfileHashes    map[string]string               `json:"user_profile_hashes,omitempty"`
+	UserProfileDir       string                          `json:"user_profile_dir,omitempty"`
+	RevokedSessionGen    map[string]uint64               `json:"revoked_session_gen,omitempty"`
+	PendingUserRevoke    map[string]string               `json:"pending_user_revoke,omitempty"`
+	PendingUserRevokeSet map[string][]string             `json:"pending_user_revoke_set,omitempty"`
+	Groups               map[string]bool                 `json:"groups,omitempty"`
+	Memberships          map[string][]string             `json:"memberships,omitempty"`
+	TokenBindings        map[string][]tokenBindingRecord `json:"token_bindings,omitempty"`
+	ChildSeq             uint64                          `json:"child_seq,omitempty"`
+	UserSeq              map[string]uint64               `json:"user_seq,omitempty"`
+	GroupSeq             map[string]uint64               `json:"group_seq,omitempty"`
+	MembershipSeq        map[string]uint64               `json:"membership_seq,omitempty"`
 }
 
 const (
-	maxUserpoolProfileCacheEntries = 256
-	maxUserpoolProfileCacheBytes   = 8 << 20
+	maxUserpoolProfileCacheEntries     = 256
+	maxUserpoolProfileCacheBytes       = 8 << 20
+	maxNonRevocationUserpoolStateBytes = 8*1024*1024 - 4096
 )
 
 var (
 	userpoolProfileCacheMu    sync.Mutex
 	userpoolProfileCache      = make(map[string]map[string]string, 64)
 	userpoolProfileCacheBytes int
-	userpoolTBCache           = make(map[string][]tokenBindingRecord, 64)
-	userpoolTBCacheBytes      int
+
+	inFlightRevokesMu sync.Mutex
+	inFlightRevokeIDs = make(map[string]bool, 64)
 )
+
+func markRevokeInFlight(id string) {
+	if id == "" {
+		return
+	}
+	inFlightRevokesMu.Lock()
+	inFlightRevokeIDs[id] = true
+	inFlightRevokesMu.Unlock()
+}
+
+func unmarkRevokeInFlight(id string) {
+	if id == "" {
+		return
+	}
+	inFlightRevokesMu.Lock()
+	delete(inFlightRevokeIDs, id)
+	inFlightRevokesMu.Unlock()
+}
+
+func isRevokeInFlight(id string) bool {
+	if id == "" {
+		return false
+	}
+	inFlightRevokesMu.Lock()
+	ok := inFlightRevokeIDs[id]
+	inFlightRevokesMu.Unlock()
+	return ok
+}
+
+func syncPendingUserRevokeSummary(st *persistedUserpoolCatalogState, username string) {
+	if st == nil || username == "" {
+		return
+	}
+	if st.PendingUserRevoke == nil {
+		st.PendingUserRevoke = map[string]string{}
+	}
+	if st.PendingUserRevokeSet == nil {
+		st.PendingUserRevokeSet = map[string][]string{}
+	}
+	list := st.PendingUserRevokeSet[username]
+	filtered := list[:0]
+	seen := make(map[string]bool, len(list))
+	for _, id := range list {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			filtered = append(filtered, id)
+		}
+	}
+	if len(filtered) == 0 {
+		delete(st.PendingUserRevokeSet, username)
+		delete(st.PendingUserRevoke, username)
+		return
+	}
+	st.PendingUserRevokeSet[username] = filtered
+	st.PendingUserRevoke[username] = filtered[len(filtered)-1]
+}
+
+func getPendingUserRevokeIDs(st *persistedUserpoolCatalogState, username string) []string {
+	if st == nil || username == "" {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, id := range st.PendingUserRevokeSet[username] {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	if legacy := st.PendingUserRevoke[username]; legacy != "" && !seen[legacy] {
+		out = append(out, legacy)
+	}
+	return out
+}
+
+func hasPendingUserRevoke(st *persistedUserpoolCatalogState, username string) bool {
+	if st == nil || username == "" {
+		return false
+	}
+	return len(st.PendingUserRevokeSet[username]) > 0 || st.PendingUserRevoke[username] != ""
+}
+
+func addPendingUserRevoke(st *persistedUserpoolCatalogState, username, revokeID string) {
+	if st == nil || username == "" || revokeID == "" {
+		return
+	}
+	if st.PendingUserRevokeSet == nil {
+		st.PendingUserRevokeSet = map[string][]string{}
+	}
+	existing := getPendingUserRevokeIDs(st, username)
+	existing = append(existing, revokeID)
+	st.PendingUserRevokeSet[username] = existing
+	syncPendingUserRevokeSummary(st, username)
+}
+
+func removePendingUserRevoke(st *persistedUserpoolCatalogState, username, revokeID string) bool {
+	if st == nil || username == "" || revokeID == "" {
+		return false
+	}
+	existing := getPendingUserRevokeIDs(st, username)
+	removed := false
+	filtered := make([]string, 0, len(existing))
+	for _, id := range existing {
+		if id == revokeID {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, id)
+	}
+	if st.PendingUserRevokeSet == nil {
+		st.PendingUserRevokeSet = map[string][]string{}
+	}
+	st.PendingUserRevokeSet[username] = filtered
+	syncPendingUserRevokeSummary(st, username)
+	return removed
+}
+
+func reconcileAbandonedUserRevokes(st *persistedUserpoolCatalogState, username string, candidateIDs []string) {
+	if st == nil || username == "" || len(candidateIDs) == 0 {
+		return
+	}
+	for _, id := range candidateIDs {
+		if id != "" && !isRevokeInFlight(id) {
+			removePendingUserRevoke(st, username, id)
+		}
+	}
+}
+
+func evictOldestTokenBindingsToFit(st *persistedUserpoolCatalogState, maxBytes int) {
+	if st == nil || len(st.TokenBindings) == 0 {
+		return
+	}
+	for len(encodePersistedUserpoolState(*st)) > maxBytes && len(st.TokenBindings) > 0 {
+		var oldestUser string
+		var oldestIssued int64
+		hasCandidate := false
+		for u, list := range st.TokenBindings {
+			if len(list) == 0 {
+				delete(st.TokenBindings, u)
+				continue
+			}
+			if !hasCandidate || list[0].IssuedAt < oldestIssued || (list[0].IssuedAt == oldestIssued && u < oldestUser) {
+				oldestUser = u
+				oldestIssued = list[0].IssuedAt
+				hasCandidate = true
+			}
+		}
+		if !hasCandidate {
+			break
+		}
+		list := st.TokenBindings[oldestUser]
+		if len(list) <= 1 {
+			delete(st.TokenBindings, oldestUser)
+		} else {
+			st.TokenBindings[oldestUser] = list[1:]
+		}
+	}
+}
 
 func cacheUserProfileAttrs(hashHex string, attrs map[string]string) {
 	if hashHex == "" || len(attrs) == 0 {
@@ -366,110 +526,12 @@ func removeProfileBlob(profileDir, hashHex string) {
 	userpoolProfileCacheMu.Unlock()
 }
 
-func cacheUserTokenBindings(hashHex string, bindings []tokenBindingRecord) {
-	if hashHex == "" || len(bindings) == 0 {
-		return
-	}
-	cp := append([]tokenBindingRecord(nil), bindings...)
-	entryBytes := len(hashHex) + len(cp)*256
-	if entryBytes > maxUserpoolProfileCacheBytes {
-		return
-	}
-	userpoolProfileCacheMu.Lock()
-	if _, exists := userpoolTBCache[hashHex]; !exists {
-		if len(userpoolTBCache) >= maxUserpoolProfileCacheEntries || userpoolTBCacheBytes+entryBytes > maxUserpoolProfileCacheBytes {
-			userpoolTBCache = make(map[string][]tokenBindingRecord, 64)
-			userpoolTBCacheBytes = 0
-		}
-		userpoolTBCache[hashHex] = cp
-		userpoolTBCacheBytes += entryBytes
-	}
-	userpoolProfileCacheMu.Unlock()
-}
-
-func loadUserTokenBindings(profileDir, hashHex string) ([]tokenBindingRecord, bool) {
-	if hashHex == "" {
-		return nil, false
-	}
-	userpoolProfileCacheMu.Lock()
-	if cached, ok := userpoolTBCache[hashHex]; ok {
-		out := append([]tokenBindingRecord(nil), cached...)
-		userpoolProfileCacheMu.Unlock()
-		return out, true
-	}
-	userpoolProfileCacheMu.Unlock()
-	if profileDir == "" {
-		return nil, false
-	}
-	p := filepath.Join(profileDir, "tb_"+hashHex+".json")
-	raw, err := os.ReadFile(p)
-	if err != nil {
-		return nil, false
-	}
-	sum := sha256.Sum256(raw)
-	if hex.EncodeToString(sum[:]) != hashHex {
-		return nil, false
-	}
-	var bindings []tokenBindingRecord
-	if err := json.Unmarshal(raw, &bindings); err != nil {
-		return nil, false
-	}
-	cacheUserTokenBindings(hashHex, bindings)
-	return bindings, true
-}
-
-func tokenBindingBlobExists(profileDir, hashHex string) bool {
-	if profileDir == "" || hashHex == "" {
-		return false
-	}
-	fi, err := os.Stat(filepath.Join(profileDir, "tb_"+hashHex+".json"))
-	return err == nil && !fi.IsDir()
-}
-
-func writeTokenBindingBlob(profileDir, hashHex string, raw []byte) error {
-	if profileDir == "" || hashHex == "" || len(raw) == 0 {
-		return fmt.Errorf("missing token binding blob destination")
-	}
-	if err := os.MkdirAll(profileDir, 0o700); err != nil {
-		return err
-	}
-	finalPath := filepath.Join(profileDir, "tb_"+hashHex+".json")
-	if fi, err := os.Stat(finalPath); err == nil && !fi.IsDir() {
-		return nil
-	}
-	tmpPath := finalPath + ".tmp." + safety.NewToken128()
-	if err := os.WriteFile(tmpPath, raw, 0o600); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	return nil
-}
-
-func removeTokenBindingBlob(profileDir, hashHex string) {
-	if profileDir == "" || hashHex == "" {
-		return
-	}
-	_ = os.Remove(filepath.Join(profileDir, "tb_"+hashHex+".json"))
-	userpoolProfileCacheMu.Lock()
-	delete(userpoolTBCache, hashHex)
-	userpoolProfileCacheMu.Unlock()
-}
-
 func getUserTokenBindings(st *persistedUserpoolCatalogState, username string) []tokenBindingRecord {
 	if st == nil || username == "" {
 		return nil
 	}
 	if b, ok := st.TokenBindings[username]; ok && len(b) > 0 {
 		return b
-	}
-	if hashHex := st.TokenBindingHashes[username]; hashHex != "" {
-		if b, ok := loadUserTokenBindings(st.UserProfileDir, hashHex); ok {
-			return b
-		}
 	}
 	return nil
 }
@@ -492,21 +554,7 @@ func deleteUserBlobsFromCatalog(st *persistedUserpoolCatalogState, username stri
 			removeProfileBlob(st.UserProfileDir, prevProf)
 		}
 	}
-	prevTB := st.TokenBindingHashes[username]
-	delete(st.TokenBindingHashes, username)
 	delete(st.TokenBindings, username)
-	if prevTB != "" && st.UserProfileDir != "" {
-		stillUsed := false
-		for _, h := range st.TokenBindingHashes {
-			if h == prevTB {
-				stillUsed = true
-				break
-			}
-		}
-		if !stillUsed {
-			removeTokenBindingBlob(st.UserProfileDir, prevTB)
-		}
-	}
 }
 
 func (h *Host) userpoolProfileDir() string {
@@ -527,17 +575,9 @@ func encodePersistedUserpoolState(st persistedUserpoolCatalogState) string {
 	if st.UserProfileHashes == nil {
 		st.UserProfileHashes = map[string]string{}
 	}
-	if st.TokenBindingHashes == nil {
-		st.TokenBindingHashes = map[string]string{}
-	}
 	for u := range st.UserProfileHashes {
 		if _, exists := st.Users[u]; !exists {
 			delete(st.UserProfileHashes, u)
-		}
-	}
-	for u := range st.TokenBindingHashes {
-		if _, exists := st.Users[u]; !exists {
-			delete(st.TokenBindingHashes, u)
 		}
 	}
 	if len(st.Users) > 0 {
@@ -585,7 +625,6 @@ func encodePersistedUserpoolState(st persistedUserpoolCatalogState) string {
 			delete(st.TokenBindings, u)
 		}
 	}
-	st.TokenBindingHashes = nil
 	raw, err := json.Marshal(st)
 	if err != nil {
 		return ""
@@ -614,17 +653,17 @@ func journaledUserSessionGen(st *persistedUserpoolCatalogState, username string)
 func decodePersistedUserpoolState(raw string) (persistedUserpoolCatalogState, bool) {
 	empty := func() persistedUserpoolCatalogState {
 		return persistedUserpoolCatalogState{
-			Users:              map[string]hostkit.UserSnapshot{},
-			UserProfileHashes:  map[string]string{},
-			RevokedSessionGen:  map[string]uint64{},
-			PendingUserRevoke:  map[string]string{},
-			Groups:             map[string]bool{},
-			Memberships:        map[string][]string{},
-			TokenBindings:      map[string][]tokenBindingRecord{},
-			TokenBindingHashes: map[string]string{},
-			UserSeq:            map[string]uint64{},
-			GroupSeq:           map[string]uint64{},
-			MembershipSeq:      map[string]uint64{},
+			Users:                map[string]hostkit.UserSnapshot{},
+			UserProfileHashes:    map[string]string{},
+			RevokedSessionGen:    map[string]uint64{},
+			PendingUserRevoke:    map[string]string{},
+			PendingUserRevokeSet: map[string][]string{},
+			Groups:               map[string]bool{},
+			Memberships:          map[string][]string{},
+			TokenBindings:        map[string][]tokenBindingRecord{},
+			UserSeq:              map[string]uint64{},
+			GroupSeq:             map[string]uint64{},
+			MembershipSeq:        map[string]uint64{},
 		}
 	}
 	if raw == "" {
@@ -646,6 +685,17 @@ func decodePersistedUserpoolState(raw string) (persistedUserpoolCatalogState, bo
 	if st.PendingUserRevoke == nil {
 		st.PendingUserRevoke = map[string]string{}
 	}
+	if st.PendingUserRevokeSet == nil {
+		st.PendingUserRevokeSet = map[string][]string{}
+	}
+	for u, id := range st.PendingUserRevoke {
+		if id != "" && len(st.PendingUserRevokeSet[u]) == 0 {
+			st.PendingUserRevokeSet[u] = []string{id}
+		}
+	}
+	for u := range st.PendingUserRevokeSet {
+		syncPendingUserRevokeSummary(&st, u)
+	}
 	if st.Groups == nil {
 		st.Groups = map[string]bool{}
 	}
@@ -654,9 +704,6 @@ func decodePersistedUserpoolState(raw string) (persistedUserpoolCatalogState, bo
 	}
 	if st.TokenBindings == nil {
 		st.TokenBindings = map[string][]tokenBindingRecord{}
-	}
-	if st.TokenBindingHashes == nil {
-		st.TokenBindingHashes = map[string]string{}
 	}
 	if st.UserSeq == nil {
 		st.UserSeq = map[string]uint64{}
@@ -1523,9 +1570,6 @@ func (h *Host) UserpoolDelete(dry bool, name string) (bool, error) {
 		for _, hHex := range deletedPoolState.UserProfileHashes {
 			removeProfileBlob(pDir, hHex)
 		}
-		for _, tbHex := range deletedPoolState.TokenBindingHashes {
-			removeTokenBindingBlob(pDir, tbHex)
-		}
 	}
 	h.errs.UnpinActiveSecretPrefix("pw:" + ep + "\x00" + name + "\x00")
 	h.errs.UnpinActiveSecretPrefix("tok:" + ep + "\x00" + name + "\x00")
@@ -1544,7 +1588,7 @@ func hasKnownCatalogUser(stateJSON, username string) bool {
 	if _, ok := st.Users[username]; ok {
 		return true
 	}
-	if st.RevokedSessionGen[username] > 0 || st.PendingUserRevoke[username] != "" || st.UserProfileHashes[username] != "" || st.TokenBindingHashes[username] != "" || len(st.TokenBindings[username]) > 0 {
+	if st.RevokedSessionGen[username] > 0 || hasPendingUserRevoke(&st, username) || st.UserProfileHashes[username] != "" || len(st.TokenBindings[username]) > 0 {
 		return true
 	}
 	for _, members := range st.Memberships {
@@ -1562,7 +1606,7 @@ func (h *Host) checkCatalogMutationHeadroom(pool string, act safety.JournalUserp
 		return nil
 	}
 	var candidateLen int
-	if len(act.StateJSON) > 8*1024*1024-65536 && simFn != nil {
+	if len(act.StateJSON) > maxNonRevocationUserpoolStateBytes-65536 && simFn != nil {
 		if st, ok := decodePersistedUserpoolState(act.StateJSON); ok {
 			simFn(&st)
 			for u := range st.Users {
@@ -1583,7 +1627,7 @@ func (h *Host) checkCatalogMutationHeadroom(pool string, act safety.JournalUserp
 	} else {
 		candidateLen = len(act.StateJSON) + 512
 	}
-	if candidateLen > 8*1024*1024 {
+	if candidateLen > maxNonRevocationUserpoolStateBytes {
 		return hostkit.ProviderError(hostkit.InvalidArgument, 0, "UserpoolStateLimitExceeded",
 			fmt.Sprintf("userpool %q state size %d exceeds maximum 8 MiB", pool, candidateLen))
 	}
@@ -1595,12 +1639,13 @@ func (h *Host) checkCatalogMutationHeadroom(pool string, act safety.JournalUserp
 // existing user sessions (user_delete, user_set_enabled(false), user_set_password).
 // If the subsequent native call loses its reply or crashes, user_verify_token
 // fails closed (UNAUTHENTICATED) until reconciled.
-func (h *Host) beginUserRevocationIntent(ep, pool, username string, act safety.JournalUserpoolEntry, _ bool) (string, uint64, uint64, bool, *hostkit.CloudError) {
+func (h *Host) beginUserRevocationIntent(ep, pool, username string, act safety.JournalUserpoolEntry, isCleanup bool) (string, uint64, uint64, uint64, bool, *hostkit.CloudError) {
 	revokeID := safety.NewToken128()
+	var intentGen uint64
 	var prevRevokedGen uint64
 	var prevUserGen uint64
 	var hadUser bool
-	cerr := h.cost.updateUserpoolState(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, func(cur string) string {
+	cerr := h.cost.updateUserpoolStateOpts(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, isCleanup, true, func(cur string) string {
 		st, ok := decodePersistedUserpoolState(cur)
 		if !ok {
 			st.Pool = hostkit.UserpoolInfo{Name: pool, IncarnationID: act.Incarnation, OwnerToken: act.OwnerToken}
@@ -1613,33 +1658,36 @@ func (h *Host) beginUserRevocationIntent(ep, pool, username string, act safety.J
 			prevUserGen = u.SessionGen
 		}
 		nextGen := baseGen + 1
+		intentGen = nextGen
 		st.RevokedSessionGen[username] = nextGen
-		st.PendingUserRevoke[username] = revokeID
+		addPendingUserRevoke(&st, username, revokeID)
 		if u, uok := st.Users[username]; uok {
 			u.SessionGen = nextGen
 			st.Users[username] = u
 		}
+		if len(cur) > maxNonRevocationUserpoolStateBytes {
+			evictOldestTokenBindingsToFit(&st, maxNonRevocationUserpoolStateBytes)
+		}
 		return encodePersistedUserpoolState(st)
 	})
-	return revokeID, prevRevokedGen, prevUserGen, hadUser, cerr
+	return revokeID, intentGen, prevRevokedGen, prevUserGen, hadUser, cerr
 }
 
 // rollbackUserRevocationIntent clears a pre-dispatch pending revocation intent
 // when the native adapter returned a definitive refusal (e.g., NotFound or PermissionDenied).
 // It restores prevRevokedGen only when restoreGen is true (authoritative proof that no
 // physical mutation committed); otherwise RevokedSessionGen remains monotonic.
-func (h *Host) rollbackUserRevocationIntent(ep, pool, username string, act safety.JournalUserpoolEntry, revokeID string, prevRevokedGen, prevUserGen uint64, hadUser, restoreGen bool) {
-	_ = h.cost.updateUserpoolState(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, func(cur string) string {
+func (h *Host) rollbackUserRevocationIntent(ep, pool, username string, act safety.JournalUserpoolEntry, revokeID string, prevRevokedGen, prevUserGen uint64, hadUser, restoreGen, isCleanup bool) {
+	_ = h.cost.updateUserpoolStateOpts(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, isCleanup, true, func(cur string) string {
 		st, ok := decodePersistedUserpoolState(cur)
 		if !ok {
 			return cur
 		}
 		st.UserProfileDir = h.userpoolProfileDir()
-		if st.PendingUserRevoke[username] != revokeID {
+		if !removePendingUserRevoke(&st, username, revokeID) {
 			return cur
 		}
-		delete(st.PendingUserRevoke, username)
-		if restoreGen {
+		if restoreGen && !hasPendingUserRevoke(&st, username) {
 			if prevRevokedGen == 0 {
 				delete(st.RevokedSessionGen, username)
 			} else {
@@ -1919,8 +1967,10 @@ func (h *Host) UserCreate(dry bool, pool, username string, attrs map[string]stri
 		return missingUser(username), h.fail(op, pool, hostkit.ProviderError(hostkit.Conflict, 409, "AmbiguousUserpoolState",
 			fmt.Sprintf("userpool %q has an unresolved ambiguous operation (%s) and requires reconciliation", pool, amb.IntentOp)))
 	}
+	var prePendingIDs []string
 	if hasAct && act.StateJSON != "" {
 		if st, ok := decodePersistedUserpoolState(act.StateJSON); ok {
+			prePendingIDs = getPendingUserRevokeIDs(&st, username)
 			if _, exists := st.Users[username]; !exists && len(st.Users) >= hostkit.MaxUsersPerPool {
 				failed = true
 				return missingUser(username), h.fail(op, pool, hostkit.Preflightf("userpool %q user count exceeds maximum (%d)", pool, hostkit.MaxUsersPerPool))
@@ -2026,6 +2076,7 @@ func (h *Host) UserCreate(dry bool, pool, username string, attrs map[string]stri
 			st.Pool = hostkit.UserpoolInfo{Name: pool, IncarnationID: act.Incarnation, OwnerToken: act.OwnerToken}
 		}
 		st.UserProfileDir = h.userpoolProfileDir()
+		reconcileAbandonedUserRevokes(&st, username, prePendingIDs)
 		curGen := journaledUserSessionGen(&st, username)
 		if snap.SessionGen > curGen {
 			curGen = snap.SessionGen
@@ -2033,9 +2084,8 @@ func (h *Host) UserCreate(dry bool, pool, username string, attrs map[string]stri
 		snap.SessionGen = curGen
 		if childSeq > 0 {
 			if st.UserSeq[username] > childSeq {
-				return cur
+				return encodePersistedUserpoolState(st)
 			}
-			delete(st.PendingUserRevoke, username)
 			deleteUserBlobsFromCatalog(&st, username)
 			st.RevokedSessionGen[username] = curGen
 			st.UserSeq[username] = childSeq
@@ -2045,7 +2095,6 @@ func (h *Host) UserCreate(dry bool, pool, username string, attrs map[string]stri
 			}
 			return encodePersistedUserpoolState(st)
 		}
-		delete(st.PendingUserRevoke, username)
 		deleteUserBlobsFromCatalog(&st, username)
 		st.RevokedSessionGen[username] = curGen
 		if hasReconciledUser {
@@ -2282,18 +2331,26 @@ func (h *Host) UserDelete(dry bool, pool, username string) error {
 		return h.fail(op, pool, notFound(hostkit.AbsentUserpool, fmt.Sprintf("userpool %q does not exist", pool)))
 	}
 
-	knownInCatalog := hasKnownCatalogUser(act.StateJSON, username)
+	var prePendingIDs []string
+	if act.StateJSON != "" {
+		if preSt, ok := decodePersistedUserpoolState(act.StateJSON); ok {
+			prePendingIDs = getPendingUserRevokeIDs(&preSt, username)
+		}
+	}
+	knownInCatalog := hasKnownCatalogUser(act.StateJSON, username) || h.cost.hasPoolUserCleanup(ep, pool, username)
 	var revokeID string
-	var prevRevGen, prevUserGen uint64
+	var intentGen, prevRevGen, prevUserGen uint64
 	var hadUser bool
 	if knownInCatalog {
 		var rcerr *hostkit.CloudError
-		revokeID, prevRevGen, prevUserGen, hadUser, rcerr = h.beginUserRevocationIntent(ep, pool, username, act, true)
+		revokeID, intentGen, prevRevGen, prevUserGen, hadUser, rcerr = h.beginUserRevocationIntent(ep, pool, username, act, true)
 		if rcerr != nil {
 			_ = scope.releaseNotSent()
 			failed = true
 			return h.fail(op, pool, rcerr)
 		}
+		markRevokeInFlight(revokeID)
+		defer unmarkRevokeInFlight(revokeID)
 	}
 
 	var childSeq uint64
@@ -2309,9 +2366,10 @@ func (h *Host) UserDelete(dry bool, pool, username string) error {
 		return h.fail(op, pool, abortErr)
 	}
 	if ce != nil {
-		if knownInCatalog && definitiveRefusal && childSeq == 0 {
+		if revokeID != "" && definitiveRefusal && childSeq == 0 {
 			recSnap, recOK := h.reconcileUserForCatalog(ctx, pool, username, true)
-			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser, recOK && recSnap.Exists)
+			restoreGen := (isNotFound(ce) && !hadUser && prevRevGen == 0) || (recOK && recSnap.Exists)
+			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser, restoreGen, true)
 		}
 		failed = true
 		return h.fail(op, pool, ce)
@@ -2335,14 +2393,23 @@ func (h *Host) UserDelete(dry bool, pool, username string) error {
 		}
 	}
 
-	if cerr := h.cost.updateUserpoolState(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, func(cur string) string {
+	if cerr := h.cost.updateUserpoolStateOpts(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, true, true, func(cur string) string {
 		st, ok := decodePersistedUserpoolState(cur)
 		if !ok {
 			return cur
 		}
 		st.UserProfileDir = h.userpoolProfileDir()
-		if revokeID != "" && st.PendingUserRevoke[username] == revokeID {
-			delete(st.PendingUserRevoke, username)
+		removePendingUserRevoke(&st, username, revokeID)
+		reconcileAbandonedUserRevokes(&st, username, prePendingIDs)
+		curGen := journaledUserSessionGen(&st, username)
+		if childSeq == 0 || st.UserSeq[username] <= childSeq {
+			if intentGen == 0 || curGen > intentGen {
+				curGen++
+			}
+			if curGen < 2 {
+				curGen = 2
+			}
+			st.RevokedSessionGen[username] = curGen
 		}
 		if childSeq > 0 {
 			if st.UserSeq[username] <= childSeq {
@@ -2507,22 +2574,26 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 		return h.fail(op, pool, notFound(hostkit.AbsentUserpool, fmt.Sprintf("userpool %q does not exist", pool)))
 	}
 
+	var prePendingIDs []string
+	if act.StateJSON != "" {
+		if preSt, ok := decodePersistedUserpoolState(act.StateJSON); ok {
+			prePendingIDs = getPendingUserRevokeIDs(&preSt, username)
+		}
+	}
+	knownInCatalog := hasKnownCatalogUser(act.StateJSON, username) || h.cost.hasPoolUserCleanup(ep, pool, username)
 	var revokeID string
-	var prePendingRevoke string
-	var prevRevGen, prevUserGen uint64
+	var intentGen, prevRevGen, prevUserGen uint64
 	var hadUser bool
-	if !enabled {
+	if !enabled && knownInCatalog {
 		var rcerr *hostkit.CloudError
-		revokeID, prevRevGen, prevUserGen, hadUser, rcerr = h.beginUserRevocationIntent(ep, pool, username, act, false)
+		revokeID, intentGen, prevRevGen, prevUserGen, hadUser, rcerr = h.beginUserRevocationIntent(ep, pool, username, act, false)
 		if rcerr != nil {
 			_ = scope.releaseNotSent()
 			failed = true
 			return h.fail(op, pool, rcerr)
 		}
-	} else if act.StateJSON != "" {
-		if preSt, ok := decodePersistedUserpoolState(act.StateJSON); ok {
-			prePendingRevoke = preSt.PendingUserRevoke[username]
-		}
+		markRevokeInFlight(revokeID)
+		defer unmarkRevokeInFlight(revokeID)
 	}
 
 	var childSeq uint64
@@ -2538,8 +2609,9 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 		return h.fail(op, pool, abortErr)
 	}
 	if ce != nil {
-		if !enabled && definitiveRefusal && childSeq == 0 {
-			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser, false)
+		if revokeID != "" && definitiveRefusal && childSeq == 0 {
+			restoreGen := isNotFound(ce) && !hadUser && prevRevGen == 0
+			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser, restoreGen, false)
 		}
 		failed = true
 		return h.fail(op, pool, ce)
@@ -2553,24 +2625,36 @@ func (h *Host) UserSetEnabled(dry bool, pool, username string, enabled bool) err
 		}
 	}
 
-	if cerr := h.cost.updateUserpoolState(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, func(cur string) string {
+	if cerr := h.cost.updateUserpoolStateOpts(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, false, !enabled, func(cur string) string {
 		st, ok := decodePersistedUserpoolState(cur)
 		if !ok {
 			return cur
 		}
 		st.UserProfileDir = h.userpoolProfileDir()
-		if revokeID != "" && st.PendingUserRevoke[username] == revokeID {
-			delete(st.PendingUserRevoke, username)
-		} else if enabled && prePendingRevoke != "" && st.PendingUserRevoke[username] == prePendingRevoke {
-			delete(st.PendingUserRevoke, username)
-		}
+		removePendingUserRevoke(&st, username, revokeID)
+		reconcileAbandonedUserRevokes(&st, username, prePendingIDs)
 		curGen := journaledUserSessionGen(&st, username)
+		if !enabled && (childSeq == 0 || st.UserSeq[username] <= childSeq) {
+			if intentGen == 0 || curGen > intentGen {
+				curGen++
+			}
+			if curGen < 2 {
+				curGen = 2
+			}
+		}
 		if updatedUser.SessionGen > curGen {
 			curGen = updatedUser.SessionGen
 		}
 		if childSeq > 0 {
 			if st.UserSeq[username] > childSeq {
-				return cur
+				if !enabled {
+					if u, uok := st.Users[username]; uok && curGen > u.SessionGen {
+						u.SessionGen = curGen
+						st.RevokedSessionGen[username] = curGen
+						st.Users[username] = u
+					}
+				}
+				return encodePersistedUserpoolState(st)
 			}
 			st.UserSeq[username] = childSeq
 			u, uok := st.Users[username]
@@ -2727,11 +2811,26 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 		return h.fail(op, pool, notFound(hostkit.AbsentUserpool, fmt.Sprintf("userpool %q does not exist", pool)))
 	}
 
-	revokeID, prevRevGen, prevUserGen, hadUser, rcerr := h.beginUserRevocationIntent(ep, pool, username, act, false)
-	if rcerr != nil {
-		_ = scope.releaseNotSent()
-		failed = true
-		return h.fail(op, pool, rcerr)
+	var prePendingIDs []string
+	if act.StateJSON != "" {
+		if preSt, ok := decodePersistedUserpoolState(act.StateJSON); ok {
+			prePendingIDs = getPendingUserRevokeIDs(&preSt, username)
+		}
+	}
+	knownInCatalog := hasKnownCatalogUser(act.StateJSON, username) || h.cost.hasPoolUserCleanup(ep, pool, username)
+	var revokeID string
+	var intentGen, prevRevGen, prevUserGen uint64
+	var hadUser bool
+	if knownInCatalog {
+		var rcerr *hostkit.CloudError
+		revokeID, intentGen, prevRevGen, prevUserGen, hadUser, rcerr = h.beginUserRevocationIntent(ep, pool, username, act, false)
+		if rcerr != nil {
+			_ = scope.releaseNotSent()
+			failed = true
+			return h.fail(op, pool, rcerr)
+		}
+		markRevokeInFlight(revokeID)
+		defer unmarkRevokeInFlight(revokeID)
 	}
 
 	var childSeq uint64
@@ -2747,8 +2846,9 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 		return h.fail(op, pool, abortErr)
 	}
 	if ce != nil {
-		if definitiveRefusal && childSeq == 0 {
-			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser, false)
+		if revokeID != "" && definitiveRefusal && childSeq == 0 {
+			restoreGen := isNotFound(ce) && !hadUser && prevRevGen == 0
+			h.rollbackUserRevocationIntent(ep, pool, username, act, revokeID, prevRevGen, prevUserGen, hadUser, restoreGen, false)
 		}
 		failed = true
 		return h.fail(op, pool, ce)
@@ -2762,16 +2862,20 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 		}
 	}
 
-	if cerr := h.cost.updateUserpoolState(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, func(cur string) string {
+	if cerr := h.cost.updateUserpoolStateOpts(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, false, true, func(cur string) string {
 		st, ok := decodePersistedUserpoolState(cur)
 		if !ok {
 			return cur
 		}
 		st.UserProfileDir = h.userpoolProfileDir()
-		if revokeID != "" && st.PendingUserRevoke[username] == revokeID {
-			delete(st.PendingUserRevoke, username)
-		}
+		removePendingUserRevoke(&st, username, revokeID)
+		reconcileAbandonedUserRevokes(&st, username, prePendingIDs)
 		curGen := journaledUserSessionGen(&st, username)
+		if childSeq == 0 || st.UserSeq[username] <= childSeq {
+			if intentGen == 0 || curGen > intentGen {
+				curGen++
+			}
+		}
 		if updatedUser.SessionGen > curGen {
 			curGen = updatedUser.SessionGen
 		}
@@ -2784,9 +2888,8 @@ func (h *Host) UserSetPassword(dry bool, pool, username, password string) error 
 					u.SessionGen = curGen
 					st.RevokedSessionGen[username] = curGen
 					st.Users[username] = u
-					return encodePersistedUserpoolState(st)
 				}
-				return cur
+				return encodePersistedUserpoolState(st)
 			}
 			st.UserSeq[username] = childSeq
 			u, uok := st.Users[username]
@@ -3208,13 +3311,13 @@ func (h *Host) UserSignIn(dry bool, pool, username, password string) (*Session, 
 			fmt.Sprintf("userpool %q has an unresolved ambiguous operation (%s) and requires reconciliation", pool, amb.IntentOp)))
 	}
 
-	var prePending string
+	var preHasPending bool
 	var preSGen uint64
 	var preUserSeq uint64
 	var preSub string
 	var expectedClientID string
 	if preSt, ok := decodePersistedUserpoolState(act.StateJSON); ok {
-		prePending = preSt.PendingUserRevoke[username]
+		preHasPending = hasPendingUserRevoke(&preSt, username)
 		preSGen = journaledUserSessionGen(&preSt, username)
 		preUserSeq = preSt.UserSeq[username]
 		expectedClientID = preSt.Pool.ClientID
@@ -3326,7 +3429,7 @@ func (h *Host) UserSignIn(dry bool, pool, username, password string) (*Session, 
 			st.Pool = hostkit.UserpoolInfo{Name: pool, PoolID: out.PoolID, IncarnationID: act.Incarnation, OwnerToken: act.OwnerToken}
 		}
 		st.UserProfileDir = h.userpoolProfileDir()
-		if prePending != "" || st.PendingUserRevoke[username] != "" {
+		if preHasPending || hasPendingUserRevoke(&st, username) {
 			revokedConcurrently = true
 			return cur
 		}
@@ -3384,6 +3487,9 @@ func (h *Host) UserSignIn(dry bool, pool, username, password string) (*Session, 
 			live = live[len(live)-hostkit.MaxSessionBindingsPerUser:]
 		}
 		st.TokenBindings[username] = live
+		if len(cur) > maxNonRevocationUserpoolStateBytes-4096 {
+			evictOldestTokenBindingsToFit(&st, maxNonRevocationUserpoolStateBytes)
+		}
 		return encodePersistedUserpoolState(st)
 	}); cerr != nil {
 		failed = true
@@ -3403,6 +3509,11 @@ func (h *Host) UserSignIn(dry bool, pool, username, password string) (*Session, 
 }
 
 // UserVerifyToken implements user_verify_token(pool, token).
+// Note: Once the journal reaches maxNonCleanupJournalBytes (60 MiB), all non-cleanup
+// operations (including UserVerifyToken) fail closed at attempt reservation with
+// INVALID_ARGUMENT / JournalSizeLimitExceeded, while cleanup operations (UserDelete,
+// GroupDelete, GroupRemoveUser, UserpoolDelete) continue using the reserved 4 MiB
+// cleanup journal headroom.
 func (h *Host) UserVerifyToken(dry bool, pool, token string) (*Session, error) {
 	const op = "user_verify_token"
 	if token != "" {
@@ -3532,7 +3643,7 @@ func (h *Host) UserVerifyToken(dry bool, pool, token string) (*Session, error) {
 				ce = unauthErr
 			} else {
 				username := verified.Username
-				if st.PendingUserRevoke[username] != "" {
+				if hasPendingUserRevoke(&st, username) {
 					ce = unauthErr
 				} else {
 					bindings := getUserTokenBindings(&st, username)
@@ -3891,7 +4002,7 @@ func (h *Host) GroupDelete(dry bool, pool, group string) (bool, error) {
 		}
 	}
 
-	if cerr := h.cost.updateUserpoolState(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, func(cur string) string {
+	if cerr := h.cost.updateUserpoolStateOpts(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, true, false, func(cur string) string {
 		st, ok := decodePersistedUserpoolState(cur)
 		if !ok {
 			return cur
@@ -4425,7 +4536,7 @@ func (h *Host) GroupRemoveUser(dry bool, pool, group, username string) error {
 		}
 	}
 
-	if cerr := h.cost.updateUserpoolState(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, func(cur string) string {
+	if cerr := h.cost.updateUserpoolStateOpts(ep, pool, act.OwnerToken, act.Incarnation, act.Generation, true, false, func(cur string) string {
 		st, ok := decodePersistedUserpoolState(cur)
 		if !ok {
 			return cur

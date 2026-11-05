@@ -1972,7 +1972,13 @@ func (ct *costTracker) replayCampaignBytes(raw []byte) (*replayedCampaignState, 
 	for _, v := range st.activePoolMemberships {
 		st.resourceCleanupNanoUSD += v
 	}
-	ct.verifiedCampaignRaw = append(ct.verifiedCampaignRaw[:0], raw...)
+	if cachedCount > 0 {
+		if len(raw) > len(ct.verifiedCampaignRaw) {
+			ct.verifiedCampaignRaw = append(ct.verifiedCampaignRaw, raw[len(ct.verifiedCampaignRaw):]...)
+		}
+	} else {
+		ct.verifiedCampaignRaw = append(ct.verifiedCampaignRaw[:0], raw...)
+	}
 	ct.verifiedCampaignRecs = newRecs
 	return st, nil
 }
@@ -2237,12 +2243,19 @@ func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(s
 		}
 	}()
 
-	raw, err := io.ReadAll(io.LimitReader(f, safety.MaxJournalFileBytes+1))
+	fi, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("read campaign %s: %w", ct.statePath, err)
+		return fmt.Errorf("stat campaign %s: %w", ct.statePath, err)
 	}
-	if len(raw) > safety.MaxJournalFileBytes {
+	if fi.Size() > safety.MaxJournalFileBytes {
 		return fmt.Errorf("campaign %s exceeds maximum size of %d bytes", ct.statePath, safety.MaxJournalFileBytes)
+	}
+	var raw []byte
+	if fi.Size() > 0 {
+		raw = make([]byte, fi.Size())
+		if _, err := io.ReadFull(f, raw); err != nil {
+			return fmt.Errorf("read campaign %s: %w", ct.statePath, err)
+		}
 	}
 	st, err := ct.replayCampaignBytes(raw)
 	if err != nil {
@@ -2250,7 +2263,7 @@ func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(s
 	}
 	st.journalFileBytes = len(raw)
 	if createIfMissing && fn != nil && len(raw) > 310<<10 {
-		if compactedRaw, compactedSeq, ok := compactSupersededCampaignStates(raw, ct.verifiedCampaignRecs); ok && len(compactedRaw) < len(raw) {
+		if compactedRaw, compactedRecs, compactedSeq, ok := compactSupersededCampaignStates(raw, ct.verifiedCampaignRecs); ok && len(compactedRaw) < len(raw) {
 			newF, _ := rewriteCampaignFileAtomic(ct.statePath, compactedRaw)
 			if newF != nil {
 				_ = f.Close()
@@ -2258,8 +2271,8 @@ func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(s
 				st.lastSeq = compactedSeq
 				st.journalFileBytes = len(compactedRaw)
 				raw = compactedRaw
-				ct.verifiedCampaignRaw = nil
-				ct.verifiedCampaignRecs = nil
+				ct.verifiedCampaignRaw = append(ct.verifiedCampaignRaw[:0], compactedRaw...)
+				ct.verifiedCampaignRecs = compactedRecs
 			}
 		}
 	}
@@ -2304,7 +2317,7 @@ func (ct *costTracker) withLockedCampaignJournal(createIfMissing bool, fn func(s
 	return nil
 }
 
-func compactSupersededCampaignStates(raw []byte, cachedRecs []campaignJournalRecord) ([]byte, uint64, bool) {
+func compactSupersededCampaignStates(raw []byte, cachedRecs []campaignJournalRecord) ([]byte, []campaignJournalRecord, uint64, bool) {
 	recs := cachedRecs
 	if len(recs) == 0 {
 		lines := bytes.Split(raw, []byte{'\n'})
@@ -2315,7 +2328,7 @@ func compactSupersededCampaignStates(raw []byte, cachedRecs []campaignJournalRec
 			}
 			var rec campaignJournalRecord
 			if err := json.Unmarshal(line, &rec); err != nil {
-				return nil, 0, false
+				return nil, nil, 0, false
 			}
 			recs = append(recs, rec)
 		}
@@ -2365,11 +2378,12 @@ func compactSupersededCampaignStates(raw []byte, cachedRecs []campaignJournalRec
 			}
 		}
 	}
-	if dropped < 4 && droppedBytes <= 256<<10 {
-		return nil, 0, false
+	if (dropped < 4 && droppedBytes <= 256<<10) || (len(raw) > 2<<20 && droppedBytes <= 256<<10) {
+		return nil, nil, 0, false
 	}
 	rawLines := bytes.Split(raw, []byte{'\n'})
 	var buf bytes.Buffer
+	compactedRecs := make([]campaignJournalRecord, 0, len(recs)-dropped)
 	var seq uint64
 	for idx, rec := range recs {
 		if rec.Event == safety.EventUserpoolState {
@@ -2385,13 +2399,16 @@ func compactSupersededCampaignStates(raw []byte, cachedRecs []campaignJournalRec
 			}
 		}
 		seq++
+		origSeq := rec.Seq
+		rec.Seq = seq
+		compactedRecs = append(compactedRecs, rec)
 		if idx < len(rawLines) && len(rawLines[idx]) > 0 {
-			if rec.Seq == seq {
+			if origSeq == seq {
 				buf.Write(rawLines[idx])
 				buf.WriteByte('\n')
 				continue
 			}
-			oldPrefix := fmt.Sprintf(`{"v":%d,"seq":%d,`, rec.Version, rec.Seq)
+			oldPrefix := fmt.Sprintf(`{"v":%d,"seq":%d,`, rec.Version, origSeq)
 			if bytes.HasPrefix(rawLines[idx], []byte(oldPrefix)) {
 				newPrefix := fmt.Sprintf(`{"v":%d,"seq":%d,`, rec.Version, seq)
 				buf.WriteString(newPrefix)
@@ -2400,15 +2417,14 @@ func compactSupersededCampaignStates(raw []byte, cachedRecs []campaignJournalRec
 				continue
 			}
 		}
-		rec.Seq = seq
 		b, err := json.Marshal(rec)
 		if err != nil {
-			return nil, 0, false
+			return nil, nil, 0, false
 		}
 		buf.Write(b)
 		buf.WriteByte('\n')
 	}
-	return buf.Bytes(), seq, true
+	return buf.Bytes(), compactedRecs, seq, true
 }
 
 // opusCrashHook, opusStepHook, and opusDirSyncFail are fault-injection hooks for testing crash-safety during campaign journal compaction.
@@ -2462,12 +2478,8 @@ func rewriteCampaignFileAtomic(statePath string, raw []byte) (*os.File, error) {
 		return nil, err
 	}
 	opusStep("tmp_synced")
-	if err := tf.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return nil, err
-	}
 	if err := os.Rename(tmpPath, statePath); err != nil {
-		_ = os.Remove(tmpPath)
+		cleanupTmp()
 		return nil, err
 	}
 	opusStep("renamed")
@@ -2479,11 +2491,7 @@ func rewriteCampaignFileAtomic(statePath string, raw []byte) (*os.File, error) {
 	} else {
 		opusStep("dir_synced")
 	}
-	reopened, _, err := openCampaignFileNoFollow(statePath)
-	if err != nil {
-		return nil, err
-	}
-	return reopened, syncErr
+	return tf, syncErr
 }
 
 func (ct *costTracker) syncFromSafetyJournalLocked() {
@@ -5513,7 +5521,11 @@ func (ct *costTracker) hasPoolMembershipCleanup(endpoint, pool, group, username 
 	return false
 }
 
-func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expIncarnation, _ string, mutate func(curStateJSON string) string) *hostkit.CloudError {
+func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expIncarnation, expGen string, mutate func(curStateJSON string) string) *hostkit.CloudError {
+	return ct.updateUserpoolStateOpts(endpoint, name, expOwnerToken, expIncarnation, expGen, false, false, mutate)
+}
+
+func (ct *costTracker) updateUserpoolStateOpts(endpoint, name, expOwnerToken, expIncarnation, _ string, isCleanup, allowRevokeHeadroom bool, mutate func(curStateJSON string) string) *hostkit.CloudError {
 	if mutate == nil {
 		return nil
 	}
@@ -5525,6 +5537,14 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 	key := scopedResKey(endpoint, name)
 	staleErr := hostkit.ProviderError(hostkit.Conflict, 409, "AmbiguousUserpoolState",
 		fmt.Sprintf("userpool %q state changed concurrently during operation", name))
+	maxStateBytes := 8 * 1024 * 1024
+	if isCleanup || allowRevokeHeadroom {
+		maxStateBytes = 8*1024*1024 + 64*1024
+	}
+	maxJournalBytes := int64(maxNonCleanupJournalBytes)
+	if isCleanup {
+		maxJournalBytes = safety.MaxJournalFileBytes
+	}
 	stateTooLargeErr := func(sz int) *hostkit.CloudError {
 		return hostkit.ProviderError(hostkit.InvalidArgument, 0, "UserpoolStateLimitExceeded",
 			fmt.Sprintf("userpool %q state size %d exceeds maximum 8 MiB", name, sz))
@@ -5551,15 +5571,15 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 		if newState == act.StateJSON {
 			return nil
 		}
-		if len(newState) > 8*1024*1024 {
+		if len(newState) > maxStateBytes {
 			return stateTooLargeErr(len(newState))
 		}
 		if ct.journal.FileSize()+int64(len(newState))+1024 > maxNonCleanupJournalBytes {
 			_ = ct.journal.Compact()
-			if ct.journal.FileSize()+int64(len(newState))+1024 > maxNonCleanupJournalBytes {
-				return hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
-					fmt.Sprintf("journal size would exceed non-cleanup headroom limit (%d bytes)", maxNonCleanupJournalBytes))
-			}
+		}
+		if ct.journal.FileSize()+int64(len(newState))+1024 > maxJournalBytes {
+			return hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
+				fmt.Sprintf("journal size would exceed headroom limit (%d bytes)", maxJournalBytes))
 		}
 		if err := ct.journal.RecordUserpoolState(act.Scope, act.Name, act.OwnerToken, act.Incarnation, act.Generation, newState); err != nil {
 			if ct.journal.CheckHealth() == nil {
@@ -5589,13 +5609,13 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 			if newState == act.StateJSON {
 				return nil
 			}
-			if len(newState) > 8*1024*1024 {
+			if len(newState) > maxStateBytes {
 				cerr = stateTooLargeErr(len(newState))
 				return nil
 			}
-			if st.journalFileBytes+len(newState)+1024 > maxNonCleanupJournalBytes {
+			if int64(st.journalFileBytes)+int64(len(newState))+1024 > maxJournalBytes {
 				cerr = hostkit.ProviderError(hostkit.InvalidArgument, 0, "JournalSizeLimitExceeded",
-					fmt.Sprintf("campaign journal size would exceed non-cleanup headroom limit (%d bytes)", maxNonCleanupJournalBytes))
+					fmt.Sprintf("campaign journal size would exceed headroom limit (%d bytes)", maxJournalBytes))
 				return nil
 			}
 			if err := appendRec(campaignJournalRecord{
@@ -5632,7 +5652,7 @@ func (ct *costTracker) updateUserpoolState(endpoint, name, expOwnerToken, expInc
 		return staleErr
 	}
 	newState := mutate(act.StateJSON)
-	if len(newState) > 8*1024*1024 {
+	if len(newState) > maxStateBytes {
 		return stateTooLargeErr(len(newState))
 	}
 	act.StateJSON = newState

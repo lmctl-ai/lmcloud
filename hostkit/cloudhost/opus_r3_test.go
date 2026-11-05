@@ -17,8 +17,6 @@ func clearProfileCaches() {
 	userpoolProfileCacheMu.Lock()
 	userpoolProfileCache = make(map[string]map[string]string, 64)
 	userpoolProfileCacheBytes = 0
-	userpoolTBCache = make(map[string][]tokenBindingRecord, 64)
-	userpoolTBCacheBytes = 0
 	userpoolProfileCacheMu.Unlock()
 }
 

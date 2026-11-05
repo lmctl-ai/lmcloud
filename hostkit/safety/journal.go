@@ -2970,14 +2970,29 @@ func hasControlCharsExceptDEL(s string) bool {
 	return false
 }
 
+func mayContainForbiddenCredentialKey(raw string) bool {
+	return strings.Contains(raw, "password") ||
+		strings.Contains(raw, "private_key") ||
+		strings.Contains(raw, "access_token") ||
+		strings.Contains(raw, `\u`) ||
+		strings.Contains(raw, `\U`)
+}
+
 func validateJournalUserpoolState(raw string) error {
-	if len(raw) > 8*1024*1024 {
+	if len(raw) > 8*1024*1024+64*1024 {
 		return errors.New("userpool_state exceeds maximum size")
 	}
 	if hasControlCharsExceptDEL(raw) {
 		return errors.New("userpool_state contains control characters")
 	}
 	if raw == "" {
+		return nil
+	}
+	trimmed := strings.TrimSpace(raw)
+	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' || !json.Valid([]byte(raw)) {
+		return errors.New("userpool_state is not valid JSON")
+	}
+	if !mayContainForbiddenCredentialKey(raw) {
 		return nil
 	}
 	var doc map[string]any
