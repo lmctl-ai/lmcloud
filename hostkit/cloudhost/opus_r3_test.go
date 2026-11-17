@@ -249,7 +249,11 @@ type opusNoGen struct {
 	reject bool
 }
 
-func stripGen(s hostkit.UserSnapshot) hostkit.UserSnapshot { s.SessionGen = 0; s.ChildSeq = 0; return s }
+func stripGen(s hostkit.UserSnapshot) hostkit.UserSnapshot {
+	s.SessionGen = 0
+	s.ChildSeq = 0
+	return s
+}
 func noSeq(ctx context.Context) context.Context {
 	var x uint64
 	return hostkit.WithUserpoolChildMutationSeqOut(ctx, &x)

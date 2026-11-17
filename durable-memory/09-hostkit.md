@@ -1,7 +1,7 @@
 # 09 — Shared Go host kit (`hostkit`) and the provider adapter contract
 
 Module `github.com/lmctl-ai/lmcloud` (Go 1.26, sole dependency `lmctl-ai/lmcode-go`
-pinned in `go.mod` and `sdk.lock` at `77932bf7134a`). Everything a script can observe is decided
+pinned in `go.mod` and `sdk.lock` at `2027887521b3d34a44e67849070bf7e39df11b1d`, providing `lmcode_std_v3` with 226 standard signatures and 10 standard REST/CLI interfaces: `RestGet`..`RestOptions`, `RestHandler`, `CliCommand`, `CliOption`, `rest_config`, `rest_route`, `rest_serve`, `rest_stop`, `rest_cli`). Everything a script can observe is decided
 once here; a provider port is **schema pin + adapter + endpoint/signing**.
 
 | Package | Contents | Imports lmcode? |
