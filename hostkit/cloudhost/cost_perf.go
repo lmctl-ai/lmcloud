@@ -312,8 +312,28 @@ type liveGuardProvider interface {
 	LiveGuard() *safety.LiveGuard
 }
 
+type liveSessionProvider interface {
+	LiveSession() *safety.Session
+}
+
 type liveTablesOwnershipProvider interface {
 	LiveTablesGuard() *safety.LiveGuard
+}
+
+func hasStoreLiveSessionProvider(store hostkit.ObjectStore) bool {
+	if gs, ok := store.(guardStore); ok {
+		store = gs.s
+	}
+	_, ok := store.(liveSessionProvider)
+	return ok
+}
+
+func hasQueueLiveSessionProvider(queue hostkit.Queue) bool {
+	if gq, ok := queue.(guardQueue); ok {
+		queue = gq.q
+	}
+	_, ok := queue.(liveSessionProvider)
+	return ok
 }
 
 func extractStoreLiveGuard(store hostkit.ObjectStore) *safety.LiveGuard {
@@ -353,6 +373,7 @@ type costTracker struct {
 	meter                  *safety.CostMeter
 	journal                *safety.Journal
 	liveGuard              *safety.LiveGuard
+	hasLiveSession         bool
 	storeDelegated         bool
 	queueDelegated         bool
 	tablesDelegated        bool
@@ -568,17 +589,17 @@ func (ct *costTracker) isServiceDelegated(op, resKind string) bool {
 	}
 	switch resKind {
 	case safety.KindBucket, safety.KindObject:
-		return ct.storeDelegated
+		return ct.storeDelegated || (ct.hasLiveSession && isLiveModeEnv())
 	case safety.KindQueue, safety.KindQueueMessage:
-		return ct.queueDelegated
+		return ct.queueDelegated || (ct.hasLiveSession && isLiveModeEnv())
 	case safety.KindTable, safety.KindTableItem:
 		return ct.tablesDelegated
 	}
 	switch {
 	case strings.HasPrefix(op, "bucket_"), strings.HasPrefix(op, "object_"):
-		return ct.storeDelegated
+		return ct.storeDelegated || (ct.hasLiveSession && isLiveModeEnv())
 	case strings.HasPrefix(op, "queue_"):
-		return ct.queueDelegated
+		return ct.queueDelegated || (ct.hasLiveSession && isLiveModeEnv())
 	case strings.HasPrefix(op, "table_"), strings.HasPrefix(op, "item_"):
 		return ct.tablesDelegated
 	}
@@ -686,6 +707,7 @@ func newCostTracker(cfg Config) *costTracker {
 			guardMismatch = true
 		}
 	}
+	hasLiveSession := hasStoreLiveSessionProvider(cfg.Store) && hasQueueLiveSessionProvider(cfg.Queue) && lg == nil && cfg.Meter == nil
 	liveMode := isLiveModeEnv() || lg != nil
 
 	ct := &costTracker{
@@ -693,6 +715,7 @@ func newCostTracker(cfg Config) *costTracker {
 		scope:                  resolveCampaignScope(),
 		journal:                cfg.Journal,
 		liveGuard:              lg,
+		hasLiveSession:         hasLiveSession,
 		storeDelegated:         storeGuard != nil,
 		queueDelegated:         queueGuard != nil,
 		tablesDelegated:        tablesGuard != nil,
@@ -763,7 +786,7 @@ func newCostTracker(cfg Config) *costTracker {
 		return ct
 	}
 
-	if liveMode {
+	if liveMode && !hasLiveSession {
 		meter := cfg.Meter
 		if meter == nil || meter.Table() == nil || meter.Table().IsSynthetic() {
 			ct.unconfiguredLive = true

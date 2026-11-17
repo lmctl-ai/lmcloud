@@ -154,7 +154,7 @@ func New(cfg Config) *Host {
 // ---- small helpers ----
 
 func (h *Host) fail(op, target string, e *hostkit.CloudError) error {
-	if e != nil && e.ProviderCode == "LiveCostCapExceeded" {
+	if e != nil && e.ProviderCode == "LiveCostCapExceeded" && (h.cost == nil || !h.cost.hasLiveSession) {
 		e = hostkit.ProviderError(hostkit.CostCapExceeded, 0, "CostCapExceeded", e.Message)
 	}
 	return h.errs.Fail(op, target, e)
