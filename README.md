@@ -1,5 +1,7 @@
 # lmcloud
 
+Documentation: [Quick reference](https://www.lmctl.com/tools/lmcloud/) · [LLM skill](https://www.lmctl.com/tools/lmcloud/skill.html) · [Guide](https://www.lmctl.com/tools/lmcloud/guide.html) · [Reference](https://www.lmctl.com/tools/lmcloud/reference.html)
+
 Script any cloud from lmscript with one procedural, provider-neutral API: a shared
 lmcode schema (object storage, queue) implemented by `lmaws`, `lmazure`, `lmgcp`
 and `lmoci`, and tested against the local emulators `awssim`, `azuresim`,
